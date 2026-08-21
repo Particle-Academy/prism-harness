@@ -1,0 +1,54 @@
+{
+    "name": "particle-academy/prism-harness",
+    "description": "Durable agent sessions for Laravel — threads, modes, tool permissions and subagents on top of Prism.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["laravel", "ai", "agents", "llm", "prism", "sessions"],
+    "authors": [
+        {
+            "name": "Wish Born",
+            "email": "wish@impact.do"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "laravel/framework": "^12.61.1|^13.12.0",
+        "particle-academy/prism": ">=0.112 <1.0"
+    },
+    "require-dev": {
+        "laravel/pint": "^1.30",
+        "orchestra/testbench": "^10.0|^11.0",
+        "pestphp/pest": "^3.0|^4.0",
+        "phpstan/phpstan": "^2.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Prism\\Harness\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "@php vendor/bin/pest",
+        "types": "@php vendor/bin/phpstan analyse",
+        "format": "@php vendor/bin/pint"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Prism\\Harness\\PrismHarnessServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    }
+}
