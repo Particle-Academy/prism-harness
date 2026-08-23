@@ -3,8 +3,62 @@
 Durable agent sessions for Laravel — threads, modes, tool permissions and subagents on top of
 [Prism](https://github.com/Particle-Academy/prism).
 
-> **Status: design only.** No implementation yet. This README records the shape and the
-> decisions taken before any code, so the first commits have something to answer to.
+> **Status: threads work; the rest is still design.** Conversation persistence is
+> implemented and tested. Sessions, modes, permissions and subagents are recorded below as
+> decisions, not code yet.
+
+## Threads
+
+The first piece, and the one everything else needs. Prism 0.113 added a `Thread` contract —
+a stored conversation it can read history from — and this package provides the Eloquent
+implementation.
+
+```php
+use Prism\Harness\Models\Thread;
+
+$thread = Thread::forParticipant($user, 'support');
+
+$response = Prism::text()
+    ->using(Provider::Anthropic, 'claude-sonnet-4-5')
+    ->withThread($thread)              // everything said so far
+    ->withPrompt('And after that?')    // the turn being taken now
+    ->asText();
+
+$thread->record($response->messages);  // the full exchange, tool steps included
+```
+
+`$response->messages` carries every step of a tool loop, so recording a turn is one call and
+a run interrupted mid-tool resumes exactly where it stopped.
+
+**Addressed by participant *and* scope.** One user holds several unrelated conversations at
+once — a support chat and a coding session are not the same thread — so the scope is part of
+the address, not a label hung off it. `Thread::forParticipant($user, 'coding')` resolves a
+different conversation from `'support'`, and a fresh worker asking for the same address lands
+on the same thread rather than starting a new one.
+
+**The storage format is ours, not Prism's.** Prism's `toArray()` exists to feed telemetry and
+debug output and is free to change for presentational reasons; persistence cannot be, so it
+does not ride on it. Two consequences worth knowing:
+
+- Content parts are stored with their concrete class. Prism's `Media::toArray()` records
+  where a file lives but not what it *is* — an Image and a Document serialise identically —
+  so without that, every attachment would come back as whatever type we guessed.
+- Anything that cannot be stored or rebuilt faithfully throws `UnmappableContent` rather than
+  being dropped. A thread is replayed to the model as context, so a silent omission does not
+  surface as an error; it surfaces much later as a model that has forgotten something.
+
+### Who can write your thread rows
+
+Prism's contract warns that stored history is replayed to the model, so it is only as
+trustworthy as the store it came from. Threads make that concrete: rebuilding an attachment
+resolves whatever locator was recorded, so a row carrying a `local_path` or `url` becomes a
+file read or an outbound fetch at replay time. Rehydration is restricted to Prism `Media`
+subclasses, but the locator itself is data.
+
+None of this is reachable without write access to your database — at which point the thread
+table is not your first problem. It matters because it sets where the boundary is: treat
+`harness_thread_messages` as trusted storage, and never let request input write directly to
+it.
 
 ## What it is for
 
@@ -64,7 +118,7 @@ use the Laravel thing rather than reimplement it.
 |---|---|
 | Controller | Singleton in the container; config file plus mode classes |
 | Session | Resolved per request from a durable store, keyed on participant + scope |
-| Thread | Eloquent models; contract defined in Prism, implementation here |
+| Thread | **Built.** Eloquent models here; contract defined in Prism (0.113) |
 | Modes | One class per mode, container-resolved so they are testable |
 | Workspace | A scoped Filesystem disk — Laravel already sandboxes; don't rebuild it |
 | Permissions | **Gates and Policies** — "may this tool run" is an authorization question |
@@ -75,7 +129,7 @@ use the Laravel thing rather than reimplement it.
 
 | Question | Decision | Why it matters |
 |---|---|---|
-| Where threads live | Contract in Prism, Eloquent implementation here | Prism keeps no storage opinion; anything can satisfy the interface |
+| Where threads live | Contract in Prism, Eloquent implementation here — **shipped** | Prism keeps no storage opinion; anything can satisfy the interface |
 | Event bus | A separate harness stream | Telemetry is observability, harness events are interface — different audiences and stability guarantees |
 | State store | Redis-first behind a configurable driver | Redis and database behind one contract |
 | Package | `particle-academy/prism-harness` | Its own repo under the Particle Academy brand |
