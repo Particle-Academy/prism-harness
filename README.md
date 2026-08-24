@@ -3,9 +3,78 @@
 Durable agent sessions for Laravel — threads, modes, tool permissions and subagents on top of
 [Prism](https://github.com/Particle-Academy/prism).
 
-> **Status: threads work; the rest is still design.** Conversation persistence is
-> implemented and tested. Sessions, modes, permissions and subagents are recorded below as
-> decisions, not code yet.
+> **Status: threads and sessions work; the rest is still design.** Conversation persistence
+> and session rehydration are implemented and tested. Modes, permissions and subagents are
+> recorded below as decisions, not code yet.
+
+## Sessions
+
+```php
+$session = PrismHarness::for($user)->session('support');
+
+$session->usingMode('plan')->usingModel('claude-sonnet-4-5');
+
+$session->lock(function (Session $session) {
+    // whatever must not happen twice
+});
+```
+
+**Resolved, never held.** A Laravel request boots, serves and dies, so a session cannot be an
+object kept in memory the way Mastra's is. Every call rebuilds one from a store, which is what
+makes a fresh worker see the same mode, model and conversation as the request that set them.
+
+### The two halves
+
+State is split into named slots, because the halves have genuinely different requirements:
+
+| Slot | Holds | Losing it means |
+|---|---|---|
+| `ephemeral` | active mode, selected model, run bookkeeping | falls back to a default |
+| `durable` | threads, pending tool approvals | work is gone |
+
+Configure them independently — Redis for the first, database for the second is the intended
+shape:
+
+```php
+'stores' => [
+    'ephemeral' => 'redis',
+    'durable'   => 'database',
+],
+```
+
+### Why the durable slot is guarded
+
+**A store that reports itself volatile is refused for durable state, loudly, at resolve time.**
+
+Redis is the natural home for live session state, but the `redis` connection in a typical
+Laravel app is a *cache* — something is entitled to flush it. The package cannot tell from the
+inside whether yours is persistent, so `redis` reports Volatile by default and pointing the
+durable slot at it throws `UnsafeStateConfiguration` with both ways out named.
+
+This is not defensive theatre. A sibling project in this workspace kept XP de-duplication in a
+cache a deploy could clear; a single `cache:clear` between two backfills would have silently
+re-awarded every contribution, with nothing in the logs. The same mistake here loses a pending
+tool approval — a half-executed action a human was asked to authorise — which does not degrade
+to a default.
+
+If your Redis really is durable (AOF or RDB), say so and it is allowed:
+
+```php
+'drivers' => [
+    'redis' => [
+        // An assertion about your infrastructure, not a preference.
+        'durable' => true,
+    ],
+],
+```
+
+### Concurrency
+
+Two workers can hold the same session at once — a queued job finishing a run while the user
+sends another message is ordinary. `lock()` takes an exclusive lock and **throws
+`SessionLocked` rather than running anyway** on timeout, since running anyway would defeat the
+only thing it is for. Locks carry an expiry, so a worker that dies mid-run does not hold the
+session shut forever.
 
 ## Threads
 
@@ -117,7 +186,7 @@ use the Laravel thing rather than reimplement it.
 | Concept | Laravel counterpart |
 |---|---|
 | Controller | Singleton in the container; config file plus mode classes |
-| Session | Resolved per request from a durable store, keyed on participant + scope |
+| Session | **Built.** Resolved per request from a store, keyed on participant + scope |
 | Thread | **Built.** Eloquent models here; contract defined in Prism (0.113) |
 | Modes | One class per mode, container-resolved so they are testable |
 | Workspace | A scoped Filesystem disk — Laravel already sandboxes; don't rebuild it |
@@ -131,7 +200,7 @@ use the Laravel thing rather than reimplement it.
 |---|---|---|
 | Where threads live | Contract in Prism, Eloquent implementation here — **shipped** | Prism keeps no storage opinion; anything can satisfy the interface |
 | Event bus | A separate harness stream | Telemetry is observability, harness events are interface — different audiences and stability guarantees |
-| State store | Redis-first behind a configurable driver | Redis and database behind one contract |
+| State store | Redis-first behind a configurable driver — **shipped** | Redis and database behind one contract, with the durable slot guarded |
 | Package | `particle-academy/prism-harness` | Its own repo under the Particle Academy brand |
 
 ### On Redis
