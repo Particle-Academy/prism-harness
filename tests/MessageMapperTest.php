@@ -5,9 +5,12 @@ declare(strict_types=1);
 use Prism\Harness\Exceptions\UnmappableContent;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Prism\Contracts\Message;
+use Prism\Prism\Enums\Citations\CitationSourceType;
 use Prism\Prism\ValueObjects\Artifact;
+use Prism\Prism\ValueObjects\Citation;
 use Prism\Prism\ValueObjects\Media\Document;
 use Prism\Prism\ValueObjects\Media\Image;
+use Prism\Prism\ValueObjects\MessagePartWithCitations;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
@@ -126,4 +129,62 @@ it('refuses a content part it cannot rebuild, rather than returning an empty one
         'content' => 'Hi',
         'additional_content' => [['class' => Image::class, 'data' => []]],
     ]))->toThrow(UnmappableContent::class);
+});
+
+it('round-trips the citation object Anthropic attaches to every reply', function (): void {
+    // Not an edge case. Anthropic wraps EVERY assistant reply in a
+    // MessagePartWithCitations, including replies that cite nothing — so a raw
+    // passthrough corrupts every Anthropic message. Found by running a
+    // two-turn conversation through a thread in a real app: turn two died in
+    // Anthropic's MessageMap with "array given" for a value object.
+    $message = new AssistantMessage('Teal noted, cool choice!', [], [
+        'citations' => [
+            new MessagePartWithCitations(
+                outputText: 'Teal noted, cool choice!',
+                citations: [
+                    new Citation(
+                        sourceType: CitationSourceType::Url,
+                        source: 'https://example.com/a',
+                        sourceText: 'teal',
+                        sourceTitle: 'A page',
+                    ),
+                ],
+            ),
+        ],
+    ]);
+
+    $restored = roundTrip($message);
+    $part = $restored->additionalContent['citations'][0];
+
+    expect($part)->toBeInstanceOf(MessagePartWithCitations::class)
+        ->and($part->outputText)->toBe('Teal noted, cool choice!')
+        ->and($part->citations[0])->toBeInstanceOf(Citation::class)
+        // The enum has to survive as an enum, not as its backing string.
+        ->and($part->citations[0]->sourceType)->toBe(CitationSourceType::Url)
+        ->and($part->citations[0]->source)->toBe('https://example.com/a')
+        ->and($part->citations[0]->sourceTitle)->toBe('A page');
+});
+
+it('keeps plain additional content plain', function (): void {
+    // Anthropic also puts scalars in here — thinking blocks and signatures.
+    // Those must not acquire an envelope.
+    $restored = roundTrip(new AssistantMessage('Hi', [], [
+        'thinking' => 'considering',
+        'thinking_signature' => 'sig_123',
+    ]));
+
+    expect($restored->additionalContent)->toBe([
+        'thinking' => 'considering',
+        'thinking_signature' => 'sig_123',
+    ]);
+});
+
+it('refuses to store an object it could never rebuild', function (): void {
+    $foreign = new class
+    {
+        public string $x = 'y';
+    };
+
+    expect(fn (): array => MessageMapper::toArray(new AssistantMessage('Hi', [], ['thing' => $foreign])))
+        ->toThrow(UnmappableContent::class);
 });

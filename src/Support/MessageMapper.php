@@ -68,7 +68,11 @@ final class MessageMapper
             $message instanceof AssistantMessage => [
                 'content' => $message->content,
                 'tool_calls' => array_map(fn (ToolCall $c): array => $c->toArray(), $message->toolCalls),
-                'additional_content' => $message->additionalContent,
+                // Encoded, not passed through: Anthropic wraps EVERY assistant
+                // reply in a MessagePartWithCitations object, and a raw array
+                // here comes back as an array and TypeErrors inside the
+                // provider's mapper on the next call.
+                'additional_content' => ValueObjectMapper::encode($message->additionalContent),
                 'tool_approval_requests' => array_map(
                     fn (ToolApprovalRequest $r): array => $r->toArray(),
                     $message->toolApprovalRequests,
@@ -100,7 +104,7 @@ final class MessageMapper
             self::TYPE_ASSISTANT => new AssistantMessage(
                 (string) ($payload['content'] ?? ''),
                 array_map(self::toolCall(...), self::arr($payload, 'tool_calls')),
-                self::arr($payload, 'additional_content'),
+                ValueObjectMapper::decode(self::arr($payload, 'additional_content')),
                 array_map(self::approvalRequest(...), self::arr($payload, 'tool_approval_requests')),
             ),
             self::TYPE_TOOL_RESULT => new ToolResultMessage(
