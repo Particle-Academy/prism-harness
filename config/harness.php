@@ -54,7 +54,12 @@ return [
     */
 
     'stores' => [
-        'ephemeral' => env('HARNESS_EPHEMERAL_STORE', 'redis'),
+        // Defaults to the database because that is what every Laravel app
+        // already has. Redis is the better home for ephemeral state and is
+        // fully supported — but defaulting to it means a fresh install throws
+        // a connection error the first time a session writes anything, on a
+        // machine that never claimed to have Redis. Opt in when you have one.
+        'ephemeral' => env('HARNESS_EPHEMERAL_STORE', 'database'),
         'durable' => env('HARNESS_DURABLE_STORE', 'database'),
     ],
 

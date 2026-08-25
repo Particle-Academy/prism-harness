@@ -87,3 +87,29 @@ it('refuses a slot naming a driver that does not exist', function (): void {
     expect(fn (): SessionStore => $manager->ephemeral())
         ->toThrow(UnsafeStateConfiguration::class, 'memcached');
 });
+
+it('works on a fresh install with no redis', function (): void {
+    // The shipped default, NOT the test override. This is the gap that let a
+    // broken first-run experience ship: every other test in this file sets the
+    // stores explicitly, so none of them ever exercised what a consumer
+    // actually gets out of the box.
+    //
+    // Found by installing the package into a real app with no Redis running:
+    // session(), key() and thread() all worked, and the first usingMode() threw
+    // a Redis connection error.
+    $defaults = require __DIR__.'/../config/harness.php';
+
+    expect($defaults['stores']['ephemeral'])->toBe('database')
+        ->and($defaults['stores']['durable'])->toBe('database');
+
+    // And prove it end to end: resolve a session on the packaged defaults and
+    // write ephemeral state, with no Redis anywhere.
+    $manager = manager($defaults);
+
+    expect($manager->ephemeral())->toBeInstanceOf(DatabaseSessionStore::class)
+        ->and($manager->durable())->toBeInstanceOf(DatabaseSessionStore::class);
+
+    $manager->ephemeral()->put('smoke', ['mode' => 'plan']);
+
+    expect($manager->ephemeral()->get('smoke'))->toBe(['mode' => 'plan']);
+});

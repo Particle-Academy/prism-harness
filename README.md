@@ -35,9 +35,14 @@ State is split into named slots, because the halves have genuinely different req
 Configure them independently — Redis for the first, database for the second is the intended
 shape:
 
+Both default to `database`, so the package works on install with nothing to set up. Point the
+ephemeral half at Redis when you have one — it is the better home for live session state, and
+opting in beats a default that throws a connection error on a machine that never claimed to
+run Redis:
+
 ```php
 'stores' => [
-    'ephemeral' => 'redis',
+    'ephemeral' => 'redis',      // recommended in production
     'durable'   => 'database',
 ],
 ```
