@@ -39,6 +39,14 @@ abstract class TestCase extends Orchestra
             // whose cascade never fires.
             'foreign_key_constraints' => true,
         ]);
+
+        // Both slots on the database driver: there is no Redis in CI, and the
+        // database store is the one that must work everywhere anyway. Tests
+        // that care about Redis specifically construct that store directly.
+        $app['config']->set('harness.stores', [
+            'ephemeral' => 'database',
+            'durable' => 'database',
+        ]);
     }
 
     /**
