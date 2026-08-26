@@ -1,9 +1,16 @@
 {
     "name": "particle-academy/prism-harness",
-    "description": "Durable agent sessions for Laravel — threads, modes, tool permissions and subagents on top of Prism.",
+    "description": "Durable agent sessions for Laravel \u2014 threads, modes, tool permissions and subagents on top of Prism.",
     "type": "library",
     "license": "MIT",
-    "keywords": ["laravel", "ai", "agents", "llm", "prism", "sessions"],
+    "keywords": [
+        "laravel",
+        "ai",
+        "agents",
+        "llm",
+        "prism",
+        "sessions"
+    ],
     "authors": [
         {
             "name": "Wish Born",
@@ -50,5 +57,8 @@
         "allow-plugins": {
             "pestphp/pest-plugin": true
         }
+    },
+    "suggest": {
+        "particle-academy/fancy-flow-php": "Drives fancy-flow's llm_call, tool_use and agent nodes through Prism, with the agent's conversation carried on a durable harness thread. Optional: fancy-flow needs PHP 8.4 and this package supports 8.2, so it is never required. See src/Flow/."
     }
 }
