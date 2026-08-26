@@ -2,3 +2,7 @@ parameters:
     level: 6
     paths:
         - src
+    # fancy-flow-php needs PHP 8.4 and this package supports 8.2, so its
+    # contracts are mirrored rather than installed. See stubs/fancy-flow.php.
+    scanFiles:
+        - stubs/fancy-flow.php
