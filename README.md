@@ -7,6 +7,11 @@ Durable agent sessions for Laravel — threads, modes, tool permissions and suba
 > and session rehydration are implemented and tested. Modes, permissions and subagents are
 > recorded below as decisions, not code yet.
 
+> **Working on this package?** Read **[`AGENTS.md`](AGENTS.md)** first — the boundary
+> this package has to hold, the gates that must be green, and the traps that have
+> already caught someone.
+> `@link AGENTS.md`
+
 ## Sessions
 
 ```php
