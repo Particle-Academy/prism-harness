@@ -45,6 +45,17 @@ final class ValueObjectMapper
      * handlers are deliberately NOT eligible: they take clients and API keys,
      * and nothing should be able to name one of those from a stored row.
      *
+     * Six providers ship value objects of their own — Gemini's search
+     * groundings, Anthropic's legacy citations — under
+     * `Prism\Prism\Providers\<Name>\ValueObjects\`. Those are the same kind
+     * of plain carrier as the core ones, and refusing them meant the harness
+     * could not store a Gemini response that used search grounding: a provider
+     * Prism supports and the harness did not.
+     *
+     * They are admitted by the SHAPE of the namespace rather than by adding
+     * `Prism\Prism\Providers\` to this list, because that prefix also covers
+     * the provider and handler classes the paragraph above rules out.
+     *
      * @var list<string>
      */
     private const ALLOWED_NAMESPACES = [
@@ -131,7 +142,36 @@ final class ValueObjectMapper
             }
         }
 
-        return false;
+        return self::isProviderValueObject($class);
+    }
+
+    /**
+     * A value object shipped by one of Prism's own providers.
+     *
+     * Matched on shape — `Prism\Prism\Providers\<Name>\ValueObjects\<Class>`
+     * — so a provider or handler class cannot slip through. `Gemini\Gemini`
+     * and `Gemini\Handlers\Text` do not match; `Gemini\ValueObjects     * MessagePartWithSearchGroundings` does.
+     *
+     * The `<Name>` segment is bounded to a single identifier deliberately: a
+     * looser pattern would let a nested `ValueObjects` anywhere under
+     * Providers qualify, which is a wider door than this needs to open.
+     */
+    private static function isProviderValueObject(string $class): bool
+    {
+        $prefix = 'Prism\\Prism\\Providers\\';
+
+        if (! str_starts_with($class, $prefix)) {
+            return false;
+        }
+
+        // Exactly <Name>\\ValueObjects\\<Class> after the prefix. Written as
+        // segment comparison rather than a pattern: the same rule as a regex,
+        // without three layers of backslash escaping between the source and
+        // the matcher, where a lost backslash reads as a Unicode property
+        // escape and silently matches nothing.
+        $segments = explode('\\', substr($class, strlen($prefix)));
+
+        return count($segments) === 3 && $segments[1] === 'ValueObjects';
     }
 
     /**
