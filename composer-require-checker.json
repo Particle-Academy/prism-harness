@@ -1,3 +1,16 @@
 {
-    "symbol-whitelist": []
+    "//": [
+        "The fancy-flow contracts the Flow bridge implements are whitelisted because",
+        "the integration is deliberately OPTIONAL: fancy-flow-php requires PHP 8.4 and",
+        "this package supports 8.2, so it lives under `suggest` and is never installed",
+        "as a dependency. Nothing autoloads src/Flow unless an application wires it.",
+        "",
+        "Only the two interfaces are listed, not the FancyFlow namespace as a whole.",
+        "A prefix would let any future use of an uninstalled fancy-flow class pass this",
+        "check silently, which is the failure the checker exists to catch."
+    ],
+    "symbol-whitelist": [
+        "FancyFlow\\Nodes\\Support\\LlmClient",
+        "FancyFlow\\Nodes\\Support\\ToolInvoker"
+    ]
 }
