@@ -188,16 +188,26 @@ if ($response->awaitingApproval()) {
 Every Mastra concept has a native Laravel counterpart. Where the mapping is exact, the plan is to
 use the Laravel thing rather than reimplement it.
 
-| Concept | Laravel counterpart |
-|---|---|
-| Controller | Singleton in the container; config file plus mode classes |
-| Session | **Built.** Resolved per request from a store, keyed on participant + scope |
-| Thread | **Built.** Eloquent models here; contract defined in Prism (0.113) |
-| Modes | One class per mode, container-resolved so they are testable |
-| Workspace | A scoped Filesystem disk — Laravel already sandboxes; don't rebuild it |
-| Permissions | **Gates and Policies** — "may this tool run" is an authorization question |
-| Subagents | A Prism Tool wrapping a nested run, with a narrowed toolset |
-| Event bus | Laravel events over Reverb — a harness stream, separate from Prism telemetry |
+| Concept | Status | Laravel counterpart |
+|---|---|---|
+| Controller | *planned* | Singleton in the container; config file plus mode classes |
+| Session | **shipped** | Resolved per request from a store, keyed on participant + scope |
+| Thread | **shipped** | Eloquent models here; contract defined in Prism (0.113) |
+| Modes | *planned* | One class per mode, container-resolved so they are testable |
+| Workspace | *elsewhere* | A scoped Filesystem disk — built as [`prism-workspace`](https://github.com/Particle-Academy/prism-workspace) |
+| Permissions | *planned* | Gates and Policies — "may this tool run" is an authorization question |
+| Subagents | *planned* | A Prism Tool wrapping a nested run, with a narrowed toolset |
+| Event bus | *planned* | Laravel events over Reverb — a harness stream, separate from Prism telemetry |
+
+Every row states its status, because the previous version of this table did not
+and it misled someone. Bold was doing two jobs: marking *Session* and *Thread*
+as built, and emphasising *Gates and Policies* as a design choice. Identical
+weight, identical position, different meaning — so the planned row read exactly
+like the shipped ones, and a reader concluded this package gates tools on
+Laravel Gates. It does not; there is no `Gate` reference anywhere in `src/`.
+
+That reader then told two other agents, one of which built on it. A status line
+four lines above a table does not travel with the row someone quotes.
 
 ## Decisions already taken
 
