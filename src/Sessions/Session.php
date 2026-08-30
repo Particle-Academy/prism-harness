@@ -6,6 +6,8 @@ namespace Prism\Harness\Sessions;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Prism\Harness\AgentResponse;
+use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Models\Thread;
 
@@ -35,6 +37,7 @@ class Session
         protected readonly SessionStore $ephemeral,
         protected readonly SessionStore $durable,
         protected readonly ?int $ttlSeconds = null,
+        protected readonly ?AgentRuntime $runtime = null,
     ) {}
 
     public function scope(): string
@@ -90,6 +93,50 @@ class Session
         return $this->write('model', $model);
     }
 
+    public function provider(): ?string
+    {
+        $provider = $this->state()['provider'] ?? null;
+
+        return is_string($provider) ? $provider : null;
+    }
+
+    public function usingProvider(string $provider): self
+    {
+        return $this->write('provider', $provider);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function capability(string $name): ?array
+    {
+        $state = $this->durable->get($this->durableKey()) ?? [];
+        $capability = $state['capabilities'][$name] ?? null;
+
+        return is_array($capability) ? $capability : null;
+    }
+
+    /** @param array<string, mixed> $state */
+    public function usingCapability(string $name, array $state): self
+    {
+        $durable = $this->durable->get($this->durableKey()) ?? [];
+        $capabilities = is_array($durable['capabilities'] ?? null) ? $durable['capabilities'] : [];
+        $capabilities[$name] = $state;
+        $durable['capabilities'] = $capabilities;
+        $this->durable->put($this->durableKey(), $durable);
+
+        return $this;
+    }
+
+    public function forgetCapability(string $name): self
+    {
+        $durable = $this->durable->get($this->durableKey()) ?? [];
+        $capabilities = is_array($durable['capabilities'] ?? null) ? $durable['capabilities'] : [];
+        unset($capabilities[$name]);
+        $durable['capabilities'] = $capabilities;
+        $this->durable->put($this->durableKey(), $durable);
+
+        return $this;
+    }
+
     /**
      * The stored conversation this session is bound to.
      *
@@ -99,6 +146,42 @@ class Session
     public function thread(): Thread
     {
         return Thread::forParticipant($this->participant, $this->scope);
+    }
+
+    /** @param list<string>|null $toolNames */
+    public function send(string $prompt, ?array $toolNames = null): AgentResponse
+    {
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        return $this->runtime->send($this, $prompt, $toolNames);
+    }
+
+    /** @return array<string, mixed>|null */
+    public function run(): ?array
+    {
+        $run = $this->state()['run'] ?? null;
+
+        return is_array($run) ? $run : null;
+    }
+
+    public function beginRun(string $id, string $mode, string $provider, string $model): self
+    {
+        return $this->write('run', [
+            'id' => $id, 'status' => 'running', 'mode' => $mode,
+            'provider' => $provider, 'model' => $model, 'started_at' => now()->toIso8601String(),
+        ]);
+    }
+
+    public function completeRun(string $id, string $finishReason): self
+    {
+        return $this->finishRun($id, 'completed', ['finish_reason' => $finishReason]);
+    }
+
+    public function failRun(string $id, string $failure): self
+    {
+        return $this->finishRun($id, 'failed', ['failure' => $failure]);
     }
 
     /**
@@ -135,6 +218,8 @@ class Session
      */
     public function forget(): self
     {
+        $this->ephemeral->forget($this->ephemeralKey());
+        // Pre-runtime releases stored ephemeral state at the unsuffixed key.
         $this->ephemeral->forget($this->key());
         $this->cachedState = null;
 
@@ -146,7 +231,9 @@ class Session
      */
     public function state(): array
     {
-        return $this->cachedState ??= $this->ephemeral->get($this->key()) ?? [];
+        return $this->cachedState ??= $this->ephemeral->get($this->ephemeralKey())
+            ?? $this->ephemeral->get($this->key())
+            ?? [];
     }
 
     protected function write(string $key, mixed $value): self
@@ -154,9 +241,32 @@ class Session
         $state = $this->state();
         $state[$key] = $value;
 
-        $this->ephemeral->put($this->key(), $state, $this->ttlSeconds);
+        $this->ephemeral->put($this->ephemeralKey(), $state, $this->ttlSeconds);
         $this->cachedState = $state;
 
         return $this;
+    }
+
+    /** @param array<string, mixed> $details */
+    protected function finishRun(string $id, string $status, array $details): self
+    {
+        $run = $this->run();
+        if (! is_array($run) || ($run['id'] ?? null) !== $id) {
+            throw new \LogicException('Harness run state changed while the run was active.');
+        }
+
+        return $this->write('run', [
+            ...$run, ...$details, 'status' => $status, 'finished_at' => now()->toIso8601String(),
+        ]);
+    }
+
+    protected function ephemeralKey(): string
+    {
+        return $this->key().':ephemeral';
+    }
+
+    protected function durableKey(): string
+    {
+        return $this->key().':durable';
     }
 }

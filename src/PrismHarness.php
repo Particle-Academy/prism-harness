@@ -25,6 +25,7 @@ class PrismHarness
      */
     public function __construct(
         protected readonly SessionStoreManager $stores,
+        protected readonly AgentRuntime $runtime,
         protected readonly array $config = [],
     ) {}
 
@@ -41,6 +42,7 @@ class PrismHarness
             ephemeral: $this->stores->ephemeral(),
             durable: $this->stores->durable(),
             ttlSeconds: $this->ephemeralTtl(),
+            runtime: $this->runtime,
         );
     }
 

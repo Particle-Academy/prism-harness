@@ -58,6 +58,37 @@ it('carries mode and model independently', function (): void {
         ->and($session->model())->toBe('claude-sonnet-4-5');
 });
 
+it('persists the selected provider independently from the model', function (): void {
+    $ada = Participant::create(['name' => 'Ada']);
+    harness()->for($ada)->session()->usingProvider('openai')->usingModel('gpt-5');
+
+    $session = harness()->for($ada)->session();
+    expect($session->provider())->toBe('openai')->and($session->model())->toBe('gpt-5');
+});
+
+it('keeps capability attachment identifiers in the durable state slot', function (): void {
+    $ada = Participant::create(['name' => 'Ada']);
+    $session = harness()->for($ada)->session('capabilities');
+
+    $session->usingCapability('browser', ['id' => 'browser_one', 'state' => 'open']);
+    $session->forget();
+
+    expect(harness()->for($ada->fresh())->session('capabilities')->capability('browser'))
+        ->toBe(['id' => 'browser_one', 'state' => 'open']);
+});
+
+it('forgets one durable capability without disturbing another', function (): void {
+    $ada = Participant::create(['name' => 'Ada']);
+    $session = harness()->for($ada)->session('capabilities')
+        ->usingCapability('browser', ['id' => 'browser_one'])
+        ->usingCapability('human_plus', ['id' => 'surface_one']);
+
+    $session->forgetCapability('browser');
+
+    expect($session->capability('browser'))->toBeNull()
+        ->and($session->capability('human_plus'))->toBe(['id' => 'surface_one']);
+});
+
 it('falls back to a default when ephemeral state is gone', function (): void {
     $ada = Participant::create(['name' => 'Ada']);
 

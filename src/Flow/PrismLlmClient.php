@@ -54,7 +54,10 @@ final class PrismLlmClient implements LlmClient
      */
     public function complete(string $prompt, array $options = []): array
     {
-        $provider = $this->stringOption($options, 'provider') ?? $this->defaultProvider ?? 'anthropic';
+        $provider = $this->stringOption($options, 'provider')
+            ?? $this->session?->provider()
+            ?? $this->defaultProvider
+            ?? 'anthropic';
         $model = $this->stringOption($options, 'model')
             ?? $this->session?->model()
             ?? $this->defaultModel;

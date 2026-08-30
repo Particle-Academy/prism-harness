@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Prism\Harness\Exceptions\ToolNotAvailable;
+use Prism\Harness\Flow\HarnessAgentExecutor;
 use Prism\Harness\Flow\HarnessToolInvoker;
 use Prism\Harness\Flow\PrismLlmClient;
 use Prism\Prism\Tool;
@@ -80,7 +81,7 @@ it('says which knob is unset when no model is configured', function (): void {
 
 it('implements the contract fancy-flow actually declares', function (): void {
     // The mirror is the risk. This asserts the shape the bridge is written
-    // against; the signatures were verified against fancy-flow v0.41.0 with the
+    // against; the signatures were verified against fancy-flow v0.49.1 with the
     // real package installed, and this fails if either side is renamed here.
     expect(class_implements(PrismLlmClient::class))
         ->toContain('FancyFlow\Nodes\Support\LlmClient')
@@ -90,4 +91,13 @@ it('implements the contract fancy-flow actually declares', function (): void {
     $complete = new ReflectionMethod('FancyFlow\Nodes\Support\LlmClient', 'complete');
     expect($complete->getNumberOfParameters())->toBe(2)
         ->and((string) $complete->getReturnType())->toBe('array');
+});
+
+it('ships an executor for the current durable fancy-flow node contract', function (): void {
+    expect(class_implements(HarnessAgentExecutor::class))
+        ->toContain('FancyFlow\\Contracts\\NodeExecutor');
+
+    $execute = new ReflectionMethod(HarnessAgentExecutor::class, 'execute');
+    expect((string) $execute->getParameters()[0]->getType())->toBe('FancyFlow\\Runtime\\ExecutionContext')
+        ->and((string) $execute->getReturnType())->toBe('array');
 });

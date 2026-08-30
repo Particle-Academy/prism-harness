@@ -15,7 +15,7 @@ uses(TestCase::class)->in(__DIR__);
 | contracts the Flow bridge implements are declared here when absent, so those
 | tests run everywhere.
 |
-| These MIRROR fancy-flow v0.41.0 and do not define it. The signatures were
+| These MIRROR fancy-flow v0.49.1 and do not define it. The signatures were
 | verified against the real package with it temporarily installed:
 |
 |     LlmClient::complete(string $prompt, array $options = ...): array
@@ -34,4 +34,12 @@ if (! interface_exists('FancyFlow\Nodes\Support\LlmClient')) {
 
 if (! interface_exists('FancyFlow\Nodes\Support\ToolInvoker')) {
     eval('namespace FancyFlow\Nodes\Support; interface ToolInvoker { public function invoke(string $tool, array $args = []): mixed; }');
+}
+
+if (! interface_exists('FancyFlow\Contracts\NodeExecutor')) {
+    eval('namespace FancyFlow\Contracts; interface NodeExecutor { public function execute(\FancyFlow\Runtime\ExecutionContext $ctx): mixed; }');
+}
+
+if (! class_exists('FancyFlow\Runtime\ExecutionContext')) {
+    eval('namespace FancyFlow\Runtime; class ExecutionContext {}');
 }

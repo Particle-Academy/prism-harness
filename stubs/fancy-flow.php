@@ -31,3 +31,42 @@ interface ToolInvoker
      */
     public function invoke(string $tool, array $args = []): mixed;
 }
+
+namespace FancyFlow\Contracts;
+
+use FancyFlow\Runtime\ExecutionContext;
+
+interface NodeExecutor
+{
+    public function execute(ExecutionContext $ctx): mixed;
+}
+
+namespace FancyFlow\Schema;
+
+final class FlowNode
+{
+    public string $id;
+
+    /** @var array<string, mixed> */
+    public array $config;
+}
+
+namespace FancyFlow\Runtime;
+
+use FancyFlow\Schema\FlowNode;
+
+final class RunEvent
+{
+    public static function log(string $level, string $message, ?string $nodeId = null, mixed $detail = null): self {}
+}
+
+final class ExecutionContext
+{
+    public FlowNode $node;
+
+    public function option(string $key, mixed $default = null): mixed {}
+
+    public function input(string $port = 'in', mixed $default = null): mixed {}
+
+    public function emit(RunEvent $event): void {}
+}
