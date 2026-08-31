@@ -33,7 +33,7 @@ it('offers only tools named by the active mode', function (): void {
         (new Tool)->as('allowed_tool')->for('Allowed')->using(fn (): string => 'yes'),
         (new Tool)->as('hidden_tool')->for('Hidden')->using(fn (): string => 'no'),
     ]);
-    config()->set('harness.agent.modes.chat.tools', ['allowed_tool']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['allowed_tool']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     $ada = Participant::create(['name' => 'Ada']);
@@ -44,7 +44,7 @@ it('offers only tools named by the active mode', function (): void {
 });
 
 it('offers Harness skills without copying them into an agent workspace', function (): void {
-    config()->set('harness.agent.modes.chat.skills', ['remotion']);
+    config()->set('prism-harness.agent.modes.chat.skills', ['remotion']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     $ada = Participant::create(['name' => 'Ada']);
@@ -60,7 +60,7 @@ it('resolves session-bound tool factories against the locked owner session', fun
     app(ToolRegistry::class)->registerFactory('session_key', fn ($session): Tool => (new Tool)
         ->as('session_key')->for('Reports the owning session key.')
         ->using(fn (): string => $session->key()));
-    config()->set('harness.agent.modes.chat.tools', ['session_key']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['session_key']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     $ada = Participant::create(['name' => 'Ada']);
@@ -78,7 +78,7 @@ it('discovers dynamic capability tools from the locked session', function (): vo
     app(ToolRegistry::class)->registerProvider(fn ($session): array => $session->capability('surface') === null ? [] : [
         (new Tool)->as('surface_read')->for('Read the attached surface.')->using(fn (): string => 'surface'),
     ]);
-    config()->set('harness.agent.modes.chat.tools', ['*']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['*']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
     $ada = Participant::create(['name' => 'Ada']);
     harness()->for($ada)->session('chat')->usingCapability('surface', ['id' => 'surface_one'])->send('Read it');

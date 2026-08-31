@@ -48,7 +48,7 @@ it('names both ways out of the unsafe authorization configuration', function ():
     } catch (UnsafeAuthorizationConfiguration $e) {
         // An error that only says "no" sends someone hunting.
         expect($e->getMessage())
-            ->toContain('harness.agent.authorize_tools')
+            ->toContain('prism-harness.agent.authorize_tools')
             ->toContain(ToolAuthorizer::ABILITY);
     }
 });
@@ -84,7 +84,7 @@ it('refuses to widen a mode when the caller names a tool outside it', function (
     // Before this, `$toolNames ?? $mode->tools` let the caller's list REPLACE
     // the mode's, so a mode named `readonly` guaranteed nothing.
     registerTools();
-    config()->set('harness.agent.modes.chat.tools', ['read_thing']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['read_thing']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     $ada = Participant::create(['name' => 'Ada']);
@@ -97,7 +97,7 @@ it('refuses to widen a mode when the caller names a tool outside it', function (
 
 it('lets a caller narrow within the mode', function (): void {
     registerTools();
-    config()->set('harness.agent.modes.chat.tools', ['read_thing', 'write_thing']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['read_thing', 'write_thing']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     $ada = Participant::create(['name' => 'Ada']);
@@ -110,7 +110,7 @@ it('lets a caller narrow within the mode', function (): void {
 
 it('treats a wildcard mode as an unrestricted ceiling', function (): void {
     registerTools();
-    config()->set('harness.agent.modes.chat.tools', ['*']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['*']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     $ada = Participant::create(['name' => 'Ada']);
@@ -125,7 +125,7 @@ it('reads a wildcard FROM THE CALLER as everything the mode allows, never the re
     // The subtle direction. `'*'` from a caller must not escalate to whatever
     // the registry happens to hold — it means "all of mine", not "all of them".
     registerTools();
-    config()->set('harness.agent.modes.chat.tools', ['read_thing']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['read_thing']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     $ada = Participant::create(['name' => 'Ada']);
@@ -149,7 +149,7 @@ it('asks the policy again at call time, with the arguments in hand', function ()
     // no arguments yet.
     Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
     Gate::define(ToolAuthorizer::CALL_ABILITY, fn ($user, $session, Tool $tool, array $args): bool => str_starts_with((string) ($args['path'] ?? ''), '/tmp/'));
-    config()->set('harness.agent.authorize_tools', true);
+    config()->set('prism-harness.agent.authorize_tools', true);
 
     $tool = (new Tool)->as('write_thing')->for('Write')
         ->withStringParameter('path', 'Where')

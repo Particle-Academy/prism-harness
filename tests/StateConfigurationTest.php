@@ -97,7 +97,7 @@ it('works on a fresh install with no redis', function (): void {
     // Found by installing the package into a real app with no Redis running:
     // session(), key() and thread() all worked, and the first usingMode() threw
     // a Redis connection error.
-    $defaults = require __DIR__.'/../config/harness.php';
+    $defaults = require __DIR__.'/../config/prism-harness.php';
 
     expect($defaults['stores']['ephemeral'])->toBe('database')
         ->and($defaults['stores']['durable'])->toBe('database');

@@ -28,7 +28,7 @@ final readonly class ToolAuthorizer
      */
     public const CALL_ABILITY = 'harness.tool.call';
 
-    private const FLAG = 'harness.agent.authorize_tools';
+    private const FLAG = 'prism-harness.agent.authorize_tools';
 
     public function __construct(private Gate $gate, private bool $enabled = false)
     {

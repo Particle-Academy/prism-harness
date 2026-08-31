@@ -22,14 +22,14 @@ use Tests\Fixtures\Participant;
 
 function configureSubagentModes(array $overrides = []): void
 {
-    config()->set('harness.agent.modes.op_runner', array_replace([
+    config()->set('prism-harness.agent.modes.op_runner', array_replace([
         'system_prompt' => 'You run a single Op and report what happened.',
         'tools' => [],
         'skills' => [],
         'max_steps' => 4,
     ], $overrides));
 
-    config()->set('harness.agent.modes.chat.subagents', [
+    config()->set('prism-harness.agent.modes.chat.subagents', [
         'run_op' => ['description' => 'Test-run a Compass Op.', 'mode' => 'op_runner', 'max_steps' => 3],
     ]);
 }
@@ -275,8 +275,8 @@ it('offers a declared subagent to the parent run as a tool', function (): void {
 });
 
 it('offers no subagent to a mode that declares none', function (): void {
-    config()->set('harness.agent.modes.chat.subagents', []);
-    config()->set('harness.agent.modes.chat.tools', []);
+    config()->set('prism-harness.agent.modes.chat.subagents', []);
+    config()->set('prism-harness.agent.modes.chat.tools', []);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     harness()->for(Participant::create(['name' => 'Ada']))->session('chat')->send('go');
@@ -289,7 +289,7 @@ it('offers no subagent to a mode that declares none', function (): void {
 it('refuses a mode declaring a subagent whose mode does not exist', function (): void {
     // Surfaced when the parent mode loads, not halfway through a run that has
     // already spent budget.
-    config()->set('harness.agent.modes.chat.subagents', [
+    config()->set('prism-harness.agent.modes.chat.subagents', [
         'ghost' => ['mode' => 'no_such_mode'],
     ]);
 
@@ -320,7 +320,7 @@ it('passes a tool failure value through the authorization wrapper unchanged', fu
     // A wrapped tool must return what the tool returns. Flattening ToolError
     // into a string would turn a first-class failure into a successful answer.
     Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
-    config()->set('harness.agent.authorize_tools', true);
+    config()->set('prism-harness.agent.authorize_tools', true);
 
     $tool = (new Tool)->as('breaks')->for('Breaks')
         ->using(fn (): ToolError => new ToolError('nope'));

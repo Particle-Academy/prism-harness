@@ -31,8 +31,8 @@ it('marks a mode-declared tool as requiring approval before it is offered', func
         (new Tool)->as('execute_op')->for('Run')->using(fn (): string => 'ran'),
         (new Tool)->as('read_op')->for('Read')->using(fn (): string => 'read'),
     ]);
-    config()->set('harness.agent.modes.chat.tools', ['execute_op', 'read_op']);
-    config()->set('harness.agent.modes.chat.requires_approval', ['execute_op']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['execute_op', 'read_op']);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['execute_op']);
     $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
 
     harness()->for(Participant::create(['name' => 'Ada']))->session('chat')->send('go');
@@ -142,7 +142,7 @@ it('emits only the exception class when a run fails, never the message', functio
     // A provider message can carry a request URL or a key inside one, and an
     // event may end up on a screen.
     Event::fake([RunFailed::class]);
-    config()->set('harness.agent.modes.chat.subagents', ['ghost' => ['mode' => 'nope']]);
+    config()->set('prism-harness.agent.modes.chat.subagents', ['ghost' => ['mode' => 'nope']]);
 
     try {
         harness()->for(Participant::create(['name' => 'Ada']))->session('chat')->send('go');
@@ -162,7 +162,7 @@ it('emits only the exception class when a run fails, never the message', functio
 it('resolves every configured mode, not just the default one', function (): void {
     // A mode nobody has entered yet keeps its misconfiguration until someone
     // switches to it. `all()` is what finds that on a Tuesday.
-    config()->set('harness.agent.modes.other', ['system_prompt' => 'x', 'tools' => [], 'skills' => [], 'max_steps' => 2]);
+    config()->set('prism-harness.agent.modes.other', ['system_prompt' => 'x', 'tools' => [], 'skills' => [], 'max_steps' => 2]);
 
     expect(array_keys(app(ModeRegistry::class)->all()))->toContain('chat', 'other');
 });
@@ -173,14 +173,14 @@ it('reports a healthy configuration', function (): void {
 
 it('fails when an approval gate names a tool the mode never offers', function (): void {
     // A gate on nothing, which reads to an auditor exactly like a gate.
-    config()->set('harness.agent.modes.chat.tools', ['read_op']);
-    config()->set('harness.agent.modes.chat.requires_approval', ['execute_op']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['read_op']);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['execute_op']);
 
     $this->artisan('harness:doctor')->assertFailed();
 });
 
 it('fails when a mode names a subagent whose mode does not exist', function (): void {
-    config()->set('harness.agent.modes.chat.subagents', ['ghost' => ['mode' => 'no_such_mode']]);
+    config()->set('prism-harness.agent.modes.chat.subagents', ['ghost' => ['mode' => 'no_such_mode']]);
 
     $this->artisan('harness:doctor')->assertFailed();
 });
@@ -189,7 +189,7 @@ it('records which tools a run invoked, by name and not by argument', function ()
     // Names audit a guardrail; arguments are PII and already live in
     // prism-opentelemetry behind an opt-in capture gate.
     app(ToolRegistry::class)->register((new Tool)->as('read_op')->for('Read')->using(fn (): string => 'r'));
-    config()->set('harness.agent.modes.chat.tools', ['read_op']);
+    config()->set('prism-harness.agent.modes.chat.tools', ['read_op']);
     Prism::fake([
         TextResponseFake::make()->withText('done')->withSteps(collect([
             new Step(
