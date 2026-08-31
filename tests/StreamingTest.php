@@ -3,43 +3,39 @@
 declare(strict_types=1);
 
 use Prism\Harness\Models\Thread;
-use Prism\Harness\Streaming\StreamRecorder;
-use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
-use Prism\Prism\Streaming\Events\StreamEndEvent;
-use Prism\Prism\Streaming\Events\TextDeltaEvent;
 use Prism\Prism\Testing\TextResponseFake;
-use Prism\Prism\ValueObjects\Messages\AssistantMessage;
-use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Tests\Fixtures\Participant;
 
-it('rebuilds a turn from the events a stream emitted', function (): void {
-    $recorder = new StreamRecorder;
-    $recorder->observe(new TextDeltaEvent('e1', 1, 'Hello ', 'm1'));
-    $recorder->observe(new TextDeltaEvent('e2', 2, 'Ada', 'm1'));
+it('records the transcript core assembled, not one rebuilt here', function (): void {
+    // THE point of this feature. A streamed turn and a sent turn must record the
+    // same conversation, because a thread is replayed to a model as context: a
+    // message assembled slightly wrong never surfaces as an error, only later as
+    // a model that remembers things differently than they happened.
+    //
+    // Prism's StreamCollector does the assembly, so what lands here are real
+    // message objects from the same code the non-streaming path uses — not
+    // deltas this package concatenated and hoped were equivalent.
+    Prism::fake([TextResponseFake::make()->withText('streamed answer')]);
+    $ada = Participant::create(['name' => 'Ada']);
 
-    $messages = $recorder->messages('Say hello');
+    foreach (harness()->for($ada)->session('chat')->stream('go') as $event) {
+        // consume
+    }
 
-    expect($recorder->text())->toBe('Hello Ada')
-        // Both halves of the exchange. Recording only the answer leaves a
-        // conversation that replays as a monologue.
-        ->and($messages[0])->toBeInstanceOf(UserMessage::class)
-        ->and($messages[1])->toBeInstanceOf(AssistantMessage::class)
-        ->and($messages[1]->content)->toBe('Hello Ada');
+    $stored = Thread::query()->where('scope', 'chat')->firstOrFail()->storedMessages()->get();
+
+    expect($stored->pluck('type')->all())->toContain('user')
+        // The user's own turn is recorded too: a conversation holding only the
+        // answer replays as a monologue.
+        ->and($stored->first()->payload['content'])->toContain('go')
+        // Attributed to the run that wrote it, exactly as send() does.
+        ->and($stored->first()->run_id)->toStartWith('run_');
 });
 
-it('keeps a tool-only turn rather than dropping it', function (): void {
-    // A turn with no text is still a turn: dropping it would leave any tool
-    // results answering nothing.
-    $recorder = new StreamRecorder;
-    $recorder->observe(new StreamEndEvent('e', 1, FinishReason::Stop));
-
-    expect($recorder->messages('go'))->toHaveCount(1);
-});
-
-it('streams events through untouched and records the turn when it ends', function (): void {
-    // Prism's fake replays a text response as a stream, which is enough to
-    // prove the harness yields events unchanged and records afterwards.
+it('streams events through untouched', function (): void {
+    // A consuming application renders these payloads directly, so the harness
+    // must not reshape them on the way past.
     Prism::fake([TextResponseFake::make()->withText('streamed answer')]);
     $ada = Participant::create(['name' => 'Ada']);
 
@@ -49,25 +45,23 @@ it('streams events through untouched and records the turn when it ends', functio
     }
 
     expect($events)->not->toBeEmpty();
-
-    $thread = Thread::query()->where('scope', 'chat')->firstOrFail();
-
-    expect($thread->storedMessages()->count())->toBeGreaterThan(0)
-        // Recorded against the run that produced it, exactly as send() does.
-        ->and($thread->storedMessages()->first()->run_id)->toStartWith('run_');
 });
 
 it('closes out the run when a consumer abandons the stream', function (): void {
     // The awkward part of streaming through a durable session: the lock and the
     // run are held for the whole iteration, so a disconnected browser must not
     // leave a run open forever. PHP runs a generator's finally on destruction.
+    //
+    // The collector's callback only fires on StreamEnd, so an abandoned stream
+    // contributes no assistant message rather than a half-invented one — a
+    // partial turn kept, and honest about how far it got.
     Prism::fake([TextResponseFake::make()->withText('partial answer here')]);
     $ada = Participant::create(['name' => 'Ada']);
     $session = harness()->for($ada)->session('chat');
 
     $stream = $session->stream('go');
-    $stream->current();      // start it, consume nothing more
-    unset($stream);          // consumer walks away
+    $stream->current();
+    unset($stream);
 
     $run = harness()->for($ada->fresh())->session('chat')->run();
 

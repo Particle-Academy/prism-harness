@@ -11,7 +11,6 @@ use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Models\Thread;
-use Prism\Harness\Streaming\StreamRecorder;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
@@ -171,13 +170,13 @@ class Session
      * rendering thinking, tool calls and results keeps the payloads it renders
      * today; the turn is recorded durably when the stream ends.
      *
-     * ONE DIFFERENCE FROM `send()` WORTH KNOWING. A non-streamed run records
-     * the messages Prism assembled itself. A stream never carries that object,
-     * so what lands in the thread is REBUILT from the events — faithful for
-     * assistant text, tool calls and tool results, and lossy for provider
-     * extras that have no event of their own. When a byte-exact transcript
-     * matters more than incremental delivery, use `send()`.
-     * See {@see StreamRecorder}.
+     * THE RECORDED TRANSCRIPT IS THE SAME AS `send()`'s, because the same code
+     * writes both: Prism's StreamCollector assembles the messages while the
+     * events pass through. There is no choice to make between incremental
+     * delivery and a faithful record, and there should never have been one —
+     * a transcript that differs only when streamed is a difference nothing
+     * reports, surfacing much later as a model that remembers the conversation
+     * differently than it happened.
      *
      * @param  list<string>|null  $toolNames
      * @return Generator<int, StreamEvent>

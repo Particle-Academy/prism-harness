@@ -173,12 +173,16 @@ foreach ($session->stream('Refactor the billing job') as $event) {
 // the turn is recorded and the run closed out when the stream ends
 ```
 
-**One difference from `send()`, and it is worth knowing before you choose.** A non-streamed
-run records the messages Prism assembled itself. A stream emits deltas and never carries that
-object, so what lands in the thread is **rebuilt from the events** — faithful for assistant
-text, tool calls and tool results, lossy for provider extras that have no event of their own.
-When a byte-exact transcript matters more than incremental delivery, use `send()` and stream
-your own view of it.
+**A streamed turn and a sent turn record the same transcript**, because the same code writes
+both. Prism's `StreamCollector` yields every event through untouched and hands back the
+message objects the non-streaming path builds, so there is no choice to make between
+incremental delivery and a faithful record.
+
+That was not free, and it is worth saying why it mattered. An earlier draft accumulated the
+deltas here and rebuilt the messages, which meant a streamed transcript could differ from a
+sent one in ways nothing would report: a thread is replayed to a model as context, so a
+message assembled slightly wrong never surfaces as an error — only, much later, as a model
+that remembers the conversation differently than it happened.
 
 The lock and the run are held for the whole iteration, which is the awkward part of streaming
 through a durable session. A consumer that walks away — a disconnected browser, an exception

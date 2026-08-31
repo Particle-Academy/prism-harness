@@ -6,6 +6,7 @@ namespace Prism\Harness;
 
 use Closure;
 use Generator;
+use Illuminate\Support\Collection;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunStarted;
@@ -14,7 +15,6 @@ use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Skills\SkillRegistry;
-use Prism\Harness\Streaming\StreamRecorder;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\SubagentRunner;
@@ -24,8 +24,10 @@ use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
+use Prism\Prism\Streaming\StreamCollector;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Throwable;
 
 final readonly class AgentRuntime
@@ -245,7 +247,9 @@ final readonly class AgentRuntime
             model: $model,
         ));
 
-        $recorder = new StreamRecorder;
+        // ASSEMBLED BY CORE, NOT REBUILT HERE. See the loop below.
+        /** @var array{messages: list<mixed>, response: TextResponse}|null $collected */
+        $collected = null;
         $finishReason = FinishReason::Unknown;
 
         try {
@@ -275,9 +279,30 @@ final readonly class AgentRuntime
                 $generation->withTools($tools)->withMaxSteps($mode->maxSteps);
             }
 
-            foreach ($generation->asStream() as $event) {
-                $recorder->observe($event);
+            // The transcript is assembled by CORE, not rebuilt here.
+            //
+            // An earlier draft accumulated deltas into messages itself, and had
+            // to document that the result could differ from what `send()`
+            // stores. That difference is invisible by construction: a thread is
+            // replayed to a model as context, so a message assembled slightly
+            // wrong never surfaces as an error — only, much later, as a model
+            // that remembers the conversation differently than it happened.
+            // Telling callers to choose between streaming and a faithful record
+            // was a workaround for a gap on our side, not a design.
+            //
+            // `StreamCollector` yields every event through untouched and hands
+            // back the same Message objects and Response the non-streaming path
+            // builds. A streamed turn and a sent turn now record the SAME
+            // transcript, because the same code wrote both.
+            $collector = new StreamCollector(
+                $generation->asStream(),
+                null,
+                function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
+                    $collected = ['messages' => $messages->all(), 'response' => $response];
+                },
+            );
 
+            foreach ($collector->collect() as $event) {
                 if ($event instanceof StreamEndEvent) {
                     $finishReason = $event->finishReason;
                 }
@@ -300,14 +325,21 @@ final readonly class AgentRuntime
             // partial turn: a conversation missing the half the user already
             // watched stream past is the worse outcome.
             if ($session->run()['status'] === 'running') {
-                $session->thread()->record($recorder->messages($prompt), $runId);
+                // The user's own turn, then whatever core assembled. A stream
+                // abandoned before StreamEnd never fires the collector's
+                // callback, so `$collected` is null and only the prompt is
+                // recorded — a partial turn kept rather than a whole one lost,
+                // and honest about how far it got.
+                $messages = [new UserMessage($prompt), ...($collected['messages'] ?? [])];
+
+                $session->thread()->record($messages, $runId);
                 $session->completeRun($runId, $finishReason->value);
 
                 event(new RunFinished(
                     sessionKey: $session->key(),
                     runId: $runId,
                     finishReason: $finishReason->value,
-                    steps: 1,
+                    steps: count($collected['response']->steps ?? []),
                     awaitingApproval: false,
                 ));
             }
