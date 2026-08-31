@@ -3,9 +3,11 @@
 Durable agent sessions for Laravel — threads, modes, tool permissions and subagents on top of
 [Prism](https://github.com/Particle-Academy/prism).
 
-> **Status: threads and sessions work; the rest is still design.** Conversation persistence
-> and session rehydration are implemented and tested. Modes, permissions and subagents are
-> recorded below as decisions, not code yet.
+> **Status: every planned surface now ships.** Threads, sessions, modes, skills, tool
+> permissions, approvals, subagents, budgets, the event stream and a config doctor are
+> implemented and tested. Tool authorization is **off by default** — see the Concepts table
+> for exactly what each row provides, and `harness:doctor` for what your own configuration
+> is actually doing.
 
 > **Working on this package?** Read **[`AGENTS.md`](AGENTS.md)** first — the boundary
 > this package has to hold, the gates that must be green, and the traps that have
@@ -139,6 +141,156 @@ table is not your first problem. It matters because it sets where the boundary i
 `harness_thread_messages` as trusted storage, and never let request input write directly to
 it.
 
+## Tool permissions
+
+Two abilities, because they answer different questions:
+
+```php
+// May this tool be OFFERED to this run at all?
+Gate::define('harness.tool', fn ($user, Session $s, Tool $t) => $user->can('use', $t->name()));
+
+// May THIS call proceed, with THESE arguments?
+Gate::define('harness.tool.call', fn ($user, Session $s, Tool $t, array $args) =>
+    str_starts_with($args['path'] ?? '', '/tmp/'));
+```
+
+Offer-time filtering alone cannot bound how a tool is used, only whether it is present: when
+the toolset is assembled the arguments do not exist yet, so `harness.tool` can express *"may
+use `delete_file`"* and never *"only under `/tmp`"*. Once offered, a tool may otherwise be
+called any number of times with anything the model chooses.
+
+Both are **off by default** (`harness.agent.authorize_tools`). But a `harness.tool` ability
+defined while the flag is off is **refused at resolve time** rather than ignored — a policy
+that is never consulted still reads as a control to the next person who finds it, and nothing
+at runtime would have said otherwise.
+
+## Approvals
+
+A tool that must stop and wait for a human is declared **per mode**, because the same tool is
+not equally consequential everywhere — `execute_op` against a scratch project is routine and
+against production is not, and the tool cannot tell which it is in:
+
+```php
+'benchmark' => [
+    'tools' => ['workspace_read', 'workspace_write', 'workspace_delete'],
+    'requires_approval' => ['workspace_delete'],   // '*' gates everything
+],
+```
+
+```php
+$response = $session->send('Clean up the failed run');
+
+if ($response->awaitingApproval()) {
+    foreach ($response->pendingApprovals() as $pending) {
+        $session->approve($pending);              // or ->deny($pending, 'not on production')
+    }
+}
+```
+
+**The decision is a row, not a promise.** It is recorded in the thread, so the approval a
+person grants this morning is readable by whichever worker resumes tonight — a different
+process, possibly after a deploy. That is the whole reason the durable slot is guarded.
+
+Prism **denies by default** when it finds no response for a pending request, so a lost or
+unanswered approval fails closed rather than executing. And `awaitingApproval()` is **not a
+failure**: a caller that treats it as one will retry, and retrying discards the half-executed
+action somebody was asked to authorise.
+
+## Events
+
+`RunStarted`, `RunFinished` and `RunFailed` are ordinary Laravel events — broadcast them over
+Reverb, queue them, or ignore them.
+
+They are deliberately **not telemetry**. Telemetry is observability: sampled, droppable, read
+by whoever is debugging. These are interface — an application builds UI on them, so they carry
+a stability guarantee telemetry never will. `RunFinished` states `awaitingApproval` outright
+rather than leaving a listener to infer it from a finish reason, and `RunFailed` carries only
+the exception **class**, because a provider message can contain a request URL with a key in it
+and an event may end up on a screen.
+
+Every event carries `run_id`, `parent_run_id` and `root_run_id` — the same identifiers on the
+stored rows — so an existing live stream can be joined to this record without adopting it.
+
+## Checking your configuration
+
+```
+php artisan harness:doctor
+```
+
+Resolves **every** mode, not the default one. Each check here mirrors a refusal that already
+happens at runtime, and the refusals are correct but late: a mode nobody has entered yet keeps
+its broken subagent reference until someone switches to it, and the first person to find out
+is a user mid-conversation. It also reports what a mode can actually reach — a `['*']` mode is
+printed as *all registered tools*, because "1 tool" is a true number and a false report.
+
+## Subagents
+
+A nested run, reached through a tool, with authority it was **given** rather than authority
+it inherited. Declared per mode — a mode that names no subagents cannot spawn one:
+
+```php
+'modes' => [
+    'designer' => [
+        'system_prompt' => 'You author and revise Compass Ops.',
+        'tools' => ['read_op', 'write_op'],
+        'max_steps' => 12,
+        'subagents' => [
+            'run_op' => [
+                'description' => 'Test-run an Op and report what happened.',
+                'mode' => 'op_runner',   // the child's authority, not the parent's
+                'max_steps' => 4,
+                'max_cost_usd' => 0.25,
+            ],
+        ],
+    ],
+    'op_runner' => [
+        'system_prompt' => 'You run one Op and report the outcome.',
+        'tools' => ['execute_op'],       // deliberately NOT the designer's tools
+        'max_steps' => 4,
+    ],
+],
+```
+
+The parent then calls `run_op` like any other tool. Four things are true of that call, and
+each is there because the obvious implementation gets it wrong:
+
+**The child gets its own session and thread.** A run holds its session lock for its whole
+duration, and neither store's lock is reentrant — a child resolving the *parent's* address
+would be refused instantly, since `lock_wait` defaults to `0`. So the child resolves
+`{parent scope}::sub::{name}` instead. The lock is not made reentrant on purpose: a
+reentrant lock would let a child mutate parent state mid-run, which is the one thing the
+lock exists to prevent. The child's thread is linked back by `parent_thread_id`, and every
+message carries the `run_id` that wrote it.
+
+**Budgets nest; they do not reset.** This was the open question, and it has one defensible
+answer. A parent bounded at 8 steps that may spawn children each entitled to a fresh 8 has
+no bound at all — it has a bound per node in a tree whose width it also controls. A child
+receives the *smaller* of what it declares and what the tree has left, and its spend lands
+in the parent's account.
+
+**A child's output is data, never instructions.** An ordinary tool returns a value its
+author chose; a subagent returns free text a model wrote, possibly after reading untrusted
+input, and it arrives where the parent has been reading its own instructions. So it comes
+back as a JSON envelope: the model-authored text confined to `content`, attributed to the
+child run, behind an explicit note that it is material and not a directive. That is not a
+guarantee — it removes the free win of splicing model output into an instruction stream
+unmarked.
+
+**Every ending is its own outcome.** `completed` / `exhausted` / `cancelled` / `denied` /
+`failed` / `awaiting_approval`, with `retryable` stated. A parent that could only see
+"worked or didn't" would retry what was refused on purpose and abandon what merely broke.
+
+Cancellation is cooperative: PHP cannot interrupt a tool already executing, so the in-flight
+call finishes and the next step is refused. Pretending otherwise would discard a
+half-executed action — the exact loss the durable slot exists to prevent.
+
+### A cost cap you cannot enforce is refused
+
+`Usage::$cost` is nullable, because not every provider reports one. Folding that into
+`+= 0.0` would leave a cost budget that reads as enforced and can never trip. Unmetered runs
+are counted separately, and a tree with a `max_cost_usd` that has taken any of them **stops**
+rather than spending on under a cap nobody can measure.
+
 ## What it is for
 
 Applications where **the agent is the product** and the session is long-lived — an interactive
@@ -195,24 +347,40 @@ use the Laravel thing rather than reimplement it.
 
 | Concept | Status | Laravel counterpart |
 |---|---|---|
-| Controller | *planned* | Singleton in the container; config file plus mode classes |
+| Controller | **shipped** | `PrismHarness` singleton + `ModeRegistry`, config-driven. `harness:doctor` validates every mode up front |
 | Session | **shipped** | Resolved per request from a store, keyed on participant + scope |
 | Thread | **shipped** | Eloquent models here; contract defined in Prism (0.113) |
-| Modes | *planned* | One class per mode, container-resolved so they are testable |
+| Modes | **partial** | `Modes/AgentMode.php` + `ModeRegistry`, resolved in `AgentRuntime::send()`. Config-driven, not one class per mode |
+| Skills | **partial** | `Skills/SkillRegistry.php` — augments the system prompt from a mode's declared skills |
 | Workspace | *elsewhere* | A scoped Filesystem disk — built as [`prism-workspace`](https://github.com/Particle-Academy/prism-workspace) |
-| Permissions | *planned* | Gates and Policies — "may this tool run" is an authorization question |
-| Subagents | *planned* | A Prism Tool wrapping a nested run, with a narrowed toolset |
-| Event bus | *planned* | Laravel events over Reverb — a harness stream, separate from Prism telemetry |
+| Permissions | **shipped** | `harness.tool` gates the *offered* toolset; `harness.tool.call` gates each invocation with its arguments. **Off by default**, and a policy defined while off is refused |
+| Subagents | **shipped** | A Prism Tool wrapping a nested run. Declared per mode, own session + thread, budget drawn from the tree |
+| Event bus | **shipped** | `RunStarted` / `RunFinished` / `RunFailed` as Laravel events, each carrying run lineage. Broadcast over Reverb if you want it; separate from Prism telemetry |
+
+Read **partial** as "some of this exists, and the cell says which part" — it is
+the status that misleads when compressed to a binary.
 
 Every row states its status, because the previous version of this table did not
 and it misled someone. Bold was doing two jobs: marking *Session* and *Thread*
 as built, and emphasising *Gates and Policies* as a design choice. Identical
 weight, identical position, different meaning — so the planned row read exactly
 like the shipped ones, and a reader concluded this package gates tools on
-Laravel Gates. It does not; there is no `Gate` reference anywhere in `src/`.
+Laravel Gates.
 
 That reader then told two other agents, one of which built on it. A status line
 four lines above a table does not travel with the row someone quotes.
+
+**And then it happened again, inverted.** The fix above added per-row status but
+<!-- factcheck-ignore-next: quotes the retracted claim in order to explain it; the live status now lives in the table above -->
+also asserted, right here, that there was *no `Gate` reference anywhere in `src/`*. `ToolAuthorizer` later shipped and gates on exactly that — so the
+sentence written to correct the misreading became a false claim in the opposite
+direction, in the passage warning about it. It survived because our fact-checker
+verifies that things named in prose **exist**; nobody was checking claims that
+something **does not**. A negative claim is the more dangerous kind: it is what
+a reader uses to decide something still needs building.
+
+So this section no longer states what the code lacks. Absence is asserted in one
+place — the Status column — where a checker can reach it.
 
 ## Decisions already taken
 
@@ -239,10 +407,37 @@ double-awarded everything.
 
 ## Still open
 
-- Whether **mode** is owned by the session or the thread. Mastra treats it as session state but
-  persists it on the thread; those come apart when one participant holds several sessions over
-  one thread.
-- Whether subagent **step budgets** nest or reset.
+- ~~Whether **mode** is owned by the session or the thread.~~ **Decided: the session** — and
+  the case that worried us cannot arise here. Mastra's problem is that a Session and a Thread
+  are separate objects, so one participant can hold several sessions over one thread and the
+  mode has to belong to exactly one of them. In this package both are addressed by
+  **participant + scope**: `Session::key()` and `Thread::forParticipant()` take the same two
+  values, so the mapping is 1:1 and there is nothing to come apart. Mode lives in the
+  ephemeral half, where losing it falls back to a default rather than losing work.
+- ~~Whether subagent **step budgets** nest or reset.~~ **Decided: they nest.** A resetting
+  budget is not a budget — see Subagents above.
+
+Nothing is open. Items are added back here when a decision is genuinely undecided, not to
+record work that is merely unfinished — that lives in the issue tracker.
+
+## Adopting this as your transcript layer
+
+Moving an existing `Chat`/`ChatMessage` table into threads is supported, and two things are
+worth knowing before you write the migration, because neither is visible from the API.
+
+**The thread table is trusted storage.** Rebuilding an attachment resolves whatever locator
+was recorded, so a row carrying a `local_path` or `url` becomes a **file read or an outbound
+fetch at replay time**. Your chat rows are, by construction, populated from request input —
+so a bulk migration moves user-supplied content across that boundary, and any historical
+message carrying a media locator becomes a fetch the first time that thread is replayed to a
+model. Sanitise locators on the way in rather than discovering this at replay.
+
+**The harness records at turn end, not mid-stream.** `Thread::record()` takes
+`$response->messages` once a turn completes, and `messages()` is a lazy read. This is the
+durable record, not the live wire — keep your own streaming for the live view. Both can be
+joined afterwards: every message carries its `run_id`, and a subagent's rows carry
+`parent_thread_id` and `root_run_id`, so a nested run's activity can be correlated into an
+existing stream without routing it through this package.
 
 ## Background
 

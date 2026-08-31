@@ -8,6 +8,7 @@ use Generator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Prism\Harness\Support\MessageMapper;
@@ -27,10 +28,13 @@ use Prism\Prism\Contracts\Thread as ThreadContract;
  * scope is part of the address rather than a label hung off it.
  *
  * @property int $id
+ * @property int|null $parent_thread_id
  * @property string $scope
+ * @property string|null $root_run_id
  * @property string|null $title
  * @property array<string, mixed>|null $metadata
  * @property-read Collection<int, ThreadMessage> $storedMessages
+ * @property-read self|null $parentThread
  */
 class Thread extends Model implements ThreadContract
 {
@@ -104,6 +108,31 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
+     * Record that this thread is a subagent's, run beneath another.
+     *
+     * Assigned directly rather than through `$fillable` for the same reason the
+     * participant columns are not fillable: lineage decides which conversation
+     * a run belongs to, and nothing reachable from request input should be able
+     * to set it. The harness writes it; a host application never does.
+     */
+    public function linkBeneath(self $parent, string $rootRunId): self
+    {
+        $this->parent_thread_id = $parent->getKey();
+        $this->root_run_id = $rootRunId;
+        $this->save();
+
+        return $this;
+    }
+
+    /**
+     * @return BelongsTo<self, $this>
+     */
+    public function parentThread(): BelongsTo
+    {
+        return $this->belongsTo(self::class, 'parent_thread_id');
+    }
+
+    /**
      * @param  Builder<self>  $query
      * @return Builder<self>
      */
@@ -139,9 +168,14 @@ class Thread extends Model implements ThreadContract
      * tool calls and results from every step — so recording a turn is one call
      * and a conversation interrupted mid-tool-loop resumes where it stopped.
      *
+     * `$runId` attributes each row to the run that produced it. Optional, and
+     * null for anything written outside a run — but without it a parent and a
+     * subagent writing into the same conversation are indistinguishable after
+     * the fact, which makes a tree impossible to reconstruct from storage.
+     *
      * @param  iterable<Message>  $messages
      */
-    public function record(iterable $messages): self
+    public function record(iterable $messages, ?string $runId = null): self
     {
         $position = (int) $this->storedMessages()->max('position');
 
@@ -149,6 +183,7 @@ class Thread extends Model implements ThreadContract
             $this->storedMessages()->create([
                 'position' => ++$position,
                 'type' => MessageMapper::typeOf($message),
+                'run_id' => $runId,
                 'payload' => MessageMapper::toArray($message),
             ]);
         }

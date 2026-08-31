@@ -6,9 +6,11 @@ namespace Prism\Harness;
 
 use Illuminate\Contracts\Auth\Access\Gate;
 use Illuminate\Support\ServiceProvider;
+use Prism\Harness\Console\HarnessDoctorCommand;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Skills\SkillRegistry;
+use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
 
@@ -45,6 +47,14 @@ class PrismHarnessServiceProvider extends ServiceProvider
             $app->make(ToolAuthorizer::class),
             $app->make(SkillRegistry::class),
             $app['config']->get('harness.agent', []),
+            // Deferred: SubagentRunner needs PrismHarness, which needs this
+            // runtime. Resolved at call time, by which point both exist.
+            fn (): SubagentRunner => $app->make(SubagentRunner::class),
+        ));
+
+        $this->app->singleton(SubagentRunner::class, fn ($app): SubagentRunner => new SubagentRunner(
+            $app->make(PrismHarness::class),
+            $app->make(AgentRuntime::class),
         ));
 
         // The harness is a singleton; the sessions it hands out are not. Each
@@ -64,6 +74,8 @@ class PrismHarnessServiceProvider extends ServiceProvider
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
         if ($this->app->runningInConsole()) {
+            $this->commands([HarnessDoctorCommand::class]);
+
             $this->publishes([
                 __DIR__.'/../config/harness.php' => config_path('harness.php'),
             ], 'harness-config');

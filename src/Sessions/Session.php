@@ -10,6 +10,9 @@ use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Models\Thread;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
+use Prism\Prism\ValueObjects\ToolApprovalResponse;
 
 /**
  * One participant's live runtime, reconstructed per request.
@@ -158,6 +161,58 @@ class Session
         return $this->runtime->send($this, $prompt, $toolNames);
     }
 
+    /**
+     * Answer a pending tool approval and continue the run.
+     *
+     * The decision is RECORDED IN THE THREAD, not held anywhere else. That is
+     * what makes it survive: the approval a person granted this morning is a
+     * durable row, so the worker that resumes tonight — a different process,
+     * possibly after a deploy — reads the same answer. Mastra can treat an
+     * approval as an in-memory promise because Node holds one process; here it
+     * has to be storage.
+     *
+     * Prism DENIES BY DEFAULT when it finds no response for a pending request,
+     * so a lost or unanswered approval fails closed rather than executing.
+     *
+     * WHO MAY APPROVE IS THE APPLICATION'S DECISION, not this package's. The
+     * session is already scoped to a participant, so nobody can answer another
+     * participant's pending approval through it — but "this user may approve
+     * THIS action" is a question only the host can answer, and passing a raw
+     * request value straight in would let anyone who can reach the route
+     * approve anything their own session is waiting on. Authorize before
+     * calling.
+     *
+     * @param  ToolApprovalRequest|string  $approval  the request, or its approval id
+     */
+    public function approve(ToolApprovalRequest|string $approval, bool $approved = true, ?string $reason = null): AgentResponse
+    {
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        $id = $approval instanceof ToolApprovalRequest ? $approval->approvalId : $approval;
+
+        $this->thread()->record([
+            new ToolResultMessage(toolApprovalResponses: [
+                new ToolApprovalResponse($id, $approved, $reason),
+            ]),
+        ], $this->run()['id'] ?? null);
+
+        // Resumed with an EMPTY prompt: the conversation already contains the
+        // request, the decision, and everything before them. A new prompt here
+        // would be a second instruction competing with the one the tool call
+        // came from.
+        return $this->runtime->send($this, '');
+    }
+
+    /**
+     * Reject a pending approval. The tool does not run.
+     */
+    public function deny(ToolApprovalRequest|string $approval, ?string $reason = null): AgentResponse
+    {
+        return $this->approve($approval, false, $reason);
+    }
+
     /** @return array<string, mixed>|null */
     public function run(): ?array
     {
@@ -174,9 +229,21 @@ class Session
         ]);
     }
 
-    public function completeRun(string $id, string $finishReason): self
+    /**
+     * @param  list<string>  $toolCalls  the NAMES of the tools this run invoked, in order
+     */
+    public function completeRun(string $id, string $finishReason, array $toolCalls = []): self
     {
-        return $this->finishRun($id, 'completed', ['finish_reason' => $finishReason]);
+        // NAMES ONLY, and that boundary is deliberate. "Which tools did this
+        // run reach for" is what an operator needs to audit a guardrail, and a
+        // tool name is not PII. ARGUMENTS are, and prism-opentelemetry already
+        // carries them behind an opt-in capture gate with a length cap —
+        // recording them a second time here, ungated, would quietly undo that
+        // decision for everyone who installed both.
+        return $this->finishRun($id, 'completed', [
+            'finish_reason' => $finishReason,
+            'tool_calls' => $toolCalls,
+        ]);
     }
 
     public function failRun(string $id, string $failure): self

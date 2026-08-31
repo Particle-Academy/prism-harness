@@ -6,6 +6,8 @@ namespace Prism\Harness\Flow;
 
 use FancyFlow\Nodes\Support\ToolInvoker;
 use Prism\Harness\Exceptions\ToolNotAvailable;
+use Prism\Harness\Tools\ToolAuthorizer;
+use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolError;
 use Throwable;
@@ -17,15 +19,19 @@ use Throwable;
  * 8.4 and this package supports 8.2.
  *
  * THE ALLOWLIST IS THE CONSTRUCTOR, and that is a deliberate limit rather than
- * a design. This package has no tool registry and no permission model — the
- * README lists both as planned — so there is nothing here to consult about
- * whether a caller MAY run a tool. What exists is the set handed in, and a name
- * outside it is refused.
+ * a design. What exists is the set handed in, and a name outside it is refused.
  *
  * That is weaker than a permission model and stronger than the alternative: an
  * invoker that resolved tools from a container would let a workflow author name
- * any bound tool, including ones the flow was never meant to reach. When the
- * harness grows real permissions, this is where they attach.
+ * any bound tool, including ones the flow was never meant to reach.
+ *
+ * WHAT IS STILL MISSING, precisely — this comment previously said the package
+ * had no tool registry and no permission model, and both now exist
+ * ({@see ToolRegistry}, {@see ToolAuthorizer}).
+ * Neither is consulted HERE. The authorizer filters the tools *offered* to a
+ * run; once a tool is in this constructor it can be invoked any number of times
+ * with any arguments, and nothing asks whether this caller MAY run it with
+ * THESE arguments. That checkpoint is what attaches here.
  *
  * A tool's result is returned as the node's value. It is NOT interpreted here:
  * whatever the tool returned is what the workflow sees and what the model is

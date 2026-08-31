@@ -31,6 +31,7 @@ class ThreadMessage extends Model
         'thread_id',
         'position',
         'type',
+        'run_id',
         'payload',
     ];
 
