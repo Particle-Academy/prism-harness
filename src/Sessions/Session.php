@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace Prism\Harness\Sessions;
 
 use Closure;
+use Generator;
 use Illuminate\Database\Eloquent\Model;
 use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Models\Thread;
+use Prism\Harness\Streaming\StreamRecorder;
+use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
@@ -159,6 +162,33 @@ class Session
         }
 
         return $this->runtime->send($this, $prompt, $toolNames);
+    }
+
+    /**
+     * The same turn, delivered as it happens.
+     *
+     * Yields Prism's stream events unchanged, so an application already
+     * rendering thinking, tool calls and results keeps the payloads it renders
+     * today; the turn is recorded durably when the stream ends.
+     *
+     * ONE DIFFERENCE FROM `send()` WORTH KNOWING. A non-streamed run records
+     * the messages Prism assembled itself. A stream never carries that object,
+     * so what lands in the thread is REBUILT from the events — faithful for
+     * assistant text, tool calls and tool results, and lossy for provider
+     * extras that have no event of their own. When a byte-exact transcript
+     * matters more than incremental delivery, use `send()`.
+     * See {@see StreamRecorder}.
+     *
+     * @param  list<string>|null  $toolNames
+     * @return Generator<int, StreamEvent>
+     */
+    public function stream(string $prompt, ?array $toolNames = null): Generator
+    {
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        yield from $this->runtime->stream($this, $prompt, $toolNames);
     }
 
     /**

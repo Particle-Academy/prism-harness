@@ -164,6 +164,29 @@ defined while the flag is off is **refused at resolve time** rather than ignored
 that is never consulted still reads as a control to the next person who finds it, and nothing
 at runtime would have said otherwise.
 
+## Streaming
+
+```php
+foreach ($session->stream('Refactor the billing job') as $event) {
+    // Prism's stream events, untouched — render them as you already do
+}
+// the turn is recorded and the run closed out when the stream ends
+```
+
+**One difference from `send()`, and it is worth knowing before you choose.** A non-streamed
+run records the messages Prism assembled itself. A stream emits deltas and never carries that
+object, so what lands in the thread is **rebuilt from the events** — faithful for assistant
+text, tool calls and tool results, lossy for provider extras that have no event of their own.
+When a byte-exact transcript matters more than incremental delivery, use `send()` and stream
+your own view of it.
+
+The lock and the run are held for the whole iteration, which is the awkward part of streaming
+through a durable session. A consumer that walks away — a disconnected browser, an exception
+upstream — would otherwise leave the run open until the lock TTL expired. PHP runs a
+generator's `finally` when it is destroyed, so the run is closed on that path too and the
+partial turn is **recorded rather than discarded**: a conversation missing the half the user
+already watched stream past is the worse outcome.
+
 ## Approvals
 
 A tool that must stop and wait for a human is declared **per mode**, because the same tool is

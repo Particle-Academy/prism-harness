@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
+use Prism\Harness\Exceptions\UnmappableContent;
 use Prism\Harness\Models\Thread;
+use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Prism\Prism\Enums\Provider;
 use Prism\Prism\Text\PendingRequest;
@@ -175,4 +177,36 @@ it('deletes its messages with the thread', function (): void {
     $thread->delete();
 
     expect(DB::table('harness_thread_messages')->count())->toBe(0);
+});
+
+it('writes a whole turn or none of it', function (): void {
+    // Issue #2. `record()` was a read-modify-write with no transaction, so a
+    // multi-step exchange could half-write: a tool call stored with its result
+    // missing replays to the model as an unanswered question rather than as an
+    // error anyone can see.
+    //
+    // The RACE this fixes cannot be reproduced here — the suite runs SQLite
+    // in-memory, where `lockForUpdate` is a no-op and there is no second
+    // connection to contend with. The guarantee lives in the database. What is
+    // testable is the atomicity, which is the half that stops a partial turn.
+    $thread = Thread::forParticipant(
+        Participant::create(['name' => 'Ada']),
+        'chat',
+    );
+    $thread->record([new UserMessage('first')]);
+
+    $unmappable = new class implements Message {};
+
+    try {
+        $thread->record([
+            new UserMessage('second'),
+            $unmappable,
+        ]);
+        $this->fail('Expected the unmappable message to be refused.');
+    } catch (UnmappableContent) {
+        // expected
+    }
+
+    // The good message from the failed turn must not survive on its own.
+    expect($thread->fresh()->storedMessages()->count())->toBe(1);
 });

@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
+use Illuminate\Support\Facades\DB;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
@@ -177,16 +178,46 @@ class Thread extends Model implements ThreadContract
      */
     public function record(iterable $messages, ?string $runId = null): self
     {
-        $position = (int) $this->storedMessages()->max('position');
+        // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
+        //
+        // Reading the high-water mark and then inserting is a read-modify-write:
+        // two requests recording to one thread both read the same max and both
+        // claim the next slot. `unique(thread_id, position)` means the loser
+        // gets a QueryException rather than a silently misordered conversation
+        // — the right failure mode, and still a lost turn.
+        //
+        // Two workers on one thread is NORMAL here, not exotic: a queued job
+        // recording a response while the user sends another message is enough,
+        // and an approval is written outside the run lock by design, because
+        // taking that lock here would deadlock against the resume it precedes.
+        //
+        // The transaction also makes a multi-step tool exchange all-or-nothing.
+        // A turn that half-writes leaves a tool call with no result, which
+        // replays to the model as an unanswered question rather than as an
+        // error anyone can see.
+        return DB::transaction(function () use ($messages, $runId): self {
+            // Locks the thread ROW so a concurrent recorder waits instead of
+            // reading the same max. A no-op on SQLite, which is why the suite
+            // cannot exercise this and why the guarantee lives in the database.
+            static::query()->whereKey($this->getKey())->lockForUpdate()->first();
 
-        foreach ($messages as $message) {
-            $this->storedMessages()->create([
-                'position' => ++$position,
-                'type' => MessageMapper::typeOf($message),
-                'run_id' => $runId,
-                'payload' => MessageMapper::toArray($message),
-            ]);
-        }
+            $position = (int) $this->storedMessages()->max('position');
+
+            foreach ($messages as $message) {
+                $this->storedMessages()->create([
+                    'position' => ++$position,
+                    'type' => MessageMapper::typeOf($message),
+                    'run_id' => $runId,
+                    'payload' => MessageMapper::toArray($message),
+                ]);
+            }
+
+            return $this->afterRecording();
+        });
+    }
+
+    private function afterRecording(): self
+    {
 
         // The relation may already be loaded; without this a caller that reads
         // messages() after record() in the same request sees the stale set.

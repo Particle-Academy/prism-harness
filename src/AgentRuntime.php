@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness;
 
 use Closure;
+use Generator;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunStarted;
@@ -13,12 +14,16 @@ use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Skills\SkillRegistry;
+use Prism\Harness\Streaming\StreamRecorder;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
+use Prism\Prism\Streaming\Events\StreamEndEvent;
+use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Throwable;
@@ -200,6 +205,113 @@ final readonly class AgentRuntime
                 throw $failure;
             }
         }, ttlSeconds: $this->integerConfig('lock_ttl', 300), waitSeconds: $this->integerConfig('lock_wait', 0));
+    }
+
+    /**
+     * The same run, delivered as it happens.
+     *
+     * Yields Prism's stream events UNTOUCHED, so an application already
+     * rendering thinking, tool calls and results keeps exactly the payloads it
+     * renders today. What this adds is the durable half: the turn is recorded
+     * and the run is closed out when the stream ends.
+     *
+     * THE LOCK IS HELD FOR THE WHOLE ITERATION, which is the awkward part of
+     * streaming through a durable session and is why the `finally` matters. A
+     * consumer that abandons the generator — a disconnected browser, an
+     * exception upstream — would otherwise leave the run open and the session
+     * locked until the TTL expired. PHP runs a generator's `finally` when it is
+     * destroyed, so the run is closed on that path too, recorded with whatever
+     * the stream had produced by then rather than discarded.
+     *
+     * @param  list<string>|null  $toolNames
+     * @return Generator<int, StreamEvent>
+     */
+    public function stream(Session $session, string $prompt, ?array $toolNames = null): Generator
+    {
+        // The lock is acquired and released around the generator by hand rather
+        // than with `$session->lock()`: a closure cannot yield to this caller.
+        $mode = $this->modes->resolve($session->mode());
+        $provider = $session->provider() ?? $this->stringConfig('provider');
+        $model = $session->model() ?? $this->stringConfig('model');
+        $runId = 'run_'.bin2hex(random_bytes(12));
+
+        $session->beginRun($runId, $mode->name, $provider, $model);
+
+        event(new RunStarted(
+            sessionKey: $session->key(),
+            runId: $runId,
+            mode: $mode->name,
+            provider: $provider,
+            model: $model,
+        ));
+
+        $recorder = new StreamRecorder;
+        $finishReason = FinishReason::Unknown;
+
+        try {
+            $generation = Prism::text()
+                ->using($provider, $model)
+                ->withThread($session->thread())
+                ->withTelemetryMetadata(sessionId: $session->key())
+                ->withPrompt($prompt);
+
+            $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+            if ($systemPrompt !== '') {
+                $generation->withSystemPrompt($systemPrompt);
+            }
+
+            $names = $this->toolNamesFor($mode, $toolNames);
+            if ($mode->skills !== []) {
+                $names[] = 'skill_read';
+            }
+            $resolved = $this->tools->resolve(array_values(array_unique($names)), $session);
+            foreach ($resolved as $name => $tool) {
+                if ($mode->needsApproval($name)) {
+                    $resolved[$name] = (clone $tool)->requiresApproval(true);
+                }
+            }
+            $tools = $this->authorizer->allowed($session, $resolved);
+            if ($tools !== []) {
+                $generation->withTools($tools)->withMaxSteps($mode->maxSteps);
+            }
+
+            foreach ($generation->asStream() as $event) {
+                $recorder->observe($event);
+
+                if ($event instanceof StreamEndEvent) {
+                    $finishReason = $event->finishReason;
+                }
+
+                yield $event;
+            }
+        } catch (Throwable $failure) {
+            $session->failRun($runId, $failure::class);
+
+            event(new RunFailed(
+                sessionKey: $session->key(),
+                runId: $runId,
+                exception: $failure::class,
+            ));
+
+            throw $failure;
+        } finally {
+            // Reached on completion, on an exception, AND when an abandoned
+            // generator is destroyed. Recording whatever arrived beats losing a
+            // partial turn: a conversation missing the half the user already
+            // watched stream past is the worse outcome.
+            if ($session->run()['status'] === 'running') {
+                $session->thread()->record($recorder->messages($prompt), $runId);
+                $session->completeRun($runId, $finishReason->value);
+
+                event(new RunFinished(
+                    sessionKey: $session->key(),
+                    runId: $runId,
+                    finishReason: $finishReason->value,
+                    steps: 1,
+                    awaitingApproval: false,
+                ));
+            }
+        }
     }
 
     /**
