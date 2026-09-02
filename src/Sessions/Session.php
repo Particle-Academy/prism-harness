@@ -110,6 +110,37 @@ class Session
         return $this->write('provider', $provider);
     }
 
+    /**
+     * The step ceiling this session asks for, if it asked for one.
+     *
+     * A mode declares a default ceiling for every run in it. That is right for
+     * a mode used the same way every time and wrong for one driven by a caller
+     * that knows more — a Lab benchmark carries a FROZEN, human-approved budget
+     * and then hands the agent a task sized to it. When the mode's constant and
+     * that budget disagree, the agent is told one number and cut off at
+     * another: it plans for what it was promised, spends the promise, and its
+     * work is discarded at the smaller limit. Measured: an agent told
+     * `max_turns: 20` was truncated at the mode's 10, mid-build, and the run
+     * recorded it as a completion.
+     *
+     * The override is BOUNDED, because the alternative is not a budget. See
+     * `RunBudget::nestedWithin()` for the same argument about children: a limit
+     * the thing being limited can raise without bound is a limit in name only.
+     * A caller may ask for more than the mode's default and never for more than
+     * the operator's ceiling.
+     */
+    public function maxSteps(): ?int
+    {
+        $steps = $this->state()['max_steps'] ?? null;
+
+        return is_int($steps) && $steps > 0 ? $steps : null;
+    }
+
+    public function usingMaxSteps(int $steps): self
+    {
+        return $this->write('max_steps', max(1, $steps));
+    }
+
     /** @return array<string, mixed>|null */
     public function capability(string $name): ?array
     {

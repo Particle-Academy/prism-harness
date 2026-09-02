@@ -97,6 +97,19 @@ return [
         'lock_ttl' => (int) env('HARNESS_RUN_LOCK_TTL', 300),
         'lock_wait' => (int) env('HARNESS_RUN_LOCK_WAIT', 0),
         'authorize_tools' => env('HARNESS_AUTHORIZE_TOOLS', false),
+
+        /*
+         * The hard ceiling on a per-session step override.
+         *
+         * A mode's `max_steps` is a default, and a caller that holds a frozen,
+         * approved budget may ask for a different one via
+         * `Session::usingMaxSteps()`. This is the operator's word about how far
+         * that may go, and it outranks the caller — without it a caller could
+         * lift its own limit, which is a limit in name only. Null removes the
+         * ceiling entirely and should be a deliberate choice.
+         */
+        'max_steps_ceiling' => (int) env('HARNESS_MAX_STEPS_CEILING', 40),
+
         'default' => 'chat',
         'modes' => [
             'chat' => [

@@ -94,7 +94,7 @@ final readonly class AgentRuntime
             // A root run opens the tree's account; a child inherits it. Either
             // way there is exactly one ledger per tree from here down.
             $run = $context ?? RunContext::root($runId, new RunBudget(
-                maxSteps: $mode->maxSteps,
+                maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
             ));
@@ -380,6 +380,33 @@ final readonly class AgentRuntime
         }
 
         return array_values(array_intersect($requested, $ceiling));
+    }
+
+    /**
+     * The step ceiling for THIS run: the mode's default unless the caller asked
+     * for something else, and never more than the operator allows.
+     *
+     * A mode's constant is a sensible default, not a fact about every task run
+     * in that mode. A caller holding a frozen, approved budget knows the size
+     * of the job better than the config does — and when the two disagree the
+     * agent is told one number and cut off at another, which discards work
+     * rather than bounding it.
+     *
+     * `max_steps_ceiling` is the operator's word and outranks both. Without it
+     * this method would let any caller lift its own limit, which is the exact
+     * shape `RunBudget::nestedWithin()` refuses for subagents.
+     */
+    private function ceilingFor(Session $session, AgentMode $mode): int
+    {
+        $requested = $session->maxSteps();
+
+        if ($requested === null) {
+            return $mode->maxSteps;
+        }
+
+        $ceiling = $this->nullableIntConfig('max_steps_ceiling');
+
+        return $ceiling === null ? $requested : min($requested, $ceiling);
     }
 
     /**

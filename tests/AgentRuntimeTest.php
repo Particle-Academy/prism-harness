@@ -99,3 +99,60 @@ it('persists a failed run without storing exception prose', function (): void {
         ->and($session->run()['failure'])->toBeString()
         ->and($session->run())->not->toHaveKey('message');
 });
+
+it('lets a caller raise the step ceiling above the mode default', function (): void {
+    // A mode's `max_steps` is a sensible DEFAULT, not a fact about every task.
+    // A caller holding a frozen, approved budget knows the size of the job
+    // better than the config does — and when the two disagree the agent is told
+    // one number and cut off at another, which discards work rather than
+    // bounding it. Measured in the Lab: an agent told `max_turns: 20` was
+    // truncated at the mode's 10, mid-build.
+    app(ToolRegistry::class)->registerMany([
+        (new Tool)->as('allowed_tool')->for('Allowed')->using(fn (): string => 'yes'),
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', ['allowed_tool']);
+    config()->set('prism-harness.agent.modes.chat.max_steps', 10);
+    $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
+
+    $ada = Participant::create(['name' => 'Ada']);
+    harness()->for($ada)->session('chat')->usingMaxSteps(20)->send('Build something large');
+
+    $fake->assertRequest(function (array $requests): void {
+        expect($requests[0]->maxSteps())->toBe(20);
+    });
+});
+
+it('never lets a caller raise the step ceiling past the operator ceiling', function (): void {
+    // The other half, and the reason the override is bounded at all: a limit
+    // the thing being limited can raise without bound is a limit in name only.
+    // Same argument RunBudget::nestedWithin() makes for subagents.
+    app(ToolRegistry::class)->registerMany([
+        (new Tool)->as('allowed_tool')->for('Allowed')->using(fn (): string => 'yes'),
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', ['allowed_tool']);
+    config()->set('prism-harness.agent.max_steps_ceiling', 12);
+    $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
+
+    $ada = Participant::create(['name' => 'Ada']);
+    harness()->for($ada)->session('chat')->usingMaxSteps(500)->send('Ask for the moon');
+
+    $fake->assertRequest(function (array $requests): void {
+        expect($requests[0]->maxSteps())->toBe(12);
+    });
+});
+
+it('uses the mode default when the caller asks for nothing', function (): void {
+    app(ToolRegistry::class)->registerMany([
+        (new Tool)->as('allowed_tool')->for('Allowed')->using(fn (): string => 'yes'),
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', ['allowed_tool']);
+    config()->set('prism-harness.agent.modes.chat.max_steps', 7);
+    $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
+
+    $ada = Participant::create(['name' => 'Ada']);
+    harness()->for($ada)->session('chat')->send('Ordinary work');
+
+    $fake->assertRequest(function (array $requests): void {
+        expect($requests[0]->maxSteps())->toBe(7);
+    });
+});
