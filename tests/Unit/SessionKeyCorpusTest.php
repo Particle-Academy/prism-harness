@@ -76,7 +76,11 @@ final class UnusedStore implements SessionStore
 function sessionKeyCorpus(): array
 {
     return json_decode(
-        (string) file_get_contents(__DIR__.'/../fixtures/harness-session-key.json'),
+        // `Fixtures`, capital F, because that is where the file is TRACKED.
+        // Windows resolved the lowercase spelling to the same directory, so this
+        // passed on every developer machine and failed on Linux CI from the day
+        // it was written -- main was red for three days and nothing said so.
+        (string) file_get_contents(__DIR__.'/../Fixtures/harness-session-key.json'),
         true,
         512,
         JSON_THROW_ON_ERROR,
