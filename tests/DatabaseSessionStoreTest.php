@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Database\DatabaseManager;
+use Illuminate\Support\Facades\DB;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Stores\DatabaseSessionStore;
 
@@ -82,6 +83,52 @@ it('refuses a second holder while the first is inside', function (): void {
     expect($outcome)->toBe('refused');
 });
 
+it('does not delete a lock a DIFFERENT worker now holds', function (): void {
+    // ONE KEY HANDED TO TWO CALLERS, which is the only way this store can fail
+    // that matters: everything built on withLock — a run advancing a session, a
+    // task claim — is exclusive only because this is.
+    //
+    // The sequence: A takes the lock; A is slow and its TTL lapses; B
+    // legitimately reclaims the expired key; A finally returns and releases.
+    // A release scoped only to the KEY deletes B's lock, and the next worker
+    // walks straight in while B is still inside.
+    //
+    // The sibling Redis store has guarded against exactly this since it was
+    // written — a random token, checked on release — and this one did not.
+    $store = store();
+
+    $store->withLock('k', function (): void {
+        // A's lease lapses while A is still working.
+        $this->travel(11)->seconds();
+
+        // B reclaims it. Written directly against the table because PHP has no
+        // second thread to run B in; this is byte for byte what B's own
+        // acquire() would have inserted.
+        DB::table('harness_session_state')->where('key', 'lock:k')->delete();
+        DB::table('harness_session_state')->insert([
+            'key' => 'lock:k',
+            'payload' => json_encode(['locked' => true]),
+            'expires_at' => now()->addSeconds(30),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }, ttlSeconds: 10, waitSeconds: 0);
+
+    // A has returned and run its release. B must still hold the key.
+    expect(DB::table('harness_session_state')->where('key', 'lock:k')->exists())->toBeTrue();
+});
+
+it('still releases a lock it does hold', function (): void {
+    // The control for the test above. A release that never deletes anything
+    // would satisfy it perfectly and wedge every session in the application.
+    $store = store();
+
+    $store->withLock('k', fn (): bool => true, ttlSeconds: 10, waitSeconds: 0);
+
+    expect(DB::table('harness_session_state')->where('key', 'lock:k')->exists())->toBeFalse()
+        ->and($store->withLock('k', fn (): string => 'again', waitSeconds: 0))->toBe('again');
+});
+
 it('reclaims a lock whose holder died', function (): void {
     $store = store();
 
@@ -94,13 +141,10 @@ it('reclaims a lock whose holder died', function (): void {
             ->update(['expires_at' => now()->subMinute()]);
     });
 
-    app(DatabaseManager::class)->connection()->table('harness_session_state')->insert([
-        'key' => 'lock:k',
-        'payload' => json_encode(['locked' => true]),
-        'expires_at' => now()->subMinute(),
-        'created_at' => now(),
-        'updated_at' => now(),
-    ]);
+    // The abandoned row really is still there. Release no longer deletes a row
+    // that is not the one it inserted — which is what makes this an honest
+    // stand-in for a process that died, rather than a tidy exit.
+    expect(DB::table('harness_session_state')->where('key', 'lock:k')->exists())->toBeTrue();
 
     // Without expiry-based reclamation, one dead worker would hold this
     // session shut permanently.

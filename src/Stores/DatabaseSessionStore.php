@@ -76,7 +76,7 @@ class DatabaseSessionStore implements SessionStore
         $lockKey = 'lock:'.$key;
         $deadline = microtime(true) + $waitSeconds;
 
-        while (! $this->acquire($lockKey, $ttlSeconds)) {
+        while (($heldUntil = $this->acquire($lockKey, $ttlSeconds)) === null) {
             if (microtime(true) >= $deadline) {
                 throw SessionLocked::forKey($key, $waitSeconds);
             }
@@ -87,7 +87,7 @@ class DatabaseSessionStore implements SessionStore
         try {
             return $callback();
         } finally {
-            $this->query()->where('key', $lockKey)->delete();
+            $this->release($lockKey, $heldUntil);
         }
     }
 
@@ -98,36 +98,74 @@ class DatabaseSessionStore implements SessionStore
     }
 
     /**
-     * Claim the lock row, or fail.
+     * Claim the lock row, and return the expiry that proves it is OURS.
      *
      * The unique index on `key` is what makes this exclusive: two workers
      * inserting the same key at once means one insert fails, rather than both
      * believing they hold it. Checking-then-inserting would leave a gap between
-     * the two statements for exactly that race.
+     * the two statements for exactly that race — and note the insert writes the
+     * key and its expiry in ONE statement, so there is never a moment where the
+     * row exists without an expiry for another worker to read as "expired in
+     * 1970" and sweep away.
+     *
+     * The returned expiry is the ownership proof; see {@see self::release()}.
+     * Null means the lock was not taken.
      */
-    protected function acquire(string $lockKey, int $ttlSeconds): bool
+    protected function acquire(string $lockKey, int $ttlSeconds): ?Carbon
     {
         // Clear an expired holder first, so a worker that died mid-run does not
-        // hold the session forever.
+        // hold the session forever. NULL is deliberately not swept: a lock row
+        // with no expiry cannot be shown to be abandoned, and taking one on the
+        // assumption that it is would hand the key to a second caller.
         $this->query()
             ->where('key', $lockKey)
             ->whereNotNull('expires_at')
             ->where('expires_at', '<', Carbon::now())
             ->delete();
 
+        $expiresAt = Carbon::now()->addSeconds($ttlSeconds);
+
         try {
             $this->query()->insert([
                 'key' => $lockKey,
                 'payload' => json_encode(['locked' => true]),
-                'expires_at' => Carbon::now()->addSeconds($ttlSeconds),
+                'expires_at' => $expiresAt,
                 'created_at' => Carbon::now(),
                 'updated_at' => Carbon::now(),
             ]);
 
-            return true;
+            return $expiresAt;
         } catch (QueryException) {
-            return false;
+            return null;
         }
+    }
+
+    /**
+     * Release the lock ONLY IF IT IS STILL THE ONE WE TOOK.
+     *
+     * Deleting by key alone is the bug this method exists to prevent, and it is
+     * not theoretical: a slow worker whose TTL lapsed mid-callback would delete
+     * the lock a DIFFERENT worker had legitimately reclaimed, and the next
+     * caller would walk in while that worker was still inside. One key, two
+     * holders — which is the only failure of this class that matters, because
+     * everything above it is exclusive only because this is.
+     *
+     * {@see RedisSessionStore::release()} has guarded
+     * against exactly this since it was written, with a random token and a
+     * compare-and-delete. This is the same guard, using the expiry as the
+     * token: a row that is still ours has the expiry WE inserted, and a
+     * reclaimer's expiry is necessarily later — it could only have taken the
+     * key after ours had passed, and it stamped its own from the time it did.
+     * So equality here means "nobody has taken this since", which is the whole
+     * question. No extra column, and it works on every driver, where comparing
+     * a JSON payload column for equality does not.
+     */
+    protected function release(string $lockKey, Carbon $heldUntil): void
+    {
+        $this->query()
+            ->where('key', $lockKey)
+            ->where('expires_at', $heldUntil)
+            ->delete();
     }
 
     /**
