@@ -144,7 +144,12 @@ final class TaskCompletionTool
                 }
 
                 try {
-                    $source->release($task, $resolution);
+                    // The worker goes to the source, which checks ownership
+                    // again. The pre-check above is not redundant — it is what
+                    // produces a refusal worded for the model instead of an
+                    // exception message worded for a developer, and it refuses
+                    // before attempting a write.
+                    $source->release($task, $worker, $resolution);
                 } catch (TaskNotReleasable) {
                     // The ownership check above already refuses every case this
                     // can raise from a list that stood still. It stands for the

@@ -10,10 +10,13 @@ use Prism\Harness\Exceptions\InvalidTaskOutcome;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tasks\StoreTaskSource;
+use Prism\Harness\Tasks\TaskRecord;
 use Prism\Harness\Tools\TaskCompletionTool;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Tests\Fixtures\NaiveTaskSource;
+use Tests\Fixtures\OpaqueTask;
 use Tests\Fixtures\Participant;
 
 /*
@@ -399,6 +402,52 @@ it('refuses a malformed outcome with a code, everywhere an outcome is parsed', f
 
     expect(TaskOutcome::fromInput('done'))->toBe(TaskOutcome::Done)
         ->and(TaskOutcome::fromInput('failed'))->toBe(TaskOutcome::Failed);
+});
+
+it('refuses a task it does not hold even when the SOURCE would have allowed it', function (): void {
+    // The tool's own guarantee, held against a source that offers none.
+    //
+    // `AgentTaskSource` cannot make an implementation check anything, and a
+    // consumer writing one against the interface will implement release() as
+    // "find it, set the state" — because that is what the signature suggests
+    // and nothing fails if they do. The shipped source checks ownership; a
+    // third party's will not.
+    //
+    // Without this test the tool's own check is invisible: every other test
+    // here uses the careful source, so deleting the check changes nothing and
+    // a mutation run scores it as dead code. It is not dead — it is the only
+    // thing standing between an authorized agent and someone else's task on
+    // every source this package did not write.
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => true);
+
+    $source = new NaiveTaskSource;
+    $source->put(new TaskRecord('t-1', 'someone else\'s', TaskState::Claimed, 'worker-b', PHP_INT_MAX));
+
+    // A task whose holder cannot be established AT ALL — three methods is the
+    // whole contract, and none of them is "who holds this".
+    $source->put(new OpaqueTask('t-2', 'unknowable', TaskState::Claimed));
+
+    $tool = TaskCompletionTool::for(
+        $source,
+        completionSession(),
+        new ToolAuthorizer(app(GateContract::class), true),
+        'worker-a',
+    );
+
+    // Read through the CONTRACT's method rather than a property, because one
+    // of these two tasks is not a TaskRecord — which is the whole point of it.
+    expect(decode((string) $tool->handle(task_id: 't-1', outcome: 'done'))['allowed'])->toBeFalse()
+        ->and($source->find('t-1')?->state())->toBe(TaskState::Claimed)
+        ->and(decode((string) $tool->handle(task_id: 't-2', outcome: 'done'))['allowed'])->toBeFalse()
+        ->and($source->find('t-2')?->state())->toBe(TaskState::Claimed);
+
+    // THE CONTROL: on the same unguarded source, a task this worker really does
+    // hold still closes. The tool is refusing the right thing, not everything.
+    $source->put(new TaskRecord('t-3', 'mine', TaskState::Claimed, 'worker-a', PHP_INT_MAX));
+
+    expect(decode((string) $tool->handle(task_id: 't-3', outcome: 'done')))
+        ->toBe(['task_id' => 't-3', 'state' => 'done'])
+        ->and($source->find('t-3')?->state())->toBe(TaskState::Done);
 });
 
 it('is registered nowhere by default', function (): void {

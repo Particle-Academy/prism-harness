@@ -62,6 +62,26 @@ final class TaskNotReleasable extends RuntimeException implements HasErrorCode
         );
     }
 
+    /**
+     * The same code the lease guard uses, because it is the same fact: this
+     * worker does not hold this task.
+     *
+     * The holder is NAMED here, unlike in the refusal the completion tool hands
+     * back. This message is read by a developer in a stack trace; that one is
+     * read by the model, which is exactly who should not be told which other
+     * worker holds a task it was refused.
+     */
+    public static function heldByAnother(string $id, ?string $holder, string $worker): self
+    {
+        return new self(
+            "The task [{$id}] is held by [".($holder ?? 'nobody')."], not by [{$worker}], so it may not be "
+            .'released by this worker. A release by anyone but the holder overwrites a live claim: the '
+            .'usual way to arrive here is a worker whose lease lapsed mid-task, whose task another worker '
+            .'has since claimed and is still working on. Worker ids are compared exactly, byte for byte.',
+            'task_lease_not_held',
+        );
+    }
+
     public static function unknown(string $id, string $source): self
     {
         return new self(

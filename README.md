@@ -339,9 +339,17 @@ while ($tasks->pending() > 0) {
 
     $result = $session->send($task->instruction());
 
-    $tasks->release($task, TaskOutcome::Done);   // the APPLICATION decides
+    $tasks->release($task, $workerId, TaskOutcome::Done);   // the APPLICATION decides
 }
 ```
+
+`release()` takes the **worker**, not just the task. Without it, any caller
+holding a source can close any task in the list — including one another worker
+is halfway through, which happens with no adversary involved: a worker whose
+lease lapsed mid-task finishes, releases, and overwrites the claim of whoever
+legitimately reclaimed it. The check lives on the source rather than in any one
+caller, so a queued job and an HTTP route get the same guarantee the completion
+tool does.
 
 **No task model, no schema, no migration.** What a task *is* differs for every consumer and
 is not this package's to decide. Two contracts — `AgentTask` and `AgentTaskSource` — and two

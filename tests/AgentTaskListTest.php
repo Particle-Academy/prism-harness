@@ -299,7 +299,7 @@ it('counts nothing as pending once every task is terminal', function (): void {
     $tasks->add('one', 't-1');
 
     $claimed = $tasks->claim('worker-a');
-    $tasks->release($claimed, TaskOutcome::Done);
+    $tasks->release($claimed, 'worker-a', TaskOutcome::Done);
 
     expect($tasks->pending())->toBe(0);
 });
@@ -315,8 +315,8 @@ it('records the outcome of a claimed task', function (): void {
     $tasks->add('one', 't-1');
     $tasks->add('two', 't-2');
 
-    $tasks->release($tasks->claim('worker-a'), TaskOutcome::Done);
-    $tasks->release($tasks->claim('worker-a'), TaskOutcome::Failed);
+    $tasks->release($tasks->claim('worker-a'), 'worker-a', TaskOutcome::Done);
+    $tasks->release($tasks->claim('worker-a'), 'worker-a', TaskOutcome::Failed);
 
     expect($tasks->find('t-1')?->state)->toBe(TaskState::Done)
         ->and($tasks->find('t-2')?->state)->toBe(TaskState::Failed)
@@ -333,15 +333,15 @@ it('errors when a terminal task is released again', function (): void {
 
     // The positive control: the FIRST release must succeed, or "the second one
     // throws" proves nothing about the second one.
-    $tasks->release($claimed, TaskOutcome::Done);
+    $tasks->release($claimed, 'worker-a', TaskOutcome::Done);
     expect($tasks->find('t-1')?->state)->toBe(TaskState::Done);
 
-    expect(fn () => $tasks->release($claimed, TaskOutcome::Done))
+    expect(fn () => $tasks->release($claimed, 'worker-a', TaskOutcome::Done))
         ->toThrow(TaskNotReleasable::class, 'already [done]');
 
     // And a different outcome is refused too — a silent no-op here would let a
     // second worker quietly overwrite the first one's answer.
-    expect(fn () => $tasks->release($claimed, TaskOutcome::Failed))
+    expect(fn () => $tasks->release($claimed, 'worker-a', TaskOutcome::Failed))
         ->toThrow(TaskNotReleasable::class);
 
     expect($tasks->find('t-1')?->state)->toBe(TaskState::Done);
@@ -352,17 +352,89 @@ it('errors when a failed task is released again', function (): void {
     $tasks->add('one', 't-1');
     $claimed = $tasks->claim('worker-a');
 
-    $tasks->release($claimed, TaskOutcome::Failed);
+    $tasks->release($claimed, 'worker-a', TaskOutcome::Failed);
 
-    expect(fn () => $tasks->release($claimed, TaskOutcome::Failed))
+    expect(fn () => $tasks->release($claimed, 'worker-a', TaskOutcome::Failed))
         ->toThrow(TaskNotReleasable::class, 'already [failed]');
+});
+
+it('refuses a release by a worker that does not hold the task', function (): void {
+    // THE HOLE THE THIRD ARGUMENT EXISTS TO CLOSE, staged exactly as it
+    // happens — no adversary anywhere in it.
+    //
+    // Worker A claims and is slow. Its lease lapses. Worker B legitimately
+    // reclaims the task and starts working. A finally finishes and releases.
+    //
+    // With a two-argument release, A overwrites B's live claim: the task reads
+    // `done` while B is still working on it, B's work is discarded, and B's own
+    // release then fails as "already terminal" — the second worker is blamed
+    // for the first one's mistake.
+    $tasks = taskList(lease: 60);
+    $tasks->add('slow one', 't-1');
+
+    $a = $tasks->claim('worker-a');
+
+    $this->travel(61)->seconds();
+
+    $b = $tasks->claim('worker-b');
+    expect($b?->claimedBy)->toBe('worker-b');
+
+    try {
+        $tasks->release($a, 'worker-a', TaskOutcome::Done);
+        $this->fail('Expected the stale release to be refused.');
+    } catch (TaskNotReleasable $e) {
+        expect($e->code())->toBe('task_lease_not_held');
+    }
+
+    // B still holds it, untouched, and can still finish its own work.
+    expect($tasks->find('t-1')?->state)->toBe(TaskState::Claimed)
+        ->and($tasks->find('t-1')?->claimedBy)->toBe('worker-b');
+
+    $tasks->release($b, 'worker-b', TaskOutcome::Done);
+
+    expect($tasks->find('t-1')?->state)->toBe(TaskState::Done);
+});
+
+it('guards every caller, not only the completion tool', function (): void {
+    // The reason the check is on the SOURCE rather than in the one tool that
+    // was hardened. The question is not "what did we send?" but "what can still
+    // be invoked?" — and a guard living in a tool leaves an HTTP route, a
+    // queued job and a direct call able to do the thing the guard forbids.
+    //
+    // This is that direct call. Nothing here goes near a tool.
+    $tasks = taskList();
+    $tasks->add('mine', 't-1');
+    $held = $tasks->claim('worker-a');
+
+    expect(fn () => $tasks->release($held, 'some-other-process', TaskOutcome::Done))
+        ->toThrow(TaskNotReleasable::class, 'not by [some-other-process]');
+
+    // Exactly, byte for byte — a padded id is a different worker, the same way
+    // it is everywhere else here.
+    expect(fn () => $tasks->release($held, 'worker-a ', TaskOutcome::Done))
+        ->toThrow(TaskNotReleasable::class);
+
+    // A blank worker cannot release either, and reports the id code rather
+    // than the ownership one.
+    try {
+        $tasks->release($held, '', TaskOutcome::Done);
+        $this->fail('Expected the blank worker id to be refused.');
+    } catch (InvalidTaskIdentifier $e) {
+        expect($e->code())->toBe('task_identifier_blank');
+    }
+
+    // THE CONTROL: the holder can still close its own task, so this is not a
+    // release that refuses everyone.
+    $tasks->release($held, 'worker-a', TaskOutcome::Done);
+
+    expect($tasks->find('t-1')?->state)->toBe(TaskState::Done);
 });
 
 it('errors when a task that was never claimed is released', function (): void {
     $tasks = taskList();
     $unclaimed = $tasks->add('one', 't-1');
 
-    expect(fn () => $tasks->release($unclaimed, TaskOutcome::Done))
+    expect(fn () => $tasks->release($unclaimed, 'worker-a', TaskOutcome::Done))
         ->toThrow(TaskNotReleasable::class, 'is [todo]');
 });
 
@@ -371,7 +443,7 @@ it('errors when a task from another list is released', function (): void {
     $chores = taskList(list: 'chores');
     $stranger = $chores->add('not yours', 't-1');
 
-    expect(fn () => $work->release($stranger, TaskOutcome::Done))
+    expect(fn () => $work->release($stranger, 'worker-a', TaskOutcome::Done))
         ->toThrow(TaskNotReleasable::class, 'not in this [work]');
 });
 
@@ -382,7 +454,7 @@ it('leaves a failed task failed rather than requeueing it', function (): void {
     $tasks->add('fails', 't-1');
     $tasks->add('crashes', 't-2');
 
-    $tasks->release($tasks->claim('worker-a'), TaskOutcome::Failed);
+    $tasks->release($tasks->claim('worker-a'), 'worker-a', TaskOutcome::Failed);
     $tasks->claim('worker-a');
 
     $this->travel(3600)->seconds();
@@ -845,21 +917,21 @@ it('carries a stable code on every failure the state machine can raise', functio
     }
 
     try {
-        $tasks->release(new TaskRecord('t-99', 'ghost', TaskState::Claimed, 'worker-a', 1), TaskOutcome::Done);
+        $tasks->release(new TaskRecord('t-99', 'ghost', TaskState::Claimed, 'worker-a', 1), 'worker-a', TaskOutcome::Done);
     } catch (TaskNotReleasable $e) {
         $codes['unknown task'] = $e->code();
     }
 
     try {
-        $tasks->release($unclaimed, TaskOutcome::Done);
+        $tasks->release($unclaimed, 'worker-a', TaskOutcome::Done);
     } catch (TaskNotReleasable $e) {
         $codes['never claimed'] = $e->code();
     }
 
-    $tasks->release($claimed, TaskOutcome::Done);
+    $tasks->release($claimed, 'worker-a', TaskOutcome::Done);
 
     try {
-        $tasks->release($claimed, TaskOutcome::Done);
+        $tasks->release($claimed, 'worker-a', TaskOutcome::Done);
     } catch (TaskNotReleasable $e) {
         $codes['already terminal'] = $e->code();
     }

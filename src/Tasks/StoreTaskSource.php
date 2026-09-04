@@ -129,9 +129,11 @@ final class StoreTaskSource implements AgentTaskSource
     }
 
     #[\Override]
-    public function release(AgentTask $task, TaskOutcome $outcome): void
+    public function release(AgentTask $task, string $worker, TaskOutcome $outcome): void
     {
-        $this->transact(function (array $records) use ($task, $outcome): array {
+        $worker = $this->requireWorker($worker);
+
+        $this->transact(function (array $records) use ($task, $worker, $outcome): array {
             $index = $this->indexOf($records, $task->id());
 
             if ($index === null) {
@@ -149,6 +151,18 @@ final class StoreTaskSource implements AgentTaskSource
 
             if ($current->state !== TaskState::Claimed) {
                 throw TaskNotReleasable::notClaimed($current->id);
+            }
+
+            // THE OWNERSHIP CHECK, and it belongs here rather than in whichever
+            // caller remembered to write one. A worker whose lease lapsed
+            // mid-task, whose task another worker then legitimately reclaimed,
+            // would otherwise finish and overwrite a live claim — discarding
+            // the second worker's work and leaving its own release to fail as
+            // "already terminal". No adversary required.
+            //
+            // Compared exactly, like every other worker id here.
+            if ($current->claimedBy !== $worker) {
+                throw TaskNotReleasable::heldByAnother($current->id, $current->claimedBy, $worker);
             }
 
             $records[$index] = $current->resolvedAs($outcome->toState());

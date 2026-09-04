@@ -57,7 +57,7 @@ interface AgentTaskSource
     public function claim(string $worker, ?int $leaseSeconds = null): ?AgentTask;
 
     /**
-     * Record what happened to a claimed task.
+     * Record what happened to a claimed task — AS THE WORKER HOLDING IT.
      *
      * CALLED BY THE APPLICATION, FROM EVIDENCE — not by the agent. If the model
      * can set its own task to `done`, then "run until the goal is met" quietly
@@ -67,10 +67,29 @@ interface AgentTaskSource
      * refused unless the existing {@see ToolAuthorizer}
      * says otherwise.
      *
+     * THE WORKER IS ON THE CONTRACT, and that is the whole reason this
+     * signature has three arguments rather than the two the shape suggests.
+     * Without it the answer to "what can still be invoked?" is: any caller
+     * holding a source can close ANY task in the list, including one another
+     * worker is halfway through. That is reachable without an adversary — a
+     * worker whose lease lapsed mid-task, whose task another worker
+     * legitimately reclaimed, releases when it finally finishes and overwrites
+     * a live claim. The second worker's work is then discarded, and its own
+     * release fails as "already terminal".
+     *
+     * Guarding one caller — the completion tool — would leave that hole open
+     * for every other one: a queued job, an HTTP route, a direct call. So the
+     * check lives HERE, with the rest of the state machine, and the guarantee
+     * holds for everybody.
+     *
+     * @param  string  $worker  The claim holder, compared exactly. The same
+     *                          value that was passed to `claim()`.
+     *
      * @throws TaskNotReleasable when the task is already terminal, was never
-     *                           claimed, or is not in this source
+     *                           claimed, is held by another worker, or is not
+     *                           in this source
      */
-    public function release(AgentTask $task, TaskOutcome $outcome): void;
+    public function release(AgentTask $task, string $worker, TaskOutcome $outcome): void;
 
     /**
      * How many tasks remain claimable, counting any whose lease has expired.
