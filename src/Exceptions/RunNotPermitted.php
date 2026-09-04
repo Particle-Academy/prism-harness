@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Exceptions;
 
+use Prism\Harness\Contracts\HasErrorCode;
 use Prism\Harness\Subagents\SubagentResult;
 use RuntimeException;
 
@@ -22,8 +23,20 @@ use RuntimeException;
  * {@see SubagentResult} with an explicit outcome,
  * rather than letting it tear down the parent's run.
  */
-final class RunNotPermitted extends RuntimeException
+final class RunNotPermitted extends RuntimeException implements HasErrorCode
 {
+    /**
+     * Shared with {@see LeaseNotExtendable::budgetExhausted()}, which refuses a
+     * lease extension for exactly this reason and carries exactly this code.
+     * Two exception TYPES because the callers differ; one code, because the
+     * fact does not. See decision 0004.
+     */
+    #[\Override]
+    public function code(): string
+    {
+        return 'run_not_permitted';
+    }
+
     public static function exhausted(string $reason): self
     {
         return new self("This run may not proceed: {$reason}.");

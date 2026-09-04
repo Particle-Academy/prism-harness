@@ -318,6 +318,96 @@ half-executed action — the exact loss the durable slot exists to prevent.
 are counted separately, and a tree with a `max_cost_usd` that has taken any of them **stops**
 rather than spending on under a cap nobody can measure.
 
+## Task lists
+
+An agent given a goal has to keep working across many requests until the goal is met. It
+needs a list of what remains, and that list has to survive the request, the worker, a crash
+and a deploy.
+
+```php
+$tasks = $session->tasks();
+
+$tasks->add('Draft the summary', 't-1');
+$tasks->add('Check the figures', 't-2');
+
+while ($tasks->pending() > 0) {
+    $task = $tasks->claim($workerId);   // one atomic call
+
+    if ($task === null) {
+        break;                          // someone else holds what is left
+    }
+
+    $result = $session->send($task->instruction());
+
+    $tasks->release($task, TaskOutcome::Done);   // the APPLICATION decides
+}
+```
+
+**No task model, no schema, no migration.** What a task *is* differs for every consumer and
+is not this package's to decide. Two contracts — `AgentTask` and `AgentTaskSource` — and two
+adapters: the store-backed list above, and `Concerns\IsAgentTask`, which makes a consumer's
+own Eloquent model an `AgentTask` with conventional column names and a one-method override
+per column.
+
+**Four states, and no others:** `todo` → `claimed` → `done` / `failed`, plus `claimed` →
+`todo` when a lease expires. Each edge is a pinned decision:
+
+| | |
+|---|---|
+| `claim()` is **one** call | Read-then-mark as two calls is the race the design exists to prevent — both workers see the row free, both write their name, both succeed. |
+| A claim carries an owner **and** an expiry | Five minutes by default. This is what makes a dead worker recoverable. |
+| `claimed` is written **before** the work begins | So "started and died" is distinguishable from "never started". |
+| An expired claim returns to `todo`, **never** `failed` | A worker dying is not the task failing; conflating them burns a retry that never ran. |
+| `done` and `failed` are terminal | Re-releasing one is an error, not a silent no-op. |
+| Order is **insertion order** | Nothing errors when ordering changes — the agent just does the work in a different sequence. |
+
+### The agent cannot mark its own task complete
+
+If the model can set its own task to `done`, "run until the goal is met" quietly becomes
+"run until it decides it is met" — and a run that has stalled ends by declaring victory.
+
+So `release()` is called by the **application**, from evidence. A consumer that wants the
+agent to close its own tasks registers `Tools\TaskCompletionTool`, which refuses unless the
+tool authorizer is enabled **and** a `harness.tool.call` policy allows that specific call.
+An offer-time policy alone is not enough on purpose: a host that trusts an agent with tools
+in general has not been asked about self-completion, and silence must not read as consent
+for the authority that decides whether a run is finished. The tool is bound to one worker
+and refuses any task that worker is not holding.
+
+### Extending a lease, without inventing a second limit
+
+A worker may push its own lease out while it still holds it, bounded by the run's remaining
+`RunBudget` — cost, steps, wall-clock and cancellation, read through
+`RunLedger::exhaustion()`. Unbounded self-extension is how a wedged worker holds a task
+forever, and a fresh timeout here would be a second spelling of a limit the package already
+has. Extension therefore stops exactly when the run does.
+
+### An unreadable lock expiry means wait, not take
+
+Everything above is exclusive because the store's lock is, so the rule the lock
+follows is worth stating: **a lock is reclaimed only when its expiry can be shown
+to have passed.** An expiry that is absent, empty, or not a complete date-time is
+not evidence of anything, and the row is left alone — the caller waits and gets a
+`SessionLocked`, which is loud and recoverable.
+
+The failure this prevents is not a parse error. **Every prefix of a timestamp is
+an earlier timestamp**, so a value truncated by a torn write does not fail to
+compare — it compares as long ago, and the sweep deletes a lock somebody is
+actively holding. Both ports of this package shipped that bug in their file
+stores; here the expiry is a column written by one statement, and the
+completeness check is what closes the remaining gap.
+
+Ports keeping a lock in a file must write a **terminator** and treat a value
+without one as unreadable. Without it there is nothing to distinguish a complete
+expiry from the first half of one.
+
+### The list is durable state
+
+A task source backed by a volatile store **refuses to start**, the same way the durable
+session slot does. A half-finished task list that vanishes on a deploy is indistinguishable
+from a finished one: the next run resolves the same session, finds nothing to do, and
+reports success having dropped the rest of its work.
+
 ## What it is for
 
 Applications where **the agent is the product** and the session is long-lived — an interactive
@@ -383,6 +473,7 @@ use the Laravel thing rather than reimplement it.
 | Permissions | **shipped** | `harness.tool` gates the *offered* toolset; `harness.tool.call` gates each invocation with its arguments. **Off by default**, and a policy defined while off is refused |
 | Subagents | **shipped** | A Prism Tool wrapping a nested run. Declared per mode, own session + thread, budget drawn from the tree |
 | Event bus | **shipped** | `RunStarted` / `RunFinished` / `RunFailed` as Laravel events, each carrying run lineage. Broadcast over Reverb if you want it; separate from Prism telemetry |
+| Task lists | **shipped** | `Contracts\AgentTask` + `Contracts\AgentTaskSource`, four states, atomic claim-and-lease. Store-backed by default; `Concerns\IsAgentTask` adapts a consumer's own model. No task model, schema or migration ships |
 
 Read **partial** as "some of this exists, and the cell says which part" — it is
 the status that misleads when compressed to a binary.
@@ -444,8 +535,19 @@ double-awarded everything.
 - ~~Whether subagent **step budgets** nest or reset.~~ **Decided: they nest.** A resetting
   budget is not a budget — see Subagents above.
 
-Nothing is open. Items are added back here when a decision is genuinely undecided, not to
-record work that is merely unfinished — that lives in the issue tracker.
+- **What happens when the store is unreachable mid-claim.** The claim either happened or it
+  did not, and the worker cannot tell which. Retrying risks a double claim; not retrying
+  risks a lost task. Today a failed claim propagates the store's own exception and nothing
+  retries — which is the honest behaviour while the question is open, not an answer to it.
+  A task lease bounds the damage of a claim that landed unseen: it expires and the task
+  returns to `todo`. This needs deciding before a task list is trusted with anything
+  expensive.
+- **Whether a task carries a payload beyond `instruction`.** Consumers will want structured
+  input. Adding it invites the task to become a job, and this is not a queue. A consumer
+  that needs one today adapts its own model, where the payload is already a column.
+
+Items are added back here when a decision is genuinely undecided, not to record work that
+is merely unfinished — that lives in the issue tracker.
 
 ## Adopting this as your transcript layer
 

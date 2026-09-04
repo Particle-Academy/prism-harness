@@ -2,6 +2,11 @@ parameters:
     level: 6
     paths:
         - src
+        # The consumer-facing trait's only user is a consumer's own model, so
+        # `src` alone leaves it unanalysed — PHPStan does not check a trait
+        # nothing uses. The fixture models ARE that consumer, and analysing
+        # them is what type-checks Concerns/IsAgentTask at all.
+        - tests/Fixtures
     # fancy-flow-php needs PHP 8.4 and this package supports 8.2, so its
     # contracts are mirrored rather than installed. See stubs/fancy-flow.php.
     scanFiles:

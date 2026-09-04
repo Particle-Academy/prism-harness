@@ -60,5 +60,30 @@ abstract class TestCase extends Orchestra
             $table->string('name')->nullable();
             $table->timestamps();
         });
+
+        // Two stand-ins for a CONSUMER'S OWN task table. The package ships no
+        // task model, no schema and no migration, so these live here rather
+        // than in database/migrations — and they are deliberately different
+        // shapes: `chores` uses the conventional column names, `errands` uses
+        // none of them and relies on the trait's per-method overrides.
+        Schema::create('chores', function (Blueprint $table): void {
+            $table->id();
+            $table->string('instruction');
+            $table->string('state')->default('todo');
+            $table->string('claimed_by')->nullable();
+            $table->timestamp('claimed_until')->nullable();
+            $table->timestamps();
+        });
+
+        Schema::create('errands', function (Blueprint $table): void {
+            $table->string('ref')->primary();
+            $table->string('body');
+            $table->string('status')->default('todo');
+            $table->string('holder')->nullable();
+            // An integer column rather than a timestamp, because both shapes
+            // turn up in real applications and the trait has to read both.
+            $table->integer('lease_ends_at')->nullable();
+            $table->timestamps();
+        });
     }
 }

@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Prism\Harness\Contracts\AgentTaskSource;
+
 return [
 
     /*
@@ -89,6 +91,35 @@ return [
             'table' => 'harness_session_state',
         ],
 
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Agent task lists
+    |--------------------------------------------------------------------------
+    |
+    | A task list is DURABLE STATE and always lives in the durable slot above,
+    | which is why there is no store setting here: a half-finished list that
+    | vanishes on a deploy is indistinguishable from a finished one, and the
+    | run that resolves the same session afterwards reports success having
+    | dropped its remaining work.
+    |
+    | The lease is how a dead worker is recovered. Five minutes is long enough
+    | for a model call plus tool work and short enough that a crashed worker
+    | does not wedge the list for an hour; the exact number matters far less
+    | than it being the same one in every language, so it is defined once on
+    | the contract and read from there rather than written out again.
+    |
+    | There is deliberately NO timeout here for how long a worker may keep
+    | renewing its lease. That bound is the run's own `RunBudget` — see
+    | `StoreTaskSource::extendLease()`. A second limit for one idea is how a
+    | limit ends up configured in the place that is not enforced.
+    |
+    */
+
+    'tasks' => [
+        'lease_seconds' => (int) env('HARNESS_TASK_LEASE_SECONDS', AgentTaskSource::DEFAULT_LEASE_SECONDS),
+        'lock_wait' => (int) env('HARNESS_TASK_LOCK_WAIT', 5),
     ],
 
     'agent' => [

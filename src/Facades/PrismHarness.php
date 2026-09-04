@@ -10,10 +10,12 @@ use Prism\Harness\PendingSession;
 use Prism\Harness\PrismHarness as Manager;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
+use Prism\Harness\Tasks\StoreTaskSource;
 
 /**
  * @method static PendingSession for(Model $participant)
  * @method static Session session(Model $participant, ?string $scope = null)
+ * @method static StoreTaskSource tasks(string $list = 'default')
  * @method static SessionStoreManager stores()
  * @method static string defaultScope()
  *

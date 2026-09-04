@@ -46,6 +46,22 @@ final readonly class ToolAuthorizer
     }
 
     /**
+     * Whether the application has defined a per-call policy at all.
+     *
+     * `allowsCall()` returns true when none is defined, which is right for an
+     * ordinary tool: the offer-time ability already decided, and asking a
+     * policy that does not exist would refuse everything. But SILENCE IS NOT
+     * AUTHORIZATION for an authority that must never be granted by accident —
+     * see {@see TaskCompletionTool}, which refuses unless
+     * the host has said yes to this specific call. Exposed so such a tool can
+     * tell "allowed" from "nobody was asked".
+     */
+    public function hasCallPolicy(): bool
+    {
+        return $this->gate->has(self::CALL_ABILITY);
+    }
+
+    /**
      * The tools a run may be OFFERED.
      *
      * @param  array<string, Tool>  $tools

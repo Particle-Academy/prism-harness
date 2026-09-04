@@ -9,8 +9,10 @@ use Generator;
 use Illuminate\Database\Eloquent\Model;
 use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
+use Prism\Harness\Contracts\AgentTaskSource;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Models\Thread;
+use Prism\Harness\Tasks\StoreTaskSource;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
@@ -43,6 +45,7 @@ class Session
         protected readonly SessionStore $durable,
         protected readonly ?int $ttlSeconds = null,
         protected readonly ?AgentRuntime $runtime = null,
+        protected readonly int $taskLeaseSeconds = AgentTaskSource::DEFAULT_LEASE_SECONDS,
     ) {}
 
     public function scope(): string
@@ -182,6 +185,29 @@ class Session
     public function thread(): Thread
     {
         return Thread::forParticipant($this->participant, $this->scope);
+    }
+
+    /**
+     * The durable task list for this session.
+     *
+     * Addressed at `<session key>:tasks`, beside the session's own durable
+     * state and mirroring how {@see self::thread()} is addressed — so a
+     * restarted worker that resolves the same session finds the same list, and
+     * any task its predecessor was holding is either still leased or has
+     * expired back to `todo`.
+     *
+     * ON THE DURABLE STORE, ALWAYS. The list is the record of what is left to
+     * do: a half-finished list that vanishes on a deploy is indistinguishable
+     * from a finished one, and the run that resolves this session afterwards
+     * reports success having dropped the rest of its work.
+     */
+    public function tasks(): StoreTaskSource
+    {
+        return new StoreTaskSource(
+            store: $this->durable,
+            list: $this->key(),
+            leaseSeconds: $this->taskLeaseSeconds,
+        );
     }
 
     /** @param list<string>|null $toolNames */
