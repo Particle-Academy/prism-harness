@@ -404,6 +404,25 @@ it('refuses a malformed outcome with a code, everywhere an outcome is parsed', f
         ->and(TaskOutcome::fromInput('failed'))->toBe(TaskOutcome::Failed);
 });
 
+it('has an unguarded fixture that really is unguarded', function (): void {
+    // A CONTROL NEEDS ITS OWN CONTROL.
+    //
+    // The test below proves the tool refuses a task it does not hold "even when
+    // the source would have allowed it" — and that claim rests entirely on the
+    // fixture actually allowing it. If NaiveTaskSource silently grew a worker
+    // check, every assertion there would still pass and would be measuring the
+    // fixture instead of the tool. The suite would look identical.
+    //
+    // So the fixture is held to its own contract first: released by a worker
+    // that plainly does not hold the task, and it goes through.
+    $source = new NaiveTaskSource;
+    $source->put(new TaskRecord('t-1', 'held by someone else', TaskState::Claimed, 'worker-b', PHP_INT_MAX));
+
+    $source->release($source->find('t-1'), 'a-completely-different-worker', TaskOutcome::Done);
+
+    expect($source->find('t-1')?->state())->toBe(TaskState::Done);
+});
+
 it('refuses a task it does not hold even when the SOURCE would have allowed it', function (): void {
     // The tool's own guarantee, held against a source that offers none.
     //

@@ -178,12 +178,20 @@ final class TaskCompletionTool
     /**
      * Whether this worker is the one holding the task RIGHT NOW.
      *
-     * {@see AgentTask} is three methods and none of them is "who holds this",
-     * so the holder is read from the record the shipped source returns. A
-     * source that returns something else cannot prove ownership, and the answer
-     * for one that cannot prove it is NO — the whole reason this check exists
-     * is that the agent chooses the id, and a check that fails open under an
-     * unfamiliar source is not a check.
+     * {@see AgentTask} IS THREE METHODS AND NONE OF THEM IS "WHO HOLDS THIS",
+     * so a perfectly conforming source can hand back a task whose holder cannot
+     * be established at all. That is not a broken implementation — it is the
+     * contract being satisfied exactly as written.
+     *
+     * READING THAT SILENCE AS PERMISSION IS THE SAME MISTAKE AS INFERRING
+     * `done` FROM AN ABSENT OUTCOME, asked about a different field. "No holder
+     * on record, therefore no mismatch, therefore allowed" is the shape that
+     * lets an agent close a task nobody can show it owns — and it is one level
+     * down from the hole the worker argument on `release()` just closed.
+     *
+     * So an unknowable holder is NOT a match. The only way through is a holder
+     * this package can read and compare, and the comparison is exact — never
+     * trimmed, for the reason {@see InvalidTaskIdentifier} gives.
      */
     private static function heldBy(AgentTask $task, string $worker): bool
     {
@@ -191,9 +199,11 @@ final class TaskCompletionTool
             return false;
         }
 
-        // Compared exactly, never trimmed: see InvalidTaskIdentifier for why a
-        // forgiving comparison here is the direction that fails open.
-        return $task instanceof TaskRecord && $task->claimedBy === $worker;
+        // A task that cannot say who holds it resolves to a holder that matches
+        // nothing, rather than to "unknown, so allow".
+        $holder = $task instanceof TaskRecord ? $task->claimedBy : null;
+
+        return $holder !== null && $holder === $worker;
     }
 
     /**
