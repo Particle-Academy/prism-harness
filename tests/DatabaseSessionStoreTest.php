@@ -129,6 +129,71 @@ it('still releases a lock it does hold', function (): void {
         ->and($store->withLock('k', fn (): string => 'again', waitSeconds: 0))->toBe('again');
 });
 
+it('waits rather than stealing a lock whose expiry cannot be read', function (): void {
+    // THE SECOND VARIANT OF THE STOLEN-LOCK BUG, found by a sibling port. The
+    // first is releasing by key; this one is deciding that an unreadable expiry
+    // means "expired".
+    //
+    // It is not a parse failure that saves you. Every PREFIX of a timestamp is
+    // a smaller timestamp: a torn write leaves a value that parses perfectly
+    // and sits in the past, so the sweep deletes a lock somebody is actively
+    // holding. Under SQL it is worse than under a file, because the comparison
+    // is a string comparison — '1735689' sorts before '2026-…' just as surely
+    // as it parses before it.
+    //
+    // Unreadable must mean WAIT: a loud, recoverable SessionLocked, which
+    // resolves itself the moment a human or a deploy fixes the row. Deleting is
+    // the one answer with no way back, because the worker on the other side is
+    // still running.
+    $torn = [
+        '' => 'an empty expiry, from a write that had not started',
+        '2026-09-04 12:0' => 'a truncated expiry, from a write that did not finish',
+        '1735689' => 'a prefix of a unix timestamp, which parses as 1970',
+    ];
+
+    foreach ($torn as $value => $why) {
+        DB::table('harness_session_state')->where('key', 'lock:k')->delete();
+        DB::table('harness_session_state')->insert([
+            'key' => 'lock:k',
+            'payload' => json_encode(['locked' => true]),
+            'expires_at' => $value,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        expect(fn (): mixed => store()->withLock('k', fn (): string => 'stolen', waitSeconds: 0))
+            ->toThrow(SessionLocked::class, 'k')
+            ->and(DB::table('harness_session_state')->where('key', 'lock:k')->exists())
+            // Still there: refused, not swept. ($why)
+            ->toBeTrue();
+    }
+});
+
+it('reads its own written expiry back, with nothing planted by hand', function (): void {
+    // THE ROUND TRIP, and it earns its place: every other test of the sweep
+    // writes the expiry itself, so all of them would stay green if the writer
+    // and the reader stopped agreeing. A sibling port's mutation run found
+    // exactly that hole — dropping the terminator from its lockfile format went
+    // green, because no test ever fed the real writer's output to the real
+    // reader.
+    //
+    // Here the store writes the expiry, the store parses it, and the store
+    // decides it has passed. If the completeness check ever refuses the format
+    // one of the drivers actually emits, the sweep silently stops reclaiming
+    // anything and every dead worker wedges a session — and this goes red.
+    $store = store();
+    $reclaimed = null;
+
+    $store->withLock('k', function () use ($store, &$reclaimed): void {
+        // The holder's own lease lapses while it is still inside.
+        $this->travel(11)->seconds();
+
+        $reclaimed = $store->withLock('k', fn (): string => 'reclaimed', ttlSeconds: 10, waitSeconds: 0);
+    }, ttlSeconds: 10, waitSeconds: 0);
+
+    expect($reclaimed)->toBe('reclaimed');
+});
+
 it('reclaims a lock whose holder died', function (): void {
     $store = store();
 

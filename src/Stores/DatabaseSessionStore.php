@@ -113,15 +113,7 @@ class DatabaseSessionStore implements SessionStore
      */
     protected function acquire(string $lockKey, int $ttlSeconds): ?Carbon
     {
-        // Clear an expired holder first, so a worker that died mid-run does not
-        // hold the session forever. NULL is deliberately not swept: a lock row
-        // with no expiry cannot be shown to be abandoned, and taking one on the
-        // assumption that it is would hand the key to a second caller.
-        $this->query()
-            ->where('key', $lockKey)
-            ->whereNotNull('expires_at')
-            ->where('expires_at', '<', Carbon::now())
-            ->delete();
+        $this->sweepExpiredHolder($lockKey);
 
         $expiresAt = Carbon::now()->addSeconds($ttlSeconds);
 
@@ -138,6 +130,73 @@ class DatabaseSessionStore implements SessionStore
         } catch (QueryException) {
             return null;
         }
+    }
+
+    /**
+     * Delete the holder's row, but ONLY when it can be SHOWN to be abandoned.
+     *
+     * Done in PHP rather than as one `where expires_at < now()` delete, because
+     * the SQL version cannot tell a complete expiry from a broken one and the
+     * difference decides whether a live worker keeps its lock.
+     *
+     * EVERY PREFIX OF A TIMESTAMP IS AN EARLIER TIMESTAMP. A value that was
+     * truncated — by a torn write, a migration, a column resized under it —
+     * does not fail to compare; it compares as long ago, and under SQL it is
+     * worse than under a parser, because `'1735689' < '2026-…'` is true as a
+     * string comparison before anything has tried to read it as a date. So the
+     * sweep would delete a lock somebody is actively holding, and the two of
+     * them would run at once. A sibling port shipped exactly this.
+     *
+     * So: a value that is null, empty, or not a COMPLETE date-time is not
+     * evidence of anything, and the row is left alone. The caller then fails to
+     * acquire and waits, which surfaces as {@see SessionLocked} — loud,
+     * recoverable, and fixable by correcting the row. Deleting is the one
+     * answer with no way back, because the worker on the other side of it is
+     * still running.
+     *
+     * The delete is scoped to the exact value that was read, so a holder that
+     * reclaimed the row between the read and the delete keeps it.
+     */
+    protected function sweepExpiredHolder(string $lockKey): void
+    {
+        $row = $this->query()->where('key', $lockKey)->first();
+
+        if ($row === null) {
+            return;
+        }
+
+        $expiresAt = $row->expires_at;
+
+        // A lock row with no expiry cannot be shown to be abandoned either.
+        // Holding it forever is a wedged session; taking it is two workers.
+        if (! is_string($expiresAt) || ! $this->isCompleteTimestamp($expiresAt)) {
+            return;
+        }
+
+        if (! Carbon::parse($expiresAt)->isPast()) {
+            return;
+        }
+
+        $this->query()
+            ->where('key', $lockKey)
+            ->where('expires_at', $expiresAt)
+            ->delete();
+    }
+
+    /**
+     * Whether this is a whole date-time and not the beginning of one.
+     *
+     * Shape rather than an exact format: the drivers return the same instant
+     * with different tails — a fractional second here, an offset there — and a
+     * strict format match would refuse the store's OWN writes on some
+     * connection and then never sweep anything, wedging every session it was
+     * meant to protect. Matching the leading date and time catches a value that
+     * stops early, which is the failure this exists for, without pretending to
+     * know how each driver renders the rest.
+     */
+    protected function isCompleteTimestamp(string $value): bool
+    {
+        return preg_match('/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/', $value) === 1;
     }
 
     /**
