@@ -297,20 +297,34 @@ it('never resolves a malformed outcome to done', function (): void {
 
     $tasks = app(PrismHarness::class)->tasks('work');
 
-    foreach (['complete', 'DONE', 'Done', 'done ', '', 'true', '1', 'success'] as $i => $malformed) {
+    // Padded and cased variants are in here on purpose: `'done '` is the G-36
+    // shape applied to an outcome, and `'DONE'` is the one a case-insensitive
+    // parse would wave through.
+    $malformed = ['complete', 'DONE', 'Done', 'done ', ' done', '', 'true', '1', 'success', 'succeeded'];
+    $probed = 0;
+
+    foreach ($malformed as $i => $value) {
         $id = 't-'.$i;
         $tasks->add('do the thing', $id);
         $tasks->claim('worker-a');
 
         $result = decode((string) completionTool($tasks, enabled: true)->handle(
             task_id: $id,
-            outcome: $malformed,
+            outcome: $value,
         ));
 
         expect($result['allowed'])->toBeFalse()
             ->and($result['code'])->toBe('task_outcome_invalid')
             ->and($tasks->find($id)?->state)->toBe(TaskState::Claimed);
+
+        $probed++;
     }
+
+    // THE LOOP COUNTS ITSELF. A test-id listing cannot see inside one test, so
+    // a loop that stopped running — an emptied array, a `continue` added
+    // above — would report green with nothing probed at all.
+    expect($probed)->toBe(count($malformed))
+        ->and($probed)->toBe(10);
 
     // The controls: the two real outcomes still work, so this is not a tool
     // that refuses every outcome.

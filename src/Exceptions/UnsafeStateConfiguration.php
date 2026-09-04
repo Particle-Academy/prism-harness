@@ -78,31 +78,6 @@ final class UnsafeStateConfiguration extends RuntimeException implements HasErro
         );
     }
 
-    /**
-     * A lease of zero or less is REFUSED, not clamped to a usable minimum.
-     *
-     * Clamping is the friendlier choice and it is the one this repository has
-     * already been bitten by: a shipped configuration that silently becomes a
-     * different configuration is how a Redis default broke every fresh install
-     * while the suite stayed green. An operator who writes `lease_seconds => 0`
-     * has said something they did not mean, and a package that quietly
-     * substitutes 1 has taken the only chance anyone had to notice.
-     *
-     * It is refused when the source is CONSTRUCTED, before any task is claimed,
-     * so nothing is half-done when it fires.
-     */
-    public static function unusableLease(int $seconds): self
-    {
-        return new self(
-            "A task lease of {$seconds} second(s) cannot hold anything: it expires at or before the moment "
-            .'it is granted, so every task would be claimable by every worker at once and a claim would '
-            ."guarantee nothing.\n\n"
-            .'Set `prism-harness.tasks.lease_seconds` to a positive number of seconds — long enough for a '
-            .'model call plus its tool work. It is not clamped to a usable value on your behalf, because a '
-            .'configuration that silently becomes a different configuration is one nobody gets to notice.'
-        );
-    }
-
     public static function unknownDriver(string $slot, string $name): self
     {
         return new self(

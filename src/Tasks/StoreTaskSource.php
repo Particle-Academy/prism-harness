@@ -12,6 +12,7 @@ use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Enums\TaskOutcome;
 use Prism\Harness\Enums\TaskState;
 use Prism\Harness\Exceptions\InvalidTaskIdentifier;
+use Prism\Harness\Exceptions\InvalidTaskLease;
 use Prism\Harness\Exceptions\LeaseNotExtendable;
 use Prism\Harness\Exceptions\TaskNotReleasable;
 use Prism\Harness\Exceptions\UnsafeStateConfiguration;
@@ -63,7 +64,7 @@ final class StoreTaskSource implements AgentTaskSource
         }
 
         if ($leaseSeconds < 1) {
-            throw UnsafeStateConfiguration::unusableLease($leaseSeconds);
+            throw InvalidTaskLease::notPositive($leaseSeconds);
         }
     }
 
@@ -413,7 +414,7 @@ final class StoreTaskSource implements AgentTaskSource
         }
 
         if ($leaseSeconds < 1) {
-            throw UnsafeStateConfiguration::unusableLease($leaseSeconds);
+            throw InvalidTaskLease::notPositive($leaseSeconds);
         }
 
         return $leaseSeconds;

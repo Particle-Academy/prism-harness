@@ -11,6 +11,7 @@ use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Enums\TaskOutcome;
 use Prism\Harness\Enums\TaskState;
 use Prism\Harness\Exceptions\InvalidTaskIdentifier;
+use Prism\Harness\Exceptions\InvalidTaskLease;
 use Prism\Harness\Exceptions\LeaseNotExtendable;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\TaskNotReleasable;
@@ -600,8 +601,8 @@ it('refuses a lease shorter than a second rather than clamping it', function ():
     try {
         taskList(lease: 0);
         $this->fail('Expected the unusable lease to be refused.');
-    } catch (UnsafeStateConfiguration $e) {
-        expect($e->code())->toBe('unsafe_state_configuration')
+    } catch (InvalidTaskLease $e) {
+        expect($e->code())->toBe('task_lease_invalid')
             // It has to name the setting, or the reader has to guess.
             ->and($e->getMessage())->toContain('lease_seconds');
     }
@@ -612,11 +613,84 @@ it('refuses a lease shorter than a second rather than clamping it', function ():
     $tasks->add('one', 't-1');
 
     expect(fn (): ?TaskRecord => $tasks->claim('worker-a', leaseSeconds: -5))
-        ->toThrow(UnsafeStateConfiguration::class);
+        ->toThrow(InvalidTaskLease::class);
 
     // The control: one second is the smallest lease that can hold anything, and
     // it is accepted.
     expect(taskList(lease: 1))->toBeInstanceOf(StoreTaskSource::class);
+});
+
+it('refuses a fractional lease rather than truncating it', function (): void {
+    // THE SAME RULE ONE SCALE DOWN. `90.4` becoming `90` is the same shape as
+    // `0` becoming `1`: the lease you get is not the lease you wrote, and
+    // nothing says so. Truncation being in the safe direction — a shorter
+    // lease, so more reclaims rather than lost work — is the clamping argument
+    // restated, and it was not enough for zero either.
+    //
+    // It also could never have been honoured as written: `claimed_until` is an
+    // integer Unix timestamp by decision, in all three languages.
+    $harness = fn (mixed $lease): PrismHarness => new PrismHarness(
+        stores: app(SessionStoreManager::class),
+        runtime: app(AgentRuntime::class),
+        config: ['tasks' => ['lease_seconds' => $lease]],
+    );
+
+    $fractional = ['90.4', 90.4, '0.5', 299.999];
+    $whole = [300, '300', 90.0, '90.0'];
+    $probed = 0;
+
+    foreach ($fractional as $lease) {
+        try {
+            $harness($lease)->tasks('work');
+            $this->fail('Expected the fractional lease ['.$lease.'] to be refused.');
+        } catch (InvalidTaskLease $e) {
+            expect($e->code())->toBe('task_lease_invalid');
+        }
+
+        $probed++;
+    }
+
+    // THE CONTROLS. A whole number is accepted however it is spelled, because
+    // an environment variable can only write one as a string and refusing '300'
+    // would refuse the ordinary case.
+    foreach ($whole as $lease) {
+        expect($harness($lease)->tasks('work'))->toBeInstanceOf(StoreTaskSource::class);
+
+        $probed++;
+    }
+
+    // Both loops count themselves — a test-id listing cannot see inside one
+    // test, and a loop that stopped running would report green having probed
+    // neither the refusals nor the controls.
+    expect($probed)->toBe(count($fractional) + count($whole))->toBe(8);
+});
+
+it('does not let the shipped config truncate a fractional lease before anyone sees it', function (): void {
+    // Decision 0012, and the reason this test is separate from the one above:
+    // the guard lives in the reader, and a `(int)` cast in the config FILE
+    // would have truncated the value before the reader ever ran — defeating
+    // the guard from inside the file that declares the setting.
+    $shipped = file_get_contents(__DIR__.'/../config/prism-harness.php');
+
+    expect($shipped)->toContain("'lease_seconds' => env(")
+        ->and($shipped)->not->toContain("'lease_seconds' => (int) env(");
+
+    // And end to end, through the shipped file with the env var set.
+    putenv('HARNESS_TASK_LEASE_SECONDS=90.4');
+    $_ENV['HARNESS_TASK_LEASE_SECONDS'] = '90.4';
+
+    try {
+        $config = require __DIR__.'/../config/prism-harness.php';
+
+        expect(fn (): StoreTaskSource => (new PrismHarness(
+            stores: app(SessionStoreManager::class),
+            runtime: app(AgentRuntime::class),
+            config: $config,
+        ))->tasks('work'))->toThrow(InvalidTaskLease::class);
+    } finally {
+        putenv('HARNESS_TASK_LEASE_SECONDS');
+        unset($_ENV['HARNESS_TASK_LEASE_SECONDS']);
+    }
 });
 
 it('puts task lists on the durable slot in the SHIPPED configuration', function (): void {
@@ -717,12 +791,18 @@ it('refuses to read a stored state it does not recognise', function (): void {
     ], 'work'))->toThrow(UnmappableTask::class, 'in_progress');
 
     // The control: the four it does recognise are read without complaint.
+    $read = 0;
+
     foreach (TaskState::cases() as $state) {
         expect(TaskRecord::fromArray([
             'id' => 't-1', 'instruction' => 'x', 'state' => $state->value,
             'claimed_by' => null, 'claimed_until' => null,
         ], 'work')->state)->toBe($state);
+
+        $read++;
     }
+
+    expect($read)->toBe(4);
 });
 
 it('treats a claim with no expiry as expired rather than honouring it forever', function (): void {

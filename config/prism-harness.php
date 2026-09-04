@@ -118,7 +118,19 @@ return [
     */
 
     'tasks' => [
-        'lease_seconds' => (int) env('HARNESS_TASK_LEASE_SECONDS', AgentTaskSource::DEFAULT_LEASE_SECONDS),
+        /*
+         * NOT cast to an int here, deliberately.
+         *
+         * `(int) '90.4'` is 90, and the cast would do that silently before
+         * anything had a chance to object — so the guard against a fractional
+         * lease would be defeated by the config file that declares it. The raw
+         * value is passed through and refused where it is read, which is the
+         * only place that can tell 300 from '300' from '90.4'.
+         */
+        'lease_seconds' => env('HARNESS_TASK_LEASE_SECONDS', AgentTaskSource::DEFAULT_LEASE_SECONDS),
+
+        // Cast, because this one is tolerant by decision — see
+        // PrismHarness::taskLockWait().
         'lock_wait' => (int) env('HARNESS_TASK_LOCK_WAIT', 5),
     ],
 

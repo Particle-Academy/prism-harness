@@ -6,6 +6,7 @@ namespace Prism\Harness;
 
 use Illuminate\Database\Eloquent\Model;
 use Prism\Harness\Contracts\AgentTaskSource;
+use Prism\Harness\Exceptions\InvalidTaskLease;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Tasks\StoreTaskSource;
@@ -45,7 +46,7 @@ class PrismHarness
             durable: $this->stores->durable(),
             ttlSeconds: $this->ephemeralTtl(),
             runtime: $this->runtime,
-            taskLeaseSeconds: $this->taskSetting('lease_seconds', AgentTaskSource::DEFAULT_LEASE_SECONDS),
+            taskLeaseSeconds: $this->taskLease(),
         );
     }
 
@@ -72,8 +73,8 @@ class PrismHarness
         return new StoreTaskSource(
             store: $this->stores->durable(),
             list: $list,
-            leaseSeconds: $this->taskSetting('lease_seconds', AgentTaskSource::DEFAULT_LEASE_SECONDS),
-            lockWaitSeconds: $this->taskSetting('lock_wait', 5),
+            leaseSeconds: $this->taskLease(),
+            lockWaitSeconds: $this->taskLockWait(),
         );
     }
 
@@ -96,11 +97,55 @@ class PrismHarness
         return is_int($ttl) ? $ttl : null;
     }
 
-    protected function taskSetting(string $key, int $default): int
+    /**
+     * The configured lease, refused rather than rounded.
+     *
+     * PHP's own signature would have caught a float passed to `claim()` — the
+     * parameter is `?int` under strict types — but NOT this path: a config
+     * value arrives as a string or a float and `(int) '90.4'` is `90`, quietly.
+     * That is the same shape as clamping a lease of zero to one, one scale
+     * down, and it is refused for the same reason: the lease you get is not the
+     * lease you wrote, and nothing says so.
+     *
+     * The comparison is against the value's own truncation rather than
+     * `is_int()`, because `'300'` out of an environment variable is a whole
+     * number of seconds written the only way an env file can write one.
+     */
+    protected function taskLease(): int
+    {
+        $value = $this->taskConfig('lease_seconds');
+
+        if (! is_numeric($value)) {
+            return AgentTaskSource::DEFAULT_LEASE_SECONDS;
+        }
+
+        if ((float) $value !== (float) (int) $value) {
+            throw InvalidTaskLease::notWholeSeconds('prism-harness.tasks.lease_seconds', (string) $value);
+        }
+
+        return (int) $value;
+    }
+
+    /**
+     * How long to wait for another worker's claim before giving up.
+     *
+     * Deliberately NOT held to the lease's strict rule. This is a local wait
+     * bound, not part of the contract the three languages share, and it never
+     * reaches a stored record — a fractional value truncating here changes how
+     * long one call blocks and nothing else. The lease decides who holds a
+     * task; this decides how patient you are about finding out.
+     */
+    protected function taskLockWait(): int
+    {
+        $value = $this->taskConfig('lock_wait');
+
+        return is_numeric($value) ? (int) $value : 5;
+    }
+
+    protected function taskConfig(string $key): mixed
     {
         $tasks = $this->config['tasks'] ?? [];
-        $value = is_array($tasks) ? ($tasks[$key] ?? null) : null;
 
-        return is_numeric($value) ? (int) $value : $default;
+        return is_array($tasks) ? ($tasks[$key] ?? null) : null;
     }
 }

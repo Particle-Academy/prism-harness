@@ -52,11 +52,21 @@ it('adapts a model whose columns are named nothing like the convention', functio
 });
 
 it('reads every one of the four states and nothing else', function (): void {
+    $read = 0;
+
     foreach (TaskState::cases() as $state) {
         $chore = Chore::create(['instruction' => 'x', 'state' => $state->value]);
 
         expect($chore->state())->toBe($state);
+
+        $read++;
     }
+
+    // FOUR, counted. "Every one of the four" is the claim in the name, and a
+    // loop inside one test is invisible to a test-id listing — so the count is
+    // asserted rather than assumed, and a fifth state added without a thought
+    // for this trait moves it.
+    expect($read)->toBe(4);
 
     // A fifth value is NOT defaulted to todo. Read as todo, a task the
     // application considers finished is handed back to a worker and run again;

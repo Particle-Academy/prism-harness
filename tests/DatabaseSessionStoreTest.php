@@ -151,6 +151,8 @@ it('waits rather than stealing a lock whose expiry cannot be read', function ():
         '1735689' => 'a prefix of a unix timestamp, which parses as 1970',
     ];
 
+    $probed = 0;
+
     foreach ($torn as $value => $why) {
         DB::table('harness_session_state')->where('key', 'lock:k')->delete();
         DB::table('harness_session_state')->insert([
@@ -166,7 +168,13 @@ it('waits rather than stealing a lock whose expiry cannot be read', function ():
             ->and(DB::table('harness_session_state')->where('key', 'lock:k')->exists())
             // Still there: refused, not swept. ($why)
             ->toBeTrue();
+
+        $probed++;
     }
+
+    // The loop counts itself: a test-id listing cannot see inside one test, so
+    // a loop that stopped running would report green having probed nothing.
+    expect($probed)->toBe(count($torn))->toBe(3);
 });
 
 it('reads its own written expiry back, with nothing planted by hand', function (): void {

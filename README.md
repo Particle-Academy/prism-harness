@@ -401,6 +401,27 @@ Ports keeping a lock in a file must write a **terminator** and treat a value
 without one as unreadable. Without it there is nothing to distinguish a complete
 expiry from the first half of one.
 
+### A lease is refused, never quietly adjusted
+
+`lease_seconds` is refused — with the code `task_lease_invalid` — when it is
+zero or negative, **and when it is fractional**. Both are one rule: a
+configuration that silently becomes a *different* configuration is one nobody
+gets to notice. `0` becoming `1` and `90.4` becoming `90` are the same shape at
+two scales, and truncation landing in the safe direction (a shorter lease, so
+more reclaims rather than lost work) is just the clamping argument restated.
+
+A fractional lease could not have been honoured as written in any case:
+`claimed_until` is an integer Unix timestamp, pinned across all three languages.
+
+Note where the check lives. `(int) '90.4'` is `90`, so a cast in the config file
+would have truncated the value before anything could object — the guard would
+have been defeated by the file that declares the setting. The raw value is
+passed through and refused where it is read.
+
+`lock_wait` is deliberately *not* held to this rule: it is a local wait bound,
+never reaches a stored record, and is not part of the contract the three
+languages share.
+
 ### The list is durable state
 
 A task source backed by a volatile store **refuses to start**, the same way the durable
