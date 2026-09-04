@@ -1,6 +1,9 @@
 {
     "symbol-whitelist": [
         "FancyFlow\\Nodes\\Support\\LlmClient",
-        "FancyFlow\\Nodes\\Support\\ToolInvoker"
+        "FancyFlow\\Nodes\\Support\\ToolInvoker",
+        "FancyFlow\\Contracts\\NodeExecutor",
+        "FancyFlow\\Runtime\\ExecutionContext",
+        "FancyFlow\\Runtime\\RunEvent"
     ]
 }
