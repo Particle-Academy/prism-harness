@@ -58,15 +58,34 @@ final readonly class RunBudget
      */
     public function nestedWithin(self $parent, RunLedger $ledger): self
     {
+        // A TREE-ABSOLUTE ceiling, not a remainder. The ledger is shared by the
+        // whole tree and counts CUMULATIVELY, and `RunLedger::exhaustion()`
+        // compares its running totals against whatever budget it is handed --
+        // so a budget expressed as "what is left" is in the wrong unit and the
+        // comparison is nonsense the moment the parent has spent anything.
+        //
+        // It used to be a remainder, and the arithmetic went like this: a parent
+        // allowed 8 steps that had taken 7, spawning a child asking for 2, got
+        // `min(2, 8 - 7) = 1` -- and then `exhaustion()` asked `7 >= 1` and
+        // refused the child outright. One step remained and the child received
+        // none, worsening with depth. Reported as prism-harness#10.
+        //
+        // Expressed as a ceiling instead, both halves are in the ledger's own
+        // unit: the child may run until the tree total reaches whichever comes
+        // first, its own allowance added to what has already been spent, or the
+        // parent's hard limit.
         $seconds = self::lesser(
-            $this->maxSeconds === null ? null : (float) $this->maxSeconds,
-            $ledger->remainingSeconds($parent) === null ? null : (float) $ledger->remainingSeconds($parent),
+            $parent->maxSeconds === null ? null : (float) $parent->maxSeconds,
+            $this->maxSeconds === null ? null : $ledger->elapsedSeconds() + (float) $this->maxSeconds,
         );
 
         return new self(
-            maxSteps: min($this->maxSteps, max(0, $parent->maxSteps - $ledger->steps())),
-            maxCostUsd: self::lesser($this->maxCostUsd, $ledger->remainingCost($parent)),
-            maxSeconds: $seconds === null ? null : (int) $seconds,
+            maxSteps: min($parent->maxSteps, $ledger->steps() + $this->maxSteps),
+            maxCostUsd: self::lesser(
+                $parent->maxCostUsd,
+                $this->maxCostUsd === null ? null : $ledger->costUsd() + $this->maxCostUsd,
+            ),
+            maxSeconds: $seconds === null ? null : (int) ceil($seconds),
         );
     }
 

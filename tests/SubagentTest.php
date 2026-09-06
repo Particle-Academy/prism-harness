@@ -131,7 +131,20 @@ it('narrows a child budget to what the tree has left', function (): void {
     // The child asks for 5; only 2 remain in a parent bounded at 10.
     $child = $ledger->forChild(subagentFixture(maxSteps: 5), 'run_parent', null);
 
-    expect($child->budget->maxSteps)->toBe(2);
+    // A CEILING in the ledger's own unit, not a remainder. This asserted 2 --
+    // the remainder -- until prism-harness#10, and that number was in a
+    // different unit from the cumulative totals RunLedger::exhaustion()
+    // compares it against, so the child was refused outright rather than
+    // granted the two steps this test is named for.
+    //
+    // The headroom is unchanged and is what the test is really about, so it is
+    // asserted directly below rather than inferred from the ceiling.
+    expect($child->budget->maxSteps)->toBe(10);
+
+    // Two steps of actual room: not exhausted now, exhausted after them.
+    expect($ledger->ledger->exhaustion($child->budget))->toBeNull();
+    $ledger->ledger->recordSteps(2);
+    expect($ledger->ledger->exhaustion($child->budget))->not->toBeNull();
 });
 
 it('refuses a subagent once the tree has no steps left, rather than running an empty one', function (): void {
