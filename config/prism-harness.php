@@ -100,6 +100,34 @@ return [
         // bound -- see the contract for why an unanswerable recall tool is
         // worse than none.
         'recall_budget' => (int) env('HARNESS_RECALL_BUDGET', 1000),
+
+        /*
+        | A SUMMARISING strategy, off unless you name a model.
+        |
+        | `SummarisingCompaction` replaces the older half of the conversation
+        | with a summary a model writes, and REWRITES that summary each time
+        | rather than appending -- an append-only precis grows without bound
+        | while looking like it compacts.
+        |
+        | IT IS THE STRATEGY MOST LIKELY TO LOSE SOMETHING THAT MATTERS, and
+        | that is measured: "Governance Decay" (arXiv 2606.22528) puts
+        | summarisation-based compaction above 40% safety violations, against
+        | 25-30% for truncation and 15-20% for semantic compression, because
+        | constraints stated early are progressively lost with nothing
+        | reporting it.
+        |
+        | So `keep_recent` above is the cheaper thing to try first: it costs
+        | nothing, cannot rewrite anything, and is entirely predictable. Reach
+        | for this when a bounded window genuinely is not enough, and BIND AN
+        | EvictionSink alongside it -- a summary is a lossy view, and this only
+        | becomes safe when something else still holds the original.
+        |
+        | It bills a model call on every turn that fires. Every other strategy
+        | here is free.
+        |
+        */
+        'summarise_with' => env('HARNESS_SUMMARISE_WITH'),
+        'summary_words' => (int) env('HARNESS_SUMMARY_WORDS', 200),
     ],
 
     'stores' => [

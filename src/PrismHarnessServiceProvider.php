@@ -10,6 +10,7 @@ use Prism\Harness\Console\HarnessDoctorCommand;
 use Prism\Harness\Context\DiscardEvicted;
 use Prism\Harness\Context\KeepRecentTurns;
 use Prism\Harness\Context\NoCompaction;
+use Prism\Harness\Context\SummarisingCompaction;
 use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\ContextRecall;
@@ -53,9 +54,23 @@ class PrismHarnessServiceProvider extends ServiceProvider
             $context = config('prism-harness.context', []);
             $keep = is_array($context) ? ($context['keep_recent'] ?? null) : null;
 
-            // A count turns it on. There is no separate `enabled` flag, because
-            // two settings that can disagree are two settings somebody will set
-            // inconsistently and then debug.
+            // A MODEL NAME turns summarising on, and it wins over `keep_recent`
+            // because naming a model is the more specific request. Both are
+            // absent by default, which is `NoCompaction`.
+            //
+            // A value turns each on. There is no separate `enabled` flag,
+            // because two settings that can disagree are two settings somebody
+            // will set inconsistently and then debug.
+            $model = is_array($context) ? ($context['summarise_with'] ?? null) : null;
+
+            if (is_string($model) && $model !== '') {
+                return new SummarisingCompaction(
+                    model: $model,
+                    keep: is_numeric($keep) && (int) $keep > 0 ? (int) $keep : 20,
+                    summaryWords: (int) (config('prism-harness.context.summary_words') ?? 200),
+                );
+            }
+
             return is_numeric($keep) && (int) $keep > 0
                 ? new KeepRecentTurns((int) $keep)
                 : new NoCompaction;

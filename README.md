@@ -3,12 +3,6 @@
 Durable agent sessions for Laravel — threads, modes, tool permissions and subagents on top of
 [Prism](https://github.com/Particle-Academy/prism).
 
-> **Status: every planned surface now ships.** Threads, sessions, modes, skills, tool
-> permissions, approvals, subagents, budgets, the event stream and a config doctor are
-> implemented and tested. Tool authorization is **off by default** — see the Concepts table
-> for exactly what each row provides, and `harness:doctor` for what your own configuration
-> is actually doing.
-
 > **Working on this package?** Read **[`AGENTS.md`](AGENTS.md)** first — the boundary
 > this package has to hold, the gates that must be green, and the traps that have
 > already caught someone.
@@ -169,6 +163,30 @@ class KeepWhatMatters implements Prism\Harness\Contracts\CompactionStrategy
 
 $this->app->singleton(CompactionStrategy::class, KeepWhatMatters::class);
 ```
+
+### A summary, when a bounded window is not enough
+
+`SummarisingCompaction` replaces the older half with a summary a model writes,
+and **rewrites that summary** each time rather than appending — an append-only
+précis grows without bound while looking like it compacts.
+
+```php
+'context' => ['summarise_with' => 'claude-haiku-4-5-20251001', 'keep_recent' => 20],
+```
+
+**Try `keep_recent` alone first.** It costs nothing, cannot rewrite anything, and
+is entirely predictable. This one bills a model call on every turn that fires.
+
+**And it is the strategy most likely to lose something that matters.**
+["Governance Decay"](https://arxiv.org/pdf/2606.22528) puts summarisation-based
+compaction above 40% safety violations, against 25–30% for truncation and 15–20%
+for semantic compression, because constraints stated early are progressively lost
+with nothing reporting it. **Bind an `EvictionSink` alongside it** — a summary is
+a lossy view, and this only becomes safe when something else still holds the
+original.
+
+If the summary call fails, or comes back empty, the whole conversation is kept
+rather than the older half being dropped with nothing standing in for it.
 
 **Compaction shortens the view, never the storage.** Every row stays; what changes is which of
 them the model sees. Change the strategy and the next turn sees a different window over the same
