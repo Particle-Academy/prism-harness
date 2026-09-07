@@ -183,8 +183,15 @@ the window is cheap, the agent cannot see what it did, and nothing reports an er
 answers from the gap.
 
 That is measured, not cautionary. On a real audit workload with results cleared and nothing able to
-hand them back, the agent asserted a total from evidence it no longer held — was right by
-coincidence — and then refused to finish rather than report more numbers it could not support.
+hand them back, the agent asserted a total from evidence it no longer held, and was right only by
+coincidence.
+
+**One thing that workload is NOT evidence for, because we published the wrong cause once already.**
+The same agent later abandoned the task, and its own explanation was that its counts would be
+"recollection" — a story about lost data. That story was wrong. Re-run with the agent's *rules*
+exempted from clearing, it cleared **six times more data** (77,328 tokens across six firings) and
+completed the whole sweep. The data was survivable; the rules were not. **An agent's account of why
+it failed is evidence about the behaviour, not about the cause.**
 
 Bind a sink that writes into `prism-memory`, a table, or a log. Then bind a `ContextRecall` and the
 agent gets a `recall_context` tool, so the detail is *reachable* rather than either resident or
@@ -204,8 +211,14 @@ remember.
 producing safety violations above 40%, token truncation 25–30%, semantic compression 15–20%,
 because constraints stated early are progressively lost with no failure signal. In this harness the
 system prompt is applied per run and is *not* part of the thread, so it cannot be compacted away —
-which removes the largest instance of that. **Anything else your agent must not forget belongs in
-the system prompt or behind a tool it can call, not in a turn you are hoping survives.**
+which removes the largest instance of that.
+
+**Whatever your agent must not forget cannot live in a clearable turn**, and the footgun is
+sharper than it sounds: if your agent loads its operating rules through a TOOL, those rules arrive
+as a tool *result* and compaction eats them like any other. That is not hypothetical — it is what
+made one consumer's agent abandon a task it completed fine once the rules were exempted. "Behind a
+tool" is only safe if that tool's results are excluded from clearing. Put the rules in the system
+prompt, or exempt the tool explicitly.
 
 ## Tool permissions
 
