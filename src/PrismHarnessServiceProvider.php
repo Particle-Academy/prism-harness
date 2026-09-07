@@ -22,7 +22,6 @@ use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ContextRecallTool;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
-use Prism\Prism\Tool;
 use RuntimeException;
 
 class PrismHarnessServiceProvider extends ServiceProvider
@@ -115,26 +114,34 @@ class PrismHarnessServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
-        // Offered ONLY when something can answer it.
+        // Offered ONLY when something can answer it — decided PER SESSION,
+        // not once at boot.
         //
-        // Registered in boot() rather than register() so an application binding
-        // its own ContextRecall in its own provider is seen whichever order the
-        // providers happen to load.
+        // A provider rather than a factory guarded by `bound()` at boot time.
+        // The guarded version looked equivalent and was not: it evaluated the
+        // binding while the framework was still booting, so an application (or
+        // a probe) that binds a ContextRecall later got no tool and no
+        // explanation. A provider closure runs when tools are resolved for a
+        // session, which is the moment the answer is actually knowable, and it
+        // can legitimately yield nothing.
         //
-        // The guard is not tidiness. A recall tool with nothing behind it
-        // answers everything with "nothing found", and an agent reads that as
-        // THE DETAIL DOES NOT EXIST rather than as I CANNOT CHECK -- a stronger
-        // and more wrong conclusion than not having the tool. An absent
-        // capability is honest; one that silently always fails is not.
-        if ($this->app->bound(ContextRecall::class)) {
-            $this->app->make(ToolRegistry::class)->registerFactory(
-                'recall_context',
-                fn (Session $session): Tool => (new ContextRecallTool(
+        // The condition itself is not tidiness. A recall tool with nothing
+        // behind it answers everything with "nothing found", and an agent reads
+        // that as THE DETAIL DOES NOT EXIST rather than as I CANNOT CHECK -- a
+        // stronger and more wrong conclusion than not having the tool. An
+        // absent capability is honest; one that silently always fails is not.
+        $this->app->make(ToolRegistry::class)->registerProvider(
+            function (Session $session): iterable {
+                if (! $this->app->bound(ContextRecall::class)) {
+                    return;
+                }
+
+                yield (new ContextRecallTool(
                     $this->app->make(ContextRecall::class),
                     (int) (config('prism-harness.context.recall_budget') ?? 1000),
-                ))->forSession($session),
-            );
-        }
+                ))->forSession($session);
+            },
+        );
 
         // A config published under the OLD name is refused rather than ignored.
         //

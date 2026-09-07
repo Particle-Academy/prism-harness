@@ -284,16 +284,45 @@ it('shortens the view and never the storage', function (): void {
 |--------------------------------------------------------------------------
 */
 
-it('does not offer a recall tool when nothing can answer it', function (): void {
+it('offers the recall tool only when something can answer it', function (): void {
     // The property worth protecting. A recall tool with nothing behind it
     // answers everything with "nothing found", and an agent reads that as THE
-    // DETAIL DOES NOT EXIST rather than as I CANNOT CHECK — a stronger and more
-    // wrong conclusion than not having the tool at all.
-    expect(app()->bound(ContextRecall::class))->toBeFalse()
-        ->and(fn (): mixed => app(ToolRegistry::class)->resolve(['recall_context'], null))
-        ->not->toThrow(LogicException::class);
+    // DETAIL DOES NOT EXIST rather than as I CANNOT CHECK.
+    //
+    // Resolved WITH a session in both directions. An earlier version asked with
+    // a null session, which yields nothing whether or not a recall is bound --
+    // so it would have passed even if the tool were always offered.
+    $session = compactionSession();
 
-    expect(app(ToolRegistry::class)->resolve(['recall_context'], null))->toBe([]);
+    expect(app()->bound(ContextRecall::class))->toBeFalse()
+        ->and(app(ToolRegistry::class)->resolve(['recall_context'], $session))->toBe([]);
+
+    app()->instance(ContextRecall::class, new class implements ContextRecall
+    {
+        public function recall(string $query, string $scope, int $budget): string
+        {
+            return 'something';
+        }
+    });
+
+    expect(app(ToolRegistry::class)->resolve(['recall_context'], $session))
+        ->toHaveKey('recall_context');
+});
+
+it('offers recall to a session bound AFTER the framework booted', function (): void {
+    // The bug this replaced: the tool was registered once at boot behind a
+    // `bound()` check, so anything binding a ContextRecall later got no tool
+    // and no explanation. The binding below happens well after boot.
+    app()->instance(ContextRecall::class, new class implements ContextRecall
+    {
+        public function recall(string $query, string $scope, int $budget): string
+        {
+            return 'late but present';
+        }
+    });
+
+    expect(app(ToolRegistry::class)->resolve(['recall_context'], compactionSession()))
+        ->toHaveKey('recall_context');
 });
 
 it('reports a broken lookup as unknown rather than as nothing found', function (): void {
