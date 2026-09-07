@@ -49,7 +49,20 @@ final class ContextRecallTool
 
     public function forSession(Session $session): Tool
     {
-        $scope = $session->key();
+        // THE THREAD KEY, not the session key, and they are not the same
+        // string: `Session::key()` is `session:<hash>:<id>:<scope>` while the
+        // sink is handed the thread's primary key.
+        //
+        // This started out as `$session->key()` and the two halves therefore
+        // searched different namespaces -- eviction wrote 448 rows and recall
+        // found none of them, silently, because a lookup that matches nothing
+        // is indistinguishable from a conversation with nothing to find. Unit
+        // tests on either side passed; only a probe that evicted a fact and
+        // asked for it back could see it.
+        //
+        // The thread is the conversation, so the thread is what both sides key
+        // on.
+        $scope = (string) $session->thread()->getKey();
 
         return ToolFactory::as('recall_context')
             ->for(

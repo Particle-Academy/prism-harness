@@ -346,6 +346,6 @@ it('passes the conversation scope and the budget to the implementation', functio
     $tool = (new ContextRecallTool($seen, 250))->forSession($session);
 
     expect($tool->handle('what was the total?'))->toBe('found it')
-        ->and($seen->scope)->toBe($session->key())
+        ->and($seen->scope)->toBe((string) $session->thread()->getKey())
         ->and($seen->budget)->toBe(250);
 });
