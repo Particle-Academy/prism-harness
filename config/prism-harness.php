@@ -55,6 +55,53 @@ return [
     |
     */
 
+    /*
+    |--------------------------------------------------------------------------
+    | Context window
+    |--------------------------------------------------------------------------
+    |
+    | How a conversation is shortened before it is replayed to the model.
+    |
+    | OFF by default: the harness replays the whole thread, which is what it has
+    | always done and the only behaviour that cannot lose something the agent
+    | needed. Setting `keep_recent` turns on the shipped strategy, which keeps
+    | that many of the most recent MESSAGES and evicts the rest.
+    |
+    | Messages rather than turns, because a turn is not a countable unit once
+    | tools are involved -- one exchange can be an assistant message plus six
+    | tool results.
+    |
+    | COMPACTION SHORTENS THE VIEW, NOT THE STORAGE. Every row stays; what
+    | changes is which of them the model sees. Change the setting and the next
+    | turn sees a different window over the same unaltered history.
+    |
+    | WHATEVER YOU SET HERE, CHOOSE A SINK IN THE SAME BREATH. Evicted messages
+    | go to the `EvictionSink` binding, which defaults to discarding them -- and
+    | compaction without recovery is the configuration with the worst properties
+    | available. The window gets cheap, the agent can no longer see what it did,
+    | and nothing reports an error when it answers from the gap. Bind an
+    | EvictionSink that writes into `prism-memory` (or a log, or a table) so the
+    | detail leaves the window and stays reachable.
+    |
+    | Your own rule goes in a class implementing `CompactionStrategy` and bound
+    | in a service provider. The harness enforces one invariant on every
+    | strategy including yours: a tool call and its result are kept or dropped
+    | together, because splitting them makes the provider reject the request.
+    |
+    */
+
+    'context' => [
+        'keep_recent' => env('HARNESS_KEEP_RECENT'),
+
+        // The ceiling on what `recall_context` hands back, in estimated tokens.
+        // Bounded because compaction is the reason recall exists: returning
+        // everything relevant would re-expand the window that was just
+        // compacted. The tool is only offered at all when a `ContextRecall` is
+        // bound -- see the contract for why an unanswerable recall tool is
+        // worse than none.
+        'recall_budget' => (int) env('HARNESS_RECALL_BUDGET', 1000),
+    ],
+
     'stores' => [
         // Defaults to the database because that is what every Laravel app
         // already has. Redis is the better home for ephemeral state and is

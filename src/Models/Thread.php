@@ -12,9 +12,14 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Support\Facades\DB;
+use Prism\Harness\Context\NoCompaction;
+use Prism\Harness\Context\ToolPairGuard;
+use Prism\Harness\Contracts\CompactionStrategy;
+use Prism\Harness\Contracts\EvictionSink;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
+use Throwable;
 
 /**
  * A stored conversation.
@@ -146,20 +151,92 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * The conversation so far, oldest first.
+     * The conversation so far, oldest first, after compaction.
      *
      * Yields rather than building an array: Prism materialises what it needs
      * for the payload, and this way a long history is paged out of the database
      * in chunks instead of every row being hydrated at once.
+     *
+     * COMPACTION SHORTENS THE VIEW, NEVER THE STORAGE. Every row stays where it
+     * is; what changes is which of them are replayed to the model. That
+     * separation is what makes the decision reversible — change the strategy and
+     * the next turn sees a different window over the same unaltered history —
+     * and it is why the thread can still be rendered whole for a human while
+     * the model sees less.
+     *
+     * The default strategy replays everything, so this is exactly what it has
+     * always been until an application chooses otherwise.
      *
      * @return Generator<int, Message>
      */
     #[\Override]
     public function messages(): Generator
     {
-        foreach ($this->storedMessages()->lazy() as $stored) {
-            yield $stored->toPrismMessage();
+        $strategy = $this->compactionStrategy();
+
+        if ($strategy instanceof NoCompaction) {
+            // The lazy path, kept intact for the default. Compaction has to
+            // materialise the conversation — a strategy that counts, or looks
+            // at the end, cannot work from a generator — and paying that on
+            // every thread to support a strategy nobody selected would make the
+            // common case worse to serve the uncommon one.
+            foreach ($this->storedMessages()->lazy() as $stored) {
+                yield $stored->toPrismMessage();
+            }
+
+            return;
         }
+
+        $messages = [];
+
+        foreach ($this->storedMessages()->lazy() as $stored) {
+            $messages[] = $stored->toPrismMessage();
+        }
+
+        $outcome = app(ToolPairGuard::class)->enforce($strategy->compact($messages));
+
+        if ($outcome->compacted()) {
+            // Handed over BEFORE the turn is sent, so the detail is recoverable
+            // by the very turn that lost it — an agent that calls a recall tool
+            // in the same run finds what was just evicted. Doing this afterwards
+            // would leave exactly one turn unable to see what it needed.
+            //
+            // A sink that fails must not take the turn down with it: the model
+            // can still answer from what remains, and trading a degraded
+            // conversation for no conversation is the wrong way round.
+            // Resolved OUTSIDE the try, deliberately.
+            //
+            // An earlier version built the scope inside it and called a method
+            // that does not exist on this model. The catch-all turned that
+            // programming error into a silent no-op: compaction ran, the
+            // messages were evicted, NOTHING was ever stored, and the tests
+            // still passed because they asserted on the window rather than on
+            // the sink. A guard meant for a failing sink must not also swallow
+            // our own bugs.
+            $sink = app(EvictionSink::class);
+            $scope = (string) $this->getKey();
+
+            try {
+                $sink->store($outcome->evicted, $scope);
+            } catch (Throwable $failure) {
+                report($failure);
+            }
+        }
+
+        yield from $outcome->kept;
+    }
+
+    /**
+     * The configured strategy, resolved per call.
+     *
+     * Per call rather than cached on the model, because a strategy is a
+     * container binding an application may swap — in a test, or per mode — and
+     * a thread holding the one that existed when it was hydrated would ignore
+     * that silently.
+     */
+    private function compactionStrategy(): CompactionStrategy
+    {
+        return app(CompactionStrategy::class);
     }
 
     /**

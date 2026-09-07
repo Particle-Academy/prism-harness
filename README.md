@@ -141,6 +141,72 @@ table is not your first problem. It matters because it sets where the boundary i
 `harness_thread_messages` as trusted storage, and never let request input write directly to
 it.
 
+## Context window
+
+A long conversation eventually costs more to replay than it is worth. The harness replays the
+whole thread by default — that has not changed and will not change on an upgrade — and gives you
+the structure to shorten it when you decide to.
+
+**The rule is yours.** There is no correct answer to hand you: a support chat can drop old turns
+freely, an audit cannot drop the tool results its final count depends on, a coding agent wants
+neither. So the harness owns *when* compaction runs, *what happens to what it removes*, and the
+invariants no strategy may break. You own the rule.
+
+```php
+// config/prism-harness.php — the shipped strategy, deterministic and no model call
+'context' => ['keep_recent' => 200],
+```
+
+```php
+// or your own
+class KeepWhatMatters implements Prism\Harness\Contracts\CompactionStrategy
+{
+    public function compact(array $messages): CompactionOutcome
+    {
+        return new CompactionOutcome(kept: /* ... */, evicted: /* ... */);
+    }
+}
+
+$this->app->singleton(CompactionStrategy::class, KeepWhatMatters::class);
+```
+
+**Compaction shortens the view, never the storage.** Every row stays; what changes is which of
+them the model sees. Change the strategy and the next turn sees a different window over the same
+unaltered history.
+
+### Choose a sink in the same breath
+
+A strategy returns what it evicted, and the harness hands it to an `EvictionSink`. **This is what
+separates compaction from loss**, and the default sink discards — so compaction with no sink is
+context clearing without recovery, which is the configuration with the worst properties available:
+the window is cheap, the agent cannot see what it did, and nothing reports an error when it
+answers from the gap.
+
+That is measured, not cautionary. On a real audit workload with results cleared and nothing able to
+hand them back, the agent asserted a total from evidence it no longer held — was right by
+coincidence — and then refused to finish rather than report more numbers it could not support.
+
+Bind a sink that writes into `prism-memory`, a table, or a log. Then bind a `ContextRecall` and the
+agent gets a `recall_context` tool, so the detail is *reachable* rather than either resident or
+gone. **The tool is only offered when a `ContextRecall` is bound**: one that always returns nothing
+is worse than none, because the agent reads "nothing found" as *the detail does not exist* rather
+than *I cannot check*.
+
+### What the harness guarantees whatever you write
+
+**A tool call and its result are kept or dropped together.** Splitting them makes the provider
+reject the whole request, intermittently, several messages after the compaction that caused it —
+so it is enforced centrally on every strategy's output rather than documented as a rule to
+remember.
+
+**It does not protect your safety constraints, and you should know why.** Compaction erases them:
+["Governance Decay"](https://arxiv.org/pdf/2606.22528) measures summarisation-based compaction
+producing safety violations above 40%, token truncation 25–30%, semantic compression 15–20%,
+because constraints stated early are progressively lost with no failure signal. In this harness the
+system prompt is applied per run and is *not* part of the thread, so it cannot be compacted away —
+which removes the largest instance of that. **Anything else your agent must not forget belongs in
+the system prompt or behind a tool it can call, not in a turn you are hoping survives.**
+
 ## Tool permissions
 
 Two abilities, because they answer different questions:
