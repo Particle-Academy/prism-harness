@@ -98,3 +98,48 @@ composer test && composer types && composer format
 
 CI runs `tests`, `phpstan`, `formatting` and `require-checker` separately. Run
 all of them.
+
+## Cutting a release, and the step that is easy to skip
+
+```sh
+git push origin main
+# WAIT for the tests workflow to go GREEN on the commit you are about to tag
+gh run watch "$(gh run list --workflow=tests.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+
+git tag -a vX.Y.Z -m "…"     # ANNOTATED. The message IS the release notes.
+git push origin vX.Y.Z
+
+# THEN CHECK IT ACTUALLY PUBLISHED — this is the step that gets skipped
+gh run list --workflow=release.yml --limit 1
+gh release view vX.Y.Z
+```
+
+**The release workflow refuses to publish a tag whose tests have not already
+succeeded for that exact commit.** That guard is right, and it means pushing
+main and the tag in the same breath FAILS — the tests for that SHA are still
+queued when the tag lands.
+
+That is not hypothetical. v0.6.0, v0.6.1 and v0.7.0 were all tagged that way in
+one afternoon; all three release runs failed on the guard, and nobody noticed
+because pushing the tag looks like success at the terminal. The releases page
+went on showing v0.5.0 as Latest while three newer versions existed as tags, and
+a downstream consumer had to diff the source tree to find out what changed.
+
+**A pushed tag is not a release.** `git push` succeeding tells you the tag
+exists, not that anything published notes for it. Check `gh release view`, every
+time. Composer resolves from tags, so the package installs either way — which is
+exactly why this failure is silent.
+
+Two other things the guard enforces, worth knowing before you are surprised by
+them:
+
+- **A lightweight tag is refused.** The annotation is the release notes; `git tag`
+  without `-a` carries none, and the workflow will not invent them.
+- **Any other gate failing on that commit blocks the release**, including the
+  NIGHTLY strict currency check in `factcheck`. That one can redden a commit
+  hours after you tagged it, because it fails on claim staleness across the
+  ecosystem rather than on anything in this repo — so a tag that released fine
+  at the time can become unreleasable later. Reconciling `factcheck.lock.json`
+  in `prism-parity` is the fix; blanket `--reconcile` is not, because it
+  re-records the claim census and will quietly bless a rule that has stopped
+  matching anything.
