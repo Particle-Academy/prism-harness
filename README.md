@@ -178,15 +178,34 @@ précis grows without bound while looking like it compacts.
 is entirely predictable. This one bills a model call on every turn that fires —
 and a second one on turns where the summary comes back over its word budget.
 
-**That budget is checked, because asking for it does not get it.** `summary_words`
-used to reach the model only as "in at most N words" inside the prompt, with
-nothing looking at the answer. Measured live: a stated 15 words came back at 92
-and at 346, and the default 60 came back at 205 — the 346 having re-stated every
-exchange one by one, which is the unbounded growth rewriting is supposed to
-prevent. An over-budget summary is now sent back once to be cut down. The retry
-does not loop and is allowed to miss; a failed or longer second answer leaves the
+**The budget is a request, and what to do about that is yours.** `summary_words`
+reaches the model as "in at most N words" inside the prompt, and a model does not
+have to grant a request. Measured live with nothing checking: a stated 15 words
+came back at 92 and at 346, and the default 60 came back at 205 — the 346 having
+re-stated every exchange one by one, which is the unbounded growth rewriting is
+supposed to prevent.
+
+So there are **two dials, deliberately separate**: how big (`summary_words`) and
+how that is enforced (`SummaryBudget`).
+
+| budget | what it does | costs |
+|---|---|---|
+| `RetryOnce` *(default)* | counts, and asks once more when over — took a 60-word budget from 205 words to 61 | a second call on turns that overshoot |
+| `AskOnly` | nothing; the behaviour before v0.6.0 | one call, and the summary may be 4x what you asked |
+| `TruncateTo` | guarantees the bound by cutting | free, and **can hand the model a fragment that reads whole** |
+
+```php
+$this->app->bind(SummaryBudget::class, fn () => new TruncateTo);
+```
+
+`RetryOnce` is allowed to miss, and does — in the same measured runs, arms
+finished at 118 and 84 words against a budget of 60, meaning both calls came back
+over. It cannot make things worse: a failed or longer second answer leaves the
 first standing, because a summary over budget is a cost problem and no summary at
-all is a lost conversation.
+all is a lost conversation. Write your own if you would rather count tokens, or
+try harder, or give up sooner — the one rule is **never return an empty string**,
+and the strategy treats a budget that does exactly like a failed model call
+rather than trusting it.
 
 **And it is the strategy most likely to lose something that matters.**
 ["Governance Decay"](https://arxiv.org/pdf/2606.22528) puts summarisation-based

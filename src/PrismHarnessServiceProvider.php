@@ -15,6 +15,7 @@ use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\ContextRecall;
 use Prism\Harness\Contracts\EvictionSink;
+use Prism\Harness\Contracts\SummaryBudget;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
@@ -68,6 +69,14 @@ class PrismHarnessServiceProvider extends ServiceProvider
                     model: $model,
                     keep: is_numeric($keep) && (int) $keep > 0 ? (int) $keep : 20,
                     summaryWords: (int) (config('prism-harness.context.summary_words') ?? 200),
+                    // RESOLVED ONLY IF THE APPLICATION BOUND ONE, so that binding
+                    // a SummaryBudget is how you change enforcement and nothing
+                    // else has to be touched. Left unbound, the strategy picks
+                    // its own default -- asking the container for one
+                    // unconditionally would build a RetryOnce here and make the
+                    // constructor default unreachable, which is the kind of
+                    // duplicated default that drifts.
+                    budget: $app->bound(SummaryBudget::class) ? $app->make(SummaryBudget::class) : null,
                 );
             }
 

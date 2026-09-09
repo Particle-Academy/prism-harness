@@ -122,17 +122,20 @@ return [
         | EvictionSink alongside it -- a summary is a lossy view, and this only
         | becomes safe when something else still holds the original.
         |
-        | It bills a model call on every turn that fires, and a SECOND one on
-        | turns where the summary comes back longer than `summary_words`. Every
-        | other strategy here is free.
+        | It bills a model call on every turn that fires. Every other strategy
+        | here is free.
         |
-        | `summary_words` is enforced, not merely asked for. It used to reach
-        | the model only as "in at most N words" inside the prompt with nothing
-        | checking the answer, and measured live a stated 15 came back at 92 and
-        | at 346, while the default 60 came back at 205. An over-budget summary
-        | is now sent back once to be cut down; the retry does not loop and is
-        | allowed to miss, and a failed or longer second answer leaves the first
-        | standing.
+        | `summary_words` is HOW BIG. How that is enforced is a separate choice,
+        | because a budget only ever reaches the model as "in at most N words"
+        | inside a prompt and a model need not grant a request -- measured live
+        | with nothing checking, a stated 15 came back at 92 and at 346, and the
+        | default 60 came back at 205.
+        |
+        | Bind a `SummaryBudget` to decide what happens then. `RetryOnce` is the
+        | default and asks once more when over (so those turns cost a second
+        | call); `AskOnly` accepts whatever came back; `TruncateTo` guarantees
+        | the bound by cutting. See the contract -- each trades cost against
+        | certainty differently, and only your application knows which way.
         |
         */
         'summarise_with' => env('HARNESS_SUMMARISE_WITH'),

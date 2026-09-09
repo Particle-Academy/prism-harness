@@ -2,7 +2,11 @@
 
 declare(strict_types=1);
 
+use Prism\Harness\Context\Budget\AskOnly;
+use Prism\Harness\Context\Budget\TruncateTo;
 use Prism\Harness\Context\SummarisingCompaction;
+use Prism\Harness\Contracts\CompactionStrategy;
+use Prism\Harness\Contracts\SummaryBudget;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Testing\TextResponseFake;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
@@ -239,5 +243,105 @@ it('counts words the way a reader would, not the way str_word_count does', funct
     $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 6))->compact(turns(10));
 
     expect($outcome->kept[0]->content)->toContain('rétablissement');
+    $fake->assertCallCount(1);
+});
+
+/*
+|--------------------------------------------------------------------------
+| Whose decision the budget is
+|--------------------------------------------------------------------------
+|
+| The operator's call: allow developer discretion on compact size AND on how it
+| is enforced. Size is a number in config; enforcement is a contract. These pin
+| the seam, and that the shipped answers differ in the way their names promise.
+|
+*/
+
+it('lets an application swap enforcement without touching anything else', function (): void {
+    $fake = Prism::fake([TextResponseFake::make()->withText('one two three four five six seven eight')]);
+
+    $outcome = (new SummarisingCompaction(
+        keep: 4,
+        summaryWords: 3,
+        budget: new AskOnly,
+    ))->compact(turns(10));
+
+    // AskOnly takes what it was given, so nothing is re-asked and the summary
+    // stays over budget. That is the point of choosing it.
+    expect($outcome->kept[0]->content)->toContain('one two three four five six seven eight');
+    $fake->assertCallCount(1);
+});
+
+it('truncates at a sentence boundary rather than mid-clause', function (): void {
+    Prism::fake([TextResponseFake::make()->withText(
+        'The customer agreed to the refund. It was approved by finance provided the invoice matched.'
+    )]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 8, budget: new TruncateTo))->compact(turns(10));
+
+    // Eight words lands inside the second sentence. Cutting there would leave
+    // "It was approved by finance provided" — which reads as complete and says
+    // something the conversation did not. The whole first sentence is kept
+    // instead.
+    expect($outcome->kept[0]->content)->toContain('The customer agreed to the refund.')
+        ->and($outcome->kept[0]->content)->not->toContain('provided');
+});
+
+it('marks a truncation that had no sentence boundary to fall back on', function (): void {
+    Prism::fake([TextResponseFake::make()->withText('one two three four five six seven eight nine ten')]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 4, budget: new TruncateTo))->compact(turns(10));
+
+    // A reader who can see it was cut can go to the sink. One who cannot reads
+    // a fragment as a finished thought.
+    expect($outcome->kept[0]->content)->toContain('one two three four …');
+});
+
+it('never lets a budget return nothing and lose the conversation', function (): void {
+    $emptying = new class implements SummaryBudget
+    {
+        public function apply(string $summary, int $limit, callable $rewrite): string
+        {
+            return '';
+        }
+    };
+
+    Prism::fake([TextResponseFake::make()->withText('a real summary')]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 5, budget: $emptying))->compact(turns(10));
+
+    // A badly-written budget must not be able to do worse than the strategy's
+    // own failure path. An empty summary is treated exactly like a failed call:
+    // keep everything rather than evict turns with nothing standing in for
+    // them.
+    expect($outcome->compacted())->toBeFalse()
+        ->and($outcome->kept)->toHaveCount(20);
+});
+
+it('defaults to RetryOnce when nothing is bound', function (): void {
+    $fake = Prism::fake([
+        TextResponseFake::make()->withText('one two three four five six'),
+        TextResponseFake::make()->withText('two words'),
+    ]);
+
+    (new SummarisingCompaction(keep: 4, summaryWords: 2))->compact(turns(10));
+
+    // The constructor default is reachable and is the retrying one — the choice
+    // that improves the result without being able to damage it.
+    $fake->assertCallCount(2);
+});
+
+it('uses a SummaryBudget bound in the container', function (): void {
+    config()->set('prism-harness.context.summarise_with', 'claude-haiku-4-5-20251001');
+    config()->set('prism-harness.context.summary_words', 3);
+    app()->bind(SummaryBudget::class, fn (): SummaryBudget => new AskOnly);
+
+    $strategy = app(CompactionStrategy::class);
+
+    $fake = Prism::fake([TextResponseFake::make()->withText('one two three four five six seven')]);
+    $strategy->compact(turns(20));
+
+    // Bound, so the provider hands it over and nothing is re-asked. Without the
+    // wiring this would spend a second call and the assertion would fail.
     $fake->assertCallCount(1);
 });
