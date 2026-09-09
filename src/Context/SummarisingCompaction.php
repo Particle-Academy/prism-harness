@@ -42,12 +42,23 @@ use Throwable;
  * and fails the requirement. Mastra's working memory is the reference: it stays
  * small because the agent REWRITES it.
  *
- * ## It costs a model call, and says so
+ * ## It costs a model call, and says so — sometimes two
  *
  * Every other strategy in this package is free and deterministic. This one bills
  * on the turns where it fires, which is why it is a separate class you select
  * rather than a flag on an existing one — the cost is visible in the name you
  * bind.
+ *
+ * `$summaryWords` is CHECKED against what comes back, and a summary over budget
+ * is sent back once to be cut down. So a compacting turn costs one call
+ * normally and two when the model overshoots. That is deliberate: measured from
+ * the Lab across five runs, a stated 15 words came back at 92 and at 346, and
+ * the default 60 came back at 205 — the budget reached the model as a request
+ * inside a prompt and nothing enforced it, so "the summary keeps compacting"
+ * was untrue while looking fine.
+ *
+ * The retry does not loop and is allowed to miss. It cannot lose the summary:
+ * a failed or longer second answer leaves the first standing.
  *
  * ## What it does NOT touch
  *
@@ -146,6 +157,64 @@ final class SummarisingCompaction implements CompactionStrategy
                 ."{$this->summaryWords} words. Do not append — produce one summary that "
                 .'replaces the old one.';
 
+        $summary = $this->ask($instruction."\n\n".$transcript);
+
+        if ($summary === null) {
+            return null;
+        }
+
+        // THE BUDGET IS CHECKED, BECAUSE ASKING FOR IT DOES NOT GET IT.
+        //
+        // `$summaryWords` used to reach the model only as "in at most N words"
+        // inside the instruction above, and nothing looked at what came back. A
+        // probe in the Lab measured it across five runs: a stated 15 words came
+        // back at 92 and at 346, and the DEFAULT 60 came back at 205. The
+        // 346-word one had re-stated every exchange in the conversation, one by
+        // one — the append-shaped growth the class comment above argues against,
+        // arriving through a rewrite.
+        //
+        // That is requirement 2 of the design — the summary keeps compacting,
+        // bounded rather than growing — and it was not met. Worse, it was
+        // invisible: the summaries looked plausible, so runs where nothing had
+        // been compressed read as a summariser that faithfully kept every
+        // detail.
+        if (! $this->overBudget($summary)) {
+            return $summary;
+        }
+
+        // ONE retry, not a loop. A loop would spend unbounded calls chasing a
+        // number the model may simply not hit, on a code path that already bills
+        // per compacting turn. The overshoot is quoted because "you used N of a
+        // budget of M" is a correction; repeating the original instruction is
+        // just asking again.
+        $retried = $this->ask(
+            sprintf(
+                'That summary was %d words. The limit is %d. Rewrite it to fit, keeping '
+                ."names, numbers, identifiers and decisions and cutting elaboration:\n\n%s",
+                $this->words($summary),
+                $this->summaryWords,
+                $summary,
+            )
+        );
+
+        // The retry is allowed to fail and allowed to miss. What it must not do
+        // is lose the summary — a null second call, or a longer second answer,
+        // leaves the first one standing. A summary over budget is a cost
+        // problem; no summary at all evicts the history and replaces it with
+        // nothing, which {@see compact()} treats as bad enough to skip
+        // compaction entirely.
+        if ($retried === null) {
+            return $summary;
+        }
+
+        return $this->words($retried) < $this->words($summary) ? $retried : $summary;
+    }
+
+    /**
+     * One summarising call. Null when it failed or came back empty.
+     */
+    private function ask(string $prompt): ?string
+    {
         try {
             $response = Prism::text()
                 ->using($this->provider, $this->model)
@@ -156,7 +225,7 @@ final class SummarisingCompaction implements CompactionStrategy
                     .'summary most often loses. Drop pleasantries and restatement. Write '
                     .'plain prose in the third person, no preamble, no headings.'
                 )
-                ->withPrompt($instruction."\n\n".$transcript)
+                ->withPrompt($prompt)
                 ->asText();
         } catch (Throwable $failure) {
             report($failure);
@@ -167,6 +236,27 @@ final class SummarisingCompaction implements CompactionStrategy
         $summary = trim($response->text);
 
         return $summary === '' ? null : $summary;
+    }
+
+    private function overBudget(string $summary): bool
+    {
+        return $this->words($summary) > $this->summaryWords;
+    }
+
+    /**
+     * Words, counted the way a reader would.
+     *
+     * `str_word_count()` is not used: it is ASCII-minded and drops or splits on
+     * accented letters and non-Latin scripts, so a summary in French or Japanese
+     * would be measured as shorter than it is and sail through a budget it
+     * broke. Splitting on whitespace over-counts nothing and under-counts
+     * nothing that matters here.
+     */
+    private function words(string $summary): int
+    {
+        $parts = preg_split('/\s+/u', trim($summary), -1, PREG_SPLIT_NO_EMPTY);
+
+        return $parts === false ? 0 : count($parts);
     }
 
     /**

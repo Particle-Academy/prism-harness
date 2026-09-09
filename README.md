@@ -175,7 +175,18 @@ précis grows without bound while looking like it compacts.
 ```
 
 **Try `keep_recent` alone first.** It costs nothing, cannot rewrite anything, and
-is entirely predictable. This one bills a model call on every turn that fires.
+is entirely predictable. This one bills a model call on every turn that fires —
+and a second one on turns where the summary comes back over its word budget.
+
+**That budget is checked, because asking for it does not get it.** `summary_words`
+used to reach the model only as "in at most N words" inside the prompt, with
+nothing looking at the answer. Measured live: a stated 15 words came back at 92
+and at 346, and the default 60 came back at 205 — the 346 having re-stated every
+exchange one by one, which is the unbounded growth rewriting is supposed to
+prevent. An over-budget summary is now sent back once to be cut down. The retry
+does not loop and is allowed to miss; a failed or longer second answer leaves the
+first standing, because a summary over budget is a cost problem and no summary at
+all is a lost conversation.
 
 **And it is the strategy most likely to lose something that matters.**
 ["Governance Decay"](https://arxiv.org/pdf/2606.22528) puts summarisation-based

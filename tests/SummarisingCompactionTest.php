@@ -149,3 +149,95 @@ it('refuses a keep count that would summarise everything including the live turn
     expect(fn (): mixed => new SummarisingCompaction(keep: 0))
         ->toThrow(InvalidArgumentException::class);
 });
+
+/*
+|--------------------------------------------------------------------------
+| The word budget, which used to be a suggestion
+|--------------------------------------------------------------------------
+|
+| `summaryWords` reached the model as "in at most N words" inside a prompt and
+| nothing looked at the answer. Measured from the Lab across five runs: a stated
+| 15 came back at 92 and at 346, and the default 60 came back at 205. These pin
+| the check that turns the request into something enforced.
+|
+*/
+
+it('accepts a summary inside its budget without spending a second call', function (): void {
+    $fake = Prism::fake([TextResponseFake::make()->withText('Three words only')]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 10))->compact(turns(10));
+
+    expect($outcome->kept[0]->content)->toContain('Three words only');
+
+    // The retry is for overshoot. Paying for one on every compacting turn would
+    // double the cost of the strategy for nothing.
+    $fake->assertCallCount(1);
+});
+
+it('sends an over-budget summary back once, and keeps the shorter answer', function (): void {
+    $fake = Prism::fake([
+        TextResponseFake::make()->withText('one two three four five six seven eight nine ten'),
+        TextResponseFake::make()->withText('two words'),
+    ]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 5))->compact(turns(10));
+
+    expect($outcome->kept[0]->content)->toContain('two words')
+        ->and($outcome->kept[0]->content)->not->toContain('seven');
+    $fake->assertCallCount(2);
+});
+
+it('retries ONCE, not until it fits', function (): void {
+    // A loop would spend unbounded calls chasing a number the model may simply
+    // never hit, on a path that already bills per compacting turn.
+    $fake = Prism::fake([
+        TextResponseFake::make()->withText('one two three four five six seven eight'),
+        TextResponseFake::make()->withText('one two three four five six'),
+    ]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 2))->compact(turns(10));
+
+    // Still over budget, and accepted anyway — shorter is the win available.
+    expect($outcome->kept[0]->content)->toContain('one two three four five six')
+        ->and($outcome->kept[0]->content)->not->toContain('seven');
+    $fake->assertCallCount(2);
+});
+
+it('keeps the first summary when the retry comes back LONGER', function (): void {
+    Prism::fake([
+        TextResponseFake::make()->withText('one two three four five six'),
+        TextResponseFake::make()->withText('one two three four five six seven eight nine ten eleven'),
+    ]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 3))->compact(turns(10));
+
+    // A retry is allowed to miss. It is not allowed to make things worse.
+    expect($outcome->kept[0]->content)->toContain('one two three four five six')
+        ->and($outcome->kept[0]->content)->not->toContain('eleven');
+});
+
+it('keeps the first summary when the retry FAILS, rather than losing the history', function (): void {
+    Prism::fake([
+        TextResponseFake::make()->withText('one two three four five six'),
+        fn () => throw new RuntimeException('the provider is down'),
+    ]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 3))->compact(turns(10));
+
+    // A summary over budget is a cost problem. No summary at all evicts the
+    // history and puts nothing in its place, which is the worse failure.
+    expect($outcome->compacted())->toBeTrue()
+        ->and($outcome->kept[0]->content)->toContain('one two three four five six');
+});
+
+it('counts words the way a reader would, not the way str_word_count does', function (): void {
+    // str_word_count() is ASCII-minded: it drops or splits accented letters and
+    // non-Latin scripts, so a French or Japanese summary would measure short and
+    // sail through a budget it broke. Six words here, whatever the alphabet.
+    $fake = Prism::fake([TextResponseFake::make()->withText('rétablissement café naïve 東京 Ünal œuvre')]);
+
+    $outcome = (new SummarisingCompaction(keep: 4, summaryWords: 6))->compact(turns(10));
+
+    expect($outcome->kept[0]->content)->toContain('rétablissement');
+    $fake->assertCallCount(1);
+});
