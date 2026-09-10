@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\ToolPairGuard;
@@ -39,6 +40,7 @@ use Throwable;
  * @property string|null $root_run_id
  * @property string|null $title
  * @property array<string, mixed>|null $metadata
+ * @property Carbon|null $retired_at
  * @property-read Collection<int, ThreadMessage> $storedMessages
  * @property-read self|null $parentThread
  */
@@ -69,6 +71,7 @@ class Thread extends Model implements ThreadContract
     {
         return [
             'metadata' => 'array',
+            'retired_at' => 'datetime',
         ];
     }
 
@@ -97,20 +100,70 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * Resolve the one thread addressed by this participant and scope.
+     * The LIVE thread at this address, created if there is not one.
      *
-     * Uses `firstOrCreate` because a session is *resolved*, not constructed —
-     * a fresh worker asking for the same address must land on the same
-     * conversation rather than starting a new one.
+     * A session is RESOLVED, not constructed: a fresh worker asking for the
+     * same address must land on the same conversation rather than starting a
+     * new one.
+     *
+     * "Live" is the whole of the change here: a retired thread is skipped, so
+     * the next resolve after {@see self::retire()} starts a fresh conversation
+     * at the same address rather than reopening the old one. Retired rows stay
+     * exactly where they are — see the migration for why that is not optional.
      */
     public static function forParticipant(Model $participant, string $scope): self
     {
-        /** @var self */
-        return static::query()->firstOrCreate([
+        $address = [
             'participant_type' => $participant->getMorphClass(),
             'participant_id' => $participant->getKey(),
             'scope' => $scope,
-        ]);
+        ];
+
+        // Not `firstOrCreate`, because the lookup and the creation no longer
+        // use the same set of attributes: `retired_at` filters the read and
+        // must not be written. Written as firstOrCreate with the null in the
+        // attributes, a fresh thread would be created with `retired_at` set to
+        // null explicitly — harmless here, and wrong the moment the column
+        // gains a default.
+        $live = static::query()
+            ->where($address)
+            ->whereNull('retired_at')
+            ->orderByDesc('id')
+            ->first();
+
+        /** @var self */
+        return $live ?? static::query()->create($address);
+    }
+
+    /**
+     * End this conversation without ending the record of it.
+     *
+     * The next {@see self::forParticipant()} at the same address returns a new,
+     * empty thread. This one keeps every message it ever had, still readable,
+     * still addressable by id — which is what separates "start a new chat" from
+     * "delete my history", two things a single button is very often asked to
+     * mean at once.
+     *
+     * Idempotent: retiring an already-retired thread keeps the original
+     * timestamp, because the question the column answers is when the
+     * conversation ENDED, not when someone last pressed the button.
+     */
+    public function retire(): self
+    {
+        if ($this->retired_at === null) {
+            // `freshTimestamp()` rather than `now()`: the model's own clock,
+            // typed as the Carbon the property declares, and the same instant
+            // Eloquent would stamp `updated_at` with on this save.
+            $this->retired_at = $this->freshTimestamp();
+            $this->save();
+        }
+
+        return $this;
+    }
+
+    public function isRetired(): bool
+    {
+        return $this->retired_at !== null;
     }
 
     /**

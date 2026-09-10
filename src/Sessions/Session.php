@@ -188,6 +188,32 @@ class Session
     }
 
     /**
+     * Start a fresh conversation at this same address.
+     *
+     * The "new chat" every chat product needs, and the harness had no way to
+     * offer it: a thread is resolved by participant and scope, so a scope held
+     * exactly one conversation for ever. Applications worked around it by
+     * minting a scope per conversation, which defeats the addressing that lets
+     * a restarted worker find the same session again.
+     *
+     * WHAT THIS IS NOT is a delete. The previous thread is retired, not
+     * removed: every message it held stays readable and addressable by id.
+     * "Clear my context" and "erase my history" are two different requests that
+     * one button is very often asked to mean at once, and conflating them is
+     * unrecoverable in the direction that matters.
+     *
+     * The session's own durable state — mode, model, provider, capabilities —
+     * is deliberately untouched. Clearing the conversation should not silently
+     * put the agent back into a different mode than the one the operator chose.
+     */
+    public function newConversation(): Thread
+    {
+        $this->thread()->retire();
+
+        return $this->thread();
+    }
+
+    /**
      * The durable task list for this session.
      *
      * Addressed at `<session key>:tasks`, beside the session's own durable

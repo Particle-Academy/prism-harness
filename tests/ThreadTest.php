@@ -210,3 +210,86 @@ it('writes a whole turn or none of it', function (): void {
     // The good message from the failed turn must not survive on its own.
     expect($thread->fresh()->storedMessages()->count())->toBe(1);
 });
+
+/*
+|--------------------------------------------------------------------------
+| Starting a new conversation without losing the old one
+|--------------------------------------------------------------------------
+|
+| A thread is addressed by participant and scope, so a scope held exactly ONE
+| conversation for ever, and any application offering "new chat" had to mint a
+| scope per conversation — defeating the addressing that lets a restarted worker
+| find the same session again.
+|
+| `retire()` is the seam. These pin the part that must never regress: the old
+| conversation is still there afterwards.
+|
+*/
+
+it('hands back the same thread until one is retired', function (): void {
+    $ada = participant();
+
+    expect(Thread::forParticipant($ada, 'support')->getKey())
+        ->toBe(Thread::forParticipant($ada, 'support')->getKey());
+});
+
+it('starts a fresh thread at the same address after retirement', function (): void {
+    $ada = participant();
+
+    $first = Thread::forParticipant($ada, 'support');
+    $first->record([new UserMessage('the old conversation')]);
+    $first->retire();
+
+    $second = Thread::forParticipant($ada, 'support');
+
+    expect($second->getKey())->not->toBe($first->getKey())
+        ->and($second->scope)->toBe('support')
+        ->and(iterator_to_array($second->messages()))->toBe([]);
+});
+
+it('KEEPS every message of the retired conversation', function (): void {
+    // The whole reason this is a retirement and not a delete. "Clear my
+    // context" and "erase my history" are different requests, and only one of
+    // them is recoverable.
+    $ada = participant();
+
+    $first = Thread::forParticipant($ada, 'support');
+    $first->record([new UserMessage('remember this')]);
+    $first->retire();
+
+    Thread::forParticipant($ada, 'support')->record([new UserMessage('a new start')]);
+
+    $reloaded = Thread::find($first->getKey());
+
+    expect($reloaded)->not->toBeNull()
+        ->and($reloaded->isRetired())->toBeTrue()
+        ->and($reloaded->storedMessages()->count())->toBe(1);
+});
+
+it('does not retire the conversations of other scopes or other people', function (): void {
+    $ada = participant('Ada');
+    $grace = participant('Grace');
+
+    $adaSupport = Thread::forParticipant($ada, 'support');
+    $adaCoding = Thread::forParticipant($ada, 'coding');
+    $graceSupport = Thread::forParticipant($grace, 'support');
+
+    $adaSupport->retire();
+
+    expect(Thread::forParticipant($ada, 'coding')->getKey())->toBe($adaCoding->getKey())
+        ->and(Thread::forParticipant($grace, 'support')->getKey())->toBe($graceSupport->getKey())
+        ->and(Thread::forParticipant($ada, 'support')->getKey())->not->toBe($adaSupport->getKey());
+});
+
+it('keeps the original timestamp when retired twice', function (): void {
+    // The column answers "when did this conversation end", not "when was the
+    // button last pressed".
+    $thread = Thread::forParticipant(participant(), 'support');
+
+    $thread->retire();
+    $first = $thread->retired_at;
+
+    $thread->retire();
+
+    expect($thread->retired_at->equalTo($first))->toBeTrue();
+});
