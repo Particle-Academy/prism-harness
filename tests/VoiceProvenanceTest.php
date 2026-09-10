@@ -103,11 +103,44 @@ it('carries a code so a caller can branch without reading English', function ():
     }
 });
 
-it('does NOT use hasBase64() to decide, because that admits a URL', function (): void {
-    // The trap this guard was written around, pinned so nobody "simplifies"
-    // the predicate back to the obvious one. `hasBase64()` answers "can bytes
-    // be obtained", not "are bytes in hand".
-    expect(Audio::fromUrl('https://example.test/a.wav')->hasBase64())->toBeTrue();
+it('refuses a URL whatever hasBase64() happens to say about it', function (): void {
+    // The trap this guard was written around. `hasBase64()` USED to delegate to
+    // `hasRawContent()` — "can bytes be obtained" rather than "are bytes in
+    // hand" — and returned true for a URL nobody had fetched, so a guard built
+    // on it admitted everything it existed to refuse.
+    //
+    // Reported and fixed upstream (Particle-Academy/prism#40). This test
+    // deliberately does NOT assert what `hasBase64()` returns: this package
+    // supports a range of Prism versions, so pinning that would make the suite
+    // red on one resolution and green on another while the security property
+    // was identical in both. What is pinned is the property — the refusal does
+    // not depend on that predicate, and stays correct whichever answer a
+    // resolved Prism gives.
+    expect(fn (): string => (new VoiceExchange)->transcribe(Audio::fromUrl('https://example.test/a.wav')))
+        ->toThrow(UnsafeAudioSource::class);
+});
+
+it('cannot un-read a file, and the refusal does not claim to', function (): void {
+    // Measured, because the docs make a claim about it. fromLocalPath() reads
+    // inside the constructor, so by the time the harness refuses the Audio the
+    // read has already happened in the host's own code. Delete the file and the
+    // bytes are still there.
+    //
+    // What the refusal stops is the upload and the read-back. If Prism ever
+    // makes this lazy, this test fails and the docs get stronger, which is the
+    // right direction for a surprise.
+    $path = tempnam(sys_get_temp_dir(), 'voice').'.wav';
+    file_put_contents($path, 'SECRETFILECONTENTS');
+
+    $audio = Audio::fromLocalPath($path, 'audio/wav');
+    unlink($path);
+
+    $raw = (new ReflectionObject($audio))->getProperty('rawContent');
+    $raw->setAccessible(true);
+
+    expect($raw->getValue($audio))->toBe('SECRETFILECONTENTS')
+        ->and(fn (): string => (new VoiceExchange)->transcribe($audio))
+        ->toThrow(UnsafeAudioSource::class);
 });
 
 it('accepts inline audio, which is what a microphone produces', function (): void {

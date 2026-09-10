@@ -354,12 +354,23 @@ $voice->transcribe(Audio::fromLocalPath($request->string('path')));             
 $voice->transcribe(Audio::fromUrl($request->string('url')));                     // SSRF
 ```
 
-A browser microphone produces the first. The other two make this process read a
-file or issue an outbound request on behalf of whoever supplied the string, and
-nothing at the call site would make you pause. **So they are refused**, with
-`UnsafeAudioSource` (code `unsafe_audio_source`). Transcribing a recording your
-own application wrote is legitimate, so it stays available behind a flag that
-says so:
+A browser microphone produces the first. **So the other two are refused**, with
+`UnsafeAudioSource` (code `unsafe_audio_source`).
+
+What that buys is not the same in both cases, and the difference is worth
+knowing before you rely on it:
+
+- **A URL is stopped outright.** `fromUrl()` is lazy — nothing is fetched until
+  the request is built — so the refusal means the request is never made.
+- **A path is stopped one step late.** `fromLocalPath()` and
+  `fromStoragePath()` read the file *inside the constructor*, in your code,
+  before the harness is called. That read cannot be prevented from here. What
+  the refusal stops is what turns a read into a breach: the bytes being
+  uploaded to a transcription provider, and the file coming back to the caller
+  as text.
+
+Transcribing a recording your own application wrote is legitimate, so it stays
+available behind a flag that says so:
 
 ```php
 new VoiceExchange(allowReferencedAudio: true);

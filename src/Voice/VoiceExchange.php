@@ -54,11 +54,14 @@ use Prism\Prism\ValueObjects\Media\Audio;
  * ## The caller owns the audio's PROVENANCE, and the harness checks it
  *
  * `Audio` can be built from inline bytes, from a path on disk, or from a URL,
- * and the three are one method name apart. A host that reaches for the second
- * or third with request-derived input has built arbitrary file read or a
- * server-side fetch. So a referenced source is REFUSED here rather than
- * documented around — see {@see UnsafeAudioSource}, and
- * {@see self::$allowReferencedAudio} for the opt-in.
+ * and the three are one method name apart. A referenced source is REFUSED here
+ * rather than documented around — see {@see UnsafeAudioSource} for what each
+ * case actually costs, and {@see self::$allowReferencedAudio} for the opt-in.
+ *
+ * The two are not equivalent and the class is careful about it: a URL is
+ * stopped before anything is fetched, while a path was already read inside the
+ * constructor, so refusing it stops the upload and the read-back rather than
+ * the read.
  *
  * ## Known exposure: a failed turn puts the recording in a stack trace
  *
