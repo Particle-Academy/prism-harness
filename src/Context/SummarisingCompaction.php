@@ -237,6 +237,19 @@ final class SummarisingCompaction implements CompactionStrategy
                 ->withPrompt($prompt)
                 ->asText();
         } catch (Throwable $failure) {
+            // THE TRANSCRIPT IS IN THIS FRAME. Under
+            // `zend.exception_ignore_args=0` — off in a PHP with no ini file,
+            // though `php.ini-production` turns it on — the trace records
+            // `$prompt`, which is the conversation. Reporting a tidier
+            // exception instead does not help: it would be constructed in this
+            // same frame and inherit the same arguments, which was measured on
+            // the voice path and holds identically here. The controls are the
+            // ini setting and the reporter's own scrubbing.
+            //
+            // Reported rather than thrown because a summariser that cannot
+            // reach its provider must not take the conversation down with it —
+            // the caller gets no summary and the window falls back to its
+            // bounded behaviour.
             report($failure);
 
             return null;

@@ -318,6 +318,84 @@ generator's `finally` when it is destroyed, so the run is closed on that path to
 partial turn is **recorded rather than discarded**: a conversation missing the half the user
 already watched stream past is the worse outcome.
 
+## Voice
+
+Press-to-talk: one utterance in, one answer out, against an ordinary session.
+
+```php
+$reply = (new VoiceExchange)->exchange($session, Audio::fromBase64($base64, 'audio/webm'));
+
+$reply->heard;   // the transcript — what the model was actually asked
+$reply->text;    // the answer
+$reply->audio;   // the answer spoken, or null when the turn produced no prose
+$reply->empty;   // true when nothing was heard, and no turn was spent
+```
+
+**The thread stores the TRANSCRIPT, not the audio.** A transcript is what
+replays to a model, what a human reads back, and what compaction operates on;
+minutes of PCM in the message table would be unreplayable by anything but the
+original provider. Keep the recording yourself if you need it — the harness
+cannot decide for you whether it is evidence or a liability.
+
+**An empty transcript is not a turn.** Silence, a mis-fired button and a dead
+microphone all produce `""`, and sending that would bill a turn answering
+nothing and leave an empty user message in the thread for ever. You get
+`empty: true` instead, so you can say "I didn't catch that" rather than leaving
+the user to wonder why the agent replied strangely.
+
+### Audio the harness would have to fetch is refused
+
+`Audio` can be built from inline bytes, from a path on disk, or from a URL, and
+those are one method name apart:
+
+```php
+$voice->transcribe(Audio::fromBase64($request->string('audio'), 'audio/webm'));  // fine
+$voice->transcribe(Audio::fromLocalPath($request->string('path')));              // file read
+$voice->transcribe(Audio::fromUrl($request->string('url')));                     // SSRF
+```
+
+A browser microphone produces the first. The other two make this process read a
+file or issue an outbound request on behalf of whoever supplied the string, and
+nothing at the call site would make you pause. **So they are refused**, with
+`UnsafeAudioSource` (code `unsafe_audio_source`). Transcribing a recording your
+own application wrote is legitimate, so it stays available behind a flag that
+says so:
+
+```php
+new VoiceExchange(allowReferencedAudio: true);
+```
+
+That flag is an assertion about where the audio came from. It is off by default
+because only the caller can make it.
+
+### One thing this package cannot fix for you
+
+When a provider call fails, the exception's trace holds `VoiceExchange`'s own
+frames, whose argument is the `Audio` — by then holding the decoded bytes. With
+`zend.exception_ignore_args=0`, PHP records frame arguments, and an error
+reporter that walks them (Flare and Sentry both do, by reflection) can put **a
+voice recording in an application log**.
+
+It cannot be closed here: a method taking an `Audio` has the `Audio` in its
+arguments, and rethrowing something tidier only builds the replacement inside
+the same frame. That was measured, not assumed — Prism's own frames are clean,
+and a test pins both halves so a future version that starts carrying the
+payload deeper fails the suite. Two things do fix it, and both are yours:
+
+- **`zend.exception_ignore_args=1`** strips frame arguments entirely. This is
+  what `php.ini-production` ships — but a PHP with no ini file at all has it
+  OFF, so "we never changed it" is not the safe answer.
+- **Scrub `Prism\Prism\ValueObjects\Media\Audio` in your error reporter**,
+  which also reaches the protected `rawContent`, not just the public `base64`.
+
+`SummarisingCompaction` has the same shape with a conversation transcript in
+scope rather than a recording, and the same two remedies apply.
+
+Not a live duplex stream, and deliberately not pretending to be one. Continuous
+bidirectional audio with barge-in is built on a provider's realtime socket and
+is a different product; a caller would otherwise discover the difference from
+latency rather than from the type.
+
 ## Approvals
 
 A tool that must stop and wait for a human is declared **per mode**, because the same tool is
