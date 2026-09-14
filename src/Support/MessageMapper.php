@@ -6,6 +6,7 @@ namespace Prism\Harness\Support;
 
 use Prism\Harness\Exceptions\UnmappableContent;
 use Prism\Prism\Contracts\Message;
+use Prism\Prism\Support\JsonMap;
 use Prism\Prism\ValueObjects\Artifact;
 use Prism\Prism\ValueObjects\Media\Media;
 use Prism\Prism\ValueObjects\Media\Text;
@@ -72,7 +73,11 @@ final class MessageMapper
                 // reply in a MessagePartWithCitations object, and a raw array
                 // here comes back as an array and TypeErrors inside the
                 // provider's mapper on the next call.
-                'additional_content' => ValueObjectMapper::encode($message->additionalContent),
+                //
+                // A MAP even when empty. A bare empty array is stored as `[]`,
+                // a list, where the TypeScript and Python harnesses store `{}`;
+                // prism-parity's harness-thread-rows corpus pins the shape.
+                'additional_content' => JsonMap::of(ValueObjectMapper::encode($message->additionalContent)),
                 'tool_approval_requests' => array_map(
                     fn (ToolApprovalRequest $r): array => $r->toArray(),
                     $message->toolApprovalRequests,
