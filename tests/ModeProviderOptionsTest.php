@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Tools\ToolRegistry;
@@ -11,7 +12,7 @@ use Prism\Prism\Tool;
 use Tests\Fixtures\Participant;
 
 it('passes a mode\'s provider options to every run, sent or streamed', function (): void {
-    config()->set('prism-harness.agent.modes.chat.provider_options', ['thinking' => ['enabled' => true, 'budgetTokens' => 4000]]);
+    config()->set('prism-harness.agent.modes.chat.provider_options', ['thinking' => ['type' => 'adaptive'], 'effort' => 'medium']);
     $fake = Prism::fake([TextResponseFake::make()->withText('a'), TextResponseFake::make()->withText('b')]);
     $ada = Participant::create(['name' => 'Ada']);
 
@@ -23,7 +24,7 @@ it('passes a mode\'s provider options to every run, sent or streamed', function 
         expect($requests)->toHaveCount(2);
 
         foreach ($requests as $request) {
-            expect($request->providerOptions('thinking'))->toBe(['enabled' => true, 'budgetTokens' => 4000]);
+            expect($request->providerOptions())->toBe(['thinking' => ['type' => 'adaptive'], 'effort' => 'medium']);
         }
     });
 });
@@ -48,17 +49,22 @@ it('refuses provider options that are not a map, rather than running without the
     'a string' => ['thinking'],
 ]);
 
-it('replays extended thinking with its signature on the next turn from a stored thread', function (): void {
+it('replays extended thinking with its signature on the next turn from a stored thread', function (array $options, array $expectedThinking, ?array $expectedOutputConfig): void {
     // Anthropic rejects a later tool-use turn whose earlier thinking blocks come
     // back without their signatures. The signature rides in the assistant
     // message's additionalContent, so it has to survive storage: recorded, read
     // back through MessageMapper, and mapped into the NEXT request. Driven
     // through the real Anthropic handler, so what is asserted is the request
     // body that would have gone over the wire.
+    //
+    // BOTH thinking shapes. Current Claude models refuse `thinking.enabled` with
+    // a 400 and take `thinking.type: adaptive` plus `effort` instead. fancy found
+    // that live, from the example this package's own README shipped. The replay
+    // must hold under the shape people actually use, not only the older one.
     config()->set('prism.providers.anthropic.api_key', 'sk-ant-test');
     config()->set('prism-harness.agent.provider', 'anthropic');
-    config()->set('prism-harness.agent.model', 'claude-3-7-sonnet-latest');
-    config()->set('prism-harness.agent.modes.chat.provider_options', ['thinking' => ['enabled' => true]]);
+    config()->set('prism-harness.agent.model', 'claude-sonnet-4-6');
+    config()->set('prism-harness.agent.modes.chat.provider_options', $options);
     config()->set('prism-harness.agent.modes.chat.tools', ['weather', 'search']);
     app(ToolRegistry::class)->registerMany([
         (new Tool)->as('weather')->for('Weather.')->withStringParameter('city', 'City')->using(fn (string $city): string => 'The weather will be 75 and sunny'),
@@ -86,5 +92,17 @@ it('replays extended thinking with its signature on the next turn from a stored 
 
     expect($replayedThinking)->not->toBeEmpty()
         ->and($replayedThinking->pluck('signature')->all())->toContain($signature)
-        ->and($nextTurn['thinking']['type'] ?? null)->not->toBeNull();
-});
+        ->and(Arr::only($nextTurn['thinking'] ?? [], array_keys($expectedThinking)))->toBe($expectedThinking)
+        ->and($nextTurn['output_config'] ?? null)->toBe($expectedOutputConfig);
+})->with([
+    'adaptive, for current models' => [
+        ['thinking' => ['type' => 'adaptive'], 'effort' => 'medium'],
+        ['type' => 'adaptive'],
+        ['effort' => 'medium'],
+    ],
+    'enabled with a budget, for older models' => [
+        ['thinking' => ['enabled' => true, 'budgetTokens' => 2048]],
+        ['type' => 'enabled', 'budget_tokens' => 2048],
+        null,
+    ],
+]);

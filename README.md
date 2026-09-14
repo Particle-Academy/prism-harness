@@ -365,11 +365,16 @@ A mode can pass options to the provider on every run, through Prism's `withProvi
     'overseer' => [
         'system_prompt' => '...',
         'provider_options' => [
-            'thinking' => ['enabled' => true, 'budgetTokens' => 4000],
+            'thinking' => ['type' => 'adaptive'],
+            'effort' => 'medium',
         ],
     ],
 ],
 ```
+
+That is Anthropic's adaptive thinking, which current Claude models require. They refuse
+`['thinking' => ['enabled' => true, 'budgetTokens' => 4000]]` with a 400; that shape is for
+older models only.
 
 The keys mean whatever the provider says they mean. The harness passes them through
 unchanged. A value that is not a map of option names is refused when the mode is resolved,
