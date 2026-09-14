@@ -314,14 +314,38 @@ class Session
 
         $id = $approval instanceof ToolApprovalRequest ? $approval->approvalId : $approval;
 
+        return $this->decide([new ToolApprovalResponse($id, $approved, $reason)]);
+    }
+
+    /**
+     * Answer SEVERAL pending approvals, then continue the run once.
+     *
+     * A run can stop on more than one call that needs a person. Answering them
+     * one at a time with approve() resumes after the first answer, and Prism
+     * denies by default every call it has no answer for yet: the second call is
+     * refused before anyone was asked about it. Answer them together here.
+     *
+     * The same authorization rule as approve(): decide who may answer before
+     * calling.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     */
+    public function decide(array $decisions): AgentResponse
+    {
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        if ($decisions === []) {
+            throw new \InvalidArgumentException('decide() needs at least one decision.');
+        }
+
         $this->thread()->record([
-            new ToolResultMessage(toolApprovalResponses: [
-                new ToolApprovalResponse($id, $approved, $reason),
-            ]),
+            new ToolResultMessage(toolApprovalResponses: $decisions),
         ], $this->run()['id'] ?? null);
 
         // Resumed with an EMPTY prompt: the conversation already contains the
-        // request, the decision, and everything before them. A new prompt here
+        // request, the decisions, and everything before them. A new prompt here
         // would be a second instruction competing with the one the tool call
         // came from.
         return $this->runtime->send($this, '');

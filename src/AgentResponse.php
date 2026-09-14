@@ -70,7 +70,11 @@ final readonly class AgentResponse
      */
     public function awaitingApproval(): bool
     {
-        return $this->response->finishReason === FinishReason::Pause
+        // ToolCalls as well as Pause. A real provider handler that stops on a
+        // tool awaiting approval finishes with ToolCalls; only a fake reported
+        // Pause, so this read false for every real run with a pending approval
+        // and the documented `if ($response->awaitingApproval())` never fired.
+        return in_array($this->response->finishReason, [FinishReason::Pause, FinishReason::ToolCalls], true)
             && $this->pendingApprovals() !== [];
     }
 

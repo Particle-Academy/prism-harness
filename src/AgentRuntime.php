@@ -471,31 +471,33 @@ final readonly class AgentRuntime
      * every release from v0.2.0 on because `Prism::fake()` returns only the
      * messages a test gives it, and every test gave it one exchange.
      *
-     * The history is dropped by IDENTITY, not by position alone. It is exactly
-     * the objects this run handed to Prism, and a handler that echoes them
-     * returns those same instances. A response that does not begin with them
-     * (a fake, or a handler that returns only the new exchange) is recorded
-     * whole rather than having real messages cut off its front.
+     * The history is dropped by IDENTITY. It is exactly the objects this run
+     * handed to Prism, and a handler that echoes them returns those same
+     * instances, so every message that is not one of them is new. A response
+     * with none of them (a fake, or a handler that returns only the new
+     * exchange) is recorded whole.
+     *
+     * By identity, not as a prefix. Resuming an approval, Prism removes the
+     * tool result messages after the assistant and appends one merged message,
+     * so the response no longer BEGINS with the history. Matched as a prefix,
+     * that recorded the whole conversation again, the doubling this method
+     * exists to prevent, on the approval path only.
      *
      * @param  list<Message>  $history
      * @return list<Message>
      */
     private function newMessages(TextResponse $response, array $history): array
     {
-        $messages = $response->messages->values()->all();
-        $sent = count($history);
+        $sent = [];
 
-        if ($sent === 0 || count($messages) < $sent) {
-            return $messages;
+        foreach ($history as $message) {
+            $sent[spl_object_id($message)] = true;
         }
 
-        foreach ($history as $index => $message) {
-            if ($messages[$index] !== $message) {
-                return $messages;
-            }
-        }
-
-        return array_slice($messages, $sent);
+        return array_values(array_filter(
+            $response->messages->values()->all(),
+            fn (Message $message): bool => ! isset($sent[spl_object_id($message)]),
+        ));
     }
 
     /**

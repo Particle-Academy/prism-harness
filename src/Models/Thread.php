@@ -18,6 +18,7 @@ use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\EvictionSink;
 use Prism\Harness\Support\MessageMapper;
+use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Throwable;
@@ -233,18 +234,12 @@ class Thread extends Model implements ThreadContract
             // at the end, cannot work from a generator — and paying that on
             // every thread to support a strategy nobody selected would make the
             // common case worse to serve the uncommon one.
-            foreach ($this->storedMessages()->lazy() as $stored) {
-                yield $stored->toPrismMessage();
-            }
+            yield from ToolResultRuns::fold($this->hydrated());
 
             return;
         }
 
-        $messages = [];
-
-        foreach ($this->storedMessages()->lazy() as $stored) {
-            $messages[] = $stored->toPrismMessage();
-        }
+        $messages = iterator_to_array(ToolResultRuns::fold($this->hydrated()), false);
 
         $outcome = app(ToolPairGuard::class)->enforce($strategy->compact($messages));
 
@@ -277,6 +272,18 @@ class Thread extends Model implements ThreadContract
         }
 
         yield from $outcome->kept;
+    }
+
+    /**
+     * Every stored row as a Prism message, paged from the database.
+     *
+     * @return Generator<int, Message>
+     */
+    private function hydrated(): Generator
+    {
+        foreach ($this->storedMessages()->lazy() as $stored) {
+            yield $stored->toPrismMessage();
+        }
     }
 
     /**

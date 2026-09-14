@@ -489,11 +489,17 @@ against production is not, and the tool cannot tell which it is in:
 $response = $session->send('Clean up the failed run');
 
 if ($response->awaitingApproval()) {
-    foreach ($response->pendingApprovals() as $pending) {
-        $session->approve($pending);              // or ->deny($pending, 'not on production')
-    }
+    $session->decide(array_map(
+        fn (ToolApprovalRequest $pending) => new ToolApprovalResponse($pending->approvalId, approved: true),
+        $response->pendingApprovals(),
+    ));
 }
 ```
+
+A single pending call can be answered with `$session->approve($pending)` or
+`$session->deny($pending, 'not on production')`. Answer several with `decide()`: each
+`approve()` or `deny()` continues the run, and Prism denies by default any call still without an
+answer, so answering them one at a time refuses the rest.
 
 **The decision is a row, not a promise.** It is recorded in the thread, so the approval a
 person grants this morning is readable by whichever worker resumes tonight — a different
@@ -763,7 +769,7 @@ $session->mode('plan');                          // persisted on the thread
 $response = $session->send('Refactor the billing job');
 
 if ($response->awaitingApproval()) {
-    $session->approve($response->pendingApprovals()->first());
+    $session->approve($response->pendingApprovals()[0]);
 }
 ```
 
