@@ -20,6 +20,7 @@ use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
@@ -122,11 +123,15 @@ final readonly class AgentRuntime
             }
 
             try {
+                // The history is read HERE, once, and handed to Prism as
+                // messages rather than as a Thread. See newMessages() for why
+                // this run has to know exactly which message objects it sent.
+                $history = iterator_to_array($session->thread()->messages(), false);
+
                 $generation = Prism::text()
                     ->using($provider, $model)
-                    ->withThread($session->thread())
-                    ->withTelemetryMetadata(sessionId: $session->key())
-                    ->withPrompt($prompt);
+                    ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt)])
+                    ->withTelemetryMetadata(sessionId: $session->key());
 
                 $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
                 if ($systemPrompt !== '') {
@@ -161,7 +166,7 @@ final readonly class AgentRuntime
                 }
 
                 $response = $generation->asText();
-                $session->thread()->record($response->messages, $runId);
+                $session->thread()->record($this->newMessages($response, $history), $runId);
                 $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
 
                 // Charged AFTER the run, to the tree's shared account. A child
@@ -431,6 +436,44 @@ final readonly class AgentRuntime
         }
 
         return $tools;
+    }
+
+    /**
+     * What this turn ADDED to the conversation. That is not `$response->messages`.
+     *
+     * A real provider handler builds `$response->messages` from the request it
+     * sent, and the request carries the history. Recording that list whole
+     * re-appended the entire conversation on every turn, so a thread doubled
+     * each time. The Lab's commentary thread reached 2,046 rows holding 20
+     * distinct messages after ten runs, 2^11 - 2 exactly. It went unseen for
+     * every release from v0.2.0 on because `Prism::fake()` returns only the
+     * messages a test gives it, and every test gave it one exchange.
+     *
+     * The history is dropped by IDENTITY, not by position alone. It is exactly
+     * the objects this run handed to Prism, and a handler that echoes them
+     * returns those same instances. A response that does not begin with them
+     * (a fake, or a handler that returns only the new exchange) is recorded
+     * whole rather than having real messages cut off its front.
+     *
+     * @param  list<Message>  $history
+     * @return list<Message>
+     */
+    private function newMessages(TextResponse $response, array $history): array
+    {
+        $messages = $response->messages->values()->all();
+        $sent = count($history);
+
+        if ($sent === 0 || count($messages) < $sent) {
+            return $messages;
+        }
+
+        foreach ($history as $index => $message) {
+            if ($messages[$index] !== $message) {
+                return $messages;
+            }
+        }
+
+        return array_slice($messages, $sent);
     }
 
     /**
