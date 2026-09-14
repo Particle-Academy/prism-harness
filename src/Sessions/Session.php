@@ -236,14 +236,23 @@ class Session
         );
     }
 
-    /** @param list<string>|null $toolNames */
-    public function send(string $prompt, ?array $toolNames = null): AgentResponse
+    /**
+     * Take a turn.
+     *
+     * `$additionalContent` is media sent with the prompt: an Image, Document,
+     * Audio or Video built from its bytes or a provider file id. Media built
+     * from a URL or a path is refused, and so is media with an empty prompt.
+     *
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent
+     */
+    public function send(string $prompt, ?array $toolNames = null, array $additionalContent = []): AgentResponse
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
 
-        return $this->runtime->send($this, $prompt, $toolNames);
+        return $this->runtime->send($this, $prompt, $toolNames, null, $additionalContent);
     }
 
     /**
@@ -262,15 +271,16 @@ class Session
      * differently than it happened.
      *
      * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt, as for send()
      * @return Generator<int, StreamEvent>
      */
-    public function stream(string $prompt, ?array $toolNames = null): Generator
+    public function stream(string $prompt, ?array $toolNames = null, array $additionalContent = []): Generator
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
 
-        yield from $this->runtime->stream($this, $prompt, $toolNames);
+        yield from $this->runtime->stream($this, $prompt, $toolNames, $additionalContent);
     }
 
     /**

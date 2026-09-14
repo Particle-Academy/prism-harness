@@ -247,6 +247,11 @@ return [
                 'tools' => [],
                 'skills' => [],
                 'max_steps' => 8,
+
+                // Passed to Prism's withProviderOptions() on every run in this
+                // mode, unchanged: for example ['thinking' => ['enabled' => true]]
+                // for Anthropic extended thinking. Must be a map of option names.
+                'provider_options' => [],
             ],
         ],
     ],

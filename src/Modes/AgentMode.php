@@ -13,6 +13,7 @@ final readonly class AgentMode
      * @param  list<string>  $skills
      * @param  array<string, Subagent>  $subagents  nested agents this mode may call, by name
      * @param  list<string>  $requiresApproval  tools that must not run until a human says so
+     * @param  array<string, mixed>  $providerOptions  passed to Prism's withProviderOptions() on every run in this mode
      */
     public function __construct(
         public string $name,
@@ -22,6 +23,7 @@ final readonly class AgentMode
         public int $maxSteps,
         public array $subagents = [],
         public array $requiresApproval = [],
+        public array $providerOptions = [],
     ) {}
 
     /**

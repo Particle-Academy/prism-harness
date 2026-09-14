@@ -318,6 +318,66 @@ generator's `finally` when it is destroyed, so the run is closed on that path to
 partial turn is **recorded rather than discarded**: a conversation missing the half the user
 already watched stream past is the worse outcome.
 
+## Attachments
+
+A turn can carry media alongside its prompt, on `send()` and `stream()` alike:
+
+```php
+use Prism\Prism\ValueObjects\Media\Image;
+
+$session->send('What is wrong with this layout?', null, [
+    Image::fromBase64($request->string('screenshot'), 'image/png'),
+]);
+```
+
+Attachments are stored in the thread with the turn and replayed on later turns. Each one
+must be an `Image`, `Document`, `Audio` or `Video` that carries something to send: its bytes
+(`fromBase64()`, `fromRawContent()`, `Document::fromText()`), a provider file id, or document
+chunks.
+
+**Refused, with an `UnacceptableAttachment` that names the problem:**
+
+| Code | When |
+|---|---|
+| `attachment_by_reference` | built from a URL, or from a local or storage path |
+| `attachment_not_media` | anything other than those four media types |
+| `attachment_empty` | no bytes, no file id and no chunks |
+| `attachment_without_prompt` | attachments with an empty prompt |
+
+**A URL or a path is refused even when you trust it.** A URL taken from request input is
+somebody else's choice of address, and a path's contents would go to a third-party model.
+`fromLocalPath()` and `fromStoragePath()` read the file when they're called, so refusing here
+cannot undo that read. What the refusal stops is those contents being sent onwards. For a
+file your application stored itself, read it and attach the bytes.
+
+The refusal happens before a run starts, so a refused attachment leaves no run, no events and
+nothing in the thread.
+
+Whether a *provider* accepts a given attachment is still the provider's rule. OpenAI, for
+example, does not take document chunks.
+
+## Provider options per mode
+
+A mode can pass options to the provider on every run, through Prism's `withProviderOptions()`:
+
+```php
+'modes' => [
+    'overseer' => [
+        'system_prompt' => '...',
+        'provider_options' => [
+            'thinking' => ['enabled' => true, 'budgetTokens' => 4000],
+        ],
+    ],
+],
+```
+
+The keys mean whatever the provider says they mean. The harness passes them through
+unchanged. A value that is not a map of option names is refused when the mode is resolved,
+rather than running without the option you believe is on.
+
+Extended thinking survives a stored thread: the signature Anthropic needs on a later tool-use
+turn is recorded with the assistant message and replayed with it.
+
 ## Voice
 
 Press-to-talk: one utterance in, one answer out, against an ordinary session.

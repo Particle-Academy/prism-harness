@@ -18,6 +18,7 @@ use Prism\Harness\Skills\SkillRegistry;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
@@ -53,10 +54,17 @@ final readonly class AgentRuntime
         private ?Closure $subagentRunner = null,
     ) {}
 
-    /** @param list<string>|null $toolNames */
-    public function send(Session $session, string $prompt, ?array $toolNames = null, ?RunContext $context = null): AgentResponse
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt; see TurnAttachments for what is refused
+     */
+    public function send(Session $session, string $prompt, ?array $toolNames = null, ?RunContext $context = null, array $additionalContent = []): AgentResponse
     {
-        return $session->lock(function (Session $session) use ($prompt, $toolNames, $context): AgentResponse {
+        // Refused BEFORE the lock and before a run exists: a bad attachment is a
+        // mistake in the call, and it should not cost a run row, events or budget.
+        $attachments = TurnAttachments::admit($prompt, $additionalContent);
+
+        return $session->lock(function (Session $session) use ($prompt, $toolNames, $context, $attachments): AgentResponse {
             // The id comes FIRST, before anything that can throw.
             //
             // Mode resolution and provider config used to run ahead of it, so a
@@ -130,8 +138,12 @@ final readonly class AgentRuntime
 
                 $generation = Prism::text()
                     ->using($provider, $model)
-                    ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt)])
+                    ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
                     ->withTelemetryMetadata(sessionId: $session->key());
+
+                if ($mode->providerOptions !== []) {
+                    $generation->withProviderOptions($mode->providerOptions);
+                }
 
                 $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
                 if ($systemPrompt !== '') {
@@ -231,10 +243,16 @@ final readonly class AgentRuntime
      * the stream had produced by then rather than discarded.
      *
      * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt; see TurnAttachments for what is refused
      * @return Generator<int, StreamEvent>
      */
-    public function stream(Session $session, string $prompt, ?array $toolNames = null): Generator
+    public function stream(Session $session, string $prompt, ?array $toolNames = null, array $additionalContent = []): Generator
     {
+        // First, before a run begins. A generator runs nothing until it is
+        // iterated, so this refuses on the first iteration rather than at the
+        // call, which is still before any run state exists.
+        $attachments = TurnAttachments::admit($prompt, $additionalContent);
+
         // The lock is acquired and released around the generator by hand rather
         // than with `$session->lock()`: a closure cannot yield to this caller.
         $mode = $this->modes->resolve($session->mode());
@@ -262,7 +280,11 @@ final readonly class AgentRuntime
                 ->using($provider, $model)
                 ->withThread($session->thread())
                 ->withTelemetryMetadata(sessionId: $session->key())
-                ->withPrompt($prompt);
+                ->withPrompt($prompt, $attachments);
+
+            if ($mode->providerOptions !== []) {
+                $generation->withProviderOptions($mode->providerOptions);
+            }
 
             $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
             if ($systemPrompt !== '') {
@@ -335,7 +357,7 @@ final readonly class AgentRuntime
                 // callback, so `$collected` is null and only the prompt is
                 // recorded — a partial turn kept rather than a whole one lost,
                 // and honest about how far it got.
-                $messages = [new UserMessage($prompt), ...($collected['messages'] ?? [])];
+                $messages = [new UserMessage($prompt, $attachments), ...($collected['messages'] ?? [])];
 
                 $session->thread()->record($messages, $runId);
                 $session->completeRun($runId, $finishReason->value);

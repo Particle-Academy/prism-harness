@@ -78,7 +78,36 @@ final readonly class ModeRegistry
             $maxSteps,
             $this->subagentsFor($name, $mode),
             $this->requiresApprovalFor($name, $mode),
+            $this->providerOptionsFor($name, $mode),
         );
+    }
+
+    /**
+     * Options handed to the provider on every run in this mode.
+     *
+     * Passed through to Prism's `withProviderOptions()` unchanged, so a key
+     * means whatever the provider says it means: `thinking` for Anthropic,
+     * `reasoning` for OpenAI. The harness does not translate between them,
+     * because a translation would be a second definition of each option to
+     * keep in step with the providers.
+     *
+     * Refused rather than ignored when it is not a keyed map. A list, or a
+     * scalar, would reach the provider as nothing, and the mode would run
+     * without the option its author believes is on.
+     *
+     * @param  array<string, mixed>  $mode
+     * @return array<string, mixed>
+     */
+    private function providerOptionsFor(string $name, array $mode): array
+    {
+        $declared = $mode['provider_options'] ?? [];
+
+        if (! is_array($declared) || ($declared !== [] && array_is_list($declared))) {
+            throw new InvalidArgumentException(sprintf('Harness mode [%s] declares malformed provider_options: expected a map of option names to values.', $name));
+        }
+
+        /** @var array<string, mixed> $declared */
+        return $declared;
     }
 
     /**
