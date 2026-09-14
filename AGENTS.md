@@ -110,7 +110,7 @@ git tag -a vX.Y.Z -m "…"     # ANNOTATED. The message IS the release notes.
 git push origin vX.Y.Z
 
 # THEN CHECK IT ACTUALLY PUBLISHED — this is the step that gets skipped
-gh run list --workflow=release.yml --limit 1
+gh run list --workflow=publish.yml --limit 1
 gh release view vX.Y.Z
 ```
 
