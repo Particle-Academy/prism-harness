@@ -117,6 +117,7 @@ it('refuses an attachment it will not send, before any run or request exists', f
     'a string' => [fn (): string => 'UE5HQllURVM=', 'attachment_not_media', 'Look'],
     'empty base64' => [fn (): Image => Image::fromBase64('', 'image/png'), 'attachment_empty', 'Look'],
     'nothing at all' => [fn (): Image => new Image, 'attachment_empty', 'Look'],
+    'no chunks' => [fn (): Document => Document::fromChunks([], 'Empty'), 'attachment_empty', 'Look'],
     'an empty prompt' => [fn (): Image => Image::fromBase64('UE5HQllURVM=', 'image/png'), 'attachment_without_prompt', ''],
 ]);
 

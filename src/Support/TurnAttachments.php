@@ -76,7 +76,8 @@ final class TurnAttachments
      */
     private static function carriesContent(Media $attachment): bool
     {
-        if ($attachment->isFileId()) {
+        // isFileId() answers true for fromFileId(''), which names no file.
+        if ($attachment->isFileId() && $attachment->fileId() !== '') {
             return true;
         }
 
@@ -86,6 +87,7 @@ final class TurnAttachments
             return true;
         }
 
-        return $attachment instanceof Document && $attachment->isChunks();
+        // Non-empty: `fromChunks([])` answers isChunks() and carries nothing.
+        return $attachment instanceof Document && $attachment->isChunks() && $attachment->chunks() !== [];
     }
 }
