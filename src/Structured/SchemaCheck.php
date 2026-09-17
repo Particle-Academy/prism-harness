@@ -229,10 +229,29 @@ final class SchemaCheck
         return match (true) {
             $value === null => 'null',
             is_bool($value) => $value ? 'true' : 'false',
-            is_string($value) => sprintf('the string "%s"', mb_strimwidth($value, 0, 40, '…')),
+            is_string($value) => sprintf('the string "%s"', self::shorten($value)),
             is_int($value), is_float($value) => sprintf('the number %s', $value),
             default => get_debug_type($value),
         };
+    }
+
+    /**
+     * The first 40 characters of a value quoted back in a message.
+     *
+     * PCRE's `u` modifier rather than `mb_strimwidth`, because this package
+     * declares no `ext-mbstring` and a message helper is no reason to start.
+     * A string PCRE refuses as malformed UTF-8 falls back to bytes: a message
+     * about a document that is already broken should not itself throw.
+     */
+    private static function shorten(string $value): string
+    {
+        $shortened = preg_replace('/^(.{0,40}).*$/us', '$1', $value);
+
+        if ($shortened === null) {
+            $shortened = substr($value, 0, 40);
+        }
+
+        return $shortened === $value ? $value : $shortened.'…';
     }
 
     /**
