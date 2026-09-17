@@ -318,6 +318,60 @@ generator's `finally` when it is destroyed, so the run is closed on that path to
 partial turn is **recorded rather than discarded**: a conversation missing the half the user
 already watched stream past is the worse outcome.
 
+## Structured turns
+
+When the answer is a document rather than prose, hand the turn a schema:
+
+```php
+use Prism\Prism\Schema\{ArraySchema, ObjectSchema, StringSchema};
+
+$schema = new ObjectSchema('plan', 'A proposed plan', [
+    new StringSchema('title', 'What the plan is called'),
+    new ArraySchema('steps', 'What to do', new StringSchema('step', 'One step')),
+], requiredFields: ['title', 'steps']);
+
+$response = $session->sendStructured('Plan the release', $schema);
+
+$response->structured();   // ['title' => 'Ship it', 'steps' => ['write', 'test']]
+$response->text();         // the document as the model wrote it
+```
+
+It is the same run as `send()` — the mode's system prompt, its tools, the step
+budget, the lock, the events — asking the provider for structured output.
+
+**The thread keeps the text, with the parsed object beside it.** The assistant
+message is the raw document, and `structured` rides along in the message's
+metadata. A later turn replays the conversation as messages and reads the text,
+so a thread that contains a structured answer reads like any other — the same
+argument `stream()` makes about a transcript that differs by request shape.
+
+**A document that misses the schema is refused, not repaired.**
+
+```php
+use Prism\Harness\Exceptions\StructuredSchemaViolation;
+
+try {
+    $plan = $session->sendStructured($brief, $schema)->structured();
+} catch (StructuredSchemaViolation $violation) {
+    $violation->code();       // structured_schema_violation, or structured_unreadable
+    $violation->problems();   // every way it missed, not the first
+    $violation->document();   // what the model actually said
+}
+```
+
+Nothing is coerced, nothing is trimmed to the fields that fit, and the result is
+never an empty document. An empty plan settles a batch as `done`, which reads
+exactly like a considered answer of "nothing to propose" — the failure this
+refusal exists to prevent. The exchange is still recorded, and the run is marked
+failed: a thread that omits the answer it did not like cannot explain the retry
+sitting next to it.
+
+The check reads the schema's own JSON Schema, so a `RawSchema` is held to the
+same terms. It checks declared types, required keys, enum members, array items,
+and — where a schema closes itself — keys nobody declared. It does not read
+`$ref`, `allOf`, `oneOf` or the numeric and string facets; what it cannot read,
+it passes, rather than reporting a constraint it did not actually check.
+
 ## Attachments
 
 A turn can carry media alongside its prompt, on `send()` and `stream()` alike:

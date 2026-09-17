@@ -11,10 +11,13 @@ use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Skills\SkillRegistry;
+use Prism\Harness\Structured\SchemaCheck;
+use Prism\Harness\Structured\StructuredTranscript;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\SubagentRunner;
@@ -22,14 +25,17 @@ use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
+use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\StreamCollector;
+use Prism\Prism\Structured\Response as StructuredResponse;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolCall;
 use Throwable;
 
 final readonly class AgentRuntime
@@ -150,29 +156,7 @@ final readonly class AgentRuntime
                     $generation->withSystemPrompt($systemPrompt);
                 }
 
-                $names = $this->toolNamesFor($mode, $toolNames);
-                if ($mode->skills !== []) {
-                    $names[] = 'skill_read';
-                }
-                $resolved = $this->tools->resolve(array_values(array_unique($names)), $session);
-
-                // Subagents are authority, so they go through the SAME
-                // authorization pass as any other tool rather than around it.
-                foreach ($this->subagentTools($mode, $session, $run, $runId) as $name => $tool) {
-                    $resolved[$name] = $tool;
-                }
-
-                // Marked BEFORE authorization, so an approval-gated tool that
-                // the policy then removes never reaches the model at all —
-                // rather than being offered and stopping the run on a request
-                // nobody can grant.
-                foreach ($resolved as $name => $tool) {
-                    if ($mode->needsApproval($name)) {
-                        $resolved[$name] = (clone $tool)->requiresApproval(true);
-                    }
-                }
-
-                $tools = $this->authorizer->allowed($session, $resolved);
+                $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 if ($tools !== []) {
                     $generation->withTools($tools)->withMaxSteps($budget->maxSteps);
                 }
@@ -224,6 +208,190 @@ final readonly class AgentRuntime
                 throw $failure;
             }
         }, ttlSeconds: $this->integerConfig('lock_ttl', 300), waitSeconds: $this->integerConfig('lock_wait', 0));
+    }
+
+    /**
+     * A turn whose answer is a document.
+     *
+     * The same run as {@see self::send()} — same mode, same tools, same budget,
+     * same events, same lock — asking the provider for structured output and
+     * checking what comes back against the schema before the caller sees it.
+     *
+     * WHAT THE THREAD KEEPS IS THE TEXT. The assistant message is the document
+     * exactly as the model wrote it, with the parsed object attached beside it
+     * as `structured` metadata. Never instead of it: a later turn replays this
+     * conversation as messages, and a transcript that reads differently because
+     * of the SHAPE of the request that produced it is the same defect as one
+     * that reads differently when streamed — which {@see self::stream()} exists
+     * to avoid. The metadata is stored and replayed; no provider map reads that
+     * key, so nothing is sent back out with it.
+     *
+     * A FAILED DOCUMENT IS STILL RECORDED, and then raised. The exchange
+     * happened: the model was asked and answered, and a thread that omits the
+     * answer it did not like is a thread that cannot explain the retry sitting
+     * next to it. The run is marked failed, `RunFailed` fires, and the caller
+     * gets {@see StructuredSchemaViolation} carrying the document.
+     *
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt; see TurnAttachments for what is refused
+     *
+     * @throws StructuredSchemaViolation when the model returns no document, or one the schema refuses
+     */
+    public function sendStructured(Session $session, string $prompt, Schema $schema, ?array $toolNames = null, ?RunContext $context = null, array $additionalContent = []): StructuredAgentResponse
+    {
+        $attachments = TurnAttachments::admit($prompt, $additionalContent);
+
+        return $session->lock(function (Session $session) use ($prompt, $schema, $toolNames, $context, $attachments): StructuredAgentResponse {
+            $runId = 'run_'.bin2hex(random_bytes(12));
+
+            try {
+                $mode = $this->modes->resolve($session->mode());
+                $provider = $session->provider() ?? $this->stringConfig('provider');
+                $model = $session->model() ?? $this->stringConfig('model');
+            } catch (Throwable $failure) {
+                // As in send(): no run exists yet, so there is no run state to
+                // fail — only an event to fire.
+                event(new RunFailed(
+                    sessionKey: $session->key(),
+                    runId: $runId,
+                    exception: $failure::class,
+                    parentRunId: $context?->parentRunId,
+                    rootRunId: $context?->rootRunId(),
+                ));
+
+                throw $failure;
+            }
+
+            $session->beginRun($runId, $mode->name, $provider, $model);
+
+            $run = $context ?? RunContext::root($runId, new RunBudget(
+                maxSteps: $this->ceilingFor($session, $mode),
+                maxCostUsd: $this->floatConfig('max_cost_usd'),
+                maxSeconds: $this->nullableIntConfig('max_seconds'),
+            ));
+            $budget = $run->budget;
+
+            event(new RunStarted(
+                sessionKey: $session->key(),
+                runId: $runId,
+                mode: $mode->name,
+                provider: $provider,
+                model: $model,
+                parentRunId: $run->parentRunId,
+                rootRunId: $run->rootRunId(),
+            ));
+
+            $stop = $run->ledger->exhaustion($budget);
+            if ($stop !== null) {
+                $session->failRun($runId, 'budget');
+
+                throw RunNotPermitted::exhausted($stop);
+            }
+
+            try {
+                $history = iterator_to_array($session->thread()->messages(), false);
+                $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
+
+                $generation = Prism::structured()
+                    ->using($provider, $model)
+                    ->withSchema($schema)
+                    ->withMessages($userMessage instanceof UserMessage ? [...$history, $userMessage] : $history)
+                    ->withTelemetryMetadata(sessionId: $session->key());
+
+                if ($mode->providerOptions !== []) {
+                    $generation->withProviderOptions($mode->providerOptions);
+                }
+
+                $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+                if ($systemPrompt !== '') {
+                    $generation->withSystemPrompt($systemPrompt);
+                }
+
+                $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+                if ($tools !== []) {
+                    $generation->withTools($tools)->withMaxSteps($budget->maxSteps);
+                }
+
+                $response = $generation->asStructured();
+
+                $session->thread()->record(
+                    StructuredTranscript::of($response, $userMessage),
+                    $runId,
+                );
+
+                $violation = $this->violationIn($schema, $response);
+
+                if ($violation instanceof StructuredSchemaViolation) {
+                    throw $violation;
+                }
+
+                $session->completeRun($runId, $response->finishReason->value, $this->structuredToolCallNames($response));
+
+                $run->ledger->recordSteps(count($response->steps));
+                $run->ledger->recordCost($response->usage->cost);
+
+                event(new RunFinished(
+                    sessionKey: $session->key(),
+                    runId: $runId,
+                    finishReason: $response->finishReason->value,
+                    steps: count($response->steps),
+                    // A structured run returns a document or raises, so it has
+                    // no state in which somebody has to decide something.
+                    awaitingApproval: false,
+                    parentRunId: $run->parentRunId,
+                    rootRunId: $run->rootRunId(),
+                ));
+
+                return new StructuredAgentResponse(
+                    runId: $runId,
+                    response: $response,
+                    parentRunId: $run->parentRunId,
+                    rootRunId: $run->rootRunId(),
+                );
+            } catch (Throwable $failure) {
+                $session->failRun($runId, $failure::class);
+
+                event(new RunFailed(
+                    sessionKey: $session->key(),
+                    runId: $runId,
+                    exception: $failure::class,
+                    parentRunId: $run->parentRunId,
+                    rootRunId: $run->rootRunId(),
+                ));
+
+                throw $failure;
+            }
+        }, ttlSeconds: $this->integerConfig('lock_ttl', 300), waitSeconds: $this->integerConfig('lock_wait', 0));
+    }
+
+    /**
+     * What is wrong with this document, or null when nothing is.
+     *
+     * Prism leaves `structured` null when the text held no readable document,
+     * so the two failures are told apart here rather than collapsed into one
+     * message a caller has to read prose out of.
+     */
+    private function violationIn(Schema $schema, StructuredResponse $response): ?StructuredSchemaViolation
+    {
+        if ($response->structured === null) {
+            return StructuredSchemaViolation::unreadable($response->text);
+        }
+
+        $problems = SchemaCheck::problems($schema, $response->structured);
+
+        return $problems === []
+            ? null
+            : StructuredSchemaViolation::failsSchema($response->text, $problems);
+    }
+
+    /**
+     * The tools a structured run invoked, in order.
+     *
+     * @return list<string>
+     */
+    private function structuredToolCallNames(StructuredResponse $response): array
+    {
+        return array_map(fn (ToolCall $call): string => $call->name, $response->toolCalls);
     }
 
     /**
@@ -371,6 +539,42 @@ final readonly class AgentRuntime
                 ));
             }
         }
+    }
+
+    /**
+     * The tools this run may actually offer the model, resolved and authorized.
+     *
+     * One method because every turn shape needs the same four steps in the same
+     * order, and a second copy of them is how a text turn and a structured turn
+     * end up with different authority for the same mode.
+     *
+     * @param  list<string>|null  $toolNames
+     * @return list<Tool>
+     */
+    private function authorizedTools(AgentMode $mode, Session $session, ?array $toolNames, RunContext $run, string $runId): array
+    {
+        $names = $this->toolNamesFor($mode, $toolNames);
+        if ($mode->skills !== []) {
+            $names[] = 'skill_read';
+        }
+        $resolved = $this->tools->resolve(array_values(array_unique($names)), $session);
+
+        // Subagents are authority, so they go through the SAME authorization
+        // pass as any other tool rather than around it.
+        foreach ($this->subagentTools($mode, $session, $run, $runId) as $name => $tool) {
+            $resolved[$name] = $tool;
+        }
+
+        // Marked BEFORE authorization, so an approval-gated tool that the policy
+        // then removes never reaches the model at all — rather than being
+        // offered and stopping the run on a request nobody can grant.
+        foreach ($resolved as $name => $tool) {
+            if ($mode->needsApproval($name)) {
+                $resolved[$name] = (clone $tool)->requiresApproval(true);
+            }
+        }
+
+        return $this->authorizer->allowed($session, $resolved);
     }
 
     /**

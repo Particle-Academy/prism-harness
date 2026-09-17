@@ -11,8 +11,11 @@ use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\AgentTaskSource;
 use Prism\Harness\Contracts\SessionStore;
+use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Models\Thread;
+use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Tasks\StoreTaskSource;
+use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
@@ -253,6 +256,33 @@ class Session
         }
 
         return $this->runtime->send($this, $prompt, $toolNames, null, $additionalContent);
+    }
+
+    /**
+     * Take a turn whose answer is a document.
+     *
+     * The same run as `send()` — the mode's system prompt, tools and budget all
+     * apply — with a schema the answer has to satisfy. What comes back is the
+     * parsed document, and the thread keeps the text the model wrote, so a
+     * later turn replaying this conversation reads what was actually said.
+     *
+     * A document that cannot be read, or that misses the schema, raises
+     * `StructuredSchemaViolation` carrying the model's text. It is never
+     * returned as an empty result: an empty document reads to the code that
+     * receives it exactly like a considered answer of "nothing".
+     *
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt, as for send()
+     *
+     * @throws StructuredSchemaViolation
+     */
+    public function sendStructured(string $prompt, Schema $schema, ?array $toolNames = null, array $additionalContent = []): StructuredAgentResponse
+    {
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        return $this->runtime->sendStructured($this, $prompt, $schema, $toolNames, null, $additionalContent);
     }
 
     /**
