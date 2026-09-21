@@ -84,7 +84,7 @@ function corpusRows(array $case): array
 }
 
 it('is the whole suite, not a subset someone trimmed to green', function (): void {
-    expect(threadRowsCorpus()['cases'])->toHaveCount(10);
+    expect(threadRowsCorpus()['cases'])->toHaveCount(13);
 });
 
 it('stores and replays every row as the corpus records for the reference', function (array $case): void {
