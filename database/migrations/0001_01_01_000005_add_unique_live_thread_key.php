@@ -6,7 +6,7 @@ use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
-use Prism\Harness\Support\LiveThreadAddress;
+use Prism\Harness\Support\LiveThreadKey;
 
 return new class extends Migration
 {
@@ -27,8 +27,8 @@ return new class extends Migration
         }
 
         Schema::table('harness_threads', function (Blueprint $table): void {
-            $table->string('live_address', 64)->nullable();
-            $table->unique('live_address', 'harness_threads_unique_live_address');
+            $table->string('live_key', 64)->nullable();
+            $table->unique('live_key', 'harness_threads_unique_live_key');
         });
 
         // Run with thread writers paused: legacy code does not populate the key.
@@ -36,7 +36,7 @@ return new class extends Migration
             ->chunkById(500, function ($threads): void {
                 foreach ($threads as $thread) {
                     DB::table('harness_threads')->where('id', $thread->id)->update([
-                        'live_address' => LiveThreadAddress::key(
+                        'live_key' => LiveThreadKey::key(
                             $thread->participant_type, $thread->participant_id, $thread->scope,
                         ),
                     ]);
@@ -47,8 +47,8 @@ return new class extends Migration
     public function down(): void
     {
         Schema::table('harness_threads', function (Blueprint $table): void {
-            $table->dropUnique('harness_threads_unique_live_address');
-            $table->dropColumn('live_address');
+            $table->dropUnique('harness_threads_unique_live_key');
+            $table->dropColumn('live_key');
         });
     }
 };

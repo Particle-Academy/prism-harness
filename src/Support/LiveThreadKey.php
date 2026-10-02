@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Support;
 
-final class LiveThreadAddress
+final class LiveThreadKey
 {
     public static function key(?string $participantType, int|string|null $participantId, string $scope): string
     {
