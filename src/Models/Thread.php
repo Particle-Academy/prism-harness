@@ -221,6 +221,13 @@ class Thread extends Model implements ThreadContract
      * The default strategy replays everything, so this is exactly what it has
      * always been until an application chooses otherwise.
      *
+     * A GENERATOR, not the relation. `$thread->messages()->count()` therefore
+     * fails with "Call to undefined method Generator::count()" -- reach for
+     * {@see self::storedMessages()} when you want the Eloquent relation to
+     * count, paginate or query. Noted here because the error names Generator
+     * and not this method, so it points at PHP rather than at the choice made
+     * on this line; a consumer lost time to it.
+     *
      * @return Generator<int, Message>
      */
     #[\Override]
