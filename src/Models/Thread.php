@@ -18,7 +18,7 @@ use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\EvictionSink;
-use Prism\Harness\Support\LiveThreadAddress;
+use Prism\Harness\Support\LiveThreadKey;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
@@ -44,7 +44,7 @@ use Throwable;
  * @property string|null $title
  * @property array<string, mixed>|null $metadata
  * @property Carbon|null $retired_at
- * @property string|null $live_address
+ * @property string|null $live_key
  * @property-read Collection<int, ThreadMessage> $storedMessages
  * @property-read self|null $parentThread
  */
@@ -75,13 +75,13 @@ class Thread extends Model implements ThreadContract
             // in the very UPDATE that stamps retired_at. An unrelated save on a
             // stale model must not reclaim a key released by another worker.
             if (! $thread->exists || $thread->isDirty(['participant_type', 'participant_id', 'scope', 'retired_at'])) {
-                $thread->live_address = $thread->retired_at !== null ? null : LiveThreadAddress::key(
+                $thread->live_key = $thread->retired_at !== null ? null : LiveThreadKey::key(
                     $thread->getAttribute('participant_type'),
                     $thread->getAttribute('participant_id'),
                     $thread->scope,
                 );
-            } elseif ($thread->isDirty('live_address')) {
-                $thread->live_address = $thread->getOriginal('live_address');
+            } elseif ($thread->isDirty('live_key')) {
+                $thread->live_key = $thread->getOriginal('live_key');
             }
         });
     }
@@ -151,16 +151,34 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * @param  array<string, mixed>  $address
+     * Resolve a live thread addressed by scope alone, without a participant.
+     *
+     * This makes no claim about who may read it. A host may restrict a shared
+     * thread to admins only; authorization is the host's decision. A shared
+     * conversation belonging to an agency should instead use forParticipant()
+     * with that agency, because the agency is its participant.
      */
-    protected static function resolveAddress(array $address): self
+    public static function shared(string $scope): self
+    {
+        return static::resolveAddress([
+            'participant_type' => null,
+            'participant_id' => null,
+            'scope' => $scope,
+        ], ['scope' => $scope]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $address
+     * @param  array<string, mixed>|null  $create
+     */
+    protected static function resolveAddress(array $address, ?array $create = null): self
     {
         // Use the same exact address for lookup and uniqueness. A database's
         // case-insensitive scope collation must not merge two different keys.
-        $key = LiveThreadAddress::key($address['participant_type'] ?? null, $address['participant_id'] ?? null, $address['scope']);
+        $key = LiveThreadKey::key($address['participant_type'] ?? null, $address['participant_id'] ?? null, $address['scope']);
         $lookup = static::query()
             ->where($address)
-            ->where('live_address', $key)
+            ->where('live_key', $key)
             ->whereNull('retired_at')
             ->orderByDesc('id');
         /** @var self|null $live */
@@ -172,7 +190,7 @@ class Thread extends Model implements ThreadContract
         try {
             // A savepoint keeps PostgreSQL's outer transaction usable after a
             // rejected INSERT. Lookup-only fields never enter the create data.
-            return static::query()->withSavepointIfNeeded(fn (): self => static::query()->create($address));
+            return static::query()->withSavepointIfNeeded(fn (): self => static::query()->create($create ?? $address));
         } catch (UniqueConstraintViolationException $exception) {
             // Read the writer, not a replica. A locking read also sees the winner
             // inside an InnoDB REPEATABLE READ transaction instead of its old snapshot.

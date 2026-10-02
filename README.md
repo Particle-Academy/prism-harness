@@ -112,7 +112,7 @@ different conversation from `'support'`, and a fresh worker asking for the same 
 on the same thread rather than starting a new one.
 
 **One live conversation per address is enforced by the database.** The nullable
-`live_address` key is derived by the model and uniquely indexed. A competing first-use
+`live_key` key is derived by the model and uniquely indexed. A competing first-use
 insert is rejected, and resolution returns the winning row. `retire()` clears the key
 in the same write that stamps retirement, keeping the old conversation readable by id
 and freeing the address for a new one. Use the model to write thread rows; raw inserts
@@ -124,6 +124,13 @@ duplicate live addresses already exist, it refuses before changing the schema: r
 their histories and explicitly retire the unwanted rows, then rerun. Address keys use
 exact strings, including scope case; applications that relied on case-insensitive
 database aliases should canonicalize scopes consistently before upgrading.
+
+`Thread::shared('admin-review')` resolves a participant-less conversation by scope
+alone, with the same uniqueness and retirement behavior. It makes no claim about who
+may read it: an admin-only conversation still needs the host's authorization check.
+An agency-wide conversation already has a participant—the agency—so use
+`Thread::forParticipant($agency, 'teachers-aid')` for that address. Separate shared
+audiences can use separate scopes.
 
 **The storage format is ours, not Prism's.** Prism's `toArray()` exists to feed telemetry and
 debug output and is free to change for presentational reasons; persistence cannot be, so it

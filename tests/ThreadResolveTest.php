@@ -22,16 +22,16 @@ it('rejects a second live address at the database boundary', function (): void {
 it('releases the live key atomically and allows repeated retired addresses', function (): void {
     $participant = Participant::create(['name' => 'Ada']);
     $first = Thread::forParticipant($participant, 'support');
-    $key = $first->live_address;
+    $key = $first->live_key;
     $first->retire();
-    expect($first->fresh()->live_address)->toBeNull()
+    expect($first->fresh()->live_key)->toBeNull()
         ->and($first->fresh()->retired_at)->not->toBeNull();
     $second = Thread::forParticipant($participant, 'support');
-    expect($second->live_address)->toBe($key);
+    expect($second->live_key)->toBe($key);
     $second->retire();
     $third = Thread::forParticipant($participant, 'support');
-    expect(Thread::query()->whereNull('live_address')->count())->toBe(2)
-        ->and($third->live_address)->toBe($key);
+    expect(Thread::query()->whereNull('live_key')->count())->toBe(2)
+        ->and($third->live_key)->toBe($key);
 });
 
 it('does not let an unrelated stale save reclaim a retired live key', function (): void {
@@ -42,7 +42,7 @@ it('does not let an unrelated stale save reclaim a retired live key', function (
     $replacement = Thread::forParticipant($participant, 'support');
     $stale->title = 'Updated history title';
     $stale->save();
-    expect($stale->fresh()->live_address)->toBeNull()
+    expect($stale->fresh()->live_key)->toBeNull()
         ->and(Thread::forParticipant($participant, 'support')->getKey())->toBe($replacement->getKey());
 });
 
@@ -52,32 +52,32 @@ it('derives the key rather than accepting a caller supplied key', function (): v
         'participant_type' => $participant->getMorphClass(),
         'participant_id' => $participant->getKey(),
         'scope' => 'support',
-        'live_address' => 'caller supplied',
+        'live_key' => 'caller supplied',
     ]);
-    expect($thread->live_address)->not->toBe('caller supplied');
-    $key = $thread->live_address;
-    $thread->live_address = 'another caller key';
+    expect($thread->live_key)->not->toBe('caller supplied');
+    $key = $thread->live_key;
+    $thread->live_key = 'another caller key';
     $thread->save();
-    expect($thread->fresh()->live_address)->toBe($key);
+    expect($thread->fresh()->live_key)->toBe($key);
 });
 
 it('backfills existing live rows without changing retired history', function (): void {
-    $migration = require __DIR__.'/../database/migrations/0001_01_01_000005_add_unique_live_thread_address.php';
+    $migration = require __DIR__.'/../database/migrations/0001_01_01_000005_add_unique_live_thread_key.php';
     $migration->down();
     $live = DB::table('harness_threads')->insertGetId(['scope' => 'legacy']);
     $retired = DB::table('harness_threads')->insertGetId(['scope' => 'legacy', 'retired_at' => now()]);
     $migration->up();
-    expect(Thread::findOrFail($live)->live_address)->not->toBeNull()
-        ->and(Thread::findOrFail($retired)->live_address)->toBeNull()
+    expect(Thread::findOrFail($live)->live_key)->not->toBeNull()
+        ->and(Thread::findOrFail($retired)->live_key)->toBeNull()
         ->and(Thread::findOrFail($retired)->isRetired())->toBeTrue();
 });
 
 it('refuses ambiguous legacy duplicates before changing the schema or rows', function (): void {
-    $migration = require __DIR__.'/../database/migrations/0001_01_01_000005_add_unique_live_thread_address.php';
+    $migration = require __DIR__.'/../database/migrations/0001_01_01_000005_add_unique_live_thread_key.php';
     $migration->down();
     DB::table('harness_threads')->insert([['scope' => 'legacy'], ['scope' => 'legacy']]);
     expect(fn () => $migration->up())->toThrow(RuntimeException::class, 'Duplicate live harness thread addresses');
-    expect(Schema::hasColumn('harness_threads', 'live_address'))->toBeFalse()
+    expect(Schema::hasColumn('harness_threads', 'live_key'))->toBeFalse()
         ->and(DB::table('harness_threads')->whereNull('retired_at')->count())->toBe(2);
 });
 
