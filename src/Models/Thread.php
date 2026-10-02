@@ -11,12 +11,14 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\EvictionSink;
+use Prism\Harness\Support\LiveThreadAddress;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
@@ -42,6 +44,7 @@ use Throwable;
  * @property string|null $title
  * @property array<string, mixed>|null $metadata
  * @property Carbon|null $retired_at
+ * @property string|null $live_address
  * @property-read Collection<int, ThreadMessage> $storedMessages
  * @property-read self|null $parentThread
  */
@@ -64,6 +67,24 @@ class Thread extends Model implements ThreadContract
         'title',
         'metadata',
     ];
+
+    protected static function booted(): void
+    {
+        static::saving(function (self $thread): void {
+            // Derived, never mass-assignable. Retirement releases the unique key
+            // in the very UPDATE that stamps retired_at. An unrelated save on a
+            // stale model must not reclaim a key released by another worker.
+            if (! $thread->exists || $thread->isDirty(['participant_type', 'participant_id', 'scope', 'retired_at'])) {
+                $thread->live_address = $thread->retired_at !== null ? null : LiveThreadAddress::key(
+                    $thread->getAttribute('participant_type'),
+                    $thread->getAttribute('participant_id'),
+                    $thread->scope,
+                );
+            } elseif ($thread->isDirty('live_address')) {
+                $thread->live_address = $thread->getOriginal('live_address');
+            }
+        });
+    }
 
     /**
      * @return array<string, string>
@@ -126,14 +147,40 @@ class Thread extends Model implements ThreadContract
         // attributes, a fresh thread would be created with `retired_at` set to
         // null explicitly — harmless here, and wrong the moment the column
         // gains a default.
-        $live = static::query()
-            ->where($address)
-            ->whereNull('retired_at')
-            ->orderByDesc('id')
-            ->first();
+        return static::resolveAddress($address);
+    }
 
-        /** @var self */
-        return $live ?? static::query()->create($address);
+    /**
+     * @param  array<string, mixed>  $address
+     */
+    protected static function resolveAddress(array $address): self
+    {
+        // Use the same exact address for lookup and uniqueness. A database's
+        // case-insensitive scope collation must not merge two different keys.
+        $key = LiveThreadAddress::key($address['participant_type'] ?? null, $address['participant_id'] ?? null, $address['scope']);
+        $lookup = static::query()
+            ->where($address)
+            ->where('live_address', $key)
+            ->whereNull('retired_at')
+            ->orderByDesc('id');
+        /** @var self|null $live */
+        $live = (clone $lookup)->first();
+        if ($live !== null) {
+            return $live;
+        }
+
+        try {
+            // A savepoint keeps PostgreSQL's outer transaction usable after a
+            // rejected INSERT. Lookup-only fields never enter the create data.
+            return static::query()->withSavepointIfNeeded(fn (): self => static::query()->create($address));
+        } catch (UniqueConstraintViolationException $exception) {
+            // Read the writer, not a replica. A locking read also sees the winner
+            // inside an InnoDB REPEATABLE READ transaction instead of its old snapshot.
+            /** @var self|null $winner */
+            $winner = $lookup->useWritePdo()->lockForUpdate()->first();
+
+            return $winner ?? throw $exception;
+        }
     }
 
     /**
