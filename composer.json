@@ -19,7 +19,7 @@
     ],
     "require": {
         "php": "^8.2",
-        "laravel/framework": "^12.61.1|^13.12.0",
+        "laravel/framework": "^12.69.0|^13.30.0",
         "particle-academy/prism": ">=0.123 <1.0"
     },
     "require-dev": {
