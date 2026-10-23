@@ -629,6 +629,7 @@ it inherited. Declared per mode — a mode that names no subagents cannot spawn 
                 'mode' => 'op_runner',   // the child's authority, not the parent's
                 'max_steps' => 4,
                 'max_cost_usd' => 0.25,
+                'max_output_tokens_per_call' => 2048,
             ],
         ],
     ],
@@ -673,12 +674,120 @@ Cancellation is cooperative: PHP cannot interrupt a tool already executing, so t
 call finishes and the next step is refused. Pretending otherwise would discard a
 half-executed action — the exact loss the durable slot exists to prevent.
 
-### A cost cap you cannot enforce is refused
+### Hard per-call cost budgets
 
-`Usage::$cost` is nullable, because not every provider reports one. Folding that into
-`+= 0.0` would leave a cost budget that reads as enforced and can never trip. Unmetered runs
-are counted separately, and a tree with a `max_cost_usd` that has taken any of them **stops**
-rather than spending on under a cap nobody can measure.
+An active `maxCostUsd` makes the harness drive one model call at a time on `send`,
+`sendStructured` and `stream`. Before each call it reserves the worst-case model cost:
+the input token upper bound at the highest applicable input/cache-write/cache-read price,
+plus `maxOutputTokensPerCall` at the output price. Settled cost and all open reservations
+count against admission, so a subagent cannot spend its parent's in-flight allowance.
+The next call is refused if it would cross the cap; completed calls remain in the ledger
+and transcript, and the run fails with reason `budget`.
+
+Approved pending tools are resolved through core before estimating the resumed input.
+Their results are stored before admission, so a result that makes the next call too
+expensive remains durable and is not executed again on retry. Streaming preserves the
+resolution events in order, yielding them after that write and before model events.
+Pass the same owner-held context to approval resumes: `approve($approval, context: $page)`,
+`deny($approval, context: $page)` or `decide($decisions, context: $page)`. As with `send`,
+omitting a per-run context uses the configured root budget.
+
+**Existing cost-capped configurations now require prices and an output-token ceiling.**
+Uncapped runs retain the existing core tool loop and need no price. An explicit output
+ceiling is also forwarded on uncapped runs; leaving it unset preserves default requests.
+
+Configure trusted prices under `prism-harness.pricing`, keyed by provider and exact model
+identifier. The package supplies no default model prices. A `RunContext` can override a
+model's whole price entry; child contexts inherit those overrides.
+
+```php
+use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunContext;
+
+// Your configured provider/model, not values selected by the model or browser.
+$prices = [$provider => [$model => [
+    'inputPerMTok' => 2.0,        // USD per million ordinary input tokens
+    'outputPerMTok' => 10.0,
+    'cacheWritePerMTok' => 2.5,   // optional; otherwise ordinary input price
+    'cacheReadPerMTok' => 0.1,    // optional; otherwise ordinary input price
+    'toolOverheadTokens' => 286, // configured provider-added tool system prompt
+    'imageTokenBound' => 8000,   // your conservative bound per image, if images are allowed
+]]];
+
+$build = RunContext::root('build-'.$buildId, new RunBudget(
+    maxSteps: 100,
+    maxCostUsd: 10.0,
+    maxOutputTokensPerCall: 4096,
+), pricing: $prices);
+
+// Create one child allowance per page, sharing the build's cumulative ledger.
+$page = new RunContext(
+    ledger: $build->ledger,
+    budget: (new RunBudget(12, maxCostUsd: 1.0, maxOutputTokensPerCall: 2048))
+        ->nestedWithin($build->budget, $build->ledger),
+    pricing: $build->pricing,
+);
+$session->send('Build this page', context: $page);
+$session->sendStructured('Describe this page', $schema, context: $page);
+foreach ($session->stream('Revise this page', context: $page) as $event) {
+    // Consume the entire generator: each model call yields its original events.
+}
+```
+
+Use a `$0.25` child allowance for a cheaper page lane by setting `maxCostUsd: 0.25`.
+Keep the same root ledger across pages: creating another root starts a new account.
+The ledger is the existing in-memory run-tree account, not a durable billing database;
+the host owns account persistence and coordination across workers. Child output-token
+ceilings can narrow, never raise, the parent's ceiling. Config-based budgets use
+`max_output_tokens_per_call` (under `prism-harness.agent` or a subagent declaration).
+
+The input bound counts UTF-8 **bytes**, including system prompts, history, tool-call
+arguments/results, and tool/structured schemas serialized as JSON, plus 64 tokens per
+message/tool for framing. Escaping and duplicate text intentionally over-estimate.
+Images add the configured `imageTokenBound`. Documents, audio and video are refused
+under a cap. Tools require `toolOverheadTokens` because their hidden provider system
+prompt is absent from the request text. Provider toolsets require
+`serverToolOverheadTokens` keyed by their exact type; hosted MCP input is refused.
+These are trusted upper-bound assertions; prices and bounds must cover the selected
+provider/model configuration.
+
+A price entry may also have `multiplier` (default `1.0`) and an ascending `tiers` list.
+Each tier contains `aboveInputTokens`, `inputPerMTok`, `outputPerMTok`, and optional
+cache prices. Admission selects rates using the input upper bound; actual accounting
+uses reported ordinary input plus cache reads and writes. A tier begins strictly above
+its threshold. The multiplier applies to every token-priced category. For example:
+
+```php
+'multiplier' => 1.1,
+'tiers' => [[
+    'aboveInputTokens' => 100000,
+    'inputPerMTok' => 0.50, 'outputPerMTok' => 2.50,
+    'cacheWritePerMTok' => 0.625, 'cacheReadPerMTok' => 0.05,
+]],
+```
+
+After each call, the provider-reported `usage->cost` is authoritative when supplied;
+otherwise the ledger charges ordinary input, cache reads/writes and output at that
+call's configured tier and multiplier. Reasoning tokens are already included in
+completion tokens. On failure or stream abandonment, the reservation is released and
+known usage charged. Unknown spend is recorded separately and prevents further capped
+spending. Consume a stream in full to persist its completed messages; abandoning it
+keeps completed earlier calls and the user's prompt, as with the existing collector.
+
+`RunNotPermitted::code()` distinguishes these refusals:
+
+| code | cause |
+|---|---|
+| `call_budget_exceeded` | the next call's worst case cannot fit |
+| `budget_unpriced` | missing or invalid provider/model pricing |
+| `budget_unbounded_output` | no positive per-call output ceiling |
+| `budget_input_unbounded` | unsupported media or missing image/tool overhead bound |
+| `budget_compaction_unmetered` | model-based summarising compaction is configured |
+
+`SummarisingCompaction` can bill before admission, so a capped run refuses it before
+reading the history. Free compaction remains supported; uncapped compaction is unchanged.
+Application-supplied compaction and tool callbacks are trusted extensions. Their own
+model calls or external billing outside the harness are not metered by this ledger.
 
 ## Task lists
 

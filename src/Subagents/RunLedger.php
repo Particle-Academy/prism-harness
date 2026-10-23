@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Subagents;
 
+use Prism\Harness\Exceptions\RunNotPermitted;
+
 /**
  * What a run TREE has actually spent, and whether it has been cancelled.
  *
@@ -30,6 +32,11 @@ final class RunLedger
 
     private ?string $cancelReason = null;
 
+    /** @var array<int, float> */
+    private array $reservations = [];
+
+    private int $reservationSequence = 0;
+
     public function __construct(
         public readonly string $rootRunId,
         private readonly float $startedAt = 0.0,
@@ -48,6 +55,50 @@ final class RunLedger
     public function costUsd(): float
     {
         return $this->costUsd;
+    }
+
+    public function reservedCostUsd(): float
+    {
+        return array_sum($this->reservations);
+    }
+
+    /** Admission and reservation happen together, before a provider or nested tool can spend. */
+    public function reserveCost(RunBudget $budget, float $worstCase): int
+    {
+        if (! is_finite($worstCase) || $worstCase < 0 || $budget->maxCostUsd === null
+            || ! is_finite($budget->maxCostUsd) || $budget->maxCostUsd < 0
+            || $this->costUsd + $this->reservedCostUsd() + $worstCase > $budget->maxCostUsd) {
+            throw RunNotPermitted::callBudget('call_budget_exceeded');
+        }
+
+        $this->assertCallAvailable($budget);
+
+        $id = ++$this->reservationSequence;
+        $this->reservations[$id] = $worstCase;
+
+        return $id;
+    }
+
+    /** Check cancellation/steps/time before resolving an approved side effect, then again before spending. */
+    public function assertCallAvailable(RunBudget $budget): void
+    {
+        // Cost admission uses >, allowing an exact fit (including a genuinely
+        // free call). Preserve the legacy >= exhaustion API for its callers.
+        $stop = $this->unmeteredRuns > 0 ? $this->exhaustion($budget)
+            : $this->exhaustion(new RunBudget($budget->maxSteps, maxSeconds: $budget->maxSeconds));
+        if ($stop !== null) {
+            throw RunNotPermitted::exhausted($stop);
+        }
+    }
+
+    /** Null records unknown spend, so a failed/abandoned request cannot reopen the same allowance. */
+    public function settleCost(int $reservation, ?float $cost): void
+    {
+        if (! array_key_exists($reservation, $this->reservations)) {
+            throw new \LogicException('The call reservation has already been settled.');
+        }
+        unset($this->reservations[$reservation]);
+        $this->recordCost($cost);
     }
 
     public function elapsedSeconds(): float
@@ -113,7 +164,7 @@ final class RunLedger
 
     public function remainingCost(RunBudget $budget): ?float
     {
-        return $budget->maxCostUsd === null ? null : max(0.0, $budget->maxCostUsd - $this->costUsd);
+        return $budget->maxCostUsd === null ? null : max(0.0, $budget->maxCostUsd - $this->costUsd - $this->reservedCostUsd());
     }
 
     public function remainingSeconds(RunBudget $budget): ?int

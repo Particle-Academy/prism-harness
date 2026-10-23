@@ -14,6 +14,7 @@ use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\StructuredAgentResponse;
+use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tasks\StoreTaskSource;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Streaming\Events\StreamEvent;
@@ -249,13 +250,13 @@ class Session
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $additionalContent
      */
-    public function send(string $prompt, ?array $toolNames = null, array $additionalContent = []): AgentResponse
+    public function send(string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): AgentResponse
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
 
-        return $this->runtime->send($this, $prompt, $toolNames, null, $additionalContent);
+        return $this->runtime->send($this, $prompt, $toolNames, $context, $additionalContent);
     }
 
     /**
@@ -276,13 +277,13 @@ class Session
      *
      * @throws StructuredSchemaViolation
      */
-    public function sendStructured(string $prompt, Schema $schema, ?array $toolNames = null, array $additionalContent = []): StructuredAgentResponse
+    public function sendStructured(string $prompt, Schema $schema, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): StructuredAgentResponse
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
 
-        return $this->runtime->sendStructured($this, $prompt, $schema, $toolNames, null, $additionalContent);
+        return $this->runtime->sendStructured($this, $prompt, $schema, $toolNames, $context, $additionalContent);
     }
 
     /**
@@ -304,13 +305,13 @@ class Session
      * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt, as for send()
      * @return Generator<int, StreamEvent>
      */
-    public function stream(string $prompt, ?array $toolNames = null, array $additionalContent = []): Generator
+    public function stream(string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): Generator
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
 
-        yield from $this->runtime->stream($this, $prompt, $toolNames, $additionalContent);
+        yield from $this->runtime->stream($this, $prompt, $toolNames, $additionalContent, $context);
     }
 
     /**
@@ -336,7 +337,7 @@ class Session
      *
      * @param  ToolApprovalRequest|string  $approval  the request, or its approval id
      */
-    public function approve(ToolApprovalRequest|string $approval, bool $approved = true, ?string $reason = null): AgentResponse
+    public function approve(ToolApprovalRequest|string $approval, bool $approved = true, ?string $reason = null, ?RunContext $context = null): AgentResponse
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
@@ -344,7 +345,7 @@ class Session
 
         $id = $approval instanceof ToolApprovalRequest ? $approval->approvalId : $approval;
 
-        return $this->decide([new ToolApprovalResponse($id, $approved, $reason)]);
+        return $this->decide([new ToolApprovalResponse($id, $approved, $reason)], $context);
     }
 
     /**
@@ -360,7 +361,7 @@ class Session
      *
      * @param  list<ToolApprovalResponse>  $decisions
      */
-    public function decide(array $decisions): AgentResponse
+    public function decide(array $decisions, ?RunContext $context = null): AgentResponse
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
@@ -378,15 +379,15 @@ class Session
         // request, the decisions, and everything before them. A new prompt here
         // would be a second instruction competing with the one the tool call
         // came from.
-        return $this->runtime->send($this, '');
+        return $this->runtime->send($this, '', context: $context);
     }
 
     /**
      * Reject a pending approval. The tool does not run.
      */
-    public function deny(ToolApprovalRequest|string $approval, ?string $reason = null): AgentResponse
+    public function deny(ToolApprovalRequest|string $approval, ?string $reason = null, ?RunContext $context = null): AgentResponse
     {
-        return $this->approve($approval, false, $reason);
+        return $this->approve($approval, false, $reason, $context);
     }
 
     /** @return array<string, mixed>|null */

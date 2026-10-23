@@ -7,6 +7,8 @@ namespace Prism\Harness;
 use Closure;
 use Generator;
 use Illuminate\Support\Collection;
+use Prism\Harness\Context\SummarisingCompaction;
+use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunStarted;
@@ -18,6 +20,8 @@ use Prism\Harness\Sessions\Session;
 use Prism\Harness\Skills\SkillRegistry;
 use Prism\Harness\Structured\SchemaCheck;
 use Prism\Harness\Structured\StructuredTranscript;
+use Prism\Harness\Subagents\BudgetedCalls;
+use Prism\Harness\Subagents\CallBudget;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\SubagentRunner;
@@ -34,6 +38,7 @@ use Prism\Prism\Streaming\StreamCollector;
 use Prism\Prism\Structured\Response as StructuredResponse;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolCall;
 use Throwable;
@@ -58,6 +63,8 @@ final readonly class AgentRuntime
          * @var (Closure(): SubagentRunner)|null
          */
         private ?Closure $subagentRunner = null,
+        /** @var array<string, mixed> */
+        private array $pricing = [],
     ) {}
 
     /**
@@ -112,6 +119,7 @@ final readonly class AgentRuntime
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
+                maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call'),
             ));
             $budget = $run->budget;
 
@@ -130,13 +138,14 @@ final readonly class AgentRuntime
             // was spawned; this re-checks at the moment of spending, because a
             // sibling may have consumed the remainder in between.
             $stop = $run->ledger->exhaustion($budget);
-            if ($stop !== null) {
+            if ($budget->maxCostUsd === null && $stop !== null) {
                 $session->failRun($runId, 'budget');
 
                 throw RunNotPermitted::exhausted($stop);
             }
 
             try {
+                $this->assertMeteredCompaction($budget);
                 // The history is read HERE, once, and handed to Prism as
                 // messages rather than as a Thread. See newMessages() for why
                 // this run has to know exactly which message objects it sent.
@@ -158,19 +167,32 @@ final readonly class AgentRuntime
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxSteps);
+                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $budget->maxSteps : 1);
                 }
-
-                $response = $generation->asText();
-                $session->thread()->record($this->newMessages($response, $history), $runId);
+                if ($budget->maxOutputTokensPerCall !== null) {
+                    $generation->withMaxTokens($budget->maxOutputTokensPerCall);
+                }
+                $response = $budget->maxCostUsd === null ? $generation->asText()
+                    : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
+                        function (TextResponse $response) use ($session, &$history, $runId): void {
+                            $session->thread()->record($this->newMessages($response, $history), $runId);
+                        }, function (array $messages) use ($session, &$history, $runId): void {
+                            $session->thread()->record($this->newMessageObjects($messages, $history), $runId);
+                            $history = $messages;
+                        });
+                if ($budget->maxCostUsd === null) {
+                    $session->thread()->record($this->newMessages($response, $history), $runId);
+                }
                 $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
 
                 // Charged AFTER the run, to the tree's shared account. A child
                 // spending here is what makes the parent's remaining budget
                 // shrink — see RunLedger on why one ledger is passed by
                 // reference rather than one per run.
-                $run->ledger->recordSteps(count($response->steps));
-                $run->ledger->recordCost($this->costOf($response));
+                if ($budget->maxCostUsd === null) {
+                    $run->ledger->recordSteps(count($response->steps));
+                    $run->ledger->recordCost($this->costOf($response));
+                }
 
                 $agentResponse = new AgentResponse(
                     runId: $runId,
@@ -195,7 +217,7 @@ final readonly class AgentRuntime
 
                 return $agentResponse;
             } catch (Throwable $failure) {
-                $session->failRun($runId, $failure::class);
+                $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
 
                 event(new RunFailed(
                     sessionKey: $session->key(),
@@ -268,6 +290,7 @@ final readonly class AgentRuntime
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
+                maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call'),
             ));
             $budget = $run->budget;
 
@@ -282,13 +305,14 @@ final readonly class AgentRuntime
             ));
 
             $stop = $run->ledger->exhaustion($budget);
-            if ($stop !== null) {
+            if ($budget->maxCostUsd === null && $stop !== null) {
                 $session->failRun($runId, 'budget');
 
                 throw RunNotPermitted::exhausted($stop);
             }
 
             try {
+                $this->assertMeteredCompaction($budget);
                 $history = iterator_to_array($session->thread()->messages(), false);
                 $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
 
@@ -309,15 +333,24 @@ final readonly class AgentRuntime
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxSteps);
+                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $budget->maxSteps : 1);
                 }
+                if ($budget->maxOutputTokensPerCall !== null) {
+                    $generation->withMaxTokens($budget->maxOutputTokensPerCall);
+                }
+                $response = $budget->maxCostUsd === null ? $generation->asStructured()
+                    : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
+                        function (StructuredResponse $response) use ($session, &$userMessage, $runId): void {
+                            $session->thread()->record(StructuredTranscript::of($response, $userMessage), $runId);
+                        }, function (array $messages) use ($session, &$history, &$userMessage, $runId): void {
+                            $session->thread()->record($this->newMessageObjects($messages, $history), $runId);
+                            $history = $messages;
+                            $userMessage = null;
+                        });
 
-                $response = $generation->asStructured();
-
-                $session->thread()->record(
-                    StructuredTranscript::of($response, $userMessage),
-                    $runId,
-                );
+                if ($budget->maxCostUsd === null) {
+                    $session->thread()->record(StructuredTranscript::of($response, $userMessage), $runId);
+                }
 
                 $violation = $this->violationIn($schema, $response);
 
@@ -327,8 +360,10 @@ final readonly class AgentRuntime
 
                 $session->completeRun($runId, $response->finishReason->value, $this->structuredToolCallNames($response));
 
-                $run->ledger->recordSteps(count($response->steps));
-                $run->ledger->recordCost($response->usage->cost);
+                if ($budget->maxCostUsd === null) {
+                    $run->ledger->recordSteps(count($response->steps));
+                    $run->ledger->recordCost($response->usage->cost);
+                }
 
                 event(new RunFinished(
                     sessionKey: $session->key(),
@@ -349,7 +384,7 @@ final readonly class AgentRuntime
                     rootRunId: $run->rootRunId(),
                 );
             } catch (Throwable $failure) {
-                $session->failRun($runId, $failure::class);
+                $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
 
                 event(new RunFailed(
                     sessionKey: $session->key(),
@@ -414,12 +449,18 @@ final readonly class AgentRuntime
      * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt; see TurnAttachments for what is refused
      * @return Generator<int, StreamEvent>
      */
-    public function stream(Session $session, string $prompt, ?array $toolNames = null, array $additionalContent = []): Generator
+    public function stream(Session $session, string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): Generator
     {
         // First, before a run begins. A generator runs nothing until it is
         // iterated, so this refuses on the first iteration rather than at the
         // call, which is still before any run state exists.
         $attachments = TurnAttachments::admit($prompt, $additionalContent);
+
+        if (($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null) {
+            yield from $this->streamCapped($session, $prompt, $toolNames, $context, $attachments);
+
+            return;
+        }
 
         // The lock is acquired and released around the generator by hand rather
         // than with `$session->lock()`: a closure cannot yield to this caller.
@@ -472,6 +513,10 @@ final readonly class AgentRuntime
             $tools = $this->authorizer->allowed($session, $resolved);
             if ($tools !== []) {
                 $generation->withTools($tools)->withMaxSteps($mode->maxSteps);
+            }
+            $maxOutput = $context === null ? $this->nullableIntConfig('max_output_tokens_per_call') : $context->budget->maxOutputTokensPerCall;
+            if ($maxOutput !== null) {
+                $generation->withMaxTokens($maxOutput);
             }
 
             // The transcript is assembled by CORE, not rebuilt here.
@@ -538,6 +583,94 @@ final readonly class AgentRuntime
                     awaitingApproval: false,
                 ));
             }
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $attachments
+     * @return Generator<StreamEvent>
+     */
+    private function streamCapped(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments): Generator
+    {
+        $mode = $this->modes->resolve($session->mode());
+        $provider = $session->provider() ?? $this->stringConfig('provider');
+        $model = $session->model() ?? $this->stringConfig('model');
+        $runId = 'run_'.bin2hex(random_bytes(12));
+        $run = $context ?? RunContext::root($runId, new RunBudget(
+            maxSteps: $this->ceilingFor($session, $mode),
+            maxCostUsd: $this->floatConfig('max_cost_usd'),
+            maxSeconds: $this->nullableIntConfig('max_seconds'),
+            maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call'),
+        ));
+        $session->beginRun($runId, $mode->name, $provider, $model);
+        event(new RunStarted($session->key(), $runId, $mode->name, $provider, $model,
+            $run->parentRunId, $run->rootRunId()));
+        $recorded = false;
+        $finish = FinishReason::Unknown;
+        $steps = 0;
+        $awaitingApproval = false;
+        try {
+            $this->assertMeteredCompaction($run->budget);
+            $history = iterator_to_array($session->thread()->messages(), false);
+            $generation = Prism::text()->using($provider, $model)
+                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
+                ->withTelemetryMetadata(sessionId: $session->key());
+            if ($mode->providerOptions !== []) {
+                $generation->withProviderOptions($mode->providerOptions);
+            }
+            $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+            if ($systemPrompt !== '') {
+                $generation->withSystemPrompt($systemPrompt);
+            }
+            $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+            if ($tools !== []) {
+                $generation->withTools($tools);
+            }
+            yield from $this->budgetedCalls($run, $provider, $model)->stream($generation, $run,
+                function (array $messages, TextResponse $response) use ($session, $prompt, $attachments, $runId, &$recorded, &$finish, &$steps, &$awaitingApproval): void {
+                    $session->thread()->record([
+                        ...(! $recorded && $prompt !== '' ? [new UserMessage($prompt, $attachments)] : []), ...$messages,
+                    ], $runId);
+                    $recorded = true;
+                    $finish = $response->finishReason;
+                    $steps++;
+                    foreach ($messages as $message) {
+                        if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== []) {
+                            $awaitingApproval = true;
+                        }
+                    }
+                }, function (array $messages) use ($session, &$history, $runId, &$recorded): void {
+                    $session->thread()->record($this->newMessageObjects($messages, $history), $runId);
+                    $history = $messages;
+                    $recorded = true;
+                });
+        } catch (Throwable $failure) {
+            $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
+            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
+
+            throw $failure;
+        } finally {
+            if (($session->run()['status'] ?? null) === 'running') {
+                if (! $recorded && $prompt !== '') {
+                    $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
+                }
+                $session->completeRun($runId, $finish->value);
+                event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
+                    $run->parentRunId, $run->rootRunId()));
+            }
+        }
+    }
+
+    private function budgetedCalls(RunContext $run, string $provider, string $model): BudgetedCalls
+    {
+        return new BudgetedCalls(CallBudget::forRun($run, $provider, $model, $this->pricing));
+    }
+
+    private function assertMeteredCompaction(RunBudget $budget): void
+    {
+        if ($budget->maxCostUsd !== null && app(CompactionStrategy::class) instanceof SummarisingCompaction) {
+            throw RunNotPermitted::callBudget('budget_compaction_unmetered');
         }
     }
 
@@ -692,6 +825,15 @@ final readonly class AgentRuntime
      */
     private function newMessages(TextResponse $response, array $history): array
     {
+        return $this->newMessageObjects($response->messages->values()->all(), $history);
+    }
+
+    /** @param list<Message> $messages
+     * @param  list<Message>  $history
+     * @return list<Message>
+     */
+    private function newMessageObjects(array $messages, array $history): array
+    {
         $sent = [];
 
         foreach ($history as $message) {
@@ -699,7 +841,7 @@ final readonly class AgentRuntime
         }
 
         return array_values(array_filter(
-            $response->messages->values()->all(),
+            $messages,
             fn (Message $message): bool => ! isset($sent[spl_object_id($message)]),
         ));
     }

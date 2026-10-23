@@ -25,6 +25,8 @@ use RuntimeException;
  */
 final class RunNotPermitted extends RuntimeException implements HasErrorCode
 {
+    private string $errorCode = 'run_not_permitted';
+
     /**
      * Shared with {@see LeaseNotExtendable::budgetExhausted()}, which refuses a
      * lease extension for exactly this reason and carries exactly this code.
@@ -34,11 +36,25 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
     #[\Override]
     public function code(): string
     {
-        return 'run_not_permitted';
+        return $this->errorCode;
     }
 
     public static function exhausted(string $reason): self
     {
         return new self("This run may not proceed: {$reason}.");
+    }
+
+    public static function callBudget(string $code): self
+    {
+        $failure = new self(match ($code) {
+            'budget_unpriced' => 'The capped provider/model needs finite, non-negative input and output prices.',
+            'budget_unbounded_output' => 'The capped call needs a positive maxOutputTokensPerCall.',
+            'budget_input_unbounded' => 'The capped call contains input without a configured token bound.',
+            'budget_compaction_unmetered' => 'Model-based compaction is not metered; disable it before using a hard cost cap.',
+            default => 'The next model call would exceed the remaining cost budget.',
+        });
+        $failure->errorCode = $code;
+
+        return $failure;
     }
 }

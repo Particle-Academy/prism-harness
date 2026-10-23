@@ -24,6 +24,7 @@ final readonly class RunBudget
         public int $maxSteps,
         public ?float $maxCostUsd = null,
         public ?int $maxSeconds = null,
+        public ?int $maxOutputTokensPerCall = null,
     ) {}
 
     /**
@@ -39,6 +40,8 @@ final readonly class RunBudget
             maxSteps: is_numeric($steps) ? (int) $steps : $defaultSteps,
             maxCostUsd: is_numeric($cost) ? (float) $cost : null,
             maxSeconds: is_numeric($seconds) ? (int) $seconds : null,
+            maxOutputTokensPerCall: isset($config['max_output_tokens_per_call']) && is_int($config['max_output_tokens_per_call'])
+                ? $config['max_output_tokens_per_call'] : null,
         );
     }
 
@@ -86,6 +89,9 @@ final readonly class RunBudget
                 $this->maxCostUsd === null ? null : $ledger->costUsd() + $this->maxCostUsd,
             ),
             maxSeconds: $seconds === null ? null : (int) ceil($seconds),
+            maxOutputTokensPerCall: $parent->maxOutputTokensPerCall === null ? $this->maxOutputTokensPerCall
+                : ($this->maxOutputTokensPerCall === null ? $parent->maxOutputTokensPerCall
+                    : min($parent->maxOutputTokensPerCall, $this->maxOutputTokensPerCall)),
         );
     }
 

@@ -32,17 +32,20 @@ final readonly class RunContext
      */
     public const MAX_DEPTH = 4;
 
+    /** @param array<string, array<string, array<string, mixed>>> $pricing Per-provider/model overrides, inherited by children. */
     public function __construct(
         public RunLedger $ledger,
         public RunBudget $budget,
         public ?string $parentRunId = null,
         public ?int $parentThreadId = null,
         public int $depth = 0,
+        public array $pricing = [],
     ) {}
 
-    public static function root(string $runId, RunBudget $budget): self
+    /** @param array<string, array<string, array<string, mixed>>> $pricing */
+    public static function root(string $runId, RunBudget $budget, array $pricing = []): self
     {
-        return new self(RunLedger::start($runId), $budget);
+        return new self(RunLedger::start($runId), $budget, pricing: $pricing);
     }
 
     public function rootRunId(): string
@@ -70,6 +73,7 @@ final readonly class RunContext
             parentRunId: $parentRunId,
             parentThreadId: $parentThreadId,
             depth: $this->depth + 1,
+            pricing: $this->pricing,
         );
     }
 

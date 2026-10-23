@@ -119,6 +119,7 @@ class PrismHarnessServiceProvider extends ServiceProvider
             // Deferred: SubagentRunner needs PrismHarness, which needs this
             // runtime. Resolved at call time, by which point both exist.
             fn (): SubagentRunner => $app->make(SubagentRunner::class),
+            $app['config']->get('prism-harness.pricing', []),
         ));
 
         $this->app->singleton(SubagentRunner::class, fn ($app): SubagentRunner => new SubagentRunner(

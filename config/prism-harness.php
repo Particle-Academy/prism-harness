@@ -221,7 +221,12 @@ return [
         'lock_wait' => (int) env('HARNESS_TASK_LOCK_WAIT', 5),
     ],
 
+    // Trusted per-provider/model prices in USD per million tokens. No model
+    // price is guessed. See README for tiers, cache rates and image/tool bounds.
+    'pricing' => [],
+
     'agent' => [
+        'max_output_tokens_per_call' => null,
         'provider' => env('HARNESS_PROVIDER', 'anthropic'),
         'model' => env('HARNESS_MODEL', 'claude-sonnet-4-5'),
         'lock_ttl' => (int) env('HARNESS_RUN_LOCK_TTL', 300),
