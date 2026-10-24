@@ -7,6 +7,7 @@ namespace Prism\Harness\Exceptions;
 use Prism\Harness\Contracts\HasErrorCode;
 use Prism\Harness\Subagents\SubagentResult;
 use RuntimeException;
+use Throwable;
 
 /**
  * Thrown when a run may not proceed — budget spent, tree cancelled, or a cost
@@ -51,9 +52,18 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
             'budget_unbounded_output' => 'The capped call needs a positive maxOutputTokensPerCall.',
             'budget_input_unbounded' => 'The capped call contains input without a configured token bound.',
             'budget_compaction_unmetered' => 'Model-based compaction is not metered; disable it before using a hard cost cap.',
+            'budget_observer_uncapped' => 'A call cost observer requires a hard cost cap.',
             default => 'The next model call would exceed the remaining cost budget.',
         });
         $failure->errorCode = $code;
+
+        return $failure;
+    }
+
+    public static function refusedByHost(Throwable $previous): self
+    {
+        $failure = new self('The host refused this model call.', 0, $previous);
+        $failure->errorCode = $previous instanceof CallRefused ? $previous->code() : 'call_refused_by_host';
 
         return $failure;
     }

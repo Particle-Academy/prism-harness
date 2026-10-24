@@ -726,6 +726,7 @@ $page = new RunContext(
     budget: (new RunBudget(12, maxCostUsd: 1.0, maxOutputTokensPerCall: 2048))
         ->nestedWithin($build->budget, $build->ledger),
     pricing: $build->pricing,
+    observer: $build->observer,
 );
 $session->send('Build this page', context: $page);
 $session->sendStructured('Describe this page', $schema, context: $page);
@@ -785,11 +786,72 @@ keeps completed earlier calls and the user's prompt, as with the existing collec
 | `budget_unbounded_output` | no positive per-call output ceiling |
 | `budget_input_unbounded` | unsupported media or missing image/tool overhead bound |
 | `budget_compaction_unmetered` | model-based summarising compaction is configured |
+| `budget_observer_uncapped` | a cost observer was supplied without a hard cap |
+| `call_refused_by_host` | an observer's admission callback threw without a valid host refusal code |
 
 `SummarisingCompaction` can bill before admission, so a capped run refuses it before
 reading the history. Free compaction remains supported; uncapped compaction is unchanged.
 Application-supplied compaction and tool callbacks are trusted extensions. Their own
 model calls or external billing outside the harness are not metered by this ledger.
+
+### Host cost reservations across workers
+
+For a durable account shared across workers, implement `Prism\Harness\Contracts\CallCostObserver`:
+
+```php
+use Prism\Harness\Contracts\CallCostObserver;
+use Prism\Harness\Exceptions\CallRefused;
+use Prism\Harness\Subagents\{CallReservation, CallSettlement, RunContext};
+
+final class AccountCosts implements CallCostObserver
+{
+    public function reserving(CallReservation $call, RunContext $run): void
+    {
+        // Atomically reserve $call->worstCaseUsd in your account, keyed by $call->callId.
+        // Throw new CallRefused('account_exhausted') if your account cannot admit it.
+    }
+
+    public function settled(CallSettlement $call, RunContext $run): void
+    {
+        // Replace that reservation with $call->chargedUsd, using the same callId.
+    }
+}
+
+$run = RunContext::root('build-'.$buildId, $budget, pricing: $prices,
+    observer: app(AccountCosts::class));
+$session->send('Build this page', context: $run);
+```
+
+The harness first admits and reserves in memory, then calls `reserving`, then makes the
+provider request. This applies to every capped text, structured and streaming call, including
+`approve`, `deny` and `decide` continuations. Approved tool results are resolved and stored
+before admission. A reservation carries a fresh 128-bit random hex `callId`, `provider`, `model`,
+`worstCaseUsd` and `kind` (`text`, `structured`, `stream`); it contains no prompt or tool content.
+
+Any throwable from `reserving` refuses the call with zero provider requests, releases the
+in-memory reservation without charging it, and does not invoke `settled`. `CallRefused` accepts
+only lowercase codes matching `[a-z][a-z0-9_]{0,63}`; the resulting `RunNotPermitted::code()`
+returns that host code. Other throwables become `call_refused_by_host`, preserving the original
+exception as the previous cause. If the host partially reserved funds before throwing, it must
+roll back its own transaction.
+
+After each admitted call the ledger settles first and `settled` fires exactly once, with
+`outcome` (`completed`, `failed`, `abandoned`), optional original `usage`, and `usageKnown`.
+`chargedUsd` is exactly this call's ledger charge: valid reported cost, token-derived cost,
+or the reserved maximum when usage cannot establish cost. `usageKnown` indicates that a usable
+cost was derived from usage. A throwing `settled` callback propagates; the ledger charge and
+completed transcript remain. Hosts should make durable settlement idempotent by `callId`.
+
+`RunContext::forChild` inherits the observer. It is also retained by the shared ledger, so a
+directly constructed child cannot drop or replace the tree's selected observer. The optional
+`prism-harness.cost_observer` config names a container-resolved observer class for contexts
+without one; an explicit per-run observer takes precedence. The shipped default is `null`.
+An observer on an uncapped run is refused as `budget_observer_uncapped` before any provider
+request. Use a hard cap even if its limit is large.
+
+Observers are trusted host code; their own model calls and billing are not metered. A killed
+worker cannot run `settled`, so hosts must expire or reconcile stale durable reservations.
+The observer does not turn the in-memory ledger into a distributed account by itself.
 
 ## Task lists
 

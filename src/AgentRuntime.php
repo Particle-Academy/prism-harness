@@ -8,6 +8,7 @@ use Closure;
 use Generator;
 use Illuminate\Support\Collection;
 use Prism\Harness\Context\SummarisingCompaction;
+use Prism\Harness\Contracts\CallCostObserver;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
@@ -65,6 +66,8 @@ final readonly class AgentRuntime
         private ?Closure $subagentRunner = null,
         /** @var array<string, mixed> */
         private array $pricing = [],
+        /** @var (Closure(): ?CallCostObserver)|null */
+        private ?Closure $costObserver = null,
     ) {}
 
     /**
@@ -145,6 +148,7 @@ final readonly class AgentRuntime
             }
 
             try {
+                $run = $this->observedRun($run);
                 $this->assertMeteredCompaction($budget);
                 // The history is read HERE, once, and handed to Prism as
                 // messages rather than as a Thread. See newMessages() for why
@@ -312,6 +316,7 @@ final readonly class AgentRuntime
             }
 
             try {
+                $run = $this->observedRun($run);
                 $this->assertMeteredCompaction($budget);
                 $history = iterator_to_array($session->thread()->messages(), false);
                 $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
@@ -460,6 +465,10 @@ final readonly class AgentRuntime
             yield from $this->streamCapped($session, $prompt, $toolNames, $context, $attachments);
 
             return;
+        }
+
+        if ($this->observerFor($context) !== null) {
+            throw RunNotPermitted::callBudget('budget_observer_uncapped');
         }
 
         // The lock is acquired and released around the generator by hand rather
@@ -611,6 +620,7 @@ final readonly class AgentRuntime
         $steps = 0;
         $awaitingApproval = false;
         try {
+            $run = $this->observedRun($run);
             $this->assertMeteredCompaction($run->budget);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
@@ -665,6 +675,26 @@ final readonly class AgentRuntime
     private function budgetedCalls(RunContext $run, string $provider, string $model): BudgetedCalls
     {
         return new BudgetedCalls(CallBudget::forRun($run, $provider, $model, $this->pricing));
+    }
+
+    private function observerFor(?RunContext $run): ?CallCostObserver
+    {
+        return $run->observer ?? $run?->ledger->inheritCostObserver(null)
+            ?? ($this->costObserver === null ? null : ($this->costObserver)());
+    }
+
+    private function observedRun(RunContext $run): RunContext
+    {
+        $observer = $this->observerFor($run);
+        if ($observer === null) {
+            return $run;
+        }
+        if ($run->budget->maxCostUsd === null) {
+            throw RunNotPermitted::callBudget('budget_observer_uncapped');
+        }
+
+        return $run->observer !== null ? $run : new RunContext($run->ledger, $run->budget,
+            $run->parentRunId, $run->parentThreadId, $run->depth, $run->pricing, $observer);
     }
 
     private function assertMeteredCompaction(RunBudget $budget): void

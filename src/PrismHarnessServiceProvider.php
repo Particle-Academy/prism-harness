@@ -12,6 +12,7 @@ use Prism\Harness\Context\KeepRecentTurns;
 use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\SummarisingCompaction;
 use Prism\Harness\Context\ToolPairGuard;
+use Prism\Harness\Contracts\CallCostObserver;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\ContextRecall;
 use Prism\Harness\Contracts\EvictionSink;
@@ -120,6 +121,21 @@ class PrismHarnessServiceProvider extends ServiceProvider
             // runtime. Resolved at call time, by which point both exist.
             fn (): SubagentRunner => $app->make(SubagentRunner::class),
             $app['config']->get('prism-harness.pricing', []),
+            function () use ($app): ?CallCostObserver {
+                $class = $app['config']->get('prism-harness.cost_observer');
+                if ($class === null) {
+                    return null;
+                }
+                if (! is_string($class) || $class === '') {
+                    throw new \InvalidArgumentException('cost_observer must name a CallCostObserver class.');
+                }
+                $observer = $app->make($class);
+                if (! $observer instanceof CallCostObserver) {
+                    throw new \InvalidArgumentException('cost_observer must implement CallCostObserver.');
+                }
+
+                return $observer;
+            },
         ));
 
         $this->app->singleton(SubagentRunner::class, fn ($app): SubagentRunner => new SubagentRunner(

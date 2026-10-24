@@ -225,6 +225,10 @@ return [
     // price is guessed. See README for tiers, cache rates and image/tool bounds.
     'pricing' => [],
 
+    // A container-resolved CallCostObserver class; a RunContext observer takes precedence.
+    // Requires a hard cost cap. The host owns durable reservation expiry after worker death.
+    'cost_observer' => null,
+
     'agent' => [
         'max_output_tokens_per_call' => null,
         'provider' => env('HARNESS_PROVIDER', 'anthropic'),

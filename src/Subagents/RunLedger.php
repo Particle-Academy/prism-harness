@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Subagents;
 
+use Prism\Harness\Contracts\CallCostObserver;
 use Prism\Harness\Exceptions\RunNotPermitted;
 
 /**
@@ -37,6 +38,8 @@ final class RunLedger
 
     private int $reservationSequence = 0;
 
+    private ?CallCostObserver $observer = null;
+
     public function __construct(
         public readonly string $rootRunId,
         private readonly float $startedAt = 0.0,
@@ -60,6 +63,17 @@ final class RunLedger
     public function reservedCostUsd(): float
     {
         return array_sum($this->reservations);
+    }
+
+    /** Once selected, the tree's observer cannot be dropped or replaced by a child context. */
+    public function inheritCostObserver(?CallCostObserver $observer): ?CallCostObserver
+    {
+        if ($this->observer !== null && $observer !== null && $observer !== $this->observer) {
+            throw new \LogicException('A run tree cannot replace its cost observer.');
+        }
+        $this->observer ??= $observer;
+
+        return $this->observer;
     }
 
     /** Admission and reservation happen together, before a provider or nested tool can spend. */
@@ -94,12 +108,29 @@ final class RunLedger
     /** Missing usage charges the proven upper bound, preserving only the unspent allowance. */
     public function settleCost(int $reservation, ?float $cost): void
     {
+        $this->chargeReservation($reservation, $cost);
+    }
+
+    /** Settle and return this call's charge, independently of other calls sharing the ledger. */
+    public function chargeReservation(int $reservation, ?float $cost): float
+    {
         if (! array_key_exists($reservation, $this->reservations)) {
             throw new \LogicException('The call reservation has already been settled.');
         }
         $cost ??= $this->reservations[$reservation];
         unset($this->reservations[$reservation]);
         $this->recordCost($cost);
+
+        return max(0.0, $cost);
+    }
+
+    /** A host veto happened before any provider request, so nothing was spent. */
+    public function releaseCost(int $reservation): void
+    {
+        if (! array_key_exists($reservation, $this->reservations)) {
+            throw new \LogicException('The call reservation has already been settled.');
+        }
+        unset($this->reservations[$reservation]);
     }
 
     public function elapsedSeconds(): float

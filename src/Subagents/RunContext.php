@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Subagents;
 
 use Prism\Harness\AgentRuntime;
+use Prism\Harness\Contracts\CallCostObserver;
 
 /**
  * Where a run sits in its tree, and what the tree has left to spend.
@@ -16,6 +17,8 @@ use Prism\Harness\AgentRuntime;
  */
 final readonly class RunContext
 {
+    public ?CallCostObserver $observer;
+
     /**
      * How deep a tree may nest.
      *
@@ -40,12 +43,15 @@ final readonly class RunContext
         public ?int $parentThreadId = null,
         public int $depth = 0,
         public array $pricing = [],
-    ) {}
+        ?CallCostObserver $observer = null,
+    ) {
+        $this->observer = $ledger->inheritCostObserver($observer);
+    }
 
     /** @param array<string, array<string, array<string, mixed>>> $pricing */
-    public static function root(string $runId, RunBudget $budget, array $pricing = []): self
+    public static function root(string $runId, RunBudget $budget, array $pricing = [], ?CallCostObserver $observer = null): self
     {
-        return new self(RunLedger::start($runId), $budget, pricing: $pricing);
+        return new self(RunLedger::start($runId), $budget, pricing: $pricing, observer: $observer);
     }
 
     public function rootRunId(): string
@@ -74,6 +80,7 @@ final readonly class RunContext
             parentThreadId: $parentThreadId,
             depth: $this->depth + 1,
             pricing: $this->pricing,
+            observer: $this->observer,
         );
     }
 
