@@ -203,7 +203,9 @@ final readonly class BudgetedCalls
                     }
                     yield $event;
                 }
-                $outcome = 'completed';
+                // Read to the end, but not ended normally: a provider error, a
+                // truncated stream, an Error/Unknown finish. Hosts label these.
+                $outcome = $final && ! $failed ? 'completed' : 'failed';
                 if ($collected === null) {
                     return;
                 }

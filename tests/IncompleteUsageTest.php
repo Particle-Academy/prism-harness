@@ -169,3 +169,29 @@ it('charges the reserved maximum when the consumer stops reading before a normal
     'at the end of a stream that reported an error' => ['StreamEndEvent', true, false],
     'at the end of a stream that finished normally' => ['StreamEndEvent', false, true],
 ]);
+
+it('charges a stream truncated without any error the reserved maximum, as a failed call', function (array $drop): void {
+    $observer = new CostObserver;
+    $run = incompleteUsageContext($observer);
+    $settled = incompleteUsageRun(incompleteSse($drop), $run);
+
+    // Core 0.134.0 ends such a stream with incomplete_stream and Error; before
+    // it, this read as a complete call charged its message_start usage.
+    expect($settled->usageKnown)->toBeFalse()
+        ->and($settled->outcome)->toBe('failed')
+        ->and($settled->chargedUsd)->toBe($observer->reservations[0]->worstCaseUsd);
+})->with([
+    'no final delta or stop' => [['message_delta', 'message_stop']],
+    'no stop' => [['message_stop']],
+]);
+
+it('reports an abnormally ended stream as failed, and a normal one as completed', function (bool $error, string $outcome): void {
+    $sse = $error
+        ? incompleteSse(['message_delta', 'message_stop'], after: [['type' => 'error', 'error' => ['type' => 'overloaded_error', 'message' => 'Overloaded']]])
+        : incompleteSse();
+
+    expect(incompleteUsageRun($sse, incompleteUsageContext(new CostObserver))->outcome)->toBe($outcome);
+})->with([
+    'a normal end' => [false, 'completed'],
+    'a provider error' => [true, 'failed'],
+]);
