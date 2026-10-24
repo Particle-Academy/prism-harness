@@ -20,7 +20,7 @@ final readonly class CallBudget
     public const MESSAGE_OVERHEAD = 64;
 
     /** @param array<string, mixed> $price */
-    private function __construct(private array $price, public int $maxOutputTokens) {}
+    private function __construct(private array $price, public int $maxOutputTokens, public bool $requiresCompleteBilling) {}
 
     /** @param array<string, mixed> $configured */
     public static function forRun(RunContext $run, string $provider, string $model, array $configured): self
@@ -30,6 +30,11 @@ final readonly class CallBudget
             throw RunNotPermitted::callBudget('budget_unpriced');
         }
         self::validateRates($price);
+        $billing = $price['billing'] ?? (strtolower($provider) === 'openrouter' ? 'reported-complete' : 'reported-or-tokens');
+        if (! in_array($billing, ['reported-complete', 'reported-or-tokens'], true)
+            || (strtolower($provider) === 'openrouter' && $billing !== 'reported-complete')) {
+            throw RunNotPermitted::callBudget('budget_unpriced');
+        }
         $multiplier = $price['multiplier'] ?? 1;
         if ((! is_int($multiplier) && ! is_float($multiplier)) || ! is_finite((float) $multiplier) || $multiplier <= 0) {
             throw RunNotPermitted::callBudget('budget_unpriced');
@@ -51,7 +56,7 @@ final readonly class CallBudget
             throw RunNotPermitted::callBudget('budget_unbounded_output');
         }
 
-        return new self($price, $maxOutput);
+        return new self($price, $maxOutput, $billing === 'reported-complete');
     }
 
     public function worstCase(TextRequest|StructuredRequest $request): float
@@ -139,13 +144,20 @@ final readonly class CallBudget
         return $total;
     }
 
-    public function costOf(?Usage $usage): ?float
+    /** @param array<string, mixed> $additionalContent */
+    public function costOf(?Usage $usage, array $additionalContent = []): ?float
     {
-        if ($usage === null) {
+        if ($usage === null || ($this->requiresCompleteBilling
+            && data_get($additionalContent, 'openrouter_billing.complete') !== true)) {
             return null;
         }
         if ($usage->cost !== null) {
             return is_finite($usage->cost) && $usage->cost >= 0 ? $usage->cost : null;
+        }
+        // Token prices cannot reconstruct separately billed router fees or
+        // missing upstream estimates. Keep the full reservation instead.
+        if ($this->requiresCompleteBilling) {
+            return null;
         }
         if (min($usage->promptTokens, $usage->completionTokens, $usage->cacheReadInputTokens ?? 0, $usage->cacheWriteInputTokens ?? 0) < 0) {
             return null;
