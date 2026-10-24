@@ -228,6 +228,9 @@ it('refuses an empty task id', function (): void {
 */
 
 it('returns an expired claim to todo and lets another worker take it', function (): void {
+    // Anchor the claim and travel to one clock; real setup time must not consume the last lease second.
+    $this->freezeTime();
+
     $tasks = taskList(lease: 300);
     $tasks->add('one', 't-1');
     $tasks->claim('worker-a');
