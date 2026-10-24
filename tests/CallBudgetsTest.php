@@ -160,18 +160,32 @@ it('allows a one-dollar page child under a ten-dollar session', function (): voi
     expect($root->ledger->costUsd())->toBe(8.04);
 });
 
-it('releases a failed request reservation and marks its unknown spend', function (): void {
+it('charges a failed capped request its reserved worst case and preserves the remaining allowance', function (string $shape): void {
     $session = callBudgetSession();
-    $run = callBudgetContext();
-    $fake = Prism::fake([TextResponseFake::make()]);
+    $run = callBudgetContext(0.23);
+    Prism::fake([TextResponseFake::make()]);
     Prism::text()->using('anthropic', 'budget-model')->withPrompt('consume')->asText();
-    expect(fn () => $session->send('go', context: $run))->toThrow(Exception::class);
-    expect($run->ledger->reservedCostUsd())->toBe(0.0)->and($run->ledger->unmeteredRuns())->toBe(1);
-});
+    expect(fn () => callBudgetRun($shape, $session, $run))->toThrow(Exception::class);
+    expect($run->ledger->reservedCostUsd())->toBe(0.0)->and($run->ledger->costUsd())->toBe(0.1)
+        ->and($run->ledger->unmeteredRuns())->toBe(0);
+
+    $fake = Prism::fake(array_merge(callBudgetResponses($shape, true, [0.04]), callBudgetResponses($shape, true, [0.04])));
+    callBudgetRun($shape, $session, $run);
+    $fake->assertCallCount(1);
+    expect($run->ledger->costUsd())->toEqualWithDelta(0.14, 0.00000001);
+    try {
+        callBudgetRun($shape, $session, $run);
+        $this->fail('The failed call must leave too little for another $0.10 reservation.');
+    } catch (RunNotPermitted $failure) {
+        expect($failure->code())->toBe('call_budget_exceeded');
+    }
+    $fake->assertCallCount(1);
+    expect($run->ledger->reservedCostUsd())->toBe(0.0)->and($run->ledger->unmeteredRuns())->toBe(0);
+})->with(['send', 'structured', 'stream']);
 
 it('releases an abandoned stream reservation with its known usage when available', function (bool $known): void {
     $session = callBudgetSession();
-    $run = callBudgetContext();
+    $run = callBudgetContext(0.23);
     Prism::fake(callBudgetResponses('send', true, [0.04]));
     $stream = $session->stream('go', context: $run);
     $stream->current();
@@ -183,8 +197,22 @@ it('releases an abandoned stream reservation with its known usage when available
     }
     unset($stream);
     expect($run->ledger->reservedCostUsd())->toBe(0.0)
-        ->and($run->ledger->costUsd())->toBe($known ? 0.04 : 0.0)
-        ->and($run->ledger->unmeteredRuns())->toBe($known ? 0 : 1);
+        ->and($run->ledger->costUsd())->toBe($known ? 0.04 : 0.1)
+        ->and($run->ledger->unmeteredRuns())->toBe(0);
+
+    $fake = Prism::fake(array_merge(callBudgetResponses('send', true, [0.04]), callBudgetResponses('send', true, [0.04])));
+    callBudgetRun('stream', $session, $run);
+    $fake->assertCallCount(1);
+    expect($run->ledger->costUsd())->toEqualWithDelta($known ? 0.08 : 0.14, 0.00000001);
+    $larger = new RunContext($run->ledger, new RunBudget(10, 0.23, maxOutputTokensPerCall: 20), pricing: $run->pricing);
+    try {
+        callBudgetRun('stream', $session, $larger);
+        $this->fail('A $0.20 reservation must not fit the remaining allowance.');
+    } catch (RunNotPermitted $failure) {
+        expect($failure->code())->toBe('call_budget_exceeded');
+    }
+    $fake->assertCallCount(1);
+    expect($run->ledger->reservedCostUsd())->toBe(0.0)->and($run->ledger->unmeteredRuns())->toBe(0);
 })->with([false, true]);
 
 it('counts a parent reservation before admitting an in-flight child', function (): void {

@@ -770,8 +770,10 @@ After each call, the provider-reported `usage->cost` is authoritative when suppl
 otherwise the ledger charges ordinary input, cache reads/writes and output at that
 call's configured tier and multiplier. Reasoning tokens are already included in
 completion tokens. On failure or stream abandonment, the reservation is released and
-known usage charged. Unknown spend is recorded separately and prevents further capped
-spending. Consume a stream in full to persist its completed messages; abandoning it
+known usage charged. If usage is unavailable, the ledger charges the reserved worst
+case and subsequent calls may use the remaining allowance. Legacy whole-run accounting
+without a reservation still records unknown spend separately and prevents further
+capped spending. Consume a stream in full to persist its completed messages; abandoning it
 keeps completed earlier calls and the user's prompt, as with the existing collector.
 
 `RunNotPermitted::code()` distinguishes these refusals:

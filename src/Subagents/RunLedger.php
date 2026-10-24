@@ -91,12 +91,13 @@ final class RunLedger
         }
     }
 
-    /** Null records unknown spend, so a failed/abandoned request cannot reopen the same allowance. */
+    /** Missing usage charges the proven upper bound, preserving only the unspent allowance. */
     public function settleCost(int $reservation, ?float $cost): void
     {
         if (! array_key_exists($reservation, $this->reservations)) {
             throw new \LogicException('The call reservation has already been settled.');
         }
+        $cost ??= $this->reservations[$reservation];
         unset($this->reservations[$reservation]);
         $this->recordCost($cost);
     }
