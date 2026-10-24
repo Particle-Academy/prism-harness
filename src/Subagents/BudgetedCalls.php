@@ -195,6 +195,12 @@ final readonly class BudgetedCalls
                         && in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true))) {
                         $failed = true;
                     }
+                    // A stream end without usage is core saying the call's total is
+                    // unknown (no final usage arrived). An earlier step's partial
+                    // usage is evidence, not the cost: never price it.
+                    if ($event instanceof StreamEndEvent && $event->usage === null) {
+                        $failed = true;
+                    }
                     if ($event instanceof StreamEndEvent) {
                         $final = ! $failed;
                     }

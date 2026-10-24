@@ -195,3 +195,18 @@ it('reports an abnormally ended stream as failed, and a normal one as completed'
     'a normal end' => [false, 'completed'],
     'a provider error' => [true, 'failed'],
 ]);
+
+it('charges the reserved maximum, as failed, when the stream stopped but never sent its final usage', function (): void {
+    // Reported by fancy against core 0.134.0 + harness 0.16.0: message_stop
+    // arrives but the message_delta with the final output_tokens does not.
+    // Core ends with Stop and null usage; the step's partial usage (input,
+    // no output) must not be priced as the call's cost.
+    $observer = new CostObserver;
+    $run = incompleteUsageContext($observer);
+    $settled = incompleteUsageRun(incompleteSse(['message_delta']), $run);
+
+    expect($settled->usageKnown)->toBeFalse()
+        ->and($settled->outcome)->toBe('failed')
+        ->and($settled->chargedUsd)->toBe($observer->reservations[0]->worstCaseUsd)
+        ->and($run->ledger->costUsd())->toBe($observer->reservations[0]->worstCaseUsd);
+});
