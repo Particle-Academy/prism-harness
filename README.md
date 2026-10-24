@@ -767,7 +767,24 @@ its threshold. The multiplier applies to every token-priced category. For exampl
 ]],
 ```
 
-After each call, the provider-reported `usage->cost` is authoritative when supplied;
+OpenRouter pricing uses `'billing' => 'reported-complete'` by default; set that flag
+explicitly when configuring its models. A finite nonnegative reported cost is trusted
+only when `additionalContent['openrouter_billing']['complete'] === true`. Incomplete
+evidence or a missing total charges the reserved maximum, with no token-price fallback.
+An explicitly complete zero total remains free. This requires Prism core 0.135.0 or later,
+which includes the router charge and reported BYOK upstream estimate in the call total.
+Configure conservative rates, bounds and any multiplier to cover router fees as well as
+inference; the harness does not discover or guess those prices. Other providers may opt
+into the same evidence policy with the flag. Unknown modes and an attempt to disable it
+for OpenRouter are refused as `budget_unpriced`.
+
+For streaming calls this policy requires exactly one complete `StepFinishEvent` PHP
+object and a final `StreamEndEvent` with valid total usage, because each capped request
+uses `maxSteps(1)`. The facts are read before serialization and are absent from SSE.
+Missing or duplicate finishes retain the full reservation. A normally completed call
+with incomplete accounting still has `outcome: completed` and `usageKnown: false`.
+
+For other pricing policies, the provider-reported `usage->cost` is authoritative when supplied;
 otherwise the ledger charges ordinary input, cache reads/writes and output at that
 call's configured tier and multiplier. Reasoning tokens are already included in
 completion tokens. On failure or stream abandonment, the reservation is released and

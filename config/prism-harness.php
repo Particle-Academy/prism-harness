@@ -223,6 +223,7 @@ return [
 
     // Trusted per-provider/model prices in USD per million tokens. No model
     // price is guessed. See README for tiers, cache rates and image/tool bounds.
+    // OpenRouter requires complete reported billing; its prices must also bound router fees.
     'pricing' => [],
 
     // A container-resolved CallCostObserver class; a RunContext observer takes precedence.

@@ -53,11 +53,13 @@ final readonly class BudgetedCalls
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'text');
                 $usage = null;
+                $billing = [];
                 $outcome = 'failed';
                 try {
                     $run->ledger->recordSteps(1);
                     $response = $generation->asText();
                     $usage = $response->usage;
+                    $billing = $response->additionalContent;
                     $outcome = 'completed';
                     // Prism::fake may omit steps. Real handlers supply one per call.
                     if ($response->steps->isEmpty()) {
@@ -72,7 +74,7 @@ final readonly class BudgetedCalls
                     $combined = $builder->toResponse();
                     $generation->withMessages($combined->messages->all());
                 } finally {
-                    $this->settle($run, $reservation, $call, $usage, $outcome);
+                    $this->settle($run, $reservation, $call, $usage, $outcome, additionalContent: $billing);
                 }
             } while ($this->continues($response->finishReason, $response->toolCalls, $response->toolResults)
                 && $run->ledger->steps() < $run->budget->maxSteps);
@@ -100,11 +102,13 @@ final readonly class BudgetedCalls
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'structured');
                 $usage = null;
+                $billing = [];
                 $outcome = 'failed';
                 try {
                     $run->ledger->recordSteps(1);
                     $response = $generation->asStructured();
                     $usage = $response->usage;
+                    $billing = $response->additionalContent;
                     $outcome = 'completed';
                     if ($response->steps->isEmpty()) {
                         $messages = [...$request->messages(), new AssistantMessage($response->text, $response->toolCalls, $response->additionalContent)];
@@ -138,7 +142,7 @@ final readonly class BudgetedCalls
                         $generation->withMessages(array_values($messages));
                     }
                 } finally {
-                    $this->settle($run, $reservation, $call, $usage, $outcome);
+                    $this->settle($run, $reservation, $call, $usage, $outcome, additionalContent: $billing);
                 }
             } while ($this->continues($response->finishReason, $response->toolCalls, $response->toolResults)
                 && $run->ledger->steps() < $run->budget->maxSteps);
@@ -169,6 +173,9 @@ final readonly class BudgetedCalls
             $request = $generation->toRequest();
             [$reservation, $call] = $this->reserve($run, $request, 'stream');
             $usage = null;
+            $billing = [];
+            $billingSteps = 0;
+            $billingEnds = 0;
             $outcome = 'abandoned';
             $collected = null;
             $approvals = [];
@@ -184,7 +191,14 @@ final readonly class BudgetedCalls
                         $collected = ['messages' => $messages->all(), 'response' => $response];
                     });
                 foreach ($collector->collect() as $event) {
-                    if (($event instanceof StepFinishEvent || $event instanceof StreamEndEvent) && $event->usage !== null) {
+                    if ($event instanceof StepFinishEvent) {
+                        $billingSteps++;
+                        $billing = $event->additionalContent;
+                    }
+                    if ($event instanceof StreamEndEvent) {
+                        $billingEnds++;
+                    }
+                    if (($event instanceof StreamEndEvent || ($event instanceof StepFinishEvent && ! $this->price->requiresCompleteBilling)) && $event->usage !== null) {
                         $usage = $event->usage;
                     }
                     // Older cores mark a provider error recoverable and still end
@@ -236,7 +250,11 @@ final readonly class BudgetedCalls
             } finally {
                 // Anything short of a normal end may have generated output its
                 // reported usage does not cover: charge the reserved maximum.
-                $this->settle($run, $reservation, $call, $usage, $outcome, trusted: $final && ! $failed);
+                // Every capped request uses maxSteps(1). One StepFinish owns
+                // the provenance; only StreamEnd supplies the final total.
+                $billingComplete = ! $this->price->requiresCompleteBilling || ($billingSteps === 1 && $billingEnds === 1);
+                $this->settle($run, $reservation, $call, $usage, $outcome, trusted: $final && ! $failed && $billingComplete,
+                    additionalContent: $billing);
             }
         } while ($approvals === [] && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
             && $run->ledger->steps() < $run->budget->maxSteps);
@@ -261,11 +279,15 @@ final readonly class BudgetedCalls
         return [$reservation, $call];
     }
 
-    /** @param 'completed'|'failed'|'abandoned' $outcome */
-    /** An untrusted usage is still reported to the observer, but never priced. */
-    private function settle(RunContext $run, int $reservation, CallReservation $call, ?Usage $usage, string $outcome, bool $trusted = true): void
+    /**
+     * An untrusted usage is still reported to the observer, but never priced.
+     *
+     * @param  'completed'|'failed'|'abandoned'  $outcome
+     * @param  array<string, mixed>  $additionalContent
+     */
+    private function settle(RunContext $run, int $reservation, CallReservation $call, ?Usage $usage, string $outcome, bool $trusted = true, array $additionalContent = []): void
     {
-        $cost = $trusted ? $this->price->costOf($usage) : null;
+        $cost = $trusted ? $this->price->costOf($usage, $additionalContent) : null;
         $charged = $run->ledger->chargeReservation($reservation, $cost);
         $run->observer?->settled(new CallSettlement($call->callId, $charged, $cost !== null, $usage, $outcome), $run);
     }
