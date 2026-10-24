@@ -10,6 +10,7 @@ use Illuminate\Support\Collection;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\FinishReason;
+use Prism\Prism\Streaming\Events\ErrorEvent;
 use Prism\Prism\Streaming\Events\StepFinishEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
@@ -171,6 +172,11 @@ final readonly class BudgetedCalls
             $outcome = 'abandoned';
             $collected = null;
             $approvals = [];
+            // Reported usage is only final once the stream has ENDED normally
+            // with no error along the way. Decided in `finally`, so a consumer
+            // that stops reading early, or an exception, cannot skip it.
+            $final = false;
+            $failed = false;
             try {
                 $run->ledger->recordSteps(1);
                 $collector = new StreamCollector($generation->asStream(), null,
@@ -180,6 +186,17 @@ final readonly class BudgetedCalls
                 foreach ($collector->collect() as $event) {
                     if (($event instanceof StepFinishEvent || $event instanceof StreamEndEvent) && $event->usage !== null) {
                         $usage = $event->usage;
+                    }
+                    // Older cores mark a provider error recoverable and still end
+                    // with Stop, so the error event itself is the evidence.
+                    // StepFinishEvent has no finish reason before core 0.132, so
+                    // the stream's end carries the verdict on every core.
+                    if ($event instanceof ErrorEvent || ($event instanceof StreamEndEvent
+                        && in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true))) {
+                        $failed = true;
+                    }
+                    if ($event instanceof StreamEndEvent) {
+                        $final = ! $failed;
                     }
                     if ($event instanceof ToolApprovalRequestEvent) {
                         $approvals[] = new ToolApprovalRequest($event->approvalId, $event->toolCall->id);
@@ -209,7 +226,9 @@ final readonly class BudgetedCalls
                 $outcome = 'failed';
                 throw $failure;
             } finally {
-                $this->settle($run, $reservation, $call, $usage, $outcome);
+                // Anything short of a normal end may have generated output its
+                // reported usage does not cover: charge the reserved maximum.
+                $this->settle($run, $reservation, $call, $usage, $outcome, trusted: $final && ! $failed);
             }
         } while ($approvals === [] && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
             && $run->ledger->steps() < $run->budget->maxSteps);
@@ -235,9 +254,10 @@ final readonly class BudgetedCalls
     }
 
     /** @param 'completed'|'failed'|'abandoned' $outcome */
-    private function settle(RunContext $run, int $reservation, CallReservation $call, ?Usage $usage, string $outcome): void
+    /** An untrusted usage is still reported to the observer, but never priced. */
+    private function settle(RunContext $run, int $reservation, CallReservation $call, ?Usage $usage, string $outcome, bool $trusted = true): void
     {
-        $cost = $this->price->costOf($usage);
+        $cost = $trusted ? $this->price->costOf($usage) : null;
         $charged = $run->ledger->chargeReservation($reservation, $cost);
         $run->observer?->settled(new CallSettlement($call->callId, $charged, $cost !== null, $usage, $outcome), $run);
     }

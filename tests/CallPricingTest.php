@@ -108,7 +108,8 @@ it('applies a price multiplier to both worst-case admission and token-derived co
     $price = CallBudget::forRun($run, 'anthropic', 'budget-model', []);
     $request = Prism::text()->using('anthropic', 'budget-model')->withPrompt('go')->toRequest();
     expect($price->worstCase($request))->toEqualWithDelta(0.11, 1e-12)
-        ->and($price->costOf(new Usage(0, 10)))->toEqualWithDelta(0.11, 1e-12)
+        // One input token at a zero input rate: usage with no input at all is unknown.
+        ->and($price->costOf(new Usage(1, 10)))->toEqualWithDelta(0.11, 1e-12)
         // Provider-reported total already includes its pricing/multipliers.
         ->and($price->costOf(new Usage(0, 10, cost: 0.08)))->toBe(0.08);
     $fake = Prism::fake([TextResponseFake::make()]);

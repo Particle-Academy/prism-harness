@@ -150,6 +150,12 @@ final readonly class CallBudget
         if (min($usage->promptTokens, $usage->completionTokens, $usage->cacheReadInputTokens ?? 0, $usage->cacheWriteInputTokens ?? 0) < 0) {
             return null;
         }
+        // A real call always reads input. No input tokens and no reported cost
+        // is a placeholder (core's stream fallback is `new Usage(0, 0)`), not a
+        // free call, so it is unknown and charged the reserved maximum.
+        if ($usage->promptTokens + ($usage->cacheWriteInputTokens ?? 0) + ($usage->cacheReadInputTokens ?? 0) < 1) {
+            return null;
+        }
         // Cache counters are separate from ordinary prompt tokens in Prism's
         // usage contract. Thinking is already part of completionTokens.
         $rates = $this->ratesAt($usage->promptTokens + ($usage->cacheWriteInputTokens ?? 0) + ($usage->cacheReadInputTokens ?? 0));
