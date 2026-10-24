@@ -843,7 +843,9 @@ After each admitted call the ledger settles first and `settled` fires exactly on
 `completed` is a call that ended normally. `failed` is a provider exception, or a stream that
 was read to its end but did not end normally: an error event, a truncated stream (reported by
 Prism core 0.134.0 and later as `incomplete_stream`), or an `Error`/`Unknown` finish.
-`abandoned` is a stream the consumer stopped reading before its end.
+`abandoned` is a stream the consumer stopped reading before its end. Either way the charge is
+the reserved maximum, but only `failed` says the provider failed: if your code throws as soon
+as it sees an `ErrorEvent`, keep reading the stream to its end first, then throw.
 `chargedUsd` is exactly this call's ledger charge: valid reported cost, token-derived cost,
 or the reserved maximum when usage cannot establish cost. `usageKnown` indicates that a usable
 cost was derived from usage. A throwing `settled` callback propagates; the ledger charge and
