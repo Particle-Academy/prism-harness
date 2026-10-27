@@ -393,6 +393,17 @@ and — where a schema closes itself — keys nobody declared. It does not read
 `$ref`, `allOf`, `oneOf` or the numeric and string facets; what it cannot read,
 it passes, rather than reporting a constraint it did not actually check.
 
+## Failed model steps
+
+An `Error` or `Unknown` finish marks the run failed. In a cost-capped stream,
+an error event or missing final usage also ends the run: no further model call
+is made, and unanswered tools are recorded as refused. Pending approvals from
+that failed step cannot execute on a later `approve()`.
+
+A run whose provider step failed now ends with `FinishReason::Error` or
+`FinishReason::Unknown` instead of `Stop`; pending approvals from that step are
+refused. Raw provider stream events and existing cost settlement remain available.
+
 ## Attachments
 
 A turn can carry media alongside its prompt, on `send()` and `stream()` alike:

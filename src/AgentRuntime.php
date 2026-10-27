@@ -33,6 +33,7 @@ use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
+use Prism\Prism\Streaming\Events\ErrorEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\StreamCollector;
@@ -187,7 +188,12 @@ final readonly class AgentRuntime
                 if ($budget->maxCostUsd === null) {
                     $session->thread()->record($this->newMessages($response, $history), $runId);
                 }
-                $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
+                $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
+                if ($failed) {
+                    $session->failRun($runId, $response->finishReason->value);
+                } else {
+                    $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
+                }
 
                 // Charged AFTER the run, to the tree's shared account. A child
                 // spending here is what makes the parent's remaining budget
@@ -205,19 +211,24 @@ final readonly class AgentRuntime
                     rootRunId: $run->rootRunId(),
                 );
 
-                event(new RunFinished(
-                    sessionKey: $session->key(),
-                    runId: $runId,
-                    finishReason: $response->finishReason->value,
-                    steps: count($response->steps),
-                    // Surfaced on the event, not left for a listener to infer
-                    // from the finish reason: a paused run is what an
-                    // application has to put in front of a person, and it is
-                    // the one end state that needs someone to act.
-                    awaitingApproval: $agentResponse->awaitingApproval(),
-                    parentRunId: $run->parentRunId,
-                    rootRunId: $run->rootRunId(),
-                ));
+                if ($failed) {
+                    event(new RunFailed($session->key(), $runId, $response->finishReason->value,
+                        $run->parentRunId, $run->rootRunId()));
+                } else {
+                    event(new RunFinished(
+                        sessionKey: $session->key(),
+                        runId: $runId,
+                        finishReason: $response->finishReason->value,
+                        steps: count($response->steps),
+                        // Surfaced on the event, not left for a listener to infer
+                        // from the finish reason: a paused run is what an
+                        // application has to put in front of a person, and it is
+                        // the one end state that needs someone to act.
+                        awaitingApproval: $agentResponse->awaitingApproval(),
+                        parentRunId: $run->parentRunId,
+                        rootRunId: $run->rootRunId(),
+                    ));
+                }
 
                 return $agentResponse;
             } catch (Throwable $failure) {
@@ -363,24 +374,34 @@ final readonly class AgentRuntime
                     throw $violation;
                 }
 
-                $session->completeRun($runId, $response->finishReason->value, $this->structuredToolCallNames($response));
+                $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
+                if ($failed) {
+                    $session->failRun($runId, $response->finishReason->value);
+                } else {
+                    $session->completeRun($runId, $response->finishReason->value, $this->structuredToolCallNames($response));
+                }
 
                 if ($budget->maxCostUsd === null) {
                     $run->ledger->recordSteps(count($response->steps));
                     $run->ledger->recordCost($response->usage->cost);
                 }
 
-                event(new RunFinished(
-                    sessionKey: $session->key(),
-                    runId: $runId,
-                    finishReason: $response->finishReason->value,
-                    steps: count($response->steps),
-                    // A structured run returns a document or raises, so it has
-                    // no state in which somebody has to decide something.
-                    awaitingApproval: false,
-                    parentRunId: $run->parentRunId,
-                    rootRunId: $run->rootRunId(),
-                ));
+                if ($failed) {
+                    event(new RunFailed($session->key(), $runId, $response->finishReason->value,
+                        $run->parentRunId, $run->rootRunId()));
+                } else {
+                    event(new RunFinished(
+                        sessionKey: $session->key(),
+                        runId: $runId,
+                        finishReason: $response->finishReason->value,
+                        steps: count($response->steps),
+                        // A structured run returns a document or raises, so it has
+                        // no state in which somebody has to decide something.
+                        awaitingApproval: false,
+                        parentRunId: $run->parentRunId,
+                        rootRunId: $run->rootRunId(),
+                    ));
+                }
 
                 return new StructuredAgentResponse(
                     runId: $runId,
@@ -552,8 +573,12 @@ final readonly class AgentRuntime
             );
 
             foreach ($collector->collect() as $event) {
-                if ($event instanceof StreamEndEvent) {
-                    $finishReason = $event->finishReason;
+                if ($event instanceof ErrorEvent) {
+                    $finishReason = FinishReason::Error;
+                } elseif ($event instanceof StreamEndEvent && $finishReason !== FinishReason::Error) {
+                    $finishReason = $event->finishReason === FinishReason::Error
+                        ? FinishReason::Error
+                        : ($event->usage === null ? FinishReason::Unknown : $event->finishReason);
                 }
 
                 yield $event;
@@ -582,15 +607,19 @@ final readonly class AgentRuntime
                 $messages = [new UserMessage($prompt, $attachments), ...($collected['messages'] ?? [])];
 
                 $session->thread()->record($messages, $runId);
-                $session->completeRun($runId, $finishReason->value);
-
-                event(new RunFinished(
-                    sessionKey: $session->key(),
-                    runId: $runId,
-                    finishReason: $finishReason->value,
-                    steps: count($collected['response']->steps ?? []),
-                    awaitingApproval: false,
-                ));
+                if (in_array($finishReason, [FinishReason::Error, FinishReason::Unknown], true)) {
+                    $session->failRun($runId, $finishReason->value);
+                    event(new RunFailed($session->key(), $runId, $finishReason->value));
+                } else {
+                    $session->completeRun($runId, $finishReason->value);
+                    event(new RunFinished(
+                        sessionKey: $session->key(),
+                        runId: $runId,
+                        finishReason: $finishReason->value,
+                        steps: count($collected['response']->steps ?? []),
+                        awaitingApproval: false,
+                    ));
+                }
             }
         }
     }
@@ -665,9 +694,14 @@ final readonly class AgentRuntime
                 if (! $recorded && $prompt !== '') {
                     $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
                 }
-                $session->completeRun($runId, $finish->value);
-                event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
-                    $run->parentRunId, $run->rootRunId()));
+                if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
+                    $session->failRun($runId, $finish->value);
+                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId()));
+                } else {
+                    $session->completeRun($runId, $finish->value);
+                    event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
+                        $run->parentRunId, $run->rootRunId()));
+                }
             }
         }
     }
