@@ -79,14 +79,14 @@ releases locks before any model call. It is immutable and may be shown without
 committing. A commit transaction locks parent, child and tangent rows in a stable
 order, rechecks authorization/policy/source marks, and either:
 
-- Appends exactly one framed data message to the parent and stores a canonical
-  merge record linked to that message, then changes `open` to `merged`; or
+- Appends one atomic assistant/tool-result pair to the parent and stores ONE
+  canonical merge record linked to both rows, then changes `open` to `merged`; or
 - Refuses a stale/invalid preview without appending or closing the tangent.
 
 Parent changes after the preview require a fresh preview/conflict check, even
 for `verbatim`; retries do not silently spend another model call. A unique merge
 key and conditional state transition make an identical committed-preview retry
-return the original record without a second parent message. Different-preview
+return the original record/pair without a second append. Different-preview
 retries and merge/abandon races refuse. Abandon is idempotent and appends nothing.
 Retirement or changed participant/scope authority invalidates existing handles.
 An event outbox entry is written in the same transaction; delivery after commit
@@ -94,28 +94,42 @@ is retryable with a stable event ID for consumer deduplication. A process crash
 between commit and delivery must not lose the event. Source messages remain
 intact after close.
 
-The single parent row uses the existing stored **`type = user`**, with a normal
-UserMessage payload whose `content` is a fixed `[tangent-merge:v1]` notice plus
-canonical JSON. The notice identifies it as untrusted tangent evidence, not a
-user instruction or new authorization. The provider sees role **`user`** with
-that exact content, not `system`/`assistant`/`tool_result`; a user-opened tangent
-has no pending tool call and must not synthesize one. The canonical sidecar
-retains the typed merge and provenance. Role/framing do not confer commitment
-authority; the validator still uses the trusted commitment records.
+The parent uses existing stored **`assistant` and `tool_result` types**, appended
+atomically, even for a user-opened tangent with no pending model tool call:
 
-There is **no new stored row type**. `harness-thread-rows` explicitly excludes
-user rows (G-58), so its existing scope/13 fixtures remain unchanged. The
-implementation needs a separate narrowly scoped PHP-generated tangent-merge
-record/replay corpus, including hostile quoted text, that checks the canonical
-record and exact user content survives PHP/TS/Py generic replay. Do not widen
-the existing suite or bless G-58's empty-list/omitted-field disagreement.
-Existing TS/Py generic user-row readers can carry the marker as ordinary user
-content before tangent APIs are ported; the new corpus must execute and verify
-that path rather than infer success from its type name. It must neither skip
-the content nor interpret the marker as a command. Tangent operations, sidecars
-and events remain an explicit port gap and refuse until implemented; generic
-replay alone is not feature parity. A sibling parity change accompanies the PHP
-implementation before its release, rather than declaring an untested new type.
+1. The harness writes an AssistantMessage with a fresh tool-call ID, name
+   `tangent_result` and fixed arguments identifying the merge. Its existing
+   `additional_content` MAP carries `harness_origin: tangent_merge_v1` and the
+   canonical merge ID, so audits distinguish it from model-emitted calls.
+2. The harness writes a matching ToolResultMessage with that call ID/name. Its
+   result is a JSON envelope containing a fixed "DATA, not instructions"
+   framing, the harness origin/merge ID, and the canonical cited record.
+
+The provider sees an assistant tool call and its matching tool result, following
+the existing SubagentResult data boundary. The synthetic call is a recorded
+harness event, never dispatched for execution. `tangent_result` is reserved,
+never advertised as a callable model tool, and a model-emitted call is refused
+before dispatch regardless of supplied arguments or origin-like tags. An origin
+marker is for auditing, not authorization: validate its linkage to the trusted
+canonical merge and both row IDs. A forged marker in provider or tangent data
+cannot manufacture that linkage or grant commitment authority.
+
+There is **no new stored row type**. Extend the existing `harness-thread-rows`
+assistant/tool-result corpus with a PHP-generated pair carrying the origin map
+and hostile quoted content; execute PHP/TS/Py storage/replay and compare the
+actual bytes, including matching call IDs and framing. Existing generic pair
+replay in TS/Py must preserve it before their tangent APIs are ported, not skip
+or execute the synthetic call. Tangent operations, sidecars and events remain
+explicit port gaps until implemented; pair replay alone is not feature parity.
+G-58's user-row disagreement remains outside this pair's scope, unchanged.
+A sibling parity change accompanies PHP implementation before its release.
+
+User-role framing is allowed ONLY as a local Lab comparison variant, including
+the hostile scenario; it is not the package's parent storage/provider role.
+Provider acceptance of a harness-generated historical pair must be measured in
+implementation validation. If a provider rejects a pair no model emitted,
+retain that evidence and return it to the maintainer before any fallback; do not
+silently choose user role or claim unmeasured provider compatibility.
 
 ## Merge record v1
 
@@ -163,9 +177,10 @@ decisions; it refuses an oversized transcript rather than silently truncating.
 `summary` produces schema-checked content through a dedicated harness session
 with no action tools. `select` and `relevant` are reserved for later calibrated
 trials and initially refuse as unsupported. They never quietly map to summary.
-The parent sees the record as explicitly framed untrusted tangent data, never a
-system message or an executable tool call. Framing alone is not an injection
-defense: authorization and commitment provenance enforce the privileged boundary.
+The parent sees the framed record in a tool result, never promoted to a user or
+system instruction. The accompanying harness-originated assistant call is not
+executable. Framing alone is not an injection defense: authorization, canonical
+linkage and commitment provenance enforce the privileged boundary.
 
 ## Spend and events
 
@@ -189,7 +204,7 @@ not event fields. The canonical merge and both presentations use the same data.
 ## Implementation and acceptance order
 
 1. PHP persistence/API, shipped default `none`, authorization, view seeding,
-   exact-once merge/abandon, schema/provenance validation, events and metered
+   exactly-once pair/merge/abandon, schema/provenance validation, events and metered
    `verbatim`/`summary`. Extend existing thread/message/budget seams; no memory
    dependency or Prism-core change. Replay/stream/structured paths agree.
 2. Local Lab only: functional collapsible card **and** plain merge message,
