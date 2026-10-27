@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Proposed canonical tangent merge record v1 (not implemented)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "merge_id", "tangent_id", "parent_thread_id", "tangent_thread_id", "fork_position", "parent_observed_position", "tangent_end_position", "strategy", "strategy_version", "run_id", "root_run_id", "findings", "decisions", "rejected", "open_questions", "conflicts", "omissions"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "merge_id": { "$ref": "#/$defs/id" },
+    "tangent_id": { "$ref": "#/$defs/id" },
+    "parent_thread_id": { "type": "integer", "minimum": 1 },
+    "tangent_thread_id": { "type": "integer", "minimum": 1 },
+    "fork_position": { "type": "integer", "minimum": 0 },
+    "parent_observed_position": { "type": "integer", "minimum": 0 },
+    "tangent_end_position": { "type": "integer", "minimum": 0 },
+    "strategy": { "enum": ["verbatim", "summary", "select", "relevant"] },
+    "strategy_version": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "run_id": { "$ref": "#/$defs/id" },
+    "root_run_id": { "$ref": "#/$defs/id" },
+    "findings": { "$ref": "#/$defs/claims" },
+    "rejected": { "$ref": "#/$defs/claims" },
+    "open_questions": { "$ref": "#/$defs/claims" },
+    "decisions": {
+      "type": "array", "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["commitment_id", "actor", "text", "citations"],
+        "properties": {
+          "commitment_id": { "$ref": "#/$defs/id" },
+          "actor": { "enum": ["user", "agent"] },
+          "text": { "$ref": "#/$defs/text" },
+          "citations": { "$ref": "#/$defs/citations" }
+        }
+      }
+    },
+    "conflicts": {
+      "type": "array", "maxItems": 64,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["text", "citations", "parent_positions"],
+        "properties": {
+          "text": { "$ref": "#/$defs/text" },
+          "citations": { "$ref": "#/$defs/citations" },
+          "parent_positions": { "$ref": "#/$defs/citations" }
+        }
+      }
+    },
+    "omissions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["uncited_items_dropped"],
+      "properties": { "uncited_items_dropped": { "type": "integer", "minimum": 0, "maximum": 1024 } }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+    "text": { "type": "string", "minLength": 1, "maxLength": 8192 },
+    "citations": {
+      "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "claims": {
+      "type": "array", "maxItems": 128,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["text", "citations"],
+        "properties": { "text": { "$ref": "#/$defs/text" }, "citations": { "$ref": "#/$defs/citations" } }
+      }
+    }
+  }
+}
