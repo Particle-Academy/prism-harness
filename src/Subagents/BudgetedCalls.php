@@ -184,6 +184,7 @@ final readonly class BudgetedCalls
             // that stops reading early, or an exception, cannot skip it.
             $final = false;
             $failed = false;
+            $failureFinish = null;
             try {
                 $run->ledger->recordSteps(1);
                 $collector = new StreamCollector($generation->asStream(), null,
@@ -208,12 +209,18 @@ final readonly class BudgetedCalls
                     if ($event instanceof ErrorEvent || ($event instanceof StreamEndEvent
                         && in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true))) {
                         $failed = true;
+                        if ($event instanceof ErrorEvent) {
+                            $failureFinish = FinishReason::Error;
+                        } elseif ($failureFinish !== FinishReason::Error) {
+                            $failureFinish = $event->finishReason;
+                        }
                     }
                     // A stream end without usage is core saying the call's total is
                     // unknown (no final usage arrived). An earlier step's partial
                     // usage is evidence, not the cost: never price it.
                     if ($event instanceof StreamEndEvent && $event->usage === null) {
                         $failed = true;
+                        $failureFinish ??= FinishReason::Unknown;
                     }
                     if ($event instanceof StreamEndEvent) {
                         $final = ! $failed;
@@ -230,6 +237,11 @@ final readonly class BudgetedCalls
                     return;
                 }
                 $messages = $collected['messages'];
+                $response = $collected['response'];
+                if ($failed || ! $final) {
+                    $approvals = [];
+                    [$messages, $response] = $this->refuseFailedStream($messages, $response, $failureFinish ?? FinishReason::Unknown);
+                }
                 // Core's collector does not retain approval events on messages.
                 // Preserve those IDs without rebuilding its text/tool transcript.
                 if ($approvals !== []) {
@@ -241,7 +253,6 @@ final readonly class BudgetedCalls
                         }
                     }
                 }
-                $response = $collected['response'];
                 $record($messages, $response);
                 $generation->withMessages([...$request->messages(), ...$messages]);
             } catch (Throwable $failure) {
@@ -256,8 +267,43 @@ final readonly class BudgetedCalls
                 $this->settle($run, $reservation, $call, $usage, $outcome, trusted: $final && ! $failed && $billingComplete,
                     additionalContent: $billing);
             }
-        } while ($approvals === [] && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
+        } while ($final && ! $failed && $approvals === [] && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
             && $run->ledger->steps() < $run->budget->maxSteps);
+    }
+
+    /**
+     * @param  list<Message>  $messages
+     * @return array{list<Message>, TextResponse}
+     */
+    private function refuseFailedStream(array $messages, TextResponse $response, FinishReason $finish): array
+    {
+        foreach ($messages as $index => $message) {
+            if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== []) {
+                $clean = new AssistantMessage($message->content, $message->toolCalls, $message->additionalContent);
+                /** @var array<string, mixed> $options */
+                $options = $message->providerOptions();
+                $clean->withProviderOptions($options);
+                if (($stability = $message->cacheStability()) !== null) {
+                    $clean->withCacheHint($stability, $message->cacheTtl());
+                }
+                $messages[$index] = $clean;
+            }
+        }
+        $answered = array_fill_keys(array_map(fn (ToolResult $result): string => $result->toolCallId, $response->toolResults), true);
+        $refused = [];
+        foreach ($response->toolCalls as $call) {
+            if (! isset($answered[$call->id])) {
+                $refused[] = new ToolResult($call->id, $call->name, $call->arguments(),
+                    'Not run: model step failed ('.$finish->value.').', $call->resultId);
+            }
+        }
+        if ($refused !== []) {
+            $messages[] = new ToolResultMessage($refused);
+        }
+
+        return [$messages, new TextResponse($response->steps, $response->text, $finish,
+            $response->toolCalls, [...$response->toolResults, ...$refused], $response->usage,
+            $response->meta, collect($messages), $response->additionalContent, $response->raw)];
     }
 
     /** @param 'text'|'structured'|'stream' $kind
