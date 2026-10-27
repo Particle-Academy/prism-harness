@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Subagents;
 
+use Closure;
 use Prism\Harness\Contracts\CallCostObserver;
+use Prism\Harness\Contracts\RunLedgerStore;
 use Prism\Harness\Exceptions\RunNotPermitted;
 
 /**
@@ -40,6 +42,12 @@ final class RunLedger
 
     private ?CallCostObserver $observer = null;
 
+    private ?string $observerType = null;
+
+    private ?RunLedgerStore $store = null;
+
+    private bool $synchronizing = false;
+
     public function __construct(
         public readonly string $rootRunId,
         private readonly float $startedAt = 0.0,
@@ -50,28 +58,84 @@ final class RunLedger
         return new self($rootRunId, microtime(true));
     }
 
+    /** Attach once. Duplicate root creation refuses instead of resetting spend. */
+    public function persistUsing(RunLedgerStore $store): self
+    {
+        if ($this->store !== null) {
+            if ($this->store !== $store) {
+                throw new \LogicException('A run tree cannot replace its durable ledger store.');
+            }
+
+            return $this;
+        }
+        if (! preg_match('/\A[A-Za-z0-9_-]{1,128}\z/D', $this->rootRunId)) {
+            throw new \LogicException('The durable root run identity is invalid.');
+        }
+        $store->create($this->rootRunId, $this->snapshot());
+        $this->store = $store;
+
+        return $this;
+    }
+
+    /** Only trusted harness state may choose the root; never a model argument. */
+    public static function resume(string $rootRunId, RunLedgerStore $store, ?CallCostObserver $observer = null): self
+    {
+        $state = $store->read($rootRunId);
+        $startedAt = $state['started_at'] ?? null;
+        if ((! is_float($startedAt) && ! is_int($startedAt)) || ! is_finite((float) $startedAt)) {
+            throw new \LogicException('The durable ledger clock is invalid.');
+        }
+        $ledger = new self($rootRunId, (float) $startedAt);
+        $ledger->observer = $observer;
+        $ledger->hydrate($state);
+        if ($ledger->observerType !== null && ($observer === null || $observer::class !== $ledger->observerType)) {
+            throw new \LogicException('The durable run requires its configured cost observer.');
+        }
+        $ledger->store = $store;
+
+        return $ledger;
+    }
+
     public function steps(): int
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): int => $this->steps());
+        }
+
         return $this->steps;
     }
 
     public function costUsd(): float
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): float => $this->costUsd());
+        }
+
         return $this->costUsd;
     }
 
     public function reservedCostUsd(): float
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): float => $this->reservedCostUsd());
+        }
+
         return array_sum($this->reservations);
     }
 
     /** Once selected, the tree's observer cannot be dropped or replaced by a child context. */
     public function inheritCostObserver(?CallCostObserver $observer): ?CallCostObserver
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): ?CallCostObserver => $this->inheritCostObserver($observer));
+        }
         if ($this->observer !== null && $observer !== null && $observer !== $this->observer) {
             throw new \LogicException('A run tree cannot replace its cost observer.');
         }
         $this->observer ??= $observer;
+        if ($this->observer !== null) {
+            $this->observerType = $this->observer::class;
+        }
 
         return $this->observer;
     }
@@ -79,6 +143,9 @@ final class RunLedger
     /** Admission and reservation happen together, before a provider or nested tool can spend. */
     public function reserveCost(RunBudget $budget, float $worstCase): int
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): int => $this->reserveCost($budget, $worstCase));
+        }
         if (! is_finite($worstCase) || $worstCase < 0 || $budget->maxCostUsd === null
             || ! is_finite($budget->maxCostUsd) || $budget->maxCostUsd < 0
             || $this->costUsd + $this->reservedCostUsd() + $worstCase > $budget->maxCostUsd) {
@@ -96,6 +163,11 @@ final class RunLedger
     /** Check cancellation/steps/time before resolving an approved side effect, then again before spending. */
     public function assertCallAvailable(RunBudget $budget): void
     {
+        if ($this->needsSynchronization()) {
+            $this->synchronized(fn () => $this->assertCallAvailable($budget));
+
+            return;
+        }
         // Cost admission uses >, allowing an exact fit (including a genuinely
         // free call). Preserve the legacy >= exhaustion API for its callers.
         $stop = $this->unmeteredRuns > 0 ? $this->exhaustion($budget)
@@ -114,6 +186,12 @@ final class RunLedger
     /** Settle and return this call's charge, independently of other calls sharing the ledger. */
     public function chargeReservation(int $reservation, ?float $cost): float
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): float => $this->chargeReservation($reservation, $cost));
+        }
+        if ($this->store !== null && $cost !== null && ! is_finite($cost)) {
+            throw new \LogicException('A durable ledger cannot settle an invalid cost.');
+        }
         if (! array_key_exists($reservation, $this->reservations)) {
             throw new \LogicException('The call reservation has already been settled.');
         }
@@ -127,6 +205,11 @@ final class RunLedger
     /** A host veto happened before any provider request, so nothing was spent. */
     public function releaseCost(int $reservation): void
     {
+        if ($this->needsSynchronization()) {
+            $this->synchronized(fn () => $this->releaseCost($reservation));
+
+            return;
+        }
         if (! array_key_exists($reservation, $this->reservations)) {
             throw new \LogicException('The call reservation has already been settled.');
         }
@@ -140,6 +223,11 @@ final class RunLedger
 
     public function recordSteps(int $steps): void
     {
+        if ($this->needsSynchronization()) {
+            $this->synchronized(fn () => $this->recordSteps($steps));
+
+            return;
+        }
         $this->steps += max(0, $steps);
     }
 
@@ -155,6 +243,14 @@ final class RunLedger
      */
     public function recordCost(?float $usd): void
     {
+        if ($this->needsSynchronization()) {
+            $this->synchronized(fn () => $this->recordCost($usd));
+
+            return;
+        }
+        if ($this->store !== null && $usd !== null && ! is_finite($usd)) {
+            throw new \LogicException('A durable ledger cannot record an invalid cost.');
+        }
         if ($usd === null) {
             $this->unmeteredRuns++;
 
@@ -166,6 +262,10 @@ final class RunLedger
 
     public function unmeteredRuns(): int
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): int => $this->unmeteredRuns());
+        }
+
         return $this->unmeteredRuns;
     }
 
@@ -180,22 +280,39 @@ final class RunLedger
      */
     public function cancel(string $reason = 'cancelled'): void
     {
+        if ($this->needsSynchronization()) {
+            $this->synchronized(fn () => $this->cancel($reason));
+
+            return;
+        }
         $this->cancelled = true;
         $this->cancelReason = $reason;
     }
 
     public function cancelled(): bool
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): bool => $this->cancelled());
+        }
+
         return $this->cancelled;
     }
 
     public function cancelReason(): ?string
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): ?string => $this->cancelReason());
+        }
+
         return $this->cancelReason;
     }
 
     public function remainingCost(RunBudget $budget): ?float
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): ?float => $this->remainingCost($budget));
+        }
+
         return $budget->maxCostUsd === null ? null : max(0.0, $budget->maxCostUsd - $this->costUsd - $this->reservedCostUsd());
     }
 
@@ -216,6 +333,9 @@ final class RunLedger
      */
     public function exhaustion(RunBudget $budget): ?string
     {
+        if ($this->needsSynchronization()) {
+            return $this->synchronized(fn (): ?string => $this->exhaustion($budget));
+        }
         if ($this->cancelled) {
             return $this->cancelReason ?? 'cancelled';
         }
@@ -244,5 +364,85 @@ final class RunLedger
         }
 
         return null;
+    }
+
+    private function needsSynchronization(): bool
+    {
+        return $this->store !== null && ! $this->synchronizing;
+    }
+
+    /** @template TReturn
+     * @param  Closure(): TReturn  $operation
+     * @return TReturn
+     */
+    private function synchronized(Closure $operation): mixed
+    {
+        if ($this->store === null) {
+            throw new \LogicException('No durable ledger store is attached.');
+        }
+
+        return $this->store->update($this->rootRunId, function (array $state) use ($operation): array {
+            $this->hydrate($state);
+            $this->synchronizing = true;
+            try {
+                $result = $operation();
+            } finally {
+                $this->synchronizing = false;
+            }
+
+            return ['state' => $this->snapshot(), 'result' => $result];
+        });
+    }
+
+    /** @return array<string, mixed> */
+    private function snapshot(): array
+    {
+        return [
+            'version' => 1, 'root_run_id' => $this->rootRunId, 'started_at' => $this->startedAt,
+            'steps' => $this->steps, 'cost_usd' => $this->costUsd, 'unmetered_runs' => $this->unmeteredRuns,
+            'cancelled' => $this->cancelled, 'cancel_reason' => $this->cancelReason,
+            'reservations' => $this->reservations, 'reservation_sequence' => $this->reservationSequence,
+            'observer_type' => $this->observerType,
+        ];
+    }
+
+    /** @param array<string, mixed> $state */
+    private function hydrate(array $state): void
+    {
+        $keys = array_keys($state);
+        $expected = array_keys($this->snapshot());
+        sort($keys);
+        sort($expected);
+        if ($keys !== $expected || $state['version'] !== 1 || $state['root_run_id'] !== $this->rootRunId
+            || (! is_float($state['started_at']) && ! is_int($state['started_at']))
+            || (float) $state['started_at'] !== $this->startedAt
+            || ! is_int($state['steps']) || $state['steps'] < 0
+            || (! is_float($state['cost_usd']) && ! is_int($state['cost_usd']))
+            || ! is_finite((float) $state['cost_usd']) || $state['cost_usd'] < 0
+            || ! is_int($state['unmetered_runs']) || $state['unmetered_runs'] < 0
+            || ! is_bool($state['cancelled'])
+            || ($state['cancel_reason'] !== null && ! is_string($state['cancel_reason']))
+            || ! is_array($state['reservations']) || count($state['reservations']) > 1024
+            || ! is_int($state['reservation_sequence']) || $state['reservation_sequence'] < 0
+            || ($state['observer_type'] !== null && ! is_string($state['observer_type']))) {
+            throw new \LogicException('The durable run ledger state is malformed.');
+        }
+        foreach ($state['reservations'] as $id => $cost) {
+            if (! is_int($id) || $id < 1 || $id > $state['reservation_sequence']
+                || (! is_int($cost) && ! is_float($cost)) || ! is_finite((float) $cost) || $cost < 0) {
+                throw new \LogicException('The durable run reservation state is malformed.');
+            }
+        }
+        if ($state['observer_type'] !== null && ($this->observer === null || $state['observer_type'] !== $this->observer::class)) {
+            throw new \LogicException('The durable run requires its configured cost observer.');
+        }
+        $this->steps = $state['steps'];
+        $this->costUsd = (float) $state['cost_usd'];
+        $this->unmeteredRuns = $state['unmetered_runs'];
+        $this->cancelled = $state['cancelled'];
+        $this->cancelReason = $state['cancel_reason'];
+        $this->reservations = $state['reservations'];
+        $this->reservationSequence = $state['reservation_sequence'];
+        $this->observerType = $state['observer_type'];
     }
 }
