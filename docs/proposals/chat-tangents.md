@@ -18,6 +18,8 @@ tangent.send(prompt, context: run)          // ordinary harness session executio
 preview = tangent.preview(strategy: 'summary', context: run)
 record = tangent.merge(preview)             // commit a validated frozen preview
 tangent.abandon()                          // closes with no parent message
+commitment = tangent.session.commit(text, citations: [position])
+                                           // authorized user action; no actor argument
 ```
 
 `merge(strategy, context)` is the convenience form of preview then commit.
@@ -32,6 +34,11 @@ view, never citation positions or the stored source rows.
 Mode policy defaults to `none`; an unset session restriction inherits the mode.
 When set, the session restriction intersects the mode policy. No request/tool
 argument can raise it.
+With no configuration change, an upgrade must produce a byte-identical provider
+request to the current published release: no extra tool, skill, system prompt,
+metadata or framing. Record actual text/structured/stream request bytes from
+that release with frozen clock/IDs and compare them against default-`none`
+requests; do not normalize away capability fields to make the comparison pass.
 The host authenticates and authorizes the participant/scope before resolving a
 user handle. Agent handles bind to the current authorized runtime/run; the model
 cannot supply an actor, participant, parent thread, run context or budget. A
@@ -45,6 +52,9 @@ handle is reauthorized on every operation, including preview, commit and resume.
 | both | Allowed | Present |
 
 Agent-enabled modes register `open_tangent`, `merge_tangent`, `abandon_tangent`.
+A separately enabled `allow_agent_commitments` policy (default false) may add
+`commit_tangent`; it requires `agent`/`both`, existing approval rules and an
+authorized bound handle. Its arguments are handle/text/citations, never actor.
 Opening returns an opaque handle, not permission to arbitrary thread IDs. For
 `none`/`user`, these names, schemas, descriptions, skill text and injected prompts
 are absent from the final model request; forged calls fail as unknown tools.
@@ -84,6 +94,29 @@ is retryable with a stable event ID for consumer deduplication. A process crash
 between commit and delivery must not lose the event. Source messages remain
 intact after close.
 
+The single parent row uses the existing stored **`type = user`**, with a normal
+UserMessage payload whose `content` is a fixed `[tangent-merge:v1]` notice plus
+canonical JSON. The notice identifies it as untrusted tangent evidence, not a
+user instruction or new authorization. The provider sees role **`user`** with
+that exact content, not `system`/`assistant`/`tool_result`; a user-opened tangent
+has no pending tool call and must not synthesize one. The canonical sidecar
+retains the typed merge and provenance. Role/framing do not confer commitment
+authority; the validator still uses the trusted commitment records.
+
+There is **no new stored row type**. `harness-thread-rows` explicitly excludes
+user rows (G-58), so its existing scope/13 fixtures remain unchanged. The
+implementation needs a separate narrowly scoped PHP-generated tangent-merge
+record/replay corpus, including hostile quoted text, that checks the canonical
+record and exact user content survives PHP/TS/Py generic replay. Do not widen
+the existing suite or bless G-58's empty-list/omitted-field disagreement.
+Existing TS/Py generic user-row readers can carry the marker as ordinary user
+content before tangent APIs are ported; the new corpus must execute and verify
+that path rather than infer success from its type name. It must neither skip
+the content nor interpret the marker as a command. Tangent operations, sidecars
+and events remain an explicit port gap and refuse until implemented; generic
+replay alone is not feature parity. A sibling parity change accompanies the PHP
+implementation before its release, rather than declaring an untested new type.
+
 ## Merge record v1
 
 The linked [merge-record-v1.schema.json](merge-record-v1.schema.json) specifies
@@ -103,7 +136,8 @@ is necessary but does not replace source/authority validation below.
 
 Commitment capture is an explicit proposed host/runtime action, not an extractor
 over transcript prose. User commitments originate from an authenticated user
-action; agent commitments require an explicit authorized runtime action under
+action via `tangent.session.commit(text, citations)`; agent commitments require
+the explicit `commit_tangent` action under
 the developer's commitment policy. Neither a webpage/tool response nor text
 inside a quoted message can create one. Without such provenance `decisions` is
 empty. The API must not offer a model-controlled `actor: user` or a default tool
@@ -112,6 +146,11 @@ bound to the same participant, tangent and exact source positions.
 The commitment record distinguishes accepted, rejected and withdrawn items;
 only an active accepted commitment can enter `decisions`. Rejected exploration
 stays in `rejected`, even when its transcript uses the word "decision".
+Both Lab presentations MUST expose a functional **Commit this** control bound
+to an authenticated user action and cited source positions. Reference/positive
+controls must include an accepted explicit commitment that actually appears in
+`decisions`; rejected-option/hostile controls must refuse promotion. Empty
+decision arrays alone cannot satisfy the decision-integrity instrument.
 
 Uncited ordinary claims are dropped with recorded reasons. Unknown/out-of-range
 citations, forged decisions, unlisted fields or malformed schemas reject the
@@ -174,5 +213,13 @@ tool-pair fork boundaries, nested provenance/depth, exact input/output bounds,
 zero-call budget refusal and crash/resume without budget reset. Assert the final
 model request contains no harness tangent capability material when disabled.
 Run database concurrency checks on an engine with row locking; SQLite alone
-cannot establish that guarantee. Lab calibration remains a separate acceptance
-gate from PHP unit or schema tests.
+cannot establish that guarantee. NEVER use the shared workspace Postgres:
+prism-labs and prism-sandbox share it. Use a dedicated disposable database owned
+by the test (a dedicated test service in Genie). Before any migration/refresh,
+assert APP_ENV=testing, the explicit dedicated connection/server identity, and an
+exact generated database name such as `prism_tangents_test_<fixture_nonce>`.
+Refuse inherited service URLs, a missing nonce or a name outside that owned
+allowlist before connecting/mutating. Cleanup targets only that verified owned
+database. The Lab was wiped by an unforced test run on 2026-10-25; default
+workspace service variables are never a safe test connection.
+Lab calibration remains a separate acceptance gate from PHP unit or schema tests.
