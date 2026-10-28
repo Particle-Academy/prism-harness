@@ -35,8 +35,10 @@ final readonly class ToolAuthorizer
         // Refused here rather than tolerated, for the reason the exception
         // sets out: a defined policy that is never consulted looks like a
         // control to every reader and is not one.
-        if (! $enabled && $gate->has(self::ABILITY)) {
-            throw UnsafeAuthorizationConfiguration::policyDefinedButDisabled(self::ABILITY, self::FLAG);
+        if (! $enabled && ($gate->has(self::ABILITY) || $gate->has(self::CALL_ABILITY))) {
+            $ability = $gate->has(self::ABILITY) ? self::ABILITY : self::CALL_ABILITY;
+
+            throw UnsafeAuthorizationConfiguration::policyDefinedButDisabled($ability, self::FLAG);
         }
     }
 

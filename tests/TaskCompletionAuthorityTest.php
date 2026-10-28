@@ -19,6 +19,12 @@ use Tests\Fixtures\NaiveTaskSource;
 use Tests\Fixtures\OpaqueTask;
 use Tests\Fixtures\Participant;
 
+beforeEach(function (): void {
+    // Define policies with the application authorizer enabled. Disabled
+    // handler controls supply their own instance independently below.
+    config()->set('prism-harness.agent.authorize_tools', true);
+});
+
 /*
 |--------------------------------------------------------------------------
 | The alignment decision: an agent cannot close its own task by default
@@ -58,6 +64,10 @@ it('refuses to complete a task when tool authorization is disabled', function ()
     // close anything, and a tool that quietly worked here would make the
     // DEFAULT the dangerous one.
     //
+    // Resolve before the policy exists, then define it. The handler must
+    // still refuse; constructor validation cannot replace that check.
+    $disabled = new ToolAuthorizer(app(GateContract::class), false);
+
     // The per-call policy IS defined and WOULD allow this call. That is the
     // whole test: an application that wrote the policy and never turned the
     // flag on has a policy that is never consulted — the exact shape
@@ -71,7 +81,8 @@ it('refuses to complete a task when tool authorization is disabled', function ()
     $tasks->add('do the thing', 't-1');
     $tasks->claim('worker-a');
 
-    $result = completionTool($tasks, enabled: false)->handle(task_id: 't-1', outcome: 'done');
+    $result = TaskCompletionTool::for($tasks, completionSession(), $disabled, 'worker-a')
+        ->handle(task_id: 't-1', outcome: 'done');
 
     expect(decode((string) $result)['allowed'])->toBeFalse()
         // The task is untouched — the refusal is not cosmetic.
