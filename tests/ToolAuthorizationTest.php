@@ -53,6 +53,19 @@ it('names both ways out of the unsafe authorization configuration', function ():
     }
 });
 
+it('refuses a call-only policy while the authorizer is disabled and names the ignored ability', function (): void {
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => false);
+
+    expect(fn (): ToolAuthorizer => authorizer(enabled: false))
+        ->toThrow(UnsafeAuthorizationConfiguration::class, ToolAuthorizer::CALL_ABILITY);
+});
+
+it('accepts a call-only policy when the authorizer is enabled', function (): void {
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => false);
+
+    expect(authorizer(enabled: true)->enabled())->toBeTrue();
+});
+
 it('accepts a defined policy once the authorizer is enabled', function (): void {
     Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
 

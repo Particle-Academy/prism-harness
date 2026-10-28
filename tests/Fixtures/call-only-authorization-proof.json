@@ -1,0 +1,126 @@
+{
+  "format": "harness-call-only-authorization-proof-v1",
+  "measured_at": "2026-10-28T21:47:41.316Z",
+  "scope": "Patch candidate proof; no release or registry publication claim",
+  "base_tag": "v0.18.0",
+  "base_commit": "32fed824f988caccd70e54fb1a4d31bd4f62d770",
+  "input": {
+    "authorization_enabled": false,
+    "offer_policy_defined": false,
+    "call_policy_defined": true,
+    "call_policy_allows": false,
+    "handler": "increment synthetic memory counter"
+  },
+  "native_regression_before_fix": {
+    "exit": 1,
+    "log_sha256": "a3c1534666330a84dc26917f914c430913994afab73f2b94a0f0efe9a5bacc3f"
+  },
+  "candidate_guard": {
+    "file": "src/Tools/ToolAuthorizer.php",
+    "sha256": "95547a34bdb8402071a17dc477d9058a917f42122727e495d4ea27a345d6b417"
+  },
+  "probes_sha256": {
+    "php": "05c43514e05285cf6878161834129a99b622b3c34cca7e7d5448e9ac240b7f1e",
+    "mjs": "cc74b21a133e03ac00b615e9d7470562c5f9def5ac7bb7dde14772f33c342971",
+    "py": "0121eacfef19d1320dec2a2a6aa186234aae3d350c49af5829b15d7bbded710d"
+  },
+  "notes": [
+    "TS and Python are unchanged published controls in both stages.",
+    "PHP code is a probe classification of the typed native exception, not a new exception field.",
+    "No database, model request, provider credentials or consumer application is used."
+  ],
+  "runs": [
+    {
+      "stage": "published",
+      "language": "php",
+      "artifact": "PHP0.18.0 published artifact",
+      "result": {
+        "refused": false,
+        "callbacks": 1,
+        "offered": 1,
+        "allows_call": true,
+        "code": null
+      }
+    },
+    {
+      "stage": "published",
+      "language": "ts",
+      "artifact": "TS0.8.0 unchanged published control",
+      "result": {
+        "refused": true,
+        "callbacks": 0,
+        "offered": 0,
+        "allows_call": null,
+        "code": "unsafe_authorization_configuration",
+        "native_error": {
+          "class": "HarnessError",
+          "message": "A tool authorization policy was supplied, but the authorizer is disabled, so that policy is never consulted and every registered tool is offered to every run. Either enable the authorizer, or remove the policy so nothing suggests tool access is being restricted."
+        }
+      }
+    },
+    {
+      "stage": "published",
+      "language": "py",
+      "artifact": "Python0.3.0 unchanged published control",
+      "result": {
+        "refused": true,
+        "callbacks": 0,
+        "offered": 0,
+        "allows_call": null,
+        "code": "unsafe_authorization_configuration",
+        "native_error": {
+          "class": "HarnessError",
+          "message": "A tool authorization policy was supplied, but the authorizer is disabled, so that policy is never consulted and every registered tool is offered to every run. Either enable the authorizer, or remove the policy so nothing suggests tool access is being restricted."
+        }
+      }
+    },
+    {
+      "stage": "candidate",
+      "language": "php",
+      "artifact": "PHP0.18.0 hotfix candidate",
+      "result": {
+        "refused": true,
+        "callbacks": 0,
+        "offered": 0,
+        "allows_call": null,
+        "code": "unsafe_authorization_configuration",
+        "native_error": {
+          "class": "Prism\\Harness\\Exceptions\\UnsafeAuthorizationConfiguration",
+          "message": "A [harness.tool.call] authorization policy is defined, but the harness tool authorizer is disabled by `prism-harness.agent.authorize_tools`, so that policy is never consulted and every registered tool is offered to every run.\n\nEither enable the authorizer by setting `prism-harness.agent.authorize_tools` to true, or remove the [harness.tool.call] ability so nothing suggests tool access is being restricted. The one thing not to leave in place is both at once: a policy that reads as a control and does nothing."
+        }
+      }
+    },
+    {
+      "stage": "candidate",
+      "language": "ts",
+      "artifact": "TS0.8.0 unchanged published control",
+      "result": {
+        "refused": true,
+        "callbacks": 0,
+        "offered": 0,
+        "allows_call": null,
+        "code": "unsafe_authorization_configuration",
+        "native_error": {
+          "class": "HarnessError",
+          "message": "A tool authorization policy was supplied, but the authorizer is disabled, so that policy is never consulted and every registered tool is offered to every run. Either enable the authorizer, or remove the policy so nothing suggests tool access is being restricted."
+        }
+      }
+    },
+    {
+      "stage": "candidate",
+      "language": "py",
+      "artifact": "Python0.3.0 unchanged published control",
+      "result": {
+        "refused": true,
+        "callbacks": 0,
+        "offered": 0,
+        "allows_call": null,
+        "code": "unsafe_authorization_configuration",
+        "native_error": {
+          "class": "HarnessError",
+          "message": "A tool authorization policy was supplied, but the authorizer is disabled, so that policy is never consulted and every registered tool is offered to every run. Either enable the authorizer, or remove the policy so nothing suggests tool access is being restricted."
+        }
+      }
+    }
+  ]
+}
