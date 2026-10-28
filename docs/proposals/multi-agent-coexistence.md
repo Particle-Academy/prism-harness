@@ -1,7 +1,9 @@
 # Multi-agent coexistence (G154)
 
-**Proposed for maintainer, MOIC and Fancy review; no implementation is shipped.**
+**Revised after MOIC and Fancy review; no implementation is shipped.**
 This covers H1–H14 and MOIC's requests (a)–(f), as relayed by the maintainer.
+Both reviewers approved the direction. This revision resolves Fancy's items 1–8 and
+MOIC's comments on (b), (c), (d) and (f); see [Review resolutions](#review-resolutions).
 Existing valid single-agent applications retain their addresses, configuration,
 provider requests and task semantics. PHP is the harness family reference;
 TypeScript and Python follow the reviewed contract, with published-artifact tests.
@@ -60,7 +62,9 @@ thread.record(messages, runId, speakerAgent: 'support')
 
 The agent is selected by trusted application code, never a model/tool argument.
 Use a bounded, canonical lowercase identifier, with null as the legacy/default
-namespace. Omitted agent preserves the exact old session key and live-thread
+namespace. The namespace id is a stable, configured identifier and is never derived
+from a display or persona name: renaming a persona (for example a configurable
+"Triage") must not move its threads, sessions, tasks or ledger labels. Omitted agent preserves the exact old session key and live-thread
 hash. A named agent hashes `[domain, agent, participantType, stringId, scope]`;
 domains are `prism-harness.session.v1` and `prism-harness.thread.v1`, respectively.
 Use compact UTF-8 JSON with unescaped Unicode/slashes and no whitespace. Do not
@@ -80,7 +84,11 @@ allocating a session. Include the equivalent scope-only shared-thread read.
 Keep address ownership separate from the speaker label. MOIC can explicitly
 record a handoff speaker on its already-authorized shared transcript; that label
 does not change the thread owner, grant tool permissions or resolve a session in
-another namespace. Named task-list builders qualify explicit list names too;
+another namespace. `speakerAgent` is a free, bounded label: it need not name a
+registered harness agent, because an app-side sub-agent (such as MOIC's Product
+Manager on Compass's thread) has no namespace of its own. Replay returns the
+recorded speaker on each message as metadata, so a host can tell the model who said
+what. It is never added to the provider request unless the host maps it in itself. Named task-list builders qualify explicit list names too;
 the existing app-wide entry point retains deliberately shared legacy lists.
 Subagents inherit the owner namespace by default. A different
 agent target requires an explicit host-owned delegation binding, never a supplied
@@ -108,11 +116,32 @@ name in different explicit namespaces is valid. Reject collisions before any
 handler runs or provider request is issued, independent of service-provider boot
 order. Keep legacy call forms in the null namespace.
 
+A second registration of the same name in the same namespace is refused **even
+from the same owner**, for tools and modes alike. Replacement is explicit: a
+`replace` call naming the predecessor's owner. This differs on purpose from
+agent-integrations 0.51.0, which lets the same owner re-register an MCP tool: a
+harness registry is built once at boot, so a same-owner repeat is a boot-order bug
+rather than a refresh. All three languages use this rule, and the refusal message
+uses the same shape in each: the namespace, the name, both owners, and how to
+replace. A host that hits both refusals can then tell them apart.
+
 `*` expands only that agent's effective tool set. A named agent does not inherit
 legacy tools/providers by accident; sharing requires an explicit target-agent
-registration. Built-ins are registered inside the effective namespace too.
+registration. **Built-ins are not implicit in a named namespace.** A named agent
+gets a built-in tool only when its agent configuration or a mode lists it. A mode's
+tool list is the ceiling for everything offered in that mode, built-ins included:
+a reply mode that omits an internal-notes reader cannot offer it through a
+built-in, a wildcard or a provider. The null namespace keeps today's built-ins
+unchanged.
 Resolve provider output for the current session and validate collisions on every
 resolution. There is no process-global mutable "current agent" singleton.
+
+Expose the resolution as a read API,
+`effectiveTools(agent, mode, participant) -> [{name, owner, source}]`. It returns
+exactly the set the offer path would produce, computed by the same code rather
+than a parallel derivation, so boot checks and tests (e.g. Fancy's agent-guard)
+can assert narrowing against the harness's own answer. It runs no handler, issues
+no provider request and creates no session.
 
 `agents.<id>` provides scalar provider/model, step and output ceilings, lock
 settings, default mode, observer, default task list and authorization options.
@@ -132,10 +161,17 @@ cannot widen the effective set. MOIC's skill grants and capability policy remain
 host-owned inputs to this filtering, rather than new implicit authority.
 
 Add nullable agent attribution to event correlation, messages, RunContext and
-reservation/settlement records. Legacy correlation keeps its existing fields;
+reservation/settlement records. The field is named `harness_agent` in event
+payloads and correlation, so that it cannot be confused with agent-integrations'
+presence `agentId`; the two are unrelated identifiers and the harness never maps
+one onto the other. Legacy correlation keeps its existing fields;
 agent correlation is emitted for a named context. No extra provider payload
 fields are introduced by default. A child keeps its root ledger and narrowed budget, even across an
 explicitly delegated agent; labels must not create another spend account.
+`agents.<id>.spend_ceiling` (amount and window, e.g. per day) is a cap evaluated
+against that agent's labelled reservations in the **same** root ledger: a
+reservation must fit both the root budget and the agent's ceiling, and is refused
+before the provider request if either is exceeded. No second account is created.
 Select observers per agent, with the existing RunContext override taking
 precedence, and reject conflicting session/context identity before reservation.
 
@@ -149,12 +185,37 @@ model call, external tool or generator consumer; paged reads isolate each bounde
 page. Arbitrary application Eloquent queries are outside this wrapper. Refuse an
 unsupported nested-savepoint configuration instead of claiming isolation.
 
+The precise behaviour:
+
+- **No outer transaction:** with no transaction open on the connection, an
+  operation runs exactly as it does today, with no added BEGIN wrapper.
+  Already-atomic batches such as `Thread::record()` keep their own transaction.
+- **Failure inside an outer transaction:** the operation rolls back to its own
+  savepoint and then rethrows the **original** exception, unwrapped and
+  unswallowed. The outer transaction and connection stay usable, so a host that
+  catches the exception can continue its turn.
+- **Unsupported configuration:** the refusal happens at boot or on first use, and
+  its message names `database.isolate_operations` as the setting to turn off.
+
 Keep `Session::forget()` ephemeral-only. Add separate, host-authorized
 `forgetEphemeral(addressSelector)` and `eraseHistory(addressSelector)` operations.
 Selectors always bind participant/tenant and agent; scope prefixes are literal
 strings, not SQL LIKE/Redis glob syntax. A deliberately app-wide maintenance
 selector requires an explicit maintenance grant. Produce a bounded dry-run plan
 and reauthorize it at execution; no erasure API is automatically a model tool.
+
+The design has three selector tiers, narrowest first:
+
+1. **Own conversation:** participant plus exact scope, or a literal scope prefix,
+   within one agent. The host's ordinary authorization of that person is enough,
+   with no maintenance grant, so everyday "delete this chat" stays simple. It still
+   produces a dry-run plan that is re-checked at execution.
+2. **One participant across the host's agents:** a participant-bound selector
+   whose agent is "every namespace this host registers", under an explicit
+   participant-erasure grant. One dry-run plan covers all of them, so user deletion
+   cannot miss an agent by looping. It never reaches another participant, and it
+   is narrower than maintenance.
+3. **App-wide maintenance:** as above, requiring the maintenance grant.
 
 Hashed keys cannot support prefix discovery by themselves. Introduce a durable
 address index on first write, mapping structured addresses to owned store/task
@@ -181,6 +242,11 @@ count each granted claim atomically under the existing list lock: N includes the
 first grant. At the final lease's expiry the task becomes terminal `exhausted`,
 with a typed `claim_attempts_exhausted` event; it is never silently requeued.
 This is distinct from `failed`: a worker may have died before doing any work.
+The event's name and payload are a stable contract:
+`{task_id, list, attempts, last_lease_expires_at}`.
+The canonical rules gain one statement that applies to every TaskSource: **a
+terminal state other than `done` blocks dependents.** Successors of an `exhausted`
+or `failed` task stay unclaimable until a host acts on it.
 The opt-in state extension needs an approved canonical state/schema amendment
 before implementation, following
 [decision0020](https://github.com/Particle-Academy/prism-parity/blob/main/docs/decisions/0020-collapsed-states.md)
@@ -196,10 +262,14 @@ vectors. MOIC's dependency/person-step scheduling stays in its AgentTaskSource.
 
 ## Port, conformance and delivery plan
 
-After design review, implement in this order: address/actor/index primitives;
-owned registries/config/authorization; event/message/accounting propagation;
-isolated storage and bounded forget/erase; task ceilings. Carry each settled
-caller-visible behavior into TS and Python in the same work tranche. Adapt to
+After design review, implement in this order: (1) address/actor/index primitives;
+(2) owned registries/config/authorization; (3) event/message/accounting propagation;
+(4) isolated storage and bounded forget/erase; (5) task ceilings. Carry each settled
+caller-visible behavior into TS and Python in the same work tranche. **Tranches 1
+and 2 are released as soon as they are proven** in all three languages, rather
+than held for later tranches, because Fancy's fancy-support P1 needs only those
+two. Defaults stay byte-identical, so an early release costs existing consumers
+nothing. Adapt to
 their store contracts, rather than pretending their existing memory/file stores
 are Eloquent databases. SQL savepoint guarantees require a real SQL adapter and
 native database proof; unsupported adapters must report refusal explicitly.
@@ -212,13 +282,13 @@ It must exercise the following, with native results retained:
 | Contract | Required positive and hostile controls |
 |---|---|
 | Defaults/migration | Published0.18/0.8/0.3 legacy keys, stored bytes and frozen provider requests unchanged; old rows readable; new named rows isolated |
-| Names/providers | Every boot order; exact tool sets per mode; equal names in different agents work; injected same-agent collisions name both owners; unselected providers never run |
-| Authority | Wildcards scoped; forged agent/mode/scope/unlisted tool refused; offer/call gates and approval policy enforced; cross-session approval IDs invisible |
-| Participant/handoff | Human, non-user Model and typed identity; explicit actor binding; shared transcript speaker attribution without authority transfer; context restored after success/failure |
-| Budget/events | Correct agent on every message/event/reservation/settlement; observer isolation; parent and child share hard spend cap; forged context cannot allocate a fresh ledger |
-| Persistence/queue | Separate session/task/lock keys, worker restart and serialized agent identity; noncreating reads leave DB/stores untouched; real owned PostgreSQL outer transaction survives a caught injected statement failure |
-| Forget/erase | Exact/prefix/agent scopes; retired rows and validated descendants; literal wildcard characters; blocked stale writers; cross-owner refusal; interrupted multi-store cleanup resumes |
-| Retry ceiling | Default recovery unchanged; N counts grants; exact expiry; two workers; renewal; persistent restart; exhausted task terminal and unrelated work claimable |
+| Names/providers | Every boot order; exact tool sets per mode; equal names in different agents work; injected same-agent collisions name both owners; same-owner repeat refused without `replace`; unselected providers never run |
+| Authority | Wildcards scoped; forged agent/mode/scope/unlisted tool refused; offer/call gates and approval policy enforced; cross-session approval IDs invisible; a built-in omitted from a mode is never offered or callable there; `effectiveTools` equals the offered set in every mode |
+| Participant/handoff | Human, non-user Model and typed identity; explicit actor binding; shared transcript speaker attribution without authority transfer; unregistered speaker label accepted and returned on replay, absent from the provider request; context restored after success/failure |
+| Budget/events | Correct `harness_agent` on every message/event/reservation/settlement; observer isolation; parent and child share hard spend cap; per-agent spend ceiling refuses before the provider request with no second account; forged context cannot allocate a fresh ledger |
+| Persistence/queue | Separate session/task/lock keys, worker restart and serialized agent identity; persona rename moves nothing; noncreating reads leave DB/stores untouched; no outer transaction issues no added BEGIN; real owned PostgreSQL outer transaction survives a caught injected statement failure and the original exception is rethrown |
+| Forget/erase | Exact/prefix/agent scopes; own-conversation tier needs no maintenance grant; participant-across-agents tier covers every host namespace in one plan and never another participant; retired rows and validated descendants; literal wildcard characters; blocked stale writers; cross-owner refusal; interrupted multi-store cleanup resumes |
+| Retry ceiling | Default recovery unchanged; N counts grants; exact expiry; two workers; renewal; persistent restart; exhausted task terminal, its dependents unclaimable, and unrelated work claimable; event payload exact |
 
 Run sabotage variants that create a same-agent name collision, remove an agent/
 scope guard, and add an unlisted tool. Each must turn the fixture red, including
@@ -232,3 +302,20 @@ versions, no source/path overrides and no skipped claimed coverage. Generate
 canonical outputs from the PHP execution; preserve native differences explicitly.
 The catalog and conformance status change only when their respective proofs exist.
 Tangents resumes after the reviewed G154 work, rebased onto its address contract.
+
+## Review resolutions
+
+| Item | From | Resolution |
+|---|---|---|
+| 1 Tranches | Fancy | Tranches 1–2 release as soon as they are proven in all three languages ([delivery plan](#port-conformance-and-delivery-plan)) |
+| 2 Built-ins | Fancy | No implicit built-ins in a named namespace; a mode's tool list is the ceiling, built-ins included; hostile control added |
+| 3 Read API | Fancy | `effectiveTools(agent, mode, participant)` returns the offer path's own resolution, with no side effects |
+| 4 Cross-agent erasure | Fancy | Participant-across-agents selector tier: one dry-run plan under an explicit grant, narrower than maintenance |
+| 5 Spend ceiling | Fancy | `agents.<id>.spend_ceiling` is checked against the same root ledger; no second account |
+| 6 Id vs persona | Fancy | The namespace id is never derived from a display name; a rename moves nothing |
+| 7 Duplicate wording | Fancy | Same-owner repeats are refused without an explicit `replace`, in all three languages; the difference from agent-integrations is stated |
+| 8 Event field | Fancy | The field is named `harness_agent`; no mapping to presence `agentId` |
+| (b) | MOIC | No outer transaction means no added BEGIN; the original exception is rethrown after the savepoint rollback; the refusal names `database.isolate_operations` |
+| (c) | MOIC | `speakerAgent` is a free, bounded label; replay returns it as metadata, and it is never sent to the provider by default |
+| (d) | MOIC | Deleting your own conversation needs participant plus scope, with no maintenance grant |
+| (f) | MOIC | A terminal state other than `done` blocks dependents in the canonical rules; the `claim_attempts_exhausted` payload is stable |
