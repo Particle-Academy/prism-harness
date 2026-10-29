@@ -1,0 +1,14 @@
+{
+    "name": "particle-academy/prism-harness-formula-fixture",
+    "description": "Isolated PHP 8.4 integration fixture; never a consumer dependency.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": "^8.4",
+        "particle-academy/fancy-formula": "0.0.1"
+    },
+    "config": {
+        "allow-plugins": false,
+        "sort-packages": true
+    }
+}

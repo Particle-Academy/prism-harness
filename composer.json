@@ -59,6 +59,7 @@
         }
     },
     "suggest": {
+        "particle-academy/fancy-formula": "Optional doMath engine (preview against 0.0.1, PHP 8.4+). Stub engine: no formula results until fancy-formula P1. No engine is installed by default; see docs/do-math.md.",
         "particle-academy/fancy-flow-php": "Drives fancy-flow's llm_call, tool_use and agent nodes through Prism, with the agent's conversation carried on a durable harness thread. Optional: fancy-flow needs PHP 8.4 and this package supports 8.2, so it is never required. See src/Flow/."
     }
 }

@@ -2,5 +2,7 @@
 /.idea
 /.vscode
 composer.lock
+!/tools/engine-fixture/fancy-formula/composer.lock
+/tools/engine-fixture/fancy-formula/vendor/
 .phpunit.result.cache
 .phpstan.cache
