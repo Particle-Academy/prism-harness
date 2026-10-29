@@ -169,6 +169,26 @@ final class LegacyDefaultCompatibilityTest extends TestCase
         ]);
     }
 
+    public function test_legacy_invalid_utf8_scope_preserves_session_bytes_and_native_thread_error(): void
+    {
+        $participant = LegacyDefaultParticipant::create(['name' => 'Ada']);
+        $scope = "legacy:\xff";
+        $session = app(PrismHarness::class)->for($participant)->session($scope);
+        $expected = 'session:'.substr(sha1($participant->getMorphClass()), 0, 12).':'.$participant->getKey().':'.$scope;
+        self::assertSame($expected, $session->key());
+        $session->usingMode('chat');
+        self::assertSame('chat', $session->mode());
+        $failure = null;
+        try {
+            $session->thread();
+            self::fail('The published thread JSON key must reject invalid UTF-8');
+        } catch (JsonException $error) {
+            $failure = ['class' => $error::class, 'code' => $error->getCode(), 'message' => $error->getMessage()];
+        }
+        self::assertSame(JSON_ERROR_UTF8, $failure['code']);
+        $this->record('legacy-invalid-utf8-scope', ['key_hex' => bin2hex($session->key()), 'mode' => $session->mode(), 'thread_error' => $failure]);
+    }
+
     private function record(string $id, array $result): void
     {
         if ($file = getenv('PRISM_LEGACY_DEFAULT_OUTPUT')) {

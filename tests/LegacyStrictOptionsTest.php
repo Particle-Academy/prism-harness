@@ -8,6 +8,7 @@ use Prism\Harness\Models\Thread;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\PrismHarness;
+use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Tests\Fixtures\Participant;
@@ -64,4 +65,11 @@ it('names the required migration when a new address feature is used without it',
     expect(fn () => Thread::forParticipant($participant, 'named', 'support'))->toThrow(LogicException::class, '0001_01_01_000006_add_agent_addresses')
         ->and(fn () => Thread::forParticipant(new ParticipantRef('external', '1'), 'typed'))->toThrow(LogicException::class, '0001_01_01_000006_add_agent_addresses')
         ->and(fn () => app(PrismHarness::class)->forAgent('support')->for($participant)->session('state')->usingMode('chat'))->toThrow(LogicException::class, '0001_01_01_000006_add_agent_addresses');
+});
+
+it('keeps UTF-8 validation mandatory for named and explicit-reference addresses', function (): void {
+    foreach ([['support', false], [null, true]] as [$agent, $reference]) {
+        expect(fn () => new SessionAddress('person', '1', "scope:\xff", $agent, $reference))
+            ->toThrow(InvalidArgumentException::class, 'valid UTF-8');
+    }
 });
