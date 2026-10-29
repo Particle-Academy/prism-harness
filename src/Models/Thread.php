@@ -78,7 +78,9 @@ class Thread extends Model implements ThreadContract
     {
         static::saving(function (self $thread): void {
             $fields = ['participant_type', 'participant_id', 'participant_ref_type', 'participant_ref_id', 'scope', 'agent_id'];
-            if ($thread->exists && $thread->isDirty($fields)) {
+            $indexed = $thread->agent_id !== null || $thread->participant_ref_type !== null
+                || $thread->getOriginal('agent_id') !== null || $thread->getOriginal('participant_ref_type') !== null;
+            if ($thread->exists && ($indexed || config('prism-harness.addresses.immutable_legacy_threads', false)) && $thread->isDirty($fields)) {
                 throw new \LogicException('A resolved harness thread address is immutable; import into a new address explicitly.');
             }
             $address = new SessionAddress(
@@ -187,6 +189,17 @@ class Thread extends Model implements ThreadContract
      */
     protected static function addressFields(SessionAddress $address): array
     {
+        if ($address->agent === null && ! $address->reference) {
+            // Keep the published legacy query and create fields: these columns
+            // exist before the optional named-address migration is installed.
+            return [
+                'participant_type' => $address->participantType,
+                'participant_id' => $address->participantId,
+                'scope' => $address->scope,
+            ];
+        }
+        DatabaseAddressIndex::configured(static::query()->getModel()->getConnection());
+
         return [
             'participant_type' => $address->reference ? null : $address->participantType,
             'participant_id' => $address->reference ? null : $address->participantId,

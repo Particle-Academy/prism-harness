@@ -26,10 +26,16 @@ final class ToolRegistry
     /** @var array<string, array{owner: string, source: string}> */
     private array $metadata = [];
 
+    /** @var array<string, string> */
+    private array $staticOwners = [];
+
+    /** @var array<string, string> */
+    private array $factoryOwners = [];
+
     /** @var array<string, self> */
     private array $agents = [];
 
-    public function __construct(private readonly ?string $agent = null, private readonly ?self $root = null)
+    public function __construct(private readonly ?string $agent = null, private readonly ?self $root = null, private readonly bool $refuseDuplicates = false)
     {
         SessionAddress::validateAgent($agent);
     }
@@ -42,13 +48,14 @@ final class ToolRegistry
             return $root;
         }
 
-        return $root->agents[$agent] ??= new self($agent, $root);
+        return $root->agents[$agent] ??= new self($agent, $root, $root->refuseDuplicates);
     }
 
     public function register(Tool $tool, ?string $owner = null): self
     {
         $this->claim($tool->name(), $owner, 'static');
         $this->tools[$tool->name()] = $tool;
+        $this->staticOwners[$tool->name()] = RegistrationOwner::label($owner, $this->agent);
 
         return $this;
     }
@@ -68,6 +75,7 @@ final class ToolRegistry
     {
         $this->claim($name, $owner, 'factory');
         $this->factories[$name] = $factory;
+        $this->factoryOwners[$name] = RegistrationOwner::label($owner, $this->agent);
 
         return $this;
     }
@@ -80,7 +88,7 @@ final class ToolRegistry
         if ($id === null || $id === '') {
             throw new LogicException('A named provider requires a registration name.');
         }
-        if (isset($this->providers[$id])) {
+        if ($this->strict() && isset($this->providers[$id])) {
             throw new RegistrationCollision($this->agent, $id, $this->providers[$id]['owner'], $label);
         }
         $this->providers[$id] = ['provider' => $provider, 'owner' => $label];
@@ -92,6 +100,7 @@ final class ToolRegistry
     {
         $this->claim($tool->name(), $owner, 'static', $predecessorOwner);
         $this->tools[$tool->name()] = $tool;
+        $this->staticOwners[$tool->name()] = RegistrationOwner::label($owner, $this->agent);
 
         return $this;
     }
@@ -101,6 +110,7 @@ final class ToolRegistry
     {
         $this->claim($name, $owner, 'factory', $predecessorOwner);
         $this->factories[$name] = $factory;
+        $this->factoryOwners[$name] = RegistrationOwner::label($owner, $this->agent);
 
         return $this;
     }
@@ -125,11 +135,18 @@ final class ToolRegistry
             if ($previous === null || $previous['owner'] !== $predecessor) {
                 throw new LogicException('Replacement must name the registered predecessor owner.');
             }
-        } elseif ($previous !== null) {
+        } elseif ($this->strict() && $previous !== null) {
             throw new RegistrationCollision($this->agent, $name, $previous['owner'], $label);
         }
-        unset($this->tools[$name], $this->factories[$name]);
+        if ($this->strict() || $predecessor !== null) {
+            unset($this->tools[$name], $this->factories[$name], $this->staticOwners[$name], $this->factoryOwners[$name]);
+        }
         $this->metadata[$name] = ['owner' => $label, 'source' => $source];
+    }
+
+    private function strict(): bool
+    {
+        return $this->agent !== null || $this->refuseDuplicates;
     }
 
     /** @return list<string> */
@@ -168,7 +185,7 @@ final class ToolRegistry
         $metadata = $this->metadata;
         foreach ($additional as $name => $entry) {
             $owner = RegistrationOwner::label($entry['owner'], $this->agent);
-            if (isset($metadata[$name])) {
+            if ($this->strict() && isset($metadata[$name])) {
                 throw new RegistrationCollision($this->agent, $name, $metadata[$name]['owner'], $owner);
             }
             if ($entry['tool']->name() !== $name) {
@@ -180,7 +197,7 @@ final class ToolRegistry
         if ($session instanceof Session) {
             foreach ($this->providers as $registration) {
                 foreach (($registration['provider'])($session) as $tool) {
-                    if (isset($metadata[$tool->name()])) {
+                    if ($this->strict() && isset($metadata[$tool->name()])) {
                         throw new RegistrationCollision($this->agent, $tool->name(), $metadata[$tool->name()]['owner'], $registration['owner']);
                     }
                     $provided[$tool->name()] = $tool;
@@ -202,6 +219,7 @@ final class ToolRegistry
                 throw new LogicException(sprintf('Session-bound tool factory [%s] returned [%s].', $name, $tool->name()));
             }
             $resolved[$name] = $tool;
+            $metadata[$name] = ['owner' => $this->factoryOwners[$name], 'source' => 'factory'];
         }
 
         $detailed = [];
@@ -209,6 +227,9 @@ final class ToolRegistry
             throw new LogicException('A requested tool is not registered in this agent namespace.');
         }
         foreach ($resolved as $name => $tool) {
+            if (! isset($provided[$name]) && ! isset($this->factories[$name])) {
+                $metadata[$name] = ['owner' => $this->staticOwners[$name], 'source' => 'static'];
+            }
             $detailed[$name] = ['tool' => $tool, ...$metadata[$name]];
         }
 

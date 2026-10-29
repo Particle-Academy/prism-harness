@@ -8,7 +8,11 @@ return [
 
     // Named/explicit-reference addresses only. Null leaves growth unlimited.
     // Legacy null/model state keeps its original path; backfill is explicit.
-    'addresses' => ['max_addresses_per_participant' => null],
+    'addresses' => [
+        'max_addresses_per_participant' => null,
+        'immutable_legacy_threads' => false,
+    ],
+    'registry' => ['refuse_duplicates' => false],
 
     // Named authority collections are configured independently; they are never
     // inherited from the legacy namespace. Unset scalar settings fall back.
