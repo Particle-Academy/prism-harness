@@ -1,0 +1,745 @@
+{
+    "package": "particle-academy/fancy-formula",
+    "version": "0.1.0",
+    "commit": "9dcef871f0703167923f21a8720c44243d78e2d8",
+    "tree": "27b3c56911e4eaa84b7e707b1aa6aa60d22745e9",
+    "apiReviewedCommit": "9c30ae25c9386301edbfa1012a3810561a0f5c57",
+    "entries": [
+        {
+            "path": ".gitattributes",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "7939e2ddd9662b6a6192c5bffd9fabc26d7dde65",
+            "size": 14,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/7939e2ddd9662b6a6192c5bffd9fabc26d7dde65"
+        },
+        {
+            "path": ".github",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "0a7c84b0812ee5d9fc00300310223e436546d0ee",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/0a7c84b0812ee5d9fc00300310223e436546d0ee"
+        },
+        {
+            "path": ".github/workflows",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "3c079cc79b3a9e59ed0848aaf6880bed6711b97b",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/3c079cc79b3a9e59ed0848aaf6880bed6711b97b"
+        },
+        {
+            "path": ".github/workflows/ci.yml",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "b60c9fff012c6cb61e54780e5f75ff1005f5e1ba",
+            "size": 6051,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/b60c9fff012c6cb61e54780e5f75ff1005f5e1ba"
+        },
+        {
+            "path": ".github/workflows/no-mcp-secrets.yml",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "504da6150ed227ad16e659382376d8243afc8248",
+            "size": 832,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/504da6150ed227ad16e659382376d8243afc8248"
+        },
+        {
+            "path": ".github/workflows/publish.yml",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "3d1799d06a85f29ffa309e6e2d26f31c15955aca",
+            "size": 6478,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/3d1799d06a85f29ffa309e6e2d26f31c15955aca"
+        },
+        {
+            "path": ".gitignore",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "d731b5677852910c63416613dcf17f262db80720",
+            "size": 102,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/d731b5677852910c63416613dcf17f262db80720"
+        },
+        {
+            "path": "AGENTS.md",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "4dfc226eb7b917ee128711dad0a18e2d641e80d3",
+            "size": 4420,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/4dfc226eb7b917ee128711dad0a18e2d641e80d3"
+        },
+        {
+            "path": "CHANGELOG.md",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "6793b19e827d90540852604834c55169fbd22f18",
+            "size": 9486,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/6793b19e827d90540852604834c55169fbd22f18"
+        },
+        {
+            "path": "CLAUDE.md",
+            "mode": "120000",
+            "type": "blob",
+            "sha": "47dc3e3d863cfb5727b87d785d09abf9743c0a72",
+            "size": 9,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/47dc3e3d863cfb5727b87d785d09abf9743c0a72"
+        },
+        {
+            "path": "LICENSE",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "5c480320bb89fa6c88406d9b30c453f461581c5e",
+            "size": 1073,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/5c480320bb89fa6c88406d9b30c453f461581c5e"
+        },
+        {
+            "path": "README.md",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "0108f1058a1b2415d71dd86e5f6912fa9d0123a0",
+            "size": 3272,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/0108f1058a1b2415d71dd86e5f6912fa9d0123a0"
+        },
+        {
+            "path": "SPEC.md",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "ec996e0db1ce1b2752856dbe6db9e54a8b3d1e9e",
+            "size": 50455,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/ec996e0db1ce1b2752856dbe6db9e54a8b3d1e9e"
+        },
+        {
+            "path": "capture",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "15d49533ee5373aeb29443af1945712a82723f41",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/15d49533ee5373aeb29443af1945712a82723f41"
+        },
+        {
+            "path": "capture/v1",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "97dab5ea7dfebb2dec7a2e781f530a323ffa7901",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/97dab5ea7dfebb2dec7a2e781f530a323ffa7901"
+        },
+        {
+            "path": "capture/v1/capture-v1.xlsx",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "fd332e0afc8296efd07220c814c2c55e6503cd04",
+            "size": 32391,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/fd332e0afc8296efd07220c814c2c55e6503cd04"
+        },
+        {
+            "path": "capture/v1/request.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "7190cbb895b9cbb9cc4a993ea279d2b2b082fe0d",
+            "size": 652605,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/7190cbb895b9cbb9cc4a993ea279d2b2b082fe0d"
+        },
+        {
+            "path": "composer.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "3ce1da27ea9be8fc740efa105a0f4e9c2431b4d9",
+            "size": 1862,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/3ce1da27ea9be8fc740efa105a0f4e9c2431b4d9"
+        },
+        {
+            "path": "php",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "9cae17252c703b0fcb4ca2172a66c07f5b00ad44",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/9cae17252c703b0fcb4ca2172a66c07f5b00ad44"
+        },
+        {
+            "path": "php/src",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "c44d9dcc906ac3400f363c521163334af8d7bd79",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/c44d9dcc906ac3400f363c521163334af8d7bd79"
+        },
+        {
+            "path": "php/src/CheckReport.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "0d345843c8a3edc7263050b453a6587ddb52375c",
+            "size": 1097,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/0d345843c8a3edc7263050b453a6587ddb52375c"
+        },
+        {
+            "path": "php/src/Clock.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "72592f51d5ca65abb4d5afefc6787d9d9fbb3107",
+            "size": 770,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/72592f51d5ca65abb4d5afefc6787d9d9fbb3107"
+        },
+        {
+            "path": "php/src/Dates.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "09f79a9a0f2e02a16b274b9cfac8501e71fab5f5",
+            "size": 4350,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/09f79a9a0f2e02a16b274b9cfac8501e71fab5f5"
+        },
+        {
+            "path": "php/src/Decimal.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "30d38fbb66906dd30bbe9eb9175e5049becc249b",
+            "size": 5653,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/30d38fbb66906dd30bbe9eb9175e5049becc249b"
+        },
+        {
+            "path": "php/src/Engine.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "fdbb1328af863f5db869bbf0da1d2ce85fdfee25",
+            "size": 29934,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/fdbb1328af863f5db869bbf0da1d2ce85fdfee25"
+        },
+        {
+            "path": "php/src/Eval",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "113d76d6c5bf9d8fc517c7671b0e86b9add0e038",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/113d76d6c5bf9d8fc517c7671b0e86b9add0e038"
+        },
+        {
+            "path": "php/src/Eval/Address.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "bfd2956cd404016d6e0ffbbb3aeca8e852726dad",
+            "size": 1839,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/bfd2956cd404016d6e0ffbbb3aeca8e852726dad"
+        },
+        {
+            "path": "php/src/Eval/Budget.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "61a6400f15b51ec97008bce1c2c28c8ae6134be4",
+            "size": 2067,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/61a6400f15b51ec97008bce1c2c28c8ae6134be4"
+        },
+        {
+            "path": "php/src/Eval/Constraints.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "387108a4f9014ed91d5b5a3659dfcbc7f9cdff1c",
+            "size": 23676,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/387108a4f9014ed91d5b5a3659dfcbc7f9cdff1c"
+        },
+        {
+            "path": "php/src/Eval/Criteria.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "f0fc315d6d34a2d31efff31b56ab87aea9c4dfa0",
+            "size": 4783,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/f0fc315d6d34a2d31efff31b56ab87aea9c4dfa0"
+        },
+        {
+            "path": "php/src/Eval/Evaluator.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "4b1ebef41653d134b15dd9b9d66b44011fe1e6ed",
+            "size": 22715,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/4b1ebef41653d134b15dd9b9d66b44011fe1e6ed"
+        },
+        {
+            "path": "php/src/Eval/Input.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "4fe8b2318a167c52ed2c485cd8a6c66ef234500b",
+            "size": 14701,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/4fe8b2318a167c52ed2c485cd8a6c66ef234500b"
+        },
+        {
+            "path": "php/src/Eval/Library",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "2048381d2c2b05f071b6b478d4497e393b3d4e2b",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/2048381d2c2b05f071b6b478d4497e393b3d4e2b"
+        },
+        {
+            "path": "php/src/Eval/Library/Logical.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "2f6ea080f25c88656ab763113c9f2b71bbbc7b74",
+            "size": 5277,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/2f6ea080f25c88656ab763113c9f2b71bbbc7b74"
+        },
+        {
+            "path": "php/src/Eval/Library/Lookup.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "fe99e8b5cb5265efeb643f70dbaf03faba98caa2",
+            "size": 20091,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/fe99e8b5cb5265efeb643f70dbaf03faba98caa2"
+        },
+        {
+            "path": "php/src/Eval/Library/Math.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "0f0495a72cc4a73507314e1026bee68b088cd275",
+            "size": 14080,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/0f0495a72cc4a73507314e1026bee68b088cd275"
+        },
+        {
+            "path": "php/src/Eval/Library/TextDate.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "82fa09418738361b9e86e4e14cda9c83d30c03bc",
+            "size": 10636,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/82fa09418738361b9e86e4e14cda9c83d30c03bc"
+        },
+        {
+            "path": "php/src/Eval/LimitExceeded.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "539ba52033ec01c558c41cc7820250ec3f5af861",
+            "size": 454,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/539ba52033ec01c558c41cc7820250ec3f5af861"
+        },
+        {
+            "path": "php/src/Eval/Recorder.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "118cae48a434af5543aec5379b83c3ea20cff9be",
+            "size": 3909,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/118cae48a434af5543aec5379b83c3ea20cff9be"
+        },
+        {
+            "path": "php/src/Eval/Workbook.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "4cb81cebdbeede632c86b6806d9e0641d8645d98",
+            "size": 10478,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/4cb81cebdbeede632c86b6806d9e0641d8645d98"
+        },
+        {
+            "path": "php/src/Evaluation.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "dc7e01cdd635dd586fa9498e1806339aec878f03",
+            "size": 1444,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/dc7e01cdd635dd586fa9498e1806339aec878f03"
+        },
+        {
+            "path": "php/src/ExternalProvider.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "eac6d35e626121c627c469ea0f1b0af6d0222fec",
+            "size": 962,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/eac6d35e626121c627c469ea0f1b0af6d0222fec"
+        },
+        {
+            "path": "php/src/FixedClock.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "c73550720d7f54c09dbb8234f2c70d027107681b",
+            "size": 991,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/c73550720d7f54c09dbb8234f2c70d027107681b"
+        },
+        {
+            "path": "php/src/Formula.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "d83243102086b955890d3de5ab576d2b384b6570",
+            "size": 6155,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/d83243102086b955890d3de5ab576d2b384b6570"
+        },
+        {
+            "path": "php/src/FormulaError.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "04c3ea7298055ee13f60ac2db80c7143b1fb60ee",
+            "size": 3823,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/04c3ea7298055ee13f60ac2db80c7143b1fb60ee"
+        },
+        {
+            "path": "php/src/FunctionPolicy.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "e559e04a4fb67c1d8ddae3322e4e16682bff0223",
+            "size": 1470,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/e559e04a4fb67c1d8ddae3322e4e16682bff0223"
+        },
+        {
+            "path": "php/src/Functions.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "11c024c00f879537d8858bd071348175d1c35a32",
+            "size": 7107,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/11c024c00f879537d8858bd071348175d1c35a32"
+        },
+        {
+            "path": "php/src/Limits.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "0c406e1ec035425f101ab37f09ac203352768095",
+            "size": 2507,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/0c406e1ec035425f101ab37f09ac203352768095"
+        },
+        {
+            "path": "php/src/Options.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "7c5c5fa8b0b9d570815828d723c8f13aa2dc5bcf",
+            "size": 2354,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/7c5c5fa8b0b9d570815828d723c8f13aa2dc5bcf"
+        },
+        {
+            "path": "php/src/ProviderContext.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "7eb637b52e47e31841354800aa8f49b79bd611c8",
+            "size": 361,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/7eb637b52e47e31841354800aa8f49b79bd611c8"
+        },
+        {
+            "path": "php/src/References.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "e640272508f88766079a52df138337598ffc22bf",
+            "size": 1373,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/e640272508f88766079a52df138337598ffc22bf"
+        },
+        {
+            "path": "php/src/Seed.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "bbec43fe72ead61c206f5bc775e7fa5c379ad051",
+            "size": 841,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/bbec43fe72ead61c206f5bc775e7fa5c379ad051"
+        },
+        {
+            "path": "php/src/StubEngine.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "3e24bac9dbad68c2bb23f62b2a38b7d46739f4e0",
+            "size": 5199,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/3e24bac9dbad68c2bb23f62b2a38b7d46739f4e0"
+        },
+        {
+            "path": "php/src/Syntax",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "204196c139c9a83bbf8f71a91b91eb6f580461da",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/204196c139c9a83bbf8f71a91b91eb6f580461da"
+        },
+        {
+            "path": "php/src/Syntax/Lexer.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "91ac1d4f9330e6b01983c1b624bd4c6d4c65882c",
+            "size": 7914,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/91ac1d4f9330e6b01983c1b624bd4c6d4c65882c"
+        },
+        {
+            "path": "php/src/Syntax/Parser.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "0a69bbe5cae1c9fe30ce6f69143d37a3f91f9ea8",
+            "size": 14509,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/0a69bbe5cae1c9fe30ce6f69143d37a3f91f9ea8"
+        },
+        {
+            "path": "php/src/Syntax/Printer.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "401f9b10ea5028852bdb734cc32c741f01a93080",
+            "size": 4761,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/401f9b10ea5028852bdb734cc32c741f01a93080"
+        },
+        {
+            "path": "php/src/Value",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "f44e00c3129343535b9219ae0f1a10c5d6492bad",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/f44e00c3129343535b9219ae0f1a10c5d6492bad"
+        },
+        {
+            "path": "php/src/Value/Blank.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "d8da9d55065158c2f7928622510f0b71edd87f66",
+            "size": 416,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/d8da9d55065158c2f7928622510f0b71edd87f66"
+        },
+        {
+            "path": "php/src/Value/ErrorValue.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "41c0fd2d2d9706e471cc62c34f369ac47fb8b503",
+            "size": 1165,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/41c0fd2d2d9706e471cc62c34f369ac47fb8b503"
+        },
+        {
+            "path": "php/src/Value/Matrix.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "3ed928097fe0273c87de97760aa158bb2264dee5",
+            "size": 3889,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/3ed928097fe0273c87de97760aa158bb2264dee5"
+        },
+        {
+            "path": "php/src/Value/Values.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "f626c346a86aab359962ac8a04af6c975dda8d5d",
+            "size": 9678,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/f626c346a86aab359962ac8a04af6c975dda8d5d"
+        },
+        {
+            "path": "php/src/Violations.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "1a8e6463a7b22a806991dc021b688595f3f6e31d",
+            "size": 5094,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/1a8e6463a7b22a806991dc021b688595f3f6e31d"
+        },
+        {
+            "path": "php/tests",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "a8f0672c704cb2d3e294ecd105962855421c27bf",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/a8f0672c704cb2d3e294ecd105962855421c27bf"
+        },
+        {
+            "path": "php/tests/CaptureWorkbookTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "7d22d6498fb1f00536329fec17e04984ff26c697",
+            "size": 9785,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/7d22d6498fb1f00536329fec17e04984ff26c697"
+        },
+        {
+            "path": "php/tests/CheckTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "16fca8c03f0c24ba553448c09ed510416a8d0502",
+            "size": 11884,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/16fca8c03f0c24ba553448c09ed510416a8d0502"
+        },
+        {
+            "path": "php/tests/ConformanceTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "85076631dea007f7a78d666f36a5572ef7addb2b",
+            "size": 3364,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/85076631dea007f7a78d666f36a5572ef7addb2b"
+        },
+        {
+            "path": "php/tests/ConstraintsTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "4d0ca6245db4f4118082a7d38f8f33651fd3fbb5",
+            "size": 12670,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/4d0ca6245db4f4118082a7d38f8f33651fd3fbb5"
+        },
+        {
+            "path": "php/tests/EngineApiTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "f3712cb713aee7595d4832097c5968ccdf31234b",
+            "size": 6228,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/f3712cb713aee7595d4832097c5968ccdf31234b"
+        },
+        {
+            "path": "php/tests/FormulaTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "8c65bf1f47c547cbeac4e33858c5d984add7607d",
+            "size": 9678,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/8c65bf1f47c547cbeac4e33858c5d984add7607d"
+        },
+        {
+            "path": "php/tests/HypothesesTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "27576b8ef3de7877ad832dc23c0e3af0215d610a",
+            "size": 14595,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/27576b8ef3de7877ad832dc23c0e3af0215d610a"
+        },
+        {
+            "path": "php/tests/Pest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "0507118f820795d45e07513e66aebd5733c50166",
+            "size": 916,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/0507118f820795d45e07513e66aebd5733c50166"
+        },
+        {
+            "path": "php/tests/PricingTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "a6c810a89a19bb49083d0dfaf441fd0bbcbcf808",
+            "size": 10900,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/a6c810a89a19bb49083d0dfaf441fd0bbcbcf808"
+        },
+        {
+            "path": "php/tests/SchemaTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "6665d768652d055144a51ca85f046d0f3d223c7d",
+            "size": 25491,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/6665d768652d055144a51ca85f046d0f3d223c7d"
+        },
+        {
+            "path": "php/tests/SecurityTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "234a1490d2038a6c53451cde34b4de2355142229",
+            "size": 2050,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/234a1490d2038a6c53451cde34b4de2355142229"
+        },
+        {
+            "path": "php/tests/Support",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "7b8864e5ad008a3adddc62f31a8ee265d3290d82",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/7b8864e5ad008a3adddc62f31a8ee265d3290d82"
+        },
+        {
+            "path": "php/tests/Support/Capture.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "071eff16ea248cf50f5325e076b4fade82bcefdf",
+            "size": 1820,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/071eff16ea248cf50f5325e076b4fade82bcefdf"
+        },
+        {
+            "path": "php/tests/Support/Goldens.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "c35b2ad95931740d4a65aa61a5d65a3d5cc5e61c",
+            "size": 7024,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/c35b2ad95931740d4a65aa61a5d65a3d5cc5e61c"
+        },
+        {
+            "path": "php/tests/Support/SchemaValidator.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "ac7a1873931c9befadfbb45618b913da822509b1",
+            "size": 14284,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/ac7a1873931c9befadfbb45618b913da822509b1"
+        },
+        {
+            "path": "php/tests/ViolationsTest.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "181eb7d8a177132585c6504a4d5f801751c76115",
+            "size": 13063,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/181eb7d8a177132585c6504a4d5f801751c76115"
+        },
+        {
+            "path": "php/tests/fixtures",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "026063f89ff461430c268ad4bb6bdccdbb000806",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/026063f89ff461430c268ad4bb6bdccdbb000806"
+        },
+        {
+            "path": "php/tests/fixtures/pricing-880.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "e67c14182fd487d30e1ab6345fa5ba4cfbfc3320",
+            "size": 3534,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/e67c14182fd487d30e1ab6345fa5ba4cfbfc3320"
+        },
+        {
+            "path": "phpunit.xml",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "4bbb9b180bb0866262ad5ccf6c4071ff334bb156",
+            "size": 395,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/4bbb9b180bb0866262ad5ccf6c4071ff334bb156"
+        },
+        {
+            "path": "schema",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "e7624b341427ba2d250e581f4b227c7337852b66",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/e7624b341427ba2d250e581f4b227c7337852b66"
+        },
+        {
+            "path": "schema/check-report.schema.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "9601f90746f172007c65daa608e086757314c5ea",
+            "size": 4529,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/9601f90746f172007c65daa608e086757314c5ea"
+        },
+        {
+            "path": "schema/evaluation.schema.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "2c10566d3b82017e45fb9e05e3b809895f5667bf",
+            "size": 10518,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/2c10566d3b82017e45fb9e05e3b809895f5667bf"
+        },
+        {
+            "path": "schema/request.schema.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "aac668cc537443fae43400649c16afbdbe1189d9",
+            "size": 23192,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/aac668cc537443fae43400649c16afbdbe1189d9"
+        },
+        {
+            "path": "schema/trace.schema.json",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "6eb00a30abb8cd7e3e0b42387c281e962d9dcc05",
+            "size": 12326,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/6eb00a30abb8cd7e3e0b42387c281e962d9dcc05"
+        },
+        {
+            "path": "scripts",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "52c258fb26d55f1a62963cb04b2127a47861a712",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/52c258fb26d55f1a62963cb04b2127a47861a712"
+        },
+        {
+            "path": "scripts/build-capture-workbook.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "e0cc9afe8f5fc6cfca59494dcf5157cc9ea12e25",
+            "size": 2317,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/e0cc9afe8f5fc6cfca59494dcf5157cc9ea12e25"
+        },
+        {
+            "path": "scripts/capture",
+            "mode": "040000",
+            "type": "tree",
+            "sha": "cb472a0f6b931c6f6b7f493c50007e672476c219",
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/trees/cb472a0f6b931c6f6b7f493c50007e672476c219"
+        },
+        {
+            "path": "scripts/capture/CaptureBuilder.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "ec069c7c3ea51abf7df2722fe1a5edf9e0e50a59",
+            "size": 13128,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/ec069c7c3ea51abf7df2722fe1a5edf9e0e50a59"
+        },
+        {
+            "path": "scripts/capture/cases-v1.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "662c09677558aaab7fba39fecc5bc1f53532191f",
+            "size": 42413,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/662c09677558aaab7fba39fecc5bc1f53532191f"
+        },
+        {
+            "path": "scripts/capture/p1-functions.php",
+            "mode": "100644",
+            "type": "blob",
+            "sha": "b25c2b3f3f16022ee2b79a499ef80d4459d18e0f",
+            "size": 5416,
+            "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/git/blobs/b25c2b3f3f16022ee2b79a499ef80d4459d18e0f"
+        }
+    ]
+}

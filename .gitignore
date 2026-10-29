@@ -4,5 +4,7 @@
 composer.lock
 !/tools/engine-fixture/fancy-formula/composer.lock
 /tools/engine-fixture/fancy-formula/vendor/
+!/tools/engine-fixture/fancy-formula-real/composer.lock
+/tools/engine-fixture/fancy-formula-real/vendor/
 .phpunit.result.cache
 .phpstan.cache
