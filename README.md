@@ -15,7 +15,8 @@ formula documents through `particle-academy/fancy-formula`. Installing Harness
 enables no tool and installs no engine. On PHP 8.4+, use
 `composer require particle-academy/fancy-formula` from Packagist:
 **Real results from 0.1.0; 0.0.1 is a stub.** Harness automatically constructs
-the verified 0.1.0 Engine from host policy, with no external providers. A host
+a compatible SPEC 1 Engine (verified with 0.1.0) from host policy, with no external
+providers. A host
 factory overrides autodetection. Stub results identify themselves and
 contain `#N/A`, never calculated numbers. Without an engine, the configured tool
 returns `FORMULA_ENGINE_UNAVAILABLE` and registered documents remain UNCHECKED.

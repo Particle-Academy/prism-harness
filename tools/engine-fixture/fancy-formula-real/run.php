@@ -249,3 +249,16 @@ foreach ([32, 33] as $count) {
 $wire = (new DoMathTool($service))->tool()->handle(document: 'pricing', inputs: ['qty' => 120]);
 fixtureCheck(is_string($wire) && json_decode($wire, true, flags: JSON_THROW_ON_ERROR)['results']['total']['value']['v'] === 1170, 'doMath tool did not return the real normal JSON result.');
 echo 'PASS '.$assertions.' actual real-engine assertions; engine '.Engine::ENGINE.PHP_EOL;
+$contractRows = 0;
+foreach (['future', 'prerelease', 'spec2', 'malformed', 'newline', 'partial-Options', 'partial-Limits', 'partial-FixedClock', 'partial-Seed', 'partial-FunctionPolicy'] as $mode) {
+    $process = proc_open([PHP_BINARY, __DIR__.'/contract.php', $mode], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    if (! is_resource($process)) {
+        throw new RuntimeException('Cannot start the isolated contract fixture.');
+    }
+    $output = stream_get_contents($pipes[1]).stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    fixtureCheck(proc_close($process) === 0 && str_contains($output, '"ok":true'), 'Contract row failed: '.$mode.' '.$output);
+    $contractRows++;
+}
+echo 'PASS '.$contractRows.' isolated discovery contract rows.'.PHP_EOL;

@@ -81,8 +81,12 @@ never starts evaluating because a package appeared later.
 
 ## Engine discovery and host factory
 
-Without a factory, Harness prefers the verified real `FancyFormula\Engine`
-0.1.0 over `StubEngine`. It constructs `Engine(new Options(...))` from the
+Without a factory, Harness prefers a compatible real `FancyFormula\Engine`
+over `StubEngine`. Autodetection requires `SPEC === '1'`, an ENGINE label matching
+`^fancy-formula 0\.\d+\.\d+(-[A-Za-z0-9.]+)?$`, and all five policy classes
+(`Options`, `Limits`, `FixedClock`, `Seed`, `FunctionPolicy`). The contract is
+verified against published 0.1.0; compatible releases keep working and every
+result reports the actual ENGINE string. Harness constructs `Engine(new Options(...))` from the
 host's `FormulaPolicy`: `Limits::defaults()->with(...$policy->limits)`,
 `Seed::fromString($policy->seed)` when present, `FunctionPolicy::only(...)`
 for an explicit list (including an empty list), otherwise `FunctionPolicy::all()`.
@@ -123,10 +127,11 @@ Closure in `engine_factory`; container bindings support cached configuration.
 normalizes arrays or reports with `toArray()`. Hosts must construct SDK Options
 from host policy and an explicit provider allowlist. No external provider is
 registered automatically. Without a real engine, Harness discovers the verified
-no-argument StubEngine. An unverified Engine version requires a factory; otherwise the result
+no-argument StubEngine. An unknown SPEC, malformed ENGINE label or partial SDK
+requires a factory; otherwise the result
 is `FORMULA_ENGINE_UNAVAILABLE` with `detail: "engine_factory_required"`.
 Harness never constructs a bare real Engine or falls back to a stub when an
-unverified Engine is present.
+incompatible or partial Engine SDK is present.
 
 ## Limits, output and permissions
 

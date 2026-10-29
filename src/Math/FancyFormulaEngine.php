@@ -29,11 +29,17 @@ final readonly class FancyFormulaEngine implements FormulaEngine
         $policy ??= new FormulaPolicy;
         $real = 'FancyFormula\\Engine';
         if (class_exists($real)) {
-            // Only the concrete, artifact-verified Options API is autodetected.
-            // An unknown Engine never silently falls back to a stub.
-            if (! defined($real.'::ENGINE') || constant($real.'::ENGINE') !== 'fancy-formula 0.1.0'
+            // SPEC versions the construction contract; ENGINE identifies the
+            // installed implementation. Compatible patch releases keep working.
+            if (! defined($real.'::ENGINE') || ! is_string($version = constant($real.'::ENGINE'))
+                || preg_match('/\Afancy-formula 0\.\d+\.\d+(-[A-Za-z0-9.]+)?\z/D', $version) !== 1
                 || ! defined($real.'::SPEC') || constant($real.'::SPEC') !== '1') {
                 return null;
+            }
+            foreach (['Options', 'Limits', 'FixedClock', 'Seed', 'FunctionPolicy'] as $class) {
+                if (! self::sdkClassExists($class)) {
+                    return null;
+                }
             }
             // Validate host ceilings eagerly, without sampling a dynamic clock.
             self::realLimits($policy);
@@ -44,7 +50,7 @@ final readonly class FancyFormulaEngine implements FormulaEngine
             return new self(
                 fn (array $request) => (new $real(self::realOptions($policy)))->check($request),
                 fn (array $request) => (new $real(self::realOptions($policy)))->evaluate($request),
-                constant($real.'::ENGINE'),
+                $version,
             );
         }
         if (! class_exists('FancyFormula\\StubEngine')) {
@@ -64,6 +70,11 @@ final readonly class FancyFormulaEngine implements FormulaEngine
         $class = 'FancyFormula\\Limits';
 
         return $class::defaults()->with(...$policy->limits);
+    }
+
+    private static function sdkClassExists(string $name): bool
+    {
+        return class_exists('FancyFormula\\'.$name);
     }
 
     private static function realOptions(FormulaPolicy $policy): object
