@@ -166,8 +166,10 @@ final class DoMathService
         $result['engine'] = $version;
         $result['fingerprint'] = is_string($report['fingerprint'] ?? null) ? $report['fingerprint'] : null;
         $paths = [];
-        $this->markText($result, '', $paths);
-        $result['text_safety'] = ['format' => 'json-data', 'formula_like_paths' => $paths];
+        if (! $this->markText($result, '', $paths)) {
+            return [...$this->outputLimit($report, $version, $policy), 'text_safety' => ['complete' => false]];
+        }
+        $result['text_safety'] = ['format' => 'json-data', 'complete' => true, 'formula_like_paths' => $paths];
         if (strlen(json_encode($result, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION)) > $policy->maxOutputBytes) {
             return $this->outputLimit($report, $version, $policy);
         }
@@ -244,17 +246,21 @@ final class DoMathService
     }
 
     /** @param list<string> $paths */
-    private function markText(mixed $value, string $path, array &$paths): void
+    private function markText(mixed $value, string $path, array &$paths): bool
     {
-        if (count($paths) >= 32) {
-            return;
-        }
         if (is_string($value) && preg_match('/\A[=+\-@\t\r]/', $value) === 1) {
+            if (count($paths) >= 32) {
+                return false;
+            }
             $paths[] = $path;
         } elseif (is_array($value) || $value instanceof stdClass) {
             foreach ($value as $key => $item) {
-                $this->markText($item, $path.'/'.str_replace(['~', '/'], ['~0', '~1'], (string) $key), $paths);
+                if (! $this->markText($item, $path.'/'.str_replace(['~', '/'], ['~0', '~1'], (string) $key), $paths)) {
+                    return false;
+                }
             }
         }
+
+        return true;
     }
 }

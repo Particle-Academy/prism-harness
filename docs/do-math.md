@@ -54,7 +54,9 @@ app(DoMathManager::class)->forAgent('support')->registerDocument('pricing', [
 ```
 
 Each registration is checked. `FormulaDocumentRejected::result->report` carries
-the original failed report. Failed replacement retains the previous checked
+the original failed engine check report. Host policy or document-shape refusals
+from `documentPolicy()` throw `FormulaRequestRefused` instead; both exceptions
+are host registration failures. Failed replacement retains the previous checked
 document. Registration snapshots JSON data against later mutable host aliases.
 Give tenant-specific data separate service instances rather than sharing a
 worker registry across tenants.
@@ -123,9 +125,13 @@ are preserved. Native failures may have null fingerprints because the engine
 contract supplies none.
 
 Output is JSON data. Strings beginning `=`, `+`, `-`, `@`, tab or CR keep their
-bytes and are marked by JSON Pointer in `text_safety.formula_like_paths` (up to
-32 examples). Render as text; explicitly write text cells when exporting a
-spreadsheet. These markers do not escape CSV or HTML.
+bytes and are marked by JSON Pointer in `text_safety.formula_like_paths`.
+`text_safety.complete: true` means every such string is marked (at most 32).
+If more exist in results, traces, warnings or errors, the entire report fails
+closed with `FORMULA_OUTPUT_LIMIT` and `text_safety.complete: false`; the original
+payload and partial path list are omitted. Render strings as text; explicitly
+write text cells when exporting a spreadsheet. These markers do not escape CSV
+or HTML.
 
 `doMath` uses ordinary offer/call abilities and mode approval settings. Named
 modes must list it explicitly. Effective-tool inspection writes no session,

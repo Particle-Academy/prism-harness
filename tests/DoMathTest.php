@@ -233,9 +233,65 @@ it('marks every dangerous text prefix as JSON data and leaves its bytes intact',
     $wire = (new DoMathTool($service))->tool()->handle(document: 'pricing');
     $result = json_decode($wire, true, flags: JSON_THROW_ON_ERROR);
     expect($result['results']['text'])->toBe($values)->and($result['text_safety']['format'])->toBe('json-data')
+        ->and($result['text_safety']['complete'])->toBeTrue()
         ->and($result['text_safety']['formula_like_paths'])->toHaveCount(7)
         ->toContain('/results/text/0', '/results/text/5', '/traces/x/formula');
 });
+
+it('proves the formula text marker list is complete at its boundary', function (int $count): void {
+    $engine = new FormulaProbeEngine;
+    $service = mathService($engine);
+    $values = array_fill(0, $count, '=1');
+    $engine->report['results'] = (object) ['text' => $values, 'ordinary_after_cap' => ['safe', 'still data']];
+    $result = $service->evaluate(['document' => 'pricing']);
+    expect($result['ok'])->toBeTrue()
+        ->and($result['text_safety']['complete'])->toBeTrue()
+        ->and($result['text_safety']['formula_like_paths'])->toHaveCount($count)
+        ->and($result['results']->text)->toBe($values)
+        ->and($result['results']->ordinary_after_cap)->toBe(['safe', 'still data']);
+})->with([31, 32]);
+
+it('fails closed when formula text markers overflow on any report channel', function (string $channel, int $count, int $bytes): void {
+    $engine = new FormulaProbeEngine;
+    $service = mathService($engine, new FormulaPolicy(documents: ['pricing'], maxOutputBytes: $bytes, maxTraceBytes: $bytes));
+    $values = array_fill(0, $count, '=1');
+    match ($channel) {
+        'results' => $engine->report['results'] = (object) ['text' => $values],
+        'traces' => $engine->report['traces'] = (object) ['total' => ['steps' => $values]],
+        'warnings' => $engine->report['warnings'] = array_map(fn ($text) => ['code' => 'FORMULA_WARNING', 'message' => $text], $values),
+        'mixed' => $engine->report = [...$engine->report,
+            'results' => (object) ['text' => array_slice($values, 0, 16)],
+            'traces' => (object) ['total' => ['steps' => array_slice($values, 16, 16)]],
+            'warnings' => [['code' => 'FORMULA_WARNING', 'message' => $values[32]]]],
+        'errors' => $engine->report = ['ok' => false, 'code' => 'FORMULA_INPUT_CONSTRAINT',
+            'violations' => array_map(fn ($text) => ['input' => 'seats', 'rule' => 'min', 'message' => $text], $values),
+            'truncatedViolations' => ['seats' => 7], 'truncatedByRequestCap' => 3],
+    };
+    $wire = (new DoMathTool($service))->tool()->handle(document: 'pricing');
+    $result = json_decode($wire, true, flags: JSON_THROW_ON_ERROR);
+    expect($result['ok'])->toBeFalse()
+        ->and($result['text_safety']['complete'])->toBeFalse()
+        ->and($result['error']['code'])->toBe('FORMULA_OUTPUT_LIMIT')
+        ->and($result)->not->toHaveKey('results')
+        ->and($result)->not->toHaveKey('traces')
+        ->and($result)->not->toHaveKey('warnings')
+        ->and($result['error'])->not->toHaveKey('violations')
+        ->and($result['text_safety'])->not->toHaveKey('formula_like_paths')
+        ->and($wire)->not->toContain('=1')
+        ->and(strlen($wire))->toBeLessThanOrEqual($bytes);
+    if ($channel === 'errors') {
+        expect($result['error']['engine_code'])->toBe('FORMULA_INPUT_CONSTRAINT')
+            ->and($result['error']['counts'])->toBe(['violations' => $count, 'truncatedViolations' => 7, 'truncatedByRequestCap' => 3]);
+    }
+})->with([
+    '33 result strings' => ['results', 33, 65536],
+    '80 result strings' => ['results', 80, 65536],
+    '33 trace strings' => ['traces', 33, 65536],
+    '33 warning strings' => ['warnings', 33, 65536],
+    '33 strings across report channels' => ['mixed', 33, 65536],
+    '33 native violation strings' => ['errors', 33, 65536],
+    '33 strings under the minimum output cap' => ['results', 33, 512],
+]);
 
 it('rejects executable or cyclic JSON objects without invoking serializers', function (): void {
     $engine = new FormulaProbeEngine;
