@@ -67,7 +67,7 @@ final class DoMathManager
         if ($factory !== null && ! $factory instanceof Closure) {
             throw new InvalidArgumentException('The host engine factory must be a Closure(FormulaPolicy): FormulaEngine.');
         }
-        $engine = $factory === null ? FancyFormulaEngine::detect() : $factory($policy);
+        $engine = $factory === null ? FancyFormulaEngine::detect($policy) : $factory($policy);
         if ($engine !== null && ! $engine instanceof FormulaEngine) {
             throw new InvalidArgumentException('The host engine factory must return a FormulaEngine.');
         }

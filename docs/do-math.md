@@ -1,6 +1,4 @@
-# doMath preview
-
-**stub engine: no formula results until fancy-formula P1**
+# doMath
 
 The optional `DoMathService`, engine port and tool belong to Harness. Installing
 Harness enables no tool and adds no engine dependency; PHP 8.2 remains supported.
@@ -10,11 +8,14 @@ On PHP 8.4+, install the engine from Packagist:
 composer require particle-academy/fancy-formula
 ```
 
-**0.0.1 = stub, real results from 0.1.0.** This preview is verified against
-0.0.1. Its `check()` returns no diagnostics; every result is a `#N/A` error value
+**Real results from 0.1.0; 0.0.1 is a stub.** The verified 0.1.0 engine evaluates
+formulas, checks constraints and returns native values and traces. Its first
+slice supports the pricing set; unsupported functions return native diagnostics.
+The legacy 0.0.1 `check()` returns no diagnostics; every result is a `#N/A` error value
 with a stub explanation. CHECKED means the installed engine accepted the document.
 The stub does not prove formula validity, constraints or numerical behavior.
-Every evaluation reports `fancy-formula 0.0.0-stub` and its native fingerprint.
+Stub evaluations report `fancy-formula 0.0.0-stub`; real evaluations report
+`fancy-formula 0.1.0`. Successful evaluations carry the native fingerprint.
 
 ## Host configuration
 
@@ -36,6 +37,7 @@ Keep your existing model and other mode settings.
         'max_trace_bytes' => 32768,
         'trace' => 'lookups',
         'seed' => 'host-selected-seed',
+        'clock' => ['localDateTime' => '2026-10-27T18:00:00', 'zone' => 'Europe/London'],
     ]],
     'modes' => ['reply' => ['tools' => ['doMath']]],
 ],
@@ -77,9 +79,29 @@ Availability is fixed at service construction. After installing the SDK,
 **restart workers and re-register documents**. An existing UNCHECKED document
 never starts evaluating because a package appeared later.
 
-## Host engine factory
+## Engine discovery and host factory
 
-The primary construction path is a host factory. In an application provider's
+Without a factory, Harness prefers the verified real `FancyFormula\Engine`
+0.1.0 over `StubEngine`. It constructs `Engine(new Options(...))` from the
+host's `FormulaPolicy`: `Limits::defaults()->with(...$policy->limits)`,
+`Seed::fromString($policy->seed)` when present, `FunctionPolicy::only(...)`
+for an explicit list (including an empty list), otherwise `FunctionPolicy::all()`.
+External providers are always `[]` in autodetection. Host limits above the SDK's
+hard ceiling throw at application boot; they are never clamped. Requests may
+only tighten these limits.
+
+The host `clock` array must have exactly `localDateTime` and `zone`, both strings,
+and becomes a `FixedClock`. A host Closure may return that same array; it runs
+once per check/evaluate operation and Harness rebuilds the engine for each
+operation. Wrong shapes and Closure exceptions surface as host configuration
+exceptions at registration or call time. A null clock leaves Fancy's default:
+it has no ambient clock, so `NOW` and `TODAY` are refused with
+`FORMULA_NEEDS_CLOCK`. The default does not read nondeterministic wall time;
+explicit fixed clocks give reproducible time formulas. A changing host Closure
+can deliberately change results and fingerprints between operations.
+
+For arbitrary Clock or ExternalProvider implementations, use a host factory.
+It overrides autodetection. In an application provider's
 `register()` method, bind a Closure returning Harness's `FormulaEngine` port:
 
 ```php
@@ -100,11 +122,11 @@ Closure in `engine_factory`; container bindings support cached configuration.
 `FancyFormulaEngine::fromEngine($sdk, $version)` wraps a host-constructed SDK and
 normalizes arrays or reports with `toArray()`. Hosts must construct SDK Options
 from host policy and an explicit provider allowlist. No external provider is
-registered automatically. Without a factory, the preview discovers the verified
-no-argument StubEngine. A real Engine requires a factory; otherwise the result
+registered automatically. Without a real engine, Harness discovers the verified
+no-argument StubEngine. An unverified Engine version requires a factory; otherwise the result
 is `FORMULA_ENGINE_UNAVAILABLE` with `detail: "engine_factory_required"`.
-Automatic Options construction awaits verification of the concrete 0.1.0 API.
-The adapter never constructs a bare real Engine or falls back to the stub.
+Harness never constructs a bare real Engine or falls back to a stub when an
+unverified Engine is present.
 
 ## Limits, output and permissions
 
@@ -144,5 +166,13 @@ Normal PHP 8.2/8.3/8.4 lanes run without an SDK. A separate PHP 8.4 fixture in
 plugins and autoload generation disabled. Before loading SDK code, `run.php`
 verifies the dist reference and every blob against commit
 `acd37f3ecefb6dffdb26e5f650f2c9f516f32d89`, tree
-`728380ebe956f9deaebf28c3fbe5f89238f5b76e`. This proves stub integration, not
-real formula results.
+`728380ebe956f9deaebf28c3fbe5f89238f5b76e`. This proves stub integration.
+
+Alongside it, `tools/engine-fixture/fancy-formula-real` installs exact normal
+Packagist 0.1.0 at published commit `9dcef871f0703167923f21a8720c44243d78e2d8`,
+tree `27b3c56911e4eaa84b7e707b1aa6aa60d22745e9`. All 78 blobs and the full tree
+are checked before autoload; a changed Engine file must be refused. Its runtime
+is byte-identical to the reviewed API commit `9c30ae25c9386301edbfa1012a3810561a0f5c57`.
+The fixture exercises real pricing arithmetic (120 units at 9.75 = 1170), native
+constraint reports, host function exclusions, tighter-only limits, clock sampling,
+factory-only external providers, output bounds and 32/33 marker boundaries.

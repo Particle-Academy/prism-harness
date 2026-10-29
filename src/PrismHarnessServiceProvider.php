@@ -173,6 +173,13 @@ class PrismHarnessServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        // Opted-in host policies fail at boot (including SDK hard ceilings),
+        // before an agent can invoke a tool with a broken engine configuration.
+        $math = $this->app->make(DoMathManager::class);
+        foreach ($math->configuredAgents() as $agent) {
+            $math->forAgent($agent);
+        }
+
         // Offered ONLY when something can answer it — decided PER SESSION,
         // not once at boot.
         //

@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace Prism\Harness\Math;
 
 use Closure;
+use InvalidArgumentException;
 use LogicException;
 use Prism\Harness\Contracts\FormulaEngine;
+use RuntimeException;
+use Throwable;
 
 /** Optional SDK discovery uses fixed class names and no compile-time symbols. */
 final readonly class FancyFormulaEngine implements FormulaEngine
@@ -15,20 +18,36 @@ final readonly class FancyFormulaEngine implements FormulaEngine
 
     private Closure $evaluate;
 
-    private function __construct(object $engine, private string $engineVersion)
+    private function __construct(Closure $check, Closure $evaluate, private string $engineVersion)
     {
-        if (! is_callable([$engine, 'check']) || ! is_callable([$engine, 'evaluate'])) {
-            throw new LogicException('The formula engine does not expose the frozen check/evaluate contract.');
-        }
-        $this->check = Closure::fromCallable([$engine, 'check']);
-        $this->evaluate = Closure::fromCallable([$engine, 'evaluate']);
+        $this->check = $check;
+        $this->evaluate = $evaluate;
     }
 
-    public static function detect(): ?self
+    public static function detect(?FormulaPolicy $policy = null): ?self
     {
-        // A real Engine takes precedence, but its constructor contract is not
-        // guessed. Hosts bind a FormulaEngine factory until that contract ships.
-        if (class_exists('FancyFormula\\Engine') || ! class_exists('FancyFormula\\StubEngine')) {
+        $policy ??= new FormulaPolicy;
+        $real = 'FancyFormula\\Engine';
+        if (class_exists($real)) {
+            // Only the concrete, artifact-verified Options API is autodetected.
+            // An unknown Engine never silently falls back to a stub.
+            if (! defined($real.'::ENGINE') || constant($real.'::ENGINE') !== 'fancy-formula 0.1.0'
+                || ! defined($real.'::SPEC') || constant($real.'::SPEC') !== '1') {
+                return null;
+            }
+            // Validate host ceilings eagerly, without sampling a dynamic clock.
+            self::realLimits($policy);
+            if (is_array($policy->clock)) {
+                self::clock($policy->clock);
+            }
+
+            return new self(
+                fn (array $request) => (new $real(self::realOptions($policy)))->check($request),
+                fn (array $request) => (new $real(self::realOptions($policy)))->evaluate($request),
+                constant($real.'::ENGINE'),
+            );
+        }
+        if (! class_exists('FancyFormula\\StubEngine')) {
             return null;
         }
         $class = 'FancyFormula\\StubEngine';
@@ -37,7 +56,59 @@ final readonly class FancyFormulaEngine implements FormulaEngine
             throw new LogicException('A StubEngine must identify itself as a stub.');
         }
 
-        return new self(new $class, $version);
+        return self::fromEngine(new $class, $version);
+    }
+
+    private static function realLimits(FormulaPolicy $policy): object
+    {
+        $class = 'FancyFormula\\Limits';
+
+        return $class::defaults()->with(...$policy->limits);
+    }
+
+    private static function realOptions(FormulaPolicy $policy): object
+    {
+        $options = 'FancyFormula\\Options';
+        if (! class_exists($options)) {
+            throw new LogicException('The verified formula Options class is unavailable.');
+        }
+        $seed = 'FancyFormula\\Seed';
+        $functions = 'FancyFormula\\FunctionPolicy';
+        $clock = $policy->clock;
+        if ($clock instanceof Closure) {
+            try {
+                $clock = $clock();
+            } catch (Throwable $failure) {
+                // A host callback throwing FormulaRequestRefused must not enter
+                // the service's normal model-request refusal channel.
+                throw new RuntimeException('The host formula clock failed.', previous: $failure);
+            }
+            if (! is_array($clock)) {
+                throw new InvalidArgumentException('The host formula clock must return localDateTime and zone strings.');
+            }
+        }
+
+        return new $options(
+            limits: self::realLimits($policy),
+            clock: $clock === null ? null : self::clock($clock),
+            random: $policy->seed === null ? null : $seed::fromString($policy->seed),
+            providers: [],
+            functions: $policy->functionPolicy === null ? $functions::all() : $functions::only($policy->functionPolicy),
+        );
+    }
+
+    private static function clock(mixed $clock): object
+    {
+        if (! is_array($clock) || count($clock) !== 2 || array_diff(array_keys($clock), ['localDateTime', 'zone']) !== []
+            || ! is_string($clock['localDateTime'] ?? null) || ! is_string($clock['zone'] ?? null)) {
+            throw new InvalidArgumentException('The host formula clock requires exactly localDateTime and zone strings.');
+        }
+        $class = 'FancyFormula\\FixedClock';
+        if (! class_exists($class)) {
+            throw new LogicException('The verified formula FixedClock class is unavailable.');
+        }
+
+        return new $class($clock['localDateTime'], $clock['zone']);
     }
 
     public static function unavailableDetail(): ?string
@@ -48,7 +119,11 @@ final readonly class FancyFormulaEngine implements FormulaEngine
     /** Wrap an SDK constructed by the HOST with its own Options and providers. */
     public static function fromEngine(object $engine, string $version): self
     {
-        return new self($engine, $version);
+        if (! is_callable([$engine, 'check']) || ! is_callable([$engine, 'evaluate'])) {
+            throw new LogicException('The formula engine does not expose the frozen check/evaluate contract.');
+        }
+
+        return new self(Closure::fromCallable([$engine, 'check']), Closure::fromCallable([$engine, 'evaluate']), $version);
     }
 
     public function version(): string

@@ -8,15 +8,15 @@ Durable agent sessions for Laravel — threads, modes, tool permissions and suba
 > already caught someone.
 > `@link AGENTS.md`
 
-## Optional doMath preview
-
-**stub engine: no formula results until fancy-formula P1**
+## Optional doMath
 
 The optional [doMath tool and plain service](docs/do-math.md) evaluate host-owned
 formula documents through `particle-academy/fancy-formula`. Installing Harness
 enables no tool and installs no engine. On PHP 8.4+, use
 `composer require particle-academy/fancy-formula` from Packagist:
-**0.0.1 = stub, real results from 0.1.0.** Stub results identify themselves and
+**Real results from 0.1.0; 0.0.1 is a stub.** Harness automatically constructs
+the verified 0.1.0 Engine from host policy, with no external providers. A host
+factory overrides autodetection. Stub results identify themselves and
 contain `#N/A`, never calculated numbers. Without an engine, the configured tool
 returns `FORMULA_ENGINE_UNAVAILABLE` and registered documents remain UNCHECKED.
 
