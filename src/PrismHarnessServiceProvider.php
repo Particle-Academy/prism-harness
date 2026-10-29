@@ -100,13 +100,14 @@ class PrismHarnessServiceProvider extends ServiceProvider
             __DIR__.'/../resources/skills',
         ));
         $this->app->singleton(ToolRegistry::class, function ($app): ToolRegistry {
-            $tools = new ToolRegistry;
+            $tools = new ToolRegistry(refuseDuplicates: (bool) $app['config']->get('prism-harness.registry.refuse_duplicates', false));
             $tools->register($app->make(SkillRegistry::class)->readerTool());
 
             return $tools;
         });
         $this->app->singleton(ModeRegistry::class, fn ($app): ModeRegistry => new ModeRegistry(
             [...$app['config']->get('prism-harness.agent', []), 'agents' => $app['config']->get('prism-harness.agents', [])],
+            refuseDuplicates: (bool) $app['config']->get('prism-harness.registry.refuse_duplicates', false),
         ));
         $this->app->singleton(ToolAuthorizer::class, fn ($app): ToolAuthorizer => new ToolAuthorizer(
             $app->make(Gate::class),

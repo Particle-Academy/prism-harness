@@ -29,8 +29,8 @@ use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolError;
 use Tests\Fixtures\Participant;
 
-it('refuses same-owner static factory collisions before any handler runs', function (): void {
-    $registry = new ToolRegistry;
+it('refuses same-owner static factory collisions before any handler runs when opted in', function (): void {
+    $registry = new ToolRegistry(refuseDuplicates: true);
     $registry->register((new Tool)->as('lookup')->using(fn (): never => throw new LogicException('Handler must not run')));
 
     expect(fn () => $registry->registerFactory('lookup', fn (): Tool => (new Tool)->as('lookup')))

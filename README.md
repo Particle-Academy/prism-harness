@@ -26,9 +26,12 @@ makes a fresh worker see the same mode, model and conversation as the request th
 
 ### Named agents
 
-After upgrading, run the package's additive database migrations before starting
-workers. They add address-index tables and thread-address columns; existing
-history is not migrated into a named agent.
+Before using a named agent or ParticipantRef, run the package's additive
+0001_01_01_000006_add_agent_addresses migration. It adds address-index tables and
+nullable thread-address columns; existing history is not migrated into a named
+agent. Applications using only legacy model participants continue to work on
+the 0.18.1 schema without this migration. New address features refuse with the
+migration's name when it is missing.
 
 Choose a stable agent id in trusted application code. An id uses
 [a-z][a-z0-9_-]{0,63}; a display/persona name is independent of that id. Omitting
@@ -55,9 +58,21 @@ purge expired entries, exactly as an ordinary store read does. Factories and
 tool-discovery providers run during resolution; explicit state writes refuse.
 A mode's tool list is its authority ceiling; a caller can narrow it. A named
 agent inherits no legacy tools/providers or modes. Builtins must be explicit.
-Even a same-owner duplicate is refused. Intentional tool replacement uses
+Even a same-owner duplicate in a named namespace is refused. Intentional tool replacement uses
 $tools->replace($replacement, 'app.support', 'app.support.v2'); mode replacement
 also names its predecessor owner.
+
+Legacy registries retain their published overwrite and resolution precedence
+by default: providers override static tools, and factories override both.
+Set prism-harness.registry.refuse_duplicates to true to opt into duplicate
+refusal in the legacy namespace. Directly constructed tool/mode registries
+accept the refuseDuplicates constructor option. Prefer this stricter option
+when providers from several components share a registry: silent name shadowing
+can change which implementation is offered. Named registries always refuse.
+
+Named and ParticipantRef thread addresses are immutable. Legacy thread addresses
+remain editable by default; set prism-harness.addresses.immutable_legacy_threads
+to true to opt into the same immutability guard for those rows.
 
 Configure scalar overrides under agents.support (using your agent's id):
 provider, model, max_steps_ceiling,

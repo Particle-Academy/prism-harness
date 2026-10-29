@@ -20,7 +20,7 @@ final class ModeRegistry
     private array $owners = [];
 
     /** @param array<string, mixed> $config */
-    public function __construct(private array $config, private readonly ?string $agent = null, private readonly ?self $root = null)
+    public function __construct(private array $config, private readonly ?string $agent = null, private readonly ?self $root = null, private readonly bool $refuseDuplicates = false)
     {
         SessionAddress::validateAgent($agent);
         $owner = $config['owner'] ?? null;
@@ -43,7 +43,7 @@ final class ModeRegistry
                 throw new InvalidArgumentException('Agent modes must be configured as a mapping.');
             }
             $config['default'] ??= $root->default();
-            $root->agents[$agent] = new self($config, $agent, $root);
+            $root->agents[$agent] = new self($config, $agent, $root, $root->refuseDuplicates);
         }
 
         return $root->agents[$agent];
@@ -53,7 +53,7 @@ final class ModeRegistry
     public function register(string $name, array $mode, ?string $owner = null): self
     {
         $label = RegistrationOwner::label($owner, $this->agent);
-        if (isset($this->owners[$name])) {
+        if (($this->agent !== null || $this->refuseDuplicates) && isset($this->owners[$name])) {
             throw new RegistrationCollision($this->agent, $name, $this->owners[$name], $label);
         }
         $this->set($name, $mode, $label);
