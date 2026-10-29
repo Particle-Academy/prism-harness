@@ -1,0 +1,260 @@
+{
+  "package": "particle-academy/fancy-formula",
+  "version": "0.0.1",
+  "commit": "acd37f3ecefb6dffdb26e5f650f2c9f516f32d89",
+  "tree": "728380ebe956f9deaebf28c3fbe5f89238f5b76e",
+  "entries": [
+    {
+      "path": ".gitattributes",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "7939e2ddd9662b6a6192c5bffd9fabc26d7dde65"
+    },
+    {
+      "path": ".github",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0a7c84b0812ee5d9fc00300310223e436546d0ee"
+    },
+    {
+      "path": ".github/workflows",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "3c079cc79b3a9e59ed0848aaf6880bed6711b97b"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b60c9fff012c6cb61e54780e5f75ff1005f5e1ba"
+    },
+    {
+      "path": ".github/workflows/no-mcp-secrets.yml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "504da6150ed227ad16e659382376d8243afc8248"
+    },
+    {
+      "path": ".github/workflows/publish.yml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3d1799d06a85f29ffa309e6e2d26f31c15955aca"
+    },
+    {
+      "path": ".gitignore",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "d731b5677852910c63416613dcf17f262db80720"
+    },
+    {
+      "path": "AGENTS.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "4dfc226eb7b917ee128711dad0a18e2d641e80d3"
+    },
+    {
+      "path": "CHANGELOG.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "7f828e9e82ebc3925697b058b0f2053ceb11143c"
+    },
+    {
+      "path": "CLAUDE.md",
+      "mode": "120000",
+      "type": "blob",
+      "sha": "47dc3e3d863cfb5727b87d785d09abf9743c0a72"
+    },
+    {
+      "path": "LICENSE",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "5c480320bb89fa6c88406d9b30c453f461581c5e"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "eaa30e8bc443c72b186b89131f27e9a902cc9757"
+    },
+    {
+      "path": "SPEC.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "c54aa81b3423b97a1def459510cfa55bc7761b37"
+    },
+    {
+      "path": "capture",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "15d49533ee5373aeb29443af1945712a82723f41"
+    },
+    {
+      "path": "capture/v1",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "97dab5ea7dfebb2dec7a2e781f530a323ffa7901"
+    },
+    {
+      "path": "capture/v1/capture-v1.xlsx",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "fd332e0afc8296efd07220c814c2c55e6503cd04"
+    },
+    {
+      "path": "capture/v1/request.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "7190cbb895b9cbb9cc4a993ea279d2b2b082fe0d"
+    },
+    {
+      "path": "composer.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3e8bc8c49cae6618efd640ddee7956cf2f5f5bfe"
+    },
+    {
+      "path": "php",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "36ba58a83c8247f05d7c89e1e8add26b738ffb37"
+    },
+    {
+      "path": "php/src",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "0949c16a9304c7eb47a426677407a80b457ac2e4"
+    },
+    {
+      "path": "php/src/FormulaError.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "04c3ea7298055ee13f60ac2db80c7143b1fb60ee"
+    },
+    {
+      "path": "php/src/StubEngine.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "3e24bac9dbad68c2bb23f62b2a38b7d46739f4e0"
+    },
+    {
+      "path": "php/src/Violations.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "1a8e6463a7b22a806991dc021b688595f3f6e31d"
+    },
+    {
+      "path": "php/tests",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "6d2d38836491faf354553dee45c3074b14565f0a"
+    },
+    {
+      "path": "php/tests/CaptureWorkbookTest.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "7d22d6498fb1f00536329fec17e04984ff26c697"
+    },
+    {
+      "path": "php/tests/Pest.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "174d7fd709f4ad85548fd2de5cbbfa973033b2a7"
+    },
+    {
+      "path": "php/tests/SchemaTest.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "6665d768652d055144a51ca85f046d0f3d223c7d"
+    },
+    {
+      "path": "php/tests/Support",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "b1a2e1670d5317085f78ba29d67300d81591a7fb"
+    },
+    {
+      "path": "php/tests/Support/SchemaValidator.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "ac7a1873931c9befadfbb45618b913da822509b1"
+    },
+    {
+      "path": "php/tests/ViolationsTest.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "181eb7d8a177132585c6504a4d5f801751c76115"
+    },
+    {
+      "path": "phpunit.xml",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "4bbb9b180bb0866262ad5ccf6c4071ff334bb156"
+    },
+    {
+      "path": "schema",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "ca9de33550156db94695545ead38fe225972c379"
+    },
+    {
+      "path": "schema/check-report.schema.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "9601f90746f172007c65daa608e086757314c5ea"
+    },
+    {
+      "path": "schema/evaluation.schema.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "2c10566d3b82017e45fb9e05e3b809895f5667bf"
+    },
+    {
+      "path": "schema/request.schema.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "aac668cc537443fae43400649c16afbdbe1189d9"
+    },
+    {
+      "path": "schema/trace.schema.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "fbaef829e72922e6b46bf110c972de9a6d17f89d"
+    },
+    {
+      "path": "scripts",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "52c258fb26d55f1a62963cb04b2127a47861a712"
+    },
+    {
+      "path": "scripts/build-capture-workbook.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "e0cc9afe8f5fc6cfca59494dcf5157cc9ea12e25"
+    },
+    {
+      "path": "scripts/capture",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "cb472a0f6b931c6f6b7f493c50007e672476c219"
+    },
+    {
+      "path": "scripts/capture/CaptureBuilder.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "ec069c7c3ea51abf7df2722fe1a5edf9e0e50a59"
+    },
+    {
+      "path": "scripts/capture/cases-v1.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "662c09677558aaab7fba39fecc5bc1f53532191f"
+    },
+    {
+      "path": "scripts/capture/p1-functions.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "b25c2b3f3f16022ee2b79a499ef80d4459d18e0f"
+    }
+  ]
+}

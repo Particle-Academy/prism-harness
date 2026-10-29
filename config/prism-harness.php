@@ -17,6 +17,10 @@ return [
     // Named authority collections are configured independently; they are never
     // inherited from the legacy namespace. Unset scalar settings fall back.
     'agents' => [],
+    // Optional per-agent tool. Configure the same key under agents.<id>.tools
+    // for named agents; authority is never inherited from this legacy scope.
+    // Register documents through DoMathManager at host boot/save time.
+    'tools' => ['do_math' => null],
     'default_task_list' => 'default',
 
     /*

@@ -1,0 +1,78 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "ed005fcc0f21b31391a0b2df9490ad96",
+    "packages": [
+        {
+            "name": "particle-academy/fancy-formula",
+            "version": "v0.0.1",
+            "source": {
+                "type": "git",
+                "url": "https://github.com/Particle-Academy/fancy-formula.git",
+                "reference": "acd37f3ecefb6dffdb26e5f650f2c9f516f32d89"
+            },
+            "dist": {
+                "type": "zip",
+                "url": "https://api.github.com/repos/Particle-Academy/fancy-formula/zipball/acd37f3ecefb6dffdb26e5f650f2c9f516f32d89",
+                "reference": "acd37f3ecefb6dffdb26e5f650f2c9f516f32d89",
+                "shasum": ""
+            },
+            "require": {
+                "php": "^8.4"
+            },
+            "require-dev": {
+                "laravel/pint": "^1.26",
+                "particle-academy/holy-sheet": "^2.11.3",
+                "pestphp/pest": "^3.0|^4.0"
+            },
+            "type": "library",
+            "autoload": {
+                "psr-4": {
+                    "FancyFormula\\": "php/src/"
+                }
+            },
+            "notification-url": "https://packagist.org/downloads/",
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "Particle Academy",
+                    "homepage": "https://github.com/Particle-Academy"
+                }
+            ],
+            "description": "A deterministic spreadsheet-formula engine with Google Sheets semantics. Formulas are code, inputs are always values, and every output carries a trace of what it read. Malformed input throws with a stable code, a spreadsheet error is a value, and a broken limit aborts: the three never collapse into one another.",
+            "homepage": "https://github.com/Particle-Academy/fancy-formula",
+            "keywords": [
+                "cross-language",
+                "deterministic",
+                "evaluator",
+                "formula",
+                "google-sheets",
+                "particle-academy",
+                "pricing",
+                "sandbox",
+                "spreadsheet"
+            ],
+            "support": {
+                "issues": "https://github.com/Particle-Academy/fancy-formula/issues",
+                "source": "https://github.com/Particle-Academy/fancy-formula"
+            },
+            "time": "2026-10-29T03:35:53+00:00"
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {},
+    "prefer-stable": false,
+    "prefer-lowest": false,
+    "platform": {
+        "php": "^8.4"
+    },
+    "platform-dev": {},
+    "plugin-api-version": "2.9.0"
+}

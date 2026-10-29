@@ -17,6 +17,7 @@ use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\ContextRecall;
 use Prism\Harness\Contracts\EvictionSink;
 use Prism\Harness\Contracts\SummaryBudget;
+use Prism\Harness\Math\DoMathManager;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Participants\ParticipantAdapters;
 use Prism\Harness\Sessions\Session;
@@ -24,6 +25,7 @@ use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Skills\SkillRegistry;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ContextRecallTool;
+use Prism\Harness\Tools\DoMathTool;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
 use RuntimeException;
@@ -91,6 +93,11 @@ class PrismHarnessServiceProvider extends ServiceProvider
 
         $this->app->singleton(ToolPairGuard::class, fn ($app): ToolPairGuard => new ToolPairGuard);
 
+        $this->app->singleton(DoMathManager::class, function ($app): DoMathManager {
+            return new DoMathManager($app['config']->get('prism-harness', []),
+                $app->bound(DoMathManager::ENGINE_FACTORY) ? $app->make(DoMathManager::ENGINE_FACTORY) : null);
+        });
+
         $this->app->singleton(SessionStoreManager::class, fn ($app): SessionStoreManager => new SessionStoreManager(
             container: $app,
             config: $app['config']->get('prism-harness', []),
@@ -102,6 +109,11 @@ class PrismHarnessServiceProvider extends ServiceProvider
         $this->app->singleton(ToolRegistry::class, function ($app): ToolRegistry {
             $tools = new ToolRegistry(refuseDuplicates: (bool) $app['config']->get('prism-harness.registry.refuse_duplicates', false));
             $tools->register($app->make(SkillRegistry::class)->readerTool());
+            foreach ($app->make(DoMathManager::class)->configuredAgents() as $agent) {
+                $tools->forAgent($agent)->registerFactory('doMath',
+                    fn (Session $session) => (new DoMathTool($app->make(DoMathManager::class)->forAgent($agent)))->tool(),
+                    owner: 'harness');
+            }
 
             return $tools;
         });
