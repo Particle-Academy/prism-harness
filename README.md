@@ -24,6 +24,56 @@ $session->lock(function (Session $session) {
 object kept in memory the way Mastra's is. Every call rebuilds one from a store, which is what
 makes a fresh worker see the same mode, model and conversation as the request that set them.
 
+### Named agents
+
+After upgrading, run the package's additive database migrations before starting
+workers. They add address-index tables and thread-address columns; existing
+history is not migrated into a named agent.
+
+Choose a stable agent id in trusted application code. An id uses
+[a-z][a-z0-9_-]{0,63}; a display/persona name is independent of that id. Omitting
+it keeps the existing addresses. Named agents have separate session state,
+threads, capabilities and default task lists.
+
+Register tools and modes in the same namespace, with an owner:
+
+```php
+$tools = app(\Prism\Harness\Tools\ToolRegistry::class)->forAgent('support');
+$tools->register((new \Prism\Prism\Tool)->as('lookup')->for('Look up an item')
+    ->using(fn (): string => 'found'), 'app.support');
+app(\Prism\Harness\Modes\ModeRegistry::class)->forAgent('support')
+    ->register('reply', ['tools' => ['lookup']], 'app.support')->setDefault('reply');
+$support = app(\Prism\Harness\PrismHarness::class)->forAgent('support');
+$descriptors = $support->effectiveTools('reply', $user, 'case:42');
+$session = $support->for($user)->session('case:42');
+```
+
+effectiveTools returns name/owner/source descriptors from the model offer path.
+Inspection creates no session, thread or index entry, executes no handler and
+makes no model/provider request or logical state change. Reads may physically
+purge expired entries, exactly as an ordinary store read does. Factories and
+tool-discovery providers run during resolution; explicit state writes refuse.
+A mode's tool list is its authority ceiling; a caller can narrow it. A named
+agent inherits no legacy tools/providers or modes. Builtins must be explicit.
+Even a same-owner duplicate is refused. Intentional tool replacement uses
+$tools->replace($replacement, 'app.support', 'app.support.v2'); mode replacement
+also names its predecessor owner.
+
+Configure scalar overrides under agents.support (using your agent's id):
+provider, model, max_steps_ceiling,
+max_output_tokens_per_call, lock_ttl, lock_wait, default_scope, default_task_list
+and ephemeral_ttl. Unset values fall back globally; a nullable field's explicit
+null clears its default. Step/output caps narrow the existing parent ledger and
+budget. Authorization uses authorize_tools, tool_ability and tool_call_ability;
+offer filtering and invocation checks both apply. A defined offer or call policy
+with authorization disabled is refused.
+
+Eloquent participants keep their existing ownership behavior; asActor binds a
+separate host-selected actor. Non-model ParticipantRef(type, id) values require
+a registered ParticipantAdapters actor resolver and never resolve class names
+through morph relations. A child retains its parent's bound actor. Named writes
+are indexed; legacy history is not implicitly migrated or backfilled.
+
 ### The two halves
 
 State is split into named slots, because the halves have genuinely different requirements:
@@ -962,10 +1012,10 @@ A worker may push its own lease out while it still holds it, bounded by the run'
 forever, and a fresh timeout here would be a second spelling of a limit the package already
 has. Extension therefore stops exactly when the run does.
 
-### An unreadable lock expiry means wait, not take
+### An unreadable SQL lock expiry means wait, not take
 
-Everything above is exclusive because the store's lock is, so the rule the lock
-follows is worth stating: **a lock is reclaimed only when its expiry can be shown
+This SQL store's expiry-completeness rule is separate from the ports' file-lock
+protocol: **a SQL lease is reclaimed only when its expiry can be shown
 to have passed.** An expiry that is absent, empty, or not a complete date-time is
 not evidence of anything, and the row is left alone — the caller waits and gets a
 `SessionLocked`, which is loud and recoverable.
@@ -977,9 +1027,11 @@ actively holding. Both ports of this package shipped that bug in their file
 stores; here the expiry is a column written by one statement, and the
 completeness check is what closes the remaining gap.
 
-Ports keeping a lock in a file must write a **terminator** and treat a value
-without one as unreadable. Without it there is nothing to distinguish a complete
-expiry from the first half of one.
+The TS/Python file stores now follow [decision0022](https://github.com/Particle-Academy/prism-parity/blob/main/docs/decisions/0022-local-file-lock-ownership.md).
+They publish a complete nonce-bound owner directory, compare established native
+identity before probing a PID, and never treat TTL expiry as death proof.
+Legacy timestamp files require explicit maintenance and all old workers must
+stop before that protocol upgrade. A terminator alone is not a recovery grant.
 
 ### A lease is refused, never quietly adjusted
 

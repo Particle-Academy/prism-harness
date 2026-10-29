@@ -7,7 +7,13 @@ namespace Prism\Harness;
 use Illuminate\Database\Eloquent\Model;
 use Prism\Harness\Contracts\AgentTaskSource;
 use Prism\Harness\Exceptions\InvalidTaskLease;
+use Prism\Harness\Models\Thread;
+use Prism\Harness\Participants\ParticipantAdapters;
+use Prism\Harness\Participants\ParticipantRef;
+use Prism\Harness\Sessions\DatabaseAddressIndex;
+use Prism\Harness\Sessions\IndexedSessionStore;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Tasks\StoreTaskSource;
 
@@ -30,14 +36,36 @@ class PrismHarness
         protected readonly SessionStoreManager $stores,
         protected readonly AgentRuntime $runtime,
         protected readonly array $config = [],
+        protected readonly ?string $agent = null,
+        protected readonly ?ParticipantAdapters $participants = null,
     ) {}
 
-    public function for(Model $participant): PendingSession
+    public function forAgent(?string $agent): self
+    {
+        SessionAddress::validateAgent($agent);
+        $agents = $this->config['agents'] ?? [];
+        $options = $agent === null ? [] : (is_array($agents) ? ($agents[$agent] ?? []) : null);
+        if (! is_array($options)) {
+            throw new \InvalidArgumentException('Agent settings must be a map.');
+        }
+        if (array_key_exists('ephemeral_ttl', $options) && $options['ephemeral_ttl'] !== null && (! is_int($options['ephemeral_ttl']) || $options['ephemeral_ttl'] < 0)) {
+            throw new \InvalidArgumentException('Agent ephemeral TTL must be nonnegative whole seconds or null.');
+        }
+        foreach (['default_scope', 'default_task_list'] as $key) {
+            if (array_key_exists($key, $options) && (! is_string($options[$key]) || ($key === 'default_task_list' && $options[$key] === ''))) {
+                throw new \InvalidArgumentException('Agent scope/list defaults must be valid strings.');
+            }
+        }
+
+        return new self($this->stores, $this->runtime, $this->config, $agent, $this->participants);
+    }
+
+    public function for(Model|ParticipantRef $participant): PendingSession
     {
         return new PendingSession($this, $participant);
     }
 
-    public function session(Model $participant, ?string $scope = null): Session
+    public function session(Model|ParticipantRef $participant, ?string $scope = null, ?object $actor = null): Session
     {
         return new Session(
             participant: $participant,
@@ -47,6 +75,10 @@ class PrismHarness
             ttlSeconds: $this->ephemeralTtl(),
             runtime: $this->runtime,
             taskLeaseSeconds: $this->taskLease(),
+            agent: $this->agent,
+            actor: $participant instanceof ParticipantRef
+                ? ($this->participants ?? throw new \LogicException('Participant adapters are not configured.'))->actor($participant, $actor)
+                : ($actor ?? $participant),
         );
     }
 
@@ -68,11 +100,20 @@ class PrismHarness
      * {@see StoreTaskSource} refuses one again on its own account — the second
      * check is what protects a source built by hand in an application.
      */
-    public function tasks(string $list = 'default'): StoreTaskSource
+    public function tasks(?string $list = null): StoreTaskSource
     {
+        $list ??= $this->defaultTaskList();
+        $address = new SessionAddress(null, null, 'task-list:'.$list, $this->agent);
+        $store = $this->stores->durable();
+        if ($this->agent !== null) {
+            $store = new IndexedSessionStore(
+                $store, DatabaseAddressIndex::configured((new Thread)->getConnection()), $address, 'durable', 'tasks',
+            );
+        }
+
         return new StoreTaskSource(
-            store: $this->stores->durable(),
-            list: $list,
+            store: $store,
+            list: $this->agent === null ? $list : 'agent-list:'.$address->indexKey(),
             leaseSeconds: $this->taskLease(),
             lockWaitSeconds: $this->taskLockWait(),
         );
@@ -83,18 +124,42 @@ class PrismHarness
         return $this->stores;
     }
 
+    /** @return list<array{name: string, owner: string, source: string}> */
+    public function effectiveTools(string $mode, Model|ParticipantRef $participant, ?string $scope = null): array
+    {
+        return $this->runtime->effectiveTools($this->for($participant)->session($scope), $mode);
+    }
+
     public function defaultScope(): string
     {
-        $scope = $this->config['default_scope'] ?? 'default';
+        $scope = $this->scalarConfig('default_scope');
 
         return is_string($scope) ? $scope : 'default';
     }
 
     protected function ephemeralTtl(): ?int
     {
-        $ttl = $this->config['ephemeral_ttl'] ?? null;
+        $ttl = $this->scalarConfig('ephemeral_ttl');
 
         return is_int($ttl) ? $ttl : null;
+    }
+
+    private function defaultTaskList(): string
+    {
+        $list = $this->scalarConfig('default_task_list') ?? 'default';
+        if (! is_string($list) || $list === '') {
+            throw new \InvalidArgumentException('The default task list must be a nonempty string.');
+        }
+
+        return $list;
+    }
+
+    private function scalarConfig(string $key): mixed
+    {
+        $agents = $this->config['agents'] ?? [];
+        $options = $this->agent === null ? [] : (is_array($agents) ? ($agents[$this->agent] ?? []) : []);
+
+        return is_array($options) && array_key_exists($key, $options) ? $options[$key] : ($this->config[$key] ?? null);
     }
 
     /**

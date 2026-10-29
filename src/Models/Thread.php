@@ -18,7 +18,9 @@ use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\EvictionSink;
-use Prism\Harness\Support\LiveThreadKey;
+use Prism\Harness\Participants\ParticipantRef;
+use Prism\Harness\Sessions\DatabaseAddressIndex;
+use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
@@ -45,6 +47,10 @@ use Throwable;
  * @property array<string, mixed>|null $metadata
  * @property Carbon|null $retired_at
  * @property string|null $live_key
+ * @property string|null $agent_id
+ * @property string|null $participant_ref_type
+ * @property string|null $participant_ref_id
+ * @property string|null $address_key
  * @property-read Collection<int, ThreadMessage> $storedMessages
  * @property-read self|null $parentThread
  */
@@ -71,15 +77,30 @@ class Thread extends Model implements ThreadContract
     protected static function booted(): void
     {
         static::saving(function (self $thread): void {
+            $fields = ['participant_type', 'participant_id', 'participant_ref_type', 'participant_ref_id', 'scope', 'agent_id'];
+            if ($thread->exists && $thread->isDirty($fields)) {
+                throw new \LogicException('A resolved harness thread address is immutable; import into a new address explicitly.');
+            }
+            $address = new SessionAddress(
+                $thread->participant_ref_type ?? $thread->getAttribute('participant_type'),
+                $thread->participant_ref_id ?? ($thread->getAttribute('participant_id') === null ? null : (string) $thread->getAttribute('participant_id')),
+                $thread->scope,
+                $thread->agent_id,
+                $thread->participant_ref_type !== null,
+            );
+            // Publish ownership before the row. All retired generations keep
+            // this indexed address_key; failed row writes leave harmless entries.
+            if ($address->agent !== null || $address->reference) {
+                DatabaseAddressIndex::configured($thread->getConnection())->record($address);
+                $thread->address_key = $address->indexKey();
+            } elseif ($thread->isDirty('address_key')) {
+                $thread->address_key = $thread->getOriginal('address_key');
+            }
             // Derived, never mass-assignable. Retirement releases the unique key
             // in the very UPDATE that stamps retired_at. An unrelated save on a
             // stale model must not reclaim a key released by another worker.
             if (! $thread->exists || $thread->isDirty(['participant_type', 'participant_id', 'scope', 'retired_at'])) {
-                $thread->live_key = $thread->retired_at !== null ? null : LiveThreadKey::key(
-                    $thread->getAttribute('participant_type'),
-                    $thread->getAttribute('participant_id'),
-                    $thread->scope,
-                );
+                $thread->live_key = $thread->retired_at !== null ? null : $address->threadKey();
             } elseif ($thread->isDirty('live_key')) {
                 $thread->live_key = $thread->getOriginal('live_key');
             }
@@ -133,21 +154,19 @@ class Thread extends Model implements ThreadContract
      * at the same address rather than reopening the old one. Retired rows stay
      * exactly where they are — see the migration for why that is not optional.
      */
-    public static function forParticipant(Model $participant, string $scope): self
+    public static function forParticipant(Model|ParticipantRef $participant, string $scope, ?string $agent = null): self
     {
-        $address = [
-            'participant_type' => $participant->getMorphClass(),
-            'participant_id' => $participant->getKey(),
-            'scope' => $scope,
-        ];
+        return static::forAddress(SessionAddress::forParticipant($participant, $scope, $agent));
+    }
 
-        // Not `firstOrCreate`, because the lookup and the creation no longer
-        // use the same set of attributes: `retired_at` filters the read and
-        // must not be written. Written as firstOrCreate with the null in the
-        // attributes, a fresh thread would be created with `retired_at` set to
-        // null explicitly — harmless here, and wrong the moment the column
-        // gains a default.
-        return static::resolveAddress($address);
+    public static function findLive(Model|ParticipantRef $participant, string $scope, ?string $agent = null): ?self
+    {
+        return static::lookupAddress(SessionAddress::forParticipant($participant, $scope, $agent))->first();
+    }
+
+    public static function findShared(string $scope, ?string $agent = null): ?self
+    {
+        return static::lookupAddress(SessionAddress::forParticipant(null, $scope, $agent))->first();
     }
 
     /**
@@ -158,29 +177,41 @@ class Thread extends Model implements ThreadContract
      * conversation belonging to an agency should instead use forParticipant()
      * with that agency, because the agency is its participant.
      */
-    public static function shared(string $scope): self
+    public static function shared(string $scope, ?string $agent = null): self
     {
-        return static::resolveAddress([
-            'participant_type' => null,
-            'participant_id' => null,
-            'scope' => $scope,
-        ], ['scope' => $scope]);
+        return static::forAddress(SessionAddress::forParticipant(null, $scope, $agent));
     }
 
     /**
-     * @param  array<string, mixed>  $address
-     * @param  array<string, mixed>|null  $create
+     * @return array<string, mixed>
      */
-    protected static function resolveAddress(array $address, ?array $create = null): self
+    protected static function addressFields(SessionAddress $address): array
     {
-        // Use the same exact address for lookup and uniqueness. A database's
-        // case-insensitive scope collation must not merge two different keys.
-        $key = LiveThreadKey::key($address['participant_type'] ?? null, $address['participant_id'] ?? null, $address['scope']);
-        $lookup = static::query()
-            ->where($address)
-            ->where('live_key', $key)
+        return [
+            'participant_type' => $address->reference ? null : $address->participantType,
+            'participant_id' => $address->reference ? null : $address->participantId,
+            'participant_ref_type' => $address->reference ? $address->participantType : null,
+            'participant_ref_id' => $address->reference ? $address->participantId : null,
+            'scope' => $address->scope,
+            'agent_id' => $address->agent,
+        ];
+    }
+
+    /** @return Builder<self> */
+    protected static function lookupAddress(SessionAddress $address): Builder
+    {
+        /** @var Builder<self> $query */
+        $query = static::query()->where(static::addressFields($address))
+            ->where('live_key', $address->threadKey())
             ->whereNull('retired_at')
             ->orderByDesc('id');
+
+        return $query;
+    }
+
+    public static function forAddress(SessionAddress $address): self
+    {
+        $lookup = static::lookupAddress($address);
         /** @var self|null $live */
         $live = (clone $lookup)->first();
         if ($live !== null) {
@@ -190,7 +221,14 @@ class Thread extends Model implements ThreadContract
         try {
             // A savepoint keeps PostgreSQL's outer transaction usable after a
             // rejected INSERT. Lookup-only fields never enter the create data.
-            return static::query()->withSavepointIfNeeded(fn (): self => static::query()->create($create ?? $address));
+            return static::query()->withSavepointIfNeeded(function () use ($address): self {
+                $thread = static::query()->getModel()->newInstance();
+                // Trusted address fields are not mass-assignable request input.
+                $thread->forceFill(array_filter(static::addressFields($address), fn (mixed $value): bool => $value !== null));
+                $thread->save();
+
+                return $thread;
+            });
         } catch (UniqueConstraintViolationException $exception) {
             // Read the writer, not a replica. A locking read also sees the winner
             // inside an InnoDB REPEATABLE READ transaction instead of its old snapshot.
@@ -261,10 +299,11 @@ class Thread extends Model implements ThreadContract
      * @param  Builder<self>  $query
      * @return Builder<self>
      */
-    public function scopeAddressedTo(Builder $query, Model $participant, ?string $scope = null): Builder
+    public function scopeAddressedTo(Builder $query, Model|ParticipantRef $participant, ?string $scope = null, ?string $agent = null): Builder
     {
-        $query->where('participant_type', $participant->getMorphClass())
-            ->where('participant_id', $participant->getKey());
+        $fields = static::addressFields(SessionAddress::forParticipant($participant, $scope ?? '', $agent));
+        unset($fields['scope']);
+        $query->where($fields);
 
         return $scope === null ? $query : $query->where('scope', $scope);
     }

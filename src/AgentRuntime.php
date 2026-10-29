@@ -18,6 +18,7 @@ use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Skills\SkillRegistry;
 use Prism\Harness\Structured\SchemaCheck;
 use Prism\Harness\Structured\StructuredTranscript;
@@ -69,7 +70,31 @@ final readonly class AgentRuntime
         private array $pricing = [],
         /** @var (Closure(): ?CallCostObserver)|null */
         private ?Closure $costObserver = null,
-    ) {}
+        /** @var array<string, mixed> */
+        private array $agents = [],
+    ) {
+        foreach ($agents as $agent => $options) {
+            SessionAddress::validateAgent($agent);
+            if (! is_array($options)) {
+                throw new \InvalidArgumentException('Agent settings must be a map.');
+            }
+            foreach (['provider', 'model'] as $key) {
+                if (array_key_exists($key, $options) && $options[$key] !== null && (! is_string($options[$key]) || $options[$key] === '')) {
+                    throw new \InvalidArgumentException('Agent provider/model defaults must be nonempty strings or null.');
+                }
+            }
+            foreach (['max_steps_ceiling', 'max_output_tokens_per_call'] as $key) {
+                if (array_key_exists($key, $options) && $options[$key] !== null && (! is_int($options[$key]) || $options[$key] < 1)) {
+                    throw new \InvalidArgumentException('Agent step/output ceilings must be positive integers or null.');
+                }
+            }
+            foreach (['lock_ttl' => 1, 'lock_wait' => 0] as $key => $minimum) {
+                if (array_key_exists($key, $options) && (! is_int($options[$key]) || $options[$key] < $minimum)) {
+                    throw new \InvalidArgumentException('Agent lock settings must be whole seconds with positive TTL and nonnegative wait.');
+                }
+            }
+        }
+    }
 
     /**
      * @param  list<string>|null  $toolNames
@@ -93,9 +118,9 @@ final readonly class AgentRuntime
             $runId = 'run_'.bin2hex(random_bytes(12));
 
             try {
-                $mode = $this->modes->resolve($session->mode());
-                $provider = $session->provider() ?? $this->stringConfig('provider');
-                $model = $session->model() ?? $this->stringConfig('model');
+                $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+                $provider = $session->provider() ?? $this->stringConfig('provider', $session);
+                $model = $session->model() ?? $this->stringConfig('model', $session);
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
                 // run the session never started trips its own state guard —
@@ -123,8 +148,9 @@ final readonly class AgentRuntime
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
-                maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call'),
+                maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
+            $run = $this->boundedAgentRun($session, $run);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -172,7 +198,7 @@ final readonly class AgentRuntime
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $budget->maxSteps : 1);
+                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
@@ -244,7 +270,7 @@ final readonly class AgentRuntime
 
                 throw $failure;
             }
-        }, ttlSeconds: $this->integerConfig('lock_ttl', 300), waitSeconds: $this->integerConfig('lock_wait', 0));
+        }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
     }
 
     /**
@@ -282,9 +308,9 @@ final readonly class AgentRuntime
             $runId = 'run_'.bin2hex(random_bytes(12));
 
             try {
-                $mode = $this->modes->resolve($session->mode());
-                $provider = $session->provider() ?? $this->stringConfig('provider');
-                $model = $session->model() ?? $this->stringConfig('model');
+                $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+                $provider = $session->provider() ?? $this->stringConfig('provider', $session);
+                $model = $session->model() ?? $this->stringConfig('model', $session);
             } catch (Throwable $failure) {
                 // As in send(): no run exists yet, so there is no run state to
                 // fail — only an event to fire.
@@ -305,8 +331,9 @@ final readonly class AgentRuntime
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
-                maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call'),
+                maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
+            $run = $this->boundedAgentRun($session, $run);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -349,7 +376,7 @@ final readonly class AgentRuntime
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $budget->maxSteps : 1);
+                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
@@ -422,7 +449,7 @@ final readonly class AgentRuntime
 
                 throw $failure;
             }
-        }, ttlSeconds: $this->integerConfig('lock_ttl', 300), waitSeconds: $this->integerConfig('lock_wait', 0));
+        }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
     }
 
     /**
@@ -494,10 +521,18 @@ final readonly class AgentRuntime
 
         // The lock is acquired and released around the generator by hand rather
         // than with `$session->lock()`: a closure cannot yield to this caller.
-        $mode = $this->modes->resolve($session->mode());
-        $provider = $session->provider() ?? $this->stringConfig('provider');
-        $model = $session->model() ?? $this->stringConfig('model');
+        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+        $provider = $session->provider() ?? $this->stringConfig('provider', $session);
+        $model = $session->model() ?? $this->stringConfig('model', $session);
         $runId = 'run_'.bin2hex(random_bytes(12));
+
+        $namedRun = $session->agent() === null ? null : $this->boundedAgentRun($session, $context ?? RunContext::root($runId, new RunBudget(
+            maxSteps: $this->ceilingFor($session, $mode),
+            maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
+        )));
+        if ($namedRun !== null && ($stop = $namedRun->ledger->exhaustion($namedRun->budget)) !== null) {
+            throw RunNotPermitted::exhausted($stop);
+        }
 
         $session->beginRun($runId, $mode->name, $provider, $model);
 
@@ -530,21 +565,27 @@ final readonly class AgentRuntime
                 $generation->withSystemPrompt($systemPrompt);
             }
 
-            $names = $this->toolNamesFor($mode, $toolNames);
-            if ($mode->skills !== []) {
-                $names[] = 'skill_read';
-            }
-            $resolved = $this->tools->resolve(array_values(array_unique($names)), $session);
-            foreach ($resolved as $name => $tool) {
-                if ($mode->needsApproval($name)) {
-                    $resolved[$name] = (clone $tool)->requiresApproval(true);
+            if ($session->agent() !== null) {
+                $tools = $this->ownedOffer($mode, $session, $toolNames, $namedRun, $runId)['tools'];
+            } else {
+                $names = $this->toolNamesFor($mode, $toolNames);
+                if ($mode->skills !== []) {
+                    $names[] = 'skill_read';
                 }
+                $resolved = $this->tools->resolve(array_values(array_unique($names)), $session);
+                foreach ($resolved as $name => $tool) {
+                    if ($mode->needsApproval($name)) {
+                        $resolved[$name] = (clone $tool)->requiresApproval(true);
+                    }
+                }
+                $tools = $this->authorizer->allowed($session, $resolved);
             }
-            $tools = $this->authorizer->allowed($session, $resolved);
             if ($tools !== []) {
-                $generation->withTools($tools)->withMaxSteps($mode->maxSteps);
+                $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps : $this->requestSteps($session, $namedRun));
             }
-            $maxOutput = $context === null ? $this->nullableIntConfig('max_output_tokens_per_call') : $context->budget->maxOutputTokensPerCall;
+            $maxOutput = $namedRun === null
+                ? ($context === null ? $this->nullableIntConfig('max_output_tokens_per_call', $session) : $context->budget->maxOutputTokensPerCall)
+                : $namedRun->budget->maxOutputTokensPerCall;
             if ($maxOutput !== null) {
                 $generation->withMaxTokens($maxOutput);
             }
@@ -594,6 +635,10 @@ final readonly class AgentRuntime
 
             throw $failure;
         } finally {
+            if ($namedRun !== null && $collected !== null) {
+                $namedRun->ledger->recordSteps(count($collected['response']->steps));
+                $namedRun->ledger->recordCost($this->costOf($collected['response']));
+            }
             // Reached on completion, on an exception, AND when an abandoned
             // generator is destroyed. Recording whatever arrived beats losing a
             // partial turn: a conversation missing the half the user already
@@ -631,16 +676,17 @@ final readonly class AgentRuntime
      */
     private function streamCapped(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments): Generator
     {
-        $mode = $this->modes->resolve($session->mode());
-        $provider = $session->provider() ?? $this->stringConfig('provider');
-        $model = $session->model() ?? $this->stringConfig('model');
+        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+        $provider = $session->provider() ?? $this->stringConfig('provider', $session);
+        $model = $session->model() ?? $this->stringConfig('model', $session);
         $runId = 'run_'.bin2hex(random_bytes(12));
         $run = $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxCostUsd: $this->floatConfig('max_cost_usd'),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
-            maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call'),
+            maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
+        $run = $this->boundedAgentRun($session, $run);
         $session->beginRun($runId, $mode->name, $provider, $model);
         event(new RunStarted($session->key(), $runId, $mode->name, $provider, $model,
             $run->parentRunId, $run->rootRunId()));
@@ -745,11 +791,75 @@ final readonly class AgentRuntime
      * order, and a second copy of them is how a text turn and a structured turn
      * end up with different authority for the same mode.
      *
+     * @return list<array{name: string, owner: string, source: string}>
+     */
+    public function effectiveTools(Session $session, ?string $modeName = null): array
+    {
+        $mode = $this->modes->forAgent($session->agent())->resolve($modeName ?? $session->mode());
+
+        return $this->ownedOffer($mode, $session, null, inspection: true)['descriptors'];
+    }
+
+    /**
+     * @param  list<string>|null  $requested
+     * @return array{tools: list<Tool>, descriptors: list<array{name: string, owner: string, source: string}>}
+     */
+    private function ownedOffer(AgentMode $mode, Session $session, ?array $requested, ?RunContext $run = null, string $runId = 'inspection', bool $inspection = false): array
+    {
+        return $session->resolveReadOnly($mode->name, function (Session $view) use ($mode, $requested, $run, $runId, $inspection): array {
+            $names = $this->toolNamesFor($mode, $requested, $view->agent() !== null);
+            if ($view->agent() === null && $mode->skills !== []) {
+                $names[] = 'skill_read';
+            }
+            $additional = [];
+            if ($view->agent() !== null && in_array('skill_read', $mode->tools, true)) {
+                $additional['skill_read'] = ['tool' => $this->skills->readerTool($mode->skills), 'owner' => 'harness', 'source' => 'builtin'];
+            }
+            foreach ($mode->subagents as $subagent) {
+                if ($view->agent() !== null && ! in_array($subagent->name, $mode->tools, true)) {
+                    continue;
+                }
+                if ($this->subagentRunner === null) {
+                    throw new \LogicException('No Harness subagent runner is configured.');
+                }
+                if (! $inspection && $run === null) {
+                    throw new \LogicException('Named subagent streaming requires a RunContext.');
+                }
+                if ($view->agent() === null) {
+                    $names[] = $subagent->name;
+                }
+                $additional[$subagent->name] = ['tool' => ($this->subagentRunner)()->tool($subagent, $view, $run, $runId), 'owner' => 'harness.subagent', 'source' => 'builtin'];
+            }
+            $detailed = $this->tools->resolveDetailed($names, $view, $additional);
+            $resolved = [];
+            foreach ($detailed as $name => $entry) {
+                $resolved[$name] = $mode->needsApproval($name) ? (clone $entry['tool'])->requiresApproval(true) : $entry['tool'];
+            }
+            if ($view->agent() !== null && isset($resolved['complete_task'])) {
+                $authorizer = $this->authorizer->forSession($view);
+                if (! $authorizer->enabled() || ! $authorizer->hasCallPolicy()) {
+                    throw new \LogicException('Named task completion requires enabled authorization and an explicit call policy.');
+                }
+            }
+            $offered = $this->authorizer->allowed($view, $resolved);
+            $descriptors = [];
+            foreach ($offered as $tool) {
+                $descriptors[] = ['name' => $tool->name(), 'owner' => $detailed[$tool->name()]['owner'], 'source' => $detailed[$tool->name()]['source']];
+            }
+
+            return ['tools' => $offered, 'descriptors' => $descriptors];
+        });
+    }
+
+    /**
      * @param  list<string>|null  $toolNames
      * @return list<Tool>
      */
     private function authorizedTools(AgentMode $mode, Session $session, ?array $toolNames, RunContext $run, string $runId): array
     {
+        if ($session->agent() !== null) {
+            return $this->ownedOffer($mode, $session, $toolNames, $run, $runId)['tools'];
+        }
         $names = $this->toolNamesFor($mode, $toolNames);
         if ($mode->skills !== []) {
             $names[] = 'skill_read';
@@ -795,7 +905,7 @@ final readonly class AgentRuntime
      * @param  list<string>|null  $requested
      * @return list<string>
      */
-    private function toolNamesFor(AgentMode $mode, ?array $requested): array
+    private function toolNamesFor(AgentMode $mode, ?array $requested, bool $strict = false): array
     {
         $ceiling = $mode->tools;
 
@@ -805,6 +915,10 @@ final readonly class AgentRuntime
 
         if (in_array('*', $ceiling, true)) {
             return $requested;
+        }
+
+        if ($strict && array_diff($requested, $ceiling) !== []) {
+            throw new \LogicException('A requested tool is not available in the active agent mode.');
         }
 
         return array_values(array_intersect($requested, $ceiling));
@@ -826,6 +940,12 @@ final readonly class AgentRuntime
      */
     private function ceilingFor(Session $session, AgentMode $mode): int
     {
+        if ($session->agent() !== null) {
+            $requested = $session->maxSteps() ?? $mode->maxSteps;
+            $ceiling = $this->nullableIntConfig('max_steps_ceiling', $session);
+
+            return $ceiling === null ? $requested : min($requested, $ceiling);
+        }
         $requested = $session->maxSteps();
 
         if ($requested === null) {
@@ -935,9 +1055,9 @@ final readonly class AgentRuntime
         return is_numeric($value) ? (float) $value : null;
     }
 
-    private function nullableIntConfig(string $key): ?int
+    private function nullableIntConfig(string $key, ?Session $session = null): ?int
     {
-        $value = $this->config[$key] ?? null;
+        $value = $session === null ? ($this->config[$key] ?? null) : $this->agentValue($session, $key);
 
         return is_numeric($value) ? (int) $value : null;
     }
@@ -954,9 +1074,9 @@ final readonly class AgentRuntime
         return $response->usage->cost;
     }
 
-    private function stringConfig(string $key): string
+    private function stringConfig(string $key, ?Session $session = null): string
     {
-        $value = $this->config[$key] ?? null;
+        $value = $session === null ? ($this->config[$key] ?? null) : $this->agentValue($session, $key);
         if (! is_string($value) || $value === '') {
             throw new \RuntimeException(sprintf('Harness runtime [%s] is not configured.', $key));
         }
@@ -964,10 +1084,44 @@ final readonly class AgentRuntime
         return $value;
     }
 
-    private function integerConfig(string $key, int $default): int
+    private function integerConfig(string $key, int $default, ?Session $session = null): int
     {
-        $value = $this->config[$key] ?? $default;
+        $value = $session === null ? ($this->config[$key] ?? $default) : $this->agentValue($session, $key);
 
         return is_int($value) && $value >= 0 ? $value : $default;
+    }
+
+    private function agentValue(Session $session, string $key): mixed
+    {
+        $options = $session->agent() === null ? [] : ($this->agents[$session->agent()] ?? []);
+
+        return is_array($options) && array_key_exists($key, $options) ? $options[$key] : ($this->config[$key] ?? null);
+    }
+
+    private function requestSteps(Session $session, RunContext $run): int
+    {
+        return $session->agent() === null ? $run->budget->maxSteps : max(0, $run->budget->maxSteps - $run->ledger->steps());
+    }
+
+    private function boundedAgentRun(Session $session, RunContext $run): RunContext
+    {
+        if ($session->agent() === null) {
+            return $run;
+        }
+        $steps = $this->nullableIntConfig('max_steps_ceiling', $session);
+        $output = $this->nullableIntConfig('max_output_tokens_per_call', $session);
+        $budget = $run->budget;
+
+        return new RunContext(
+            ledger: $run->ledger,
+            budget: new RunBudget(
+                maxSteps: $steps === null ? $budget->maxSteps : min($budget->maxSteps, $run->ledger->steps() + $steps),
+                maxCostUsd: $budget->maxCostUsd,
+                maxSeconds: $budget->maxSeconds,
+                maxOutputTokensPerCall: $output === null ? $budget->maxOutputTokensPerCall : min($budget->maxOutputTokensPerCall ?? $output, $output),
+            ),
+            parentRunId: $run->parentRunId, parentThreadId: $run->parentThreadId,
+            depth: $run->depth, pricing: $run->pricing, observer: $run->observer,
+        );
     }
 }

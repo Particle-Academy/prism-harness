@@ -13,6 +13,7 @@ use Prism\Harness\Contracts\AgentTaskSource;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Models\Thread;
+use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tasks\StoreTaskSource;
@@ -42,22 +43,60 @@ class Session
     /** @var array<string, mixed>|null */
     protected ?array $cachedState = null;
 
+    private bool $resolutionOnly = false;
+
+    private ?string $resolvedMode = null;
+
+    protected readonly SessionAddress $address;
+
+    protected readonly SessionStore $ephemeral;
+
+    protected readonly SessionStore $durable;
+
     public function __construct(
-        protected readonly Model $participant,
+        protected readonly Model|ParticipantRef $participant,
         protected readonly string $scope,
-        protected readonly SessionStore $ephemeral,
-        protected readonly SessionStore $durable,
+        SessionStore $ephemeral,
+        SessionStore $durable,
         protected readonly ?int $ttlSeconds = null,
         protected readonly ?AgentRuntime $runtime = null,
         protected readonly int $taskLeaseSeconds = AgentTaskSource::DEFAULT_LEASE_SECONDS,
-    ) {}
+        protected readonly ?string $agent = null,
+        protected readonly ?object $actor = null,
+    ) {
+        if ($participant instanceof ParticipantRef && $actor === null) {
+            throw new \LogicException('Typed participants require an explicit authorization actor.');
+        }
+        $this->address = SessionAddress::forParticipant($participant, $scope, $agent);
+        $indexed = $agent !== null || $participant instanceof ParticipantRef;
+        $index = $indexed ? DatabaseAddressIndex::configured((new Thread)->getConnection()) : null;
+        $this->ephemeral = $index !== null && ! $ephemeral instanceof IndexedSessionStore
+            ? new IndexedSessionStore($ephemeral, $index, $this->address, 'ephemeral') : $ephemeral;
+        $this->durable = $index !== null && ! $durable instanceof IndexedSessionStore
+            ? new IndexedSessionStore($durable, $index, $this->address, 'durable') : $durable;
+    }
+
+    public function agent(): ?string
+    {
+        return $this->agent;
+    }
+
+    public function actor(): object
+    {
+        return $this->actor ?? $this->participant;
+    }
+
+    public function address(): SessionAddress
+    {
+        return $this->address;
+    }
 
     public function scope(): string
     {
         return $this->scope;
     }
 
-    public function participant(): Model
+    public function participant(): Model|ParticipantRef
     {
         return $this->participant;
     }
@@ -73,16 +112,14 @@ class Session
      */
     public function key(): string
     {
-        return sprintf(
-            'session:%s:%s:%s',
-            substr(sha1($this->participant->getMorphClass()), 0, 12),
-            (string) $this->participant->getKey(),
-            $this->scope,
-        );
+        return $this->address->sessionKey();
     }
 
     public function mode(): ?string
     {
+        if ($this->resolvedMode !== null) {
+            return $this->resolvedMode;
+        }
         $mode = $this->state()['mode'] ?? null;
 
         return is_string($mode) ? $mode : null;
@@ -160,6 +197,7 @@ class Session
     /** @param array<string, mixed> $state */
     public function usingCapability(string $name, array $state): self
     {
+        $this->assertWritableResolution();
         $durable = $this->durable->get($this->durableKey()) ?? [];
         $capabilities = is_array($durable['capabilities'] ?? null) ? $durable['capabilities'] : [];
         $capabilities[$name] = $state;
@@ -171,6 +209,7 @@ class Session
 
     public function forgetCapability(string $name): self
     {
+        $this->assertWritableResolution();
         $durable = $this->durable->get($this->durableKey()) ?? [];
         $capabilities = is_array($durable['capabilities'] ?? null) ? $durable['capabilities'] : [];
         unset($capabilities[$name]);
@@ -188,7 +227,9 @@ class Session
      */
     public function thread(): Thread
     {
-        return Thread::forParticipant($this->participant, $this->scope);
+        $this->assertWritableResolution();
+
+        return Thread::forAddress($this->address);
     }
 
     /**
@@ -212,6 +253,7 @@ class Session
      */
     public function newConversation(): Thread
     {
+        $this->assertWritableResolution();
         $this->thread()->retire();
 
         return $this->thread();
@@ -233,8 +275,10 @@ class Session
      */
     public function tasks(): StoreTaskSource
     {
+        $this->assertWritableResolution();
+
         return new StoreTaskSource(
-            store: $this->durable,
+            store: $this->durable instanceof IndexedSessionStore ? $this->durable->forTasks() : $this->durable,
             list: $this->key(),
             leaseSeconds: $this->taskLeaseSeconds,
         );
@@ -252,6 +296,7 @@ class Session
      */
     public function send(string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): AgentResponse
     {
+        $this->assertWritableResolution();
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
@@ -279,6 +324,7 @@ class Session
      */
     public function sendStructured(string $prompt, Schema $schema, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): StructuredAgentResponse
     {
+        $this->assertWritableResolution();
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
@@ -307,6 +353,7 @@ class Session
      */
     public function stream(string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): Generator
     {
+        $this->assertWritableResolution();
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
@@ -442,6 +489,8 @@ class Session
      */
     public function lock(Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
     {
+        $this->assertWritableResolution();
+
         return $this->ephemeral->withLock(
             $this->key(),
             function () use ($callback): mixed {
@@ -462,6 +511,7 @@ class Session
      */
     public function forget(): self
     {
+        $this->assertWritableResolution();
         $this->ephemeral->forget($this->ephemeralKey());
         // Pre-runtime releases stored ephemeral state at the unsuffixed key.
         $this->ephemeral->forget($this->key());
@@ -480,8 +530,44 @@ class Session
             ?? [];
     }
 
+    /**
+     * @template T
+     *
+     * Ordinary store reads retain expired-entry cleanup; explicit logical writes refuse.
+     *
+     * @param  Closure(Session): T  $resolve
+     * @return T
+     */
+    public function resolveReadOnly(string $mode, Closure $resolve): mixed
+    {
+        $view = clone $this;
+        $view->cachedState = null;
+        $view->resolutionOnly = true;
+        $view->resolvedMode = $mode;
+        try {
+            return $resolve($view);
+        } finally {
+            $view->resolutionOnly = false;
+            $view->cachedState = null;
+        }
+    }
+
+    /** @internal Tool factories may defer resource access while resolving an offer. */
+    public function isReadOnlyResolution(): bool
+    {
+        return $this->resolutionOnly;
+    }
+
+    private function assertWritableResolution(): void
+    {
+        if ($this->resolutionOnly) {
+            throw new \LogicException('Harness tool resolution is read-only.');
+        }
+    }
+
     protected function write(string $key, mixed $value): self
     {
+        $this->assertWritableResolution();
         $state = $this->state();
         $state[$key] = $value;
 

@@ -10,7 +10,6 @@ use Prism\Harness\Subagents\CallSettlement;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\Subagent;
-use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Testing\TextResponseFake;
@@ -252,7 +251,7 @@ it('observes approval continuations after resolving the approved or denied side 
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['tick']);
     $session = callBudgetSession();
     $invoked = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Approved tool')->using(function () use (&$invoked): string {
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Approved tool')->using(function () use (&$invoked): string {
         $invoked++;
 
         return 'resolved before observer';

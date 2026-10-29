@@ -62,7 +62,10 @@ final class ContextRecallTool
         //
         // The thread is the conversation, so the thread is what both sides key
         // on.
-        $scope = (string) $session->thread()->getKey();
+        // Named tool construction also serves effectiveTools(), which must not
+        // create a thread. Resolve that address only when its handler runs.
+        $scope = $session->agent() === null && ! $session->isReadOnlyResolution()
+            ? (string) $session->thread()->getKey() : null;
 
         return ToolFactory::as('recall_context')
             ->for(
@@ -72,9 +75,9 @@ final class ContextRecallTool
                 .'work. Returns a bounded extract, so ask a specific question.'
             )
             ->withStringParameter('query', 'What you are trying to find, in your own words')
-            ->using(function (string $query) use ($scope): string {
+            ->using(function (string $query) use ($scope, $session): string {
                 try {
-                    $found = $this->recall->recall($query, $scope, $this->budget);
+                    $found = $this->recall->recall($query, $scope ?? (string) $session->thread()->getKey(), $this->budget);
                 } catch (Throwable $failure) {
                     report($failure);
 

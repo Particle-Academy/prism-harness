@@ -29,9 +29,21 @@ function callBudgetSession(string $scope = 'budget'): Session
     config()->set('prism-harness.agent.provider', 'anthropic');
     config()->set('prism-harness.agent.model', 'budget-model');
     config()->set('prism-harness.agent.modes.chat.tools', ['tick']);
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Count')->using(fn (): string => 'done'));
+    $tools = app(ToolRegistry::class);
+    $tool = (new Tool)->as('tick')->for('Count')->using(fn (): string => 'done');
+    if (in_array('tick', $tools->names(), true)) {
+        $tools->replace($tool, 'legacy');
+    } else {
+        $tools->register($tool);
+    }
 
     return app(PrismHarness::class)->for(Participant::firstOrCreate(['name' => 'Budget']))->session($scope);
+}
+
+/** Tests replacing the baseline fixture must identify its predecessor explicitly. */
+function replaceCallBudgetTool(Tool $tool): void
+{
+    app(ToolRegistry::class)->replace($tool, 'legacy');
 }
 
 function callBudgetContext(float $cap = 0.17, ?int $maxOutput = 10): RunContext

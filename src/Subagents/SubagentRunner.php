@@ -31,15 +31,19 @@ final readonly class SubagentRunner
         private AgentRuntime $runtime,
     ) {}
 
-    public function tool(Subagent $subagent, Session $parent, RunContext $context, string $parentRunId): Tool
+    public function tool(Subagent $subagent, Session $parent, ?RunContext $context, string $parentRunId): Tool
     {
         return (new Tool)
             ->as($subagent->name)
             ->for($subagent->description)
             ->withStringParameter('task', 'What the subagent should do, stated as a complete instruction. It does not see this conversation.')
-            ->using(fn (string $task): string => $this
-                ->run($subagent, $parent, $context, $parentRunId, $task)
-                ->toToolResult());
+            ->using(function (string $task) use ($subagent, $parent, $context, $parentRunId): string {
+                if ($context === null) {
+                    throw new \LogicException('Tool inspection cannot invoke a subagent.');
+                }
+
+                return $this->run($subagent, $parent, $context, $parentRunId, $task)->toToolResult();
+            });
     }
 
     public function run(
@@ -95,7 +99,9 @@ final readonly class SubagentRunner
         }
 
         try {
-            $child = $this->harness->session($parent->participant(), $subagent->scopeUnder($parent->scope()));
+            $child = $this->harness->forAgent($parent->agent())->session(
+                $parent->participant(), $subagent->scopeUnder($parent->scope()), $parent->actor(),
+            );
             $child->usingMode($subagent->mode);
             $child->thread()->linkBeneath($parent->thread(), $context->rootRunId());
 
