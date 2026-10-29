@@ -30,16 +30,50 @@ final readonly class ToolAuthorizer
 
     private const FLAG = 'prism-harness.agent.authorize_tools';
 
-    public function __construct(private Gate $gate, private bool $enabled = false)
-    {
+    /** @param array<string, mixed> $agents */
+    public function __construct(
+        private Gate $gate,
+        private bool $enabled = false,
+        private array $agents = [],
+        private ?string $agent = null,
+        private string $offerAbility = self::ABILITY,
+        private string $callAbility = self::CALL_ABILITY,
+        private string $flag = self::FLAG,
+    ) {
         // Refused here rather than tolerated, for the reason the exception
         // sets out: a defined policy that is never consulted looks like a
         // control to every reader and is not one.
-        if (! $enabled && ($gate->has(self::ABILITY) || $gate->has(self::CALL_ABILITY))) {
-            $ability = $gate->has(self::ABILITY) ? self::ABILITY : self::CALL_ABILITY;
-
-            throw UnsafeAuthorizationConfiguration::policyDefinedButDisabled($ability, self::FLAG);
+        if (! $enabled && ($gate->has($offerAbility) || $gate->has($callAbility))) {
+            throw UnsafeAuthorizationConfiguration::policyDefinedButDisabled($gate->has($offerAbility) ? $offerAbility : $callAbility, $flag);
         }
+    }
+
+    public function forSession(Session $session): self
+    {
+        if ($session->agent() === $this->agent) {
+            return $this;
+        }
+        if ($this->agent !== null) {
+            throw new \LogicException('Harness authorizer/session agent mismatch.');
+        }
+        $agent = $session->agent();
+        $options = $this->agents[$agent] ?? [];
+        if (! is_array($options)) {
+            throw new \InvalidArgumentException('Agent authorization options must be a map.');
+        }
+        $enabled = array_key_exists('authorize_tools', $options) ? $options['authorize_tools'] : $this->enabled;
+        $offer = array_key_exists('tool_ability', $options) ? $options['tool_ability'] : $this->offerAbility;
+        $call = array_key_exists('tool_call_ability', $options) ? $options['tool_call_ability'] : $this->callAbility;
+        if (! is_bool($enabled) || ! is_string($offer) || $offer === '' || ! is_string($call) || $call === '') {
+            throw new \InvalidArgumentException('Malformed agent tool authorization options.');
+        }
+
+        return new self($this->gate, $enabled, agent: $agent, offerAbility: $offer, callAbility: $call, flag: 'prism-harness.agents.'.$agent.'.authorize_tools');
+    }
+
+    public function callAbility(): string
+    {
+        return $this->callAbility;
     }
 
     public function enabled(): bool
@@ -60,7 +94,7 @@ final readonly class ToolAuthorizer
      */
     public function hasCallPolicy(): bool
     {
-        return $this->gate->has(self::CALL_ABILITY);
+        return $this->gate->has($this->callAbility);
     }
 
     /**
@@ -71,6 +105,10 @@ final readonly class ToolAuthorizer
      */
     public function allowed(Session $session, array $tools): array
     {
+        $scoped = $this->forSession($session);
+        if ($scoped !== $this) {
+            return $scoped->allowed($session, $tools);
+        }
         if (! $this->enabled) {
             return array_values($tools);
         }
@@ -82,7 +120,7 @@ final readonly class ToolAuthorizer
             fn (Tool $tool): Tool => AuthorizedTool::wrap($tool, $session, $this),
             array_filter(
                 $tools,
-                fn (Tool $tool): bool => $this->gate->forUser($session->participant())->allows(self::ABILITY, [$session, $tool]),
+                fn (Tool $tool): bool => $this->gate->forUser($session->actor())->allows($this->offerAbility, [$session, $tool]),
             ),
         ));
     }
@@ -102,10 +140,14 @@ final readonly class ToolAuthorizer
      */
     public function allowsCall(Session $session, Tool $tool, array $arguments): bool
     {
-        if (! $this->enabled || ! $this->gate->has(self::CALL_ABILITY)) {
+        $scoped = $this->forSession($session);
+        if ($scoped !== $this) {
+            return $scoped->allowsCall($session, $tool, $arguments);
+        }
+        if (! $this->enabled || ! $this->gate->has($this->callAbility)) {
             return true;
         }
 
-        return $this->gate->forUser($session->participant())->allows(self::CALL_ABILITY, [$session, $tool, $arguments]);
+        return $this->gate->forUser($session->actor())->allows($this->callAbility, [$session, $tool, $arguments]);
     }
 }

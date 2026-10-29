@@ -6,12 +6,92 @@ namespace Prism\Harness\Modes;
 
 use InvalidArgumentException;
 use Prism\Harness\Console\HarnessDoctorCommand;
+use Prism\Harness\Exceptions\RegistrationCollision;
+use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Subagents\Subagent;
+use Prism\Harness\Support\RegistrationOwner;
 
-final readonly class ModeRegistry
+final class ModeRegistry
 {
+    /** @var array<string, self> */
+    private array $agents = [];
+
+    /** @var array<string, string> */
+    private array $owners = [];
+
     /** @param array<string, mixed> $config */
-    public function __construct(private array $config) {}
+    public function __construct(private array $config, private readonly ?string $agent = null, private readonly ?self $root = null)
+    {
+        SessionAddress::validateAgent($agent);
+        $owner = $config['owner'] ?? null;
+        foreach ($this->names() as $name) {
+            $this->owners[$name] = RegistrationOwner::label(is_string($owner) ? $owner : null, $agent);
+        }
+    }
+
+    public function forAgent(?string $agent): self
+    {
+        SessionAddress::validateAgent($agent);
+        $root = $this->root ?? $this;
+        if ($agent === null) {
+            return $root;
+        }
+        if (! isset($root->agents[$agent])) {
+            $agents = $root->config['agents'] ?? [];
+            $config = is_array($agents) ? ($agents[$agent] ?? []) : null;
+            if (! is_array($config)) {
+                throw new InvalidArgumentException('Agent modes must be configured as a mapping.');
+            }
+            $config['default'] ??= $root->default();
+            $root->agents[$agent] = new self($config, $agent, $root);
+        }
+
+        return $root->agents[$agent];
+    }
+
+    /** @param array<string, mixed> $mode */
+    public function register(string $name, array $mode, ?string $owner = null): self
+    {
+        $label = RegistrationOwner::label($owner, $this->agent);
+        if (isset($this->owners[$name])) {
+            throw new RegistrationCollision($this->agent, $name, $this->owners[$name], $label);
+        }
+        $this->set($name, $mode, $label);
+
+        return $this;
+    }
+
+    /** @param array<string, mixed> $mode */
+    public function replace(string $name, array $mode, string $predecessorOwner, ?string $owner = null): self
+    {
+        $label = RegistrationOwner::label($owner, $this->agent);
+        if (($this->owners[$name] ?? null) !== $predecessorOwner) {
+            throw new \LogicException('Replacement must name the registered predecessor owner.');
+        }
+        $this->set($name, $mode, $label);
+
+        return $this;
+    }
+
+    /** @param array<string, mixed> $mode */
+    private function set(string $name, array $mode, string $owner): void
+    {
+        $modes = $this->config['modes'] ?? [];
+        if (! is_array($modes)) {
+            throw new InvalidArgumentException('Modes must be configured as a mapping.');
+        }
+        $modes[$name] = $mode;
+        $this->config['modes'] = $modes;
+        $this->owners[$name] = $owner;
+    }
+
+    public function setDefault(string $name): self
+    {
+        $this->resolve($name);
+        $this->config['default'] = $name;
+
+        return $this;
+    }
 
     public function default(): string
     {

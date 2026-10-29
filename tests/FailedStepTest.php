@@ -7,7 +7,6 @@ use Illuminate\Support\Facades\Http;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Subagents\RunContext;
-use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\PrismManager;
@@ -142,7 +141,7 @@ it('executes a valid approved call but never one from a failed step', function (
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['tick']);
     $session = callBudgetSession();
     $tools = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Count')->using(function () use (&$tools): string {
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Count')->using(function () use (&$tools): string {
         $tools++;
 
         return 'unexpected';
@@ -184,7 +183,7 @@ it('does not invoke a tool after an actual provider stream has reported an error
     config()->set('prism.providers.anthropic.api_key', 'test-only');
     $session = callBudgetSession();
     $tools = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Count')->using(function () use (&$tools): string {
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Count')->using(function () use (&$tools): string {
         $tools++;
 
         return 'unexpected';

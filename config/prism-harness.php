@@ -6,6 +6,15 @@ use Prism\Harness\Contracts\AgentTaskSource;
 
 return [
 
+    // Named/explicit-reference addresses only. Null leaves growth unlimited.
+    // Legacy null/model state keeps its original path; backfill is explicit.
+    'addresses' => ['max_addresses_per_participant' => null],
+
+    // Named authority collections are configured independently; they are never
+    // inherited from the legacy namespace. Unset scalar settings fall back.
+    'agents' => [],
+    'default_task_list' => 'default',
+
     /*
     |--------------------------------------------------------------------------
     | Default thread scope

@@ -51,11 +51,18 @@ final readonly class SkillRegistry
         return $contents;
     }
 
-    public function readerTool(): Tool
+    /** @param list<string>|null $allowedSkills */
+    public function readerTool(?array $allowedSkills = null): Tool
     {
         return (new Tool)->as('skill_read')->for('Read a referenced file from a Harness-owned skill. Skill resources are capabilities, not project files.')
             ->withStringParameter('skill', 'Registered skill name.')
             ->withStringParameter('path', 'Path relative to that skill root, such as remotion-create/REFERENCE.md.')
-            ->using(fn (string $skill, string $path): string => $this->read($skill, $path));
+            ->using(function (string $skill, string $path) use ($allowedSkills): string {
+                if ($allowedSkills !== null && ! in_array($skill, $allowedSkills, true)) {
+                    throw new InvalidArgumentException('This skill is not available in the active agent mode.');
+                }
+
+                return $this->read($skill, $path);
+            });
     }
 }

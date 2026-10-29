@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness;
 
 use Illuminate\Database\Eloquent\Model;
+use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\Sessions\Session;
 
 /**
@@ -19,11 +20,21 @@ class PendingSession
 {
     public function __construct(
         protected readonly PrismHarness $harness,
-        protected readonly Model $participant,
+        protected readonly Model|ParticipantRef $participant,
+        protected readonly ?object $actor = null,
     ) {}
+
+    public function asActor(object $actor): self
+    {
+        if ($this->participant instanceof ParticipantRef) {
+            throw new \LogicException('Typed participants require a registered actor adapter.');
+        }
+
+        return new self($this->harness, $this->participant, $actor);
+    }
 
     public function session(?string $scope = null): Session
     {
-        return $this->harness->session($this->participant, $scope);
+        return $this->harness->session($this->participant, $scope, $this->actor);
     }
 }

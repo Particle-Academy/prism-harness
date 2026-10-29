@@ -18,6 +18,7 @@ use Prism\Harness\Contracts\ContextRecall;
 use Prism\Harness\Contracts\EvictionSink;
 use Prism\Harness\Contracts\SummaryBudget;
 use Prism\Harness\Modes\ModeRegistry;
+use Prism\Harness\Participants\ParticipantAdapters;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Skills\SkillRegistry;
@@ -105,11 +106,12 @@ class PrismHarnessServiceProvider extends ServiceProvider
             return $tools;
         });
         $this->app->singleton(ModeRegistry::class, fn ($app): ModeRegistry => new ModeRegistry(
-            $app['config']->get('prism-harness.agent', []),
+            [...$app['config']->get('prism-harness.agent', []), 'agents' => $app['config']->get('prism-harness.agents', [])],
         ));
         $this->app->singleton(ToolAuthorizer::class, fn ($app): ToolAuthorizer => new ToolAuthorizer(
             $app->make(Gate::class),
             (bool) $app['config']->get('prism-harness.agent.authorize_tools', false),
+            $app['config']->get('prism-harness.agents', []),
         ));
         $this->app->singleton(AgentRuntime::class, fn ($app): AgentRuntime => new AgentRuntime(
             $app->make(ModeRegistry::class),
@@ -136,6 +138,7 @@ class PrismHarnessServiceProvider extends ServiceProvider
 
                 return $observer;
             },
+            agents: $app['config']->get('prism-harness.agents', []),
         ));
 
         $this->app->singleton(SubagentRunner::class, fn ($app): SubagentRunner => new SubagentRunner(
@@ -146,10 +149,12 @@ class PrismHarnessServiceProvider extends ServiceProvider
         // The harness is a singleton; the sessions it hands out are not. Each
         // call rebuilds one from the store, because a session held across
         // requests goes stale the moment another worker touches it.
+        $this->app->singleton(ParticipantAdapters::class, fn (): ParticipantAdapters => new ParticipantAdapters);
         $this->app->singleton(PrismHarness::class, fn ($app): PrismHarness => new PrismHarness(
             stores: $app->make(SessionStoreManager::class),
             runtime: $app->make(AgentRuntime::class),
             config: $app['config']->get('prism-harness', []),
+            participants: $app->make(ParticipantAdapters::class),
         ));
     }
 

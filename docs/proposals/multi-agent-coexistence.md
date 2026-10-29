@@ -141,7 +141,11 @@ Expose the resolution as a read API,
 exactly the set the offer path would produce, computed by the same code rather
 than a parallel derivation, so boot checks and tests (e.g. Fancy's agent-guard)
 can assert narrowing against the harness's own answer. It runs no handler, issues
-no provider request and creates no session.
+no model/provider request, creates no session, thread or index entry and makes
+no logical state change. Reads may physically purge expired entries, exactly
+as ordinary store reads do. Explicit Session, thread and index writes remain
+refused during inspection; this does not add a different read contract for
+custom stores.
 
 `agents.<id>` provides scalar provider/model, step and output ceilings, lock
 settings, default mode, observer, default task list and authorization options.

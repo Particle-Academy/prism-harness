@@ -11,7 +11,6 @@ use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
-use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Testing\TextResponseFake;
@@ -59,7 +58,7 @@ it('forwards the owner budget through the public approval resume methods', funct
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['tick']);
     $session = callBudgetSession();
     $invoked = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Approved tool')
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Approved tool')
         ->using(function () use (&$invoked): string {
             $invoked++;
 
@@ -88,7 +87,7 @@ it('rejects a reentrant child before its request while the parent model call is 
     $childContext = new RunContext($run->ledger, (new RunBudget(5, 0.17, maxOutputTokensPerCall: 10))
         ->nestedWithin($run->budget, $run->ledger), pricing: $run->pricing);
     $reason = null;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Call the child')
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Call the child')
         ->using(function () use ($child, $childContext, $run, &$reason): string {
             expect($run->ledger->reservedCostUsd())->toBe(0.1);
             try {
@@ -127,7 +126,7 @@ it('stops for approval and stores the original approval identity on capped text 
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['tick']);
     $session = callBudgetSession();
     $invoked = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Needs approval')
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Needs approval')
         ->using(function () use (&$invoked): string {
             $invoked++;
 
@@ -157,7 +156,7 @@ it('bounds approved tool results before the resumed model call and never execute
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['tick']);
     $session = callBudgetSession();
     $invoked = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Approved read')
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Approved read')
         ->using(function () use (&$invoked): string {
             $invoked++;
 
@@ -203,7 +202,7 @@ it('writes approved stream results before yielding resolution events and survive
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['tick']);
     $session = callBudgetSession();
     $invoked = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Approved tool')
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Approved tool')
         ->using(function () use (&$invoked): string {
             $invoked++;
 
@@ -236,7 +235,7 @@ it('honors tree cancellation before executing an already-approved side effect', 
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['tick']);
     $session = callBudgetSession();
     $invoked = 0;
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Approved tool')
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Approved tool')
         ->using(function () use (&$invoked): string {
             $invoked++;
 

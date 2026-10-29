@@ -69,6 +69,7 @@ final class TaskCompletionTool
      */
     public static function for(AgentTaskSource $source, Session $session, ToolAuthorizer $authorizer, string $worker): Tool
     {
+        $authorizer = $authorizer->forSession($session);
         $tool = new Tool;
 
         return $tool
@@ -102,7 +103,7 @@ final class TaskCompletionTool
 
                 if (! $authorizer->hasCallPolicy()) {
                     return self::refused(
-                        'This application has defined no '.ToolAuthorizer::CALL_ABILITY.' policy, and closing '
+                        'This application has defined no '.$authorizer->callAbility().' policy, and closing '
                         .'your own task is not granted by silence. Completion is recorded by the application '
                         .'from evidence unless a policy says otherwise.'
                     );
