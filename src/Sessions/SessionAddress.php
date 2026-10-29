@@ -24,9 +24,11 @@ final readonly class SessionAddress
         if (($participantType === null) !== ($participantId === null)) {
             throw new InvalidArgumentException('Participant type and id must both be present or both be absent.');
         }
-        foreach ([$participantType, $participantId, $scope] as $value) {
-            if ($value !== null && preg_match('//u', $value) !== 1) {
-                throw new InvalidArgumentException('Harness addresses require valid UTF-8.');
+        if ($agent !== null || $reference) {
+            foreach ([$participantType, $participantId, $scope] as $value) {
+                if ($value !== null && preg_match('//u', $value) !== 1) {
+                    throw new InvalidArgumentException('Harness addresses require valid UTF-8.');
+                }
             }
         }
     }
