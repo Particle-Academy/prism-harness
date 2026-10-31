@@ -78,7 +78,8 @@ final readonly class CallBudget
      * Use the configured provider's projected body when available. Storage-only
      * replay shadows and tool-result args are then absent. Keep the legacy
      * stored-byte calculation when projection is unavailable or unprojectable.
-     * Explicit image/tool bounds and protocol framing remain additional costs.
+     * Matched inline image data is charged only through the explicit image
+     * bound. URI prefixes, JSON framing and unmatched bytes stay counted.
      *
      * @param  'text'|'structured'|'stream'|null  $mode
      */
@@ -107,7 +108,16 @@ final readonly class CallBudget
         }
         $mappedTools = is_array($payload['tools'] ?? null) ? count($payload['tools']) : 0;
 
-        return $this->bytes($payload) + self::MESSAGE_OVERHEAD * (1 + max($storedMessages, $mappedMessages)
+        try {
+            $bytes = $this->bytes($payload) - ProjectedImageBytes::excluded($payload, $request, $provider);
+        } catch (Throwable) {
+            throw RunNotPermitted::callBudget('budget_input_unbounded');
+        }
+        if ($bytes < 0) {
+            throw RunNotPermitted::callBudget('budget_input_unbounded');
+        }
+
+        return $bytes + self::MESSAGE_OVERHEAD * (1 + max($storedMessages, $mappedMessages)
             + max(count($request->tools()), $mappedTools)) + $this->projectionOverhead($request);
     }
 
