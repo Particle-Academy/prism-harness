@@ -65,12 +65,21 @@ final readonly class CallBudget
     /** @param 'text'|'structured'|'stream'|null $mode */
     public function worstCase(TextRequest|StructuredRequest $request, ?Provider $provider = null, ?string $mode = null): float
     {
-        $input = $this->inputTokenBound($request, $provider, $mode);
+        return $this->estimate($request, $provider, $mode)->worstCaseUsd;
+    }
+
+    /** @param 'text'|'structured'|'stream'|null $mode */
+    public function estimate(TextRequest|StructuredRequest $request, ?Provider $provider = null, ?string $mode = null): CallBudgetEstimate
+    {
+        $estimate = $this->inputEstimate($request, $provider, $mode);
+        $input = $estimate['tokens'];
         $rates = $this->ratesAt($input, conservative: true);
         $inputPrice = max($rates['inputPerMTok'], $rates['cacheWritePerMTok'] ?? 0, $rates['cacheReadPerMTok'] ?? 0);
 
-        return ($input * $inputPrice + $this->maxOutputTokens * $rates['outputPerMTok'])
+        $cost = ($input * $inputPrice + $this->maxOutputTokens * $rates['outputPerMTok'])
             * ($this->price['multiplier'] ?? 1) / 1_000_000;
+
+        return new CallBudgetEstimate($input, $cost, $estimate['diagnostics']);
     }
 
     /**
@@ -85,18 +94,27 @@ final readonly class CallBudget
      */
     public function inputTokenBound(TextRequest|StructuredRequest $request, ?Provider $provider = null, ?string $mode = null): int
     {
+        return $this->inputEstimate($request, $provider, $mode)['tokens'];
+    }
+
+    /**
+     * @param  'text'|'structured'|'stream'|null  $mode
+     * @return array{tokens: int, diagnostics: list<CallBudgetDiagnostic>}
+     */
+    private function inputEstimate(TextRequest|StructuredRequest $request, ?Provider $provider, ?string $mode): array
+    {
         if ($provider === null) {
-            return $this->storedInputTokenBound($request);
+            return ['tokens' => $this->storedInputTokenBound($request), 'diagnostics' => []];
         }
         try {
             $payload = $provider->projectPayload($request, $mode ?? ($request instanceof StructuredRequest ? 'structured' : 'text'));
         } catch (PrismUnprojectableRequestException) {
-            return $this->storedInputTokenBound($request);
+            return ['tokens' => $this->storedInputTokenBound($request), 'diagnostics' => []];
         } catch (Throwable) {
             throw RunNotPermitted::callBudget('budget_input_unbounded');
         }
         if ($payload === null) {
-            return $this->storedInputTokenBound($request);
+            return ['tokens' => $this->storedInputTokenBound($request), 'diagnostics' => []];
         }
 
         $storedMessages = count($request->systemPrompts()) + count($request->messages());
@@ -109,7 +127,8 @@ final readonly class CallBudget
         $mappedTools = is_array($payload['tools'] ?? null) ? count($payload['tools']) : 0;
 
         try {
-            $bytes = $this->bytes($payload) - ProjectedImageBytes::excluded($payload, $request, $provider);
+            $images = ProjectedImageBytes::analyse($payload, $request, $provider);
+            $bytes = $this->bytes($payload) - $images['excludedBytes'];
         } catch (Throwable) {
             throw RunNotPermitted::callBudget('budget_input_unbounded');
         }
@@ -117,8 +136,11 @@ final readonly class CallBudget
             throw RunNotPermitted::callBudget('budget_input_unbounded');
         }
 
-        return $bytes + self::MESSAGE_OVERHEAD * (1 + max($storedMessages, $mappedMessages)
-            + max(count($request->tools()), $mappedTools)) + $this->projectionOverhead($request);
+        return [
+            'tokens' => $bytes + self::MESSAGE_OVERHEAD * (1 + max($storedMessages, $mappedMessages)
+                + max(count($request->tools()), $mappedTools)) + $this->projectionOverhead($request),
+            'diagnostics' => $images['diagnostics'],
+        ];
     }
 
     /** Keep the original calculation intact for unsupported/unprojectable requests. */

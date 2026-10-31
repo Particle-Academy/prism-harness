@@ -6,12 +6,16 @@ namespace Prism\Harness\Subagents;
 
 final readonly class CallReservation
 {
-    /** @param 'text'|'structured'|'stream' $kind */
+    /**
+     * @param  'text'|'structured'|'stream'  $kind
+     * @param  list<CallBudgetDiagnostic>  $diagnostics
+     */
     public function __construct(
         public string $callId,
         public string $provider,
         public string $model,
         public float $worstCaseUsd,
         public string $kind,
+        public array $diagnostics = [],
     ) {}
 }
