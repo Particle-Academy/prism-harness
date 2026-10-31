@@ -845,7 +845,12 @@ projection unavailable, the original stored-message bound applies. Capped harnes
 calls resolve and persist approvals before computing the bound. Unexpected projection
 or JSON encoding failures refuse the call before transport.
 
-Images add the configured `imageTokenBound`. Documents, audio and video are refused
+Images add the configured `imageTokenBound`. On Anthropic and OpenAI projections,
+inline image base64 matched once, in order, to an image part is excluded from the
+text byte count. JSON framing and data-URI prefixes remain counted, as does identical
+base64 appearing as text. URL/file-id images, unmatched inline data and unknown
+projectors retain their complete byte count plus the image charge.
+Documents, audio and video are refused
 under a cap. Tools require `toolOverheadTokens` because their hidden provider system
 prompt is absent from the request text. Provider toolsets require
 `serverToolOverheadTokens` keyed by their exact type; hosted MCP input is refused.

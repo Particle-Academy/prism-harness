@@ -183,11 +183,11 @@ it('retains hidden tool, image and hosted-context guards on the projection path'
     Http::assertNothingSent();
 })->with(['tool', 'server-tool', 'image', 'hosted-mcp']);
 
-it('adds the explicit image bound in addition to complete projected JSON bytes', function (): void {
+it('charges matched inline image data through the explicit image bound', function (): void {
     $generation = Prism::text()->using('anthropic', 'diagnostic-model')->withPrompt('go', [Image::fromBase64('eA==', 'image/png')]);
     $request = $generation->toRequest();
     $wireBytes = strlen(json_encode($generation->provider()->projectPayload($request, 'text'), JSON_THROW_ON_ERROR));
-    expect(projectedCallPrice(extra: ['imageTokenBound' => 3000])->inputTokenBound($request, $generation->provider()))->toBeGreaterThanOrEqual($wireBytes + 3000);
+    expect(projectedCallPrice(extra: ['imageTokenBound' => 3000])->inputTokenBound($request, $generation->provider()))->toBe($wireBytes - 4 + 128 + 3000);
 });
 
 it('counts native OpenAI replay items and opaque encrypted content without filtering keys', function (): void {
