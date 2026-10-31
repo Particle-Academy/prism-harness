@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Http;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Subagents\CallBudget;
 use Prism\Harness\Subagents\CallBudgetDiagnostic;
 use Prism\Harness\Subagents\CallReservation;
@@ -187,6 +188,35 @@ it('keeps null and private unknown declarations conservative without exposing th
     Http::assertNothingSent();
 })->with([null, 'private-future-format:do-not-disclose'])
     ->skip(fn (): bool => ! interface_exists(DescribesProjectedPayload::class), 'Requires the optional core 0.144 declaration.');
+
+it('fails closed when a declared format throws without exposing its error', function (): void {
+    Http::preventStrayRequests();
+    Http::fake();
+    $generation = projectedFormatTestGeneration('anthropic', 'responses', 'text');
+    $request = $generation->toRequest();
+    $provider = new class($generation->provider()) extends ProjectedFormatTestDecorator implements DescribesProjectedPayload
+    {
+        public int $metadataCalls = 0;
+
+        public function projectedPayloadFormat(): ?string
+        {
+            $this->metadataCalls++;
+            throw new LogicException('synthetic-private-format-error');
+        }
+    };
+
+    try {
+        projectedFormatTestBudget('anthropic')->estimate($request, $provider);
+        $this->fail('A throwing format declaration must refuse admission.');
+    } catch (RunNotPermitted $error) {
+        expect($error->code())->toBe('budget_input_unbounded')
+            ->and($error->getMessage())->not->toContain('synthetic-private-format-error')
+            ->and($error->getPrevious())->toBeNull();
+    }
+    expect($provider->projectionCalls)->toBe(1)
+        ->and($provider->metadataCalls)->toBe(1);
+    Http::assertNothingSent();
+})->skip(fn (): bool => ! interface_exists(DescribesProjectedPayload::class), 'Requires the optional core 0.144 declaration.');
 
 it('never falls back to a native class after an explicit null or unknown declaration', function (?string $format): void {
     Http::preventStrayRequests();
