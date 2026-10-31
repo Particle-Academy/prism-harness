@@ -10,6 +10,7 @@ use Illuminate\Support\Collection;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\FinishReason;
+use Prism\Prism\Providers\Provider;
 use Prism\Prism\Streaming\Events\ErrorEvent;
 use Prism\Prism\Streaming\Events\StepFinishEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
@@ -51,7 +52,7 @@ final readonly class BudgetedCalls
                 (new ApprovedTools)->resolve($generation, $resolved);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
-                [$reservation, $call] = $this->reserve($run, $request, 'text');
+                [$reservation, $call] = $this->reserve($run, $request, 'text', $generation->provider());
                 $usage = null;
                 $billing = [];
                 $outcome = 'failed';
@@ -100,7 +101,7 @@ final readonly class BudgetedCalls
                 (new ApprovedTools)->resolve($generation, $resolved);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
-                [$reservation, $call] = $this->reserve($run, $request, 'structured');
+                [$reservation, $call] = $this->reserve($run, $request, 'structured', $generation->provider());
                 $usage = null;
                 $billing = [];
                 $outcome = 'failed';
@@ -171,7 +172,7 @@ final readonly class BudgetedCalls
             }
             $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
             $request = $generation->toRequest();
-            [$reservation, $call] = $this->reserve($run, $request, 'stream');
+            [$reservation, $call] = $this->reserve($run, $request, 'stream', $generation->provider());
             $usage = null;
             $billing = [];
             $billingSteps = 0;
@@ -309,11 +310,11 @@ final readonly class BudgetedCalls
     /** @param 'text'|'structured'|'stream' $kind
      * @return array{int, CallReservation}
      */
-    private function reserve(RunContext $run, TextRequest|StructuredRequest $request, string $kind): array
+    private function reserve(RunContext $run, TextRequest|StructuredRequest $request, string $kind, Provider $provider): array
     {
         $call = new CallReservation(bin2hex(random_bytes(16)),
             $request->provider() ?? throw new \LogicException('A capped call needs a provider.'),
-            $request->model(), $this->price->worstCase($request), $kind);
+            $request->model(), $this->price->worstCase($request, $provider, $kind), $kind);
         $reservation = $run->ledger->reserveCost($run->budget, $call->worstCaseUsd);
         try {
             $run->observer?->reserving($call, $run);

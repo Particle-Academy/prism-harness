@@ -6,6 +6,8 @@ namespace Prism\Harness\Subagents;
 
 use Illuminate\Contracts\Support\Arrayable;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Prism\Exceptions\PrismUnprojectableRequestException;
+use Prism\Prism\Providers\Provider;
 use Prism\Prism\Structured\Request as StructuredRequest;
 use Prism\Prism\Text\Request as TextRequest;
 use Prism\Prism\ValueObjects\Media\Image;
@@ -13,6 +15,7 @@ use Prism\Prism\ValueObjects\Media\Text;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\Usage;
+use Throwable;
 
 /** Trusted, caller-supplied prices. No remote discovery and no guessed model rates. */
 final readonly class CallBudget
@@ -59,9 +62,10 @@ final readonly class CallBudget
         return new self($price, $maxOutput, $billing === 'reported-complete');
     }
 
-    public function worstCase(TextRequest|StructuredRequest $request): float
+    /** @param 'text'|'structured'|'stream'|null $mode */
+    public function worstCase(TextRequest|StructuredRequest $request, ?Provider $provider = null, ?string $mode = null): float
     {
-        $input = $this->inputTokenBound($request);
+        $input = $this->inputTokenBound($request, $provider, $mode);
         $rates = $this->ratesAt($input, conservative: true);
         $inputPrice = max($rates['inputPerMTok'], $rates['cacheWritePerMTok'] ?? 0, $rates['cacheReadPerMTok'] ?? 0);
 
@@ -71,12 +75,44 @@ final readonly class CallBudget
 
     /**
      * A deliberately conservative UTF-8 BYTE bound, not a tokenizer estimate.
-     * JSON escaping, keys and duplicate text over-count; admission errs early.
-     * Count system/history text, call arguments/results, schemas and provider
-     * options, plus 64 tokens per message/tool for protocol framing. Images use
-     * an explicit model bound; no bytes-to-tokens guess for other media.
+     * Use the configured provider's projected body when available. Storage-only
+     * replay shadows and tool-result args are then absent. Keep the legacy
+     * stored-byte calculation when projection is unavailable or unprojectable.
+     * Explicit image/tool bounds and protocol framing remain additional costs.
+     *
+     * @param  'text'|'structured'|'stream'|null  $mode
      */
-    public function inputTokenBound(TextRequest|StructuredRequest $request): int
+    public function inputTokenBound(TextRequest|StructuredRequest $request, ?Provider $provider = null, ?string $mode = null): int
+    {
+        if ($provider === null) {
+            return $this->storedInputTokenBound($request);
+        }
+        try {
+            $payload = $provider->projectPayload($request, $mode ?? ($request instanceof StructuredRequest ? 'structured' : 'text'));
+        } catch (PrismUnprojectableRequestException) {
+            return $this->storedInputTokenBound($request);
+        } catch (Throwable) {
+            throw RunNotPermitted::callBudget('budget_input_unbounded');
+        }
+        if ($payload === null) {
+            return $this->storedInputTokenBound($request);
+        }
+
+        $storedMessages = count($request->systemPrompts()) + count($request->messages());
+        $mappedMessages = 0;
+        foreach (['system', 'messages', 'input'] as $field) {
+            if (is_array($payload[$field] ?? null)) {
+                $mappedMessages += count($payload[$field]);
+            }
+        }
+        $mappedTools = is_array($payload['tools'] ?? null) ? count($payload['tools']) : 0;
+
+        return $this->bytes($payload) + self::MESSAGE_OVERHEAD * (1 + max($storedMessages, $mappedMessages)
+            + max(count($request->tools()), $mappedTools)) + $this->projectionOverhead($request);
+    }
+
+    /** Keep the original calculation intact for unsupported/unprojectable requests. */
+    private function storedInputTokenBound(TextRequest|StructuredRequest $request): int
     {
         $total = self::MESSAGE_OVERHEAD;
         foreach ([...$request->systemPrompts(), ...$request->messages()] as $message) {
@@ -139,6 +175,55 @@ final readonly class CallBudget
         $total += $this->bytes($request->providerOptions());
         if ($request instanceof StructuredRequest) {
             $total += $this->bytes($request->schema()->toArray());
+        }
+
+        return $total;
+    }
+
+    /** Non-text and hidden provider costs are not bounded by JSON size alone. */
+    private function projectionOverhead(TextRequest|StructuredRequest $request): int
+    {
+        $total = 0;
+        foreach ([...$request->systemPrompts(), ...$request->messages()] as $message) {
+            if (! $message instanceof Arrayable) {
+                throw RunNotPermitted::callBudget('budget_input_unbounded');
+            }
+            if ($message instanceof UserMessage) {
+                foreach ($message->additionalContent as $part) {
+                    if ($part instanceof Image) {
+                        $total += $this->imageBound();
+                    } elseif (! $part instanceof Text) {
+                        throw RunNotPermitted::callBudget('budget_input_unbounded');
+                    }
+                }
+            }
+            if ($message instanceof ToolResultMessage) {
+                foreach ($message->toolResults as $result) {
+                    foreach ($result->artifacts as $artifact) {
+                        if (! str_starts_with($artifact->mimeType, 'image/')) {
+                            throw RunNotPermitted::callBudget('budget_input_unbounded');
+                        }
+                        $total += $this->imageBound();
+                    }
+                }
+            }
+        }
+        if ($request->tools() !== []) {
+            $overhead = $this->price['toolOverheadTokens'] ?? null;
+            if (! is_int($overhead) || $overhead < 0) {
+                throw RunNotPermitted::callBudget('budget_input_unbounded');
+            }
+            $total += $overhead;
+        }
+        foreach ($request->providerTools() as $tool) {
+            $overhead = $this->price['serverToolOverheadTokens'][$tool->type] ?? null;
+            if (! is_int($overhead) || $overhead < 0) {
+                throw RunNotPermitted::callBudget('budget_input_unbounded');
+            }
+            $total += $overhead;
+        }
+        if ($request->providerOptions('mcp_servers') !== null && $request->providerOptions('mcp_servers') !== []) {
+            throw RunNotPermitted::callBudget('budget_input_unbounded');
         }
 
         return $total;

@@ -831,9 +831,20 @@ the host owns account persistence and coordination across workers. Child output-
 ceilings can narrow, never raise, the parent's ceiling. Config-based budgets use
 `max_output_tokens_per_call` (under `prism-harness.agent` or a subagent declaration).
 
-The input bound counts UTF-8 **bytes**, including system prompts, history, tool-call
-arguments/results, and tool/structured schemas serialized as JSON, plus 64 tokens per
-message/tool for framing. Escaping and duplicate text intentionally over-estimate.
+Harness requires Prism core `^0.143` for its provider request projection API.
+The input bound counts UTF-8 **bytes** of the configured provider's projected JSON
+request, plus 64 tokens per message/tool for framing. Anthropic and OpenAI projections
+include the actual message mapping, tools, provider options and structured instructions.
+Stored replay shadows and tool-result arguments that are absent from the payload do
+not count again. Thinking, signatures and other content on the wire remain counted.
+This is a conservative byte bound, not a tokenizer estimate; no token-counting network
+request is made.
+
+When a provider has no projection, or core reports that approval resolution makes
+projection unavailable, the original stored-message bound applies. Capped harness
+calls resolve and persist approvals before computing the bound. Unexpected projection
+or JSON encoding failures refuse the call before transport.
+
 Images add the configured `imageTokenBound`. Documents, audio and video are refused
 under a cap. Tools require `toolOverheadTokens` because their hidden provider system
 prompt is absent from the request text. Provider toolsets require
