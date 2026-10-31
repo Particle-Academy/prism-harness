@@ -191,10 +191,14 @@ it('keeps null and private unknown declarations conservative without exposing th
 
 it('fails closed when a declared format throws without exposing its error', function (): void {
     Http::preventStrayRequests();
-    Http::fake();
-    $generation = projectedFormatTestGeneration('anthropic', 'responses', 'text');
-    $request = $generation->toRequest();
-    $provider = new class($generation->provider()) extends ProjectedFormatTestDecorator implements DescribesProjectedPayload
+    Http::fake(fn () => Http::response(budgetHttpReply(1, true)));
+    $session = callBudgetSession('throwing-format-admission');
+    $observer = new CostObserver;
+    $run = RunContext::root('throwing-format', new RunBudget(10, 1.0, maxOutputTokensPerCall: 10), [
+        'anthropic' => ['budget-model' => ['inputPerMTok' => 1, 'outputPerMTok' => 1, 'imageTokenBound' => 3000, 'toolOverheadTokens' => 286]],
+    ], observer: $observer);
+    $inner = Prism::text()->using('anthropic', 'budget-model', ['api_key' => 'offline-only'])->provider();
+    $provider = new class($inner) extends ProjectedFormatTestDecorator implements DescribesProjectedPayload
     {
         public int $metadataCalls = 0;
 
@@ -204,9 +208,10 @@ it('fails closed when a declared format throws without exposing its error', func
             throw new LogicException('synthetic-private-format-error');
         }
     };
+    app(PrismManager::class)->extend('anthropic', static fn ($app, array $config): Provider => $provider);
 
     try {
-        projectedFormatTestBudget('anthropic')->estimate($request, $provider);
+        callBudgetRun('send', $session, $run, [Image::fromBase64('YWJj', 'image/png')]);
         $this->fail('A throwing format declaration must refuse admission.');
     } catch (RunNotPermitted $error) {
         expect($error->code())->toBe('budget_input_unbounded')
@@ -214,7 +219,13 @@ it('fails closed when a declared format throws without exposing its error', func
             ->and($error->getPrevious())->toBeNull();
     }
     expect($provider->projectionCalls)->toBe(1)
-        ->and($provider->metadataCalls)->toBe(1);
+        ->and($provider->metadataCalls)->toBe(1)
+        ->and($observer->reservations)->toBe([])
+        ->and($observer->settlements)->toBe([])
+        ->and($run->ledger->reservedCostUsd())->toBe(0.0)
+        ->and($run->ledger->costUsd())->toBe(0.0)
+        ->and($run->ledger->steps())->toBe(0)
+        ->and(json_encode($observer->reservations, JSON_THROW_ON_ERROR))->not->toContain('synthetic-private-format-error');
     Http::assertNothingSent();
 })->skip(fn (): bool => ! interface_exists(DescribesProjectedPayload::class), 'Requires the optional core 0.144 declaration.');
 
