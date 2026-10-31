@@ -919,6 +919,32 @@ reading the history. Free compaction remains supported; uncapped compaction is u
 Application-supplied compaction and tool callbacks are trusted extensions. Their own
 model calls or external billing outside the harness are not metered by this ledger.
 
+### Projected image formats and diagnostics
+
+With Prism core 0.144, decorators can forward
+`Prism\Prism\Contracts\DescribesProjectedPayload::projectedPayloadFormat()` alongside
+`projectPayload()`. Recognised formats are `anthropic-messages`, `openai-responses`
+and `openai-chat-completions`. The format only identifies where image blocks can
+appear: every discounted value must still exactly match a charged inline image,
+including its MIME type, semantic user position and ordering. Other bytes remain
+in the conservative bound.
+
+A declared `null` or unknown format keeps the complete projected byte bound.
+Providers without the interface use the existing native Anthropic/OpenAI class
+checks, including on core 0.143. A declaration without a projection has no effect.
+
+`CallBudget::estimate($request, $provider, $mode)` returns an immutable
+`CallBudgetEstimate` containing `inputTokenBound`, `worstCaseUsd` and `diagnostics`
+from one projection. Existing `inputTokenBound()` and `worstCase()` signatures and
+return types are unchanged. A projected request carrying inline images with no
+recognised format receives
+`CallBudgetDiagnostic::ProjectedImageFormatUnknown`
+(`projected_image_format_unknown`). This diagnostic retains the full bound; it
+does not itself refuse a call. Normal pricing and budget limits still apply.
+URL/file-id images and requests without a projection do not produce this reason.
+Diagnostics contain fixed enum cases, never provider-supplied format strings or
+request content.
+
 ### Host cost reservations across workers
 
 For a durable account shared across workers, implement `Prism\Harness\Contracts\CallCostObserver`:
@@ -951,7 +977,8 @@ The harness first admits and reserves in memory, then calls `reserving`, then ma
 provider request. This applies to every capped text, structured and streaming call, including
 `approve`, `deny` and `decide` continuations. Approved tool results are resolved and stored
 before admission. A reservation carries a fresh 128-bit random hex `callId`, `provider`, `model`,
-`worstCaseUsd` and `kind` (`text`, `structured`, `stream`); it contains no prompt or tool content.
+`worstCaseUsd`, `kind` (`text`, `structured`, `stream`) and `diagnostics` (a list of
+`CallBudgetDiagnostic` cases, empty by default); it contains no prompt or tool content.
 
 Any throwable from `reserving` refuses the call with zero provider requests, releases the
 in-memory reservation without charging it, and does not invoke `settled`. `CallRefused` accepts

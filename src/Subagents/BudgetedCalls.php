@@ -312,9 +312,11 @@ final readonly class BudgetedCalls
      */
     private function reserve(RunContext $run, TextRequest|StructuredRequest $request, string $kind, Provider $provider): array
     {
-        $call = new CallReservation(bin2hex(random_bytes(16)),
-            $request->provider() ?? throw new \LogicException('A capped call needs a provider.'),
-            $request->model(), $this->price->worstCase($request, $provider, $kind), $kind);
+        $callId = bin2hex(random_bytes(16));
+        $providerKey = $request->provider() ?? throw new \LogicException('A capped call needs a provider.');
+        $model = $request->model();
+        $estimate = $this->price->estimate($request, $provider, $kind);
+        $call = new CallReservation($callId, $providerKey, $model, $estimate->worstCaseUsd, $kind, $estimate->diagnostics);
         $reservation = $run->ledger->reserveCost($run->budget, $call->worstCaseUsd);
         try {
             $run->observer?->reserving($call, $run);

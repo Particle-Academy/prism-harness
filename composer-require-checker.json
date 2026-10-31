@@ -4,6 +4,7 @@
         "FancyFlow\\Nodes\\Support\\ToolInvoker",
         "FancyFlow\\Contracts\\NodeExecutor",
         "FancyFlow\\Runtime\\ExecutionContext",
-        "FancyFlow\\Runtime\\RunEvent"
+        "FancyFlow\\Runtime\\RunEvent",
+        "Prism\\Prism\\Contracts\\DescribesProjectedPayload"
     ]
 }
