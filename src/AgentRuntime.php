@@ -14,6 +14,7 @@ use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
@@ -106,7 +107,7 @@ final readonly class AgentRuntime
         // mistake in the call, and it should not cost a run row, events or budget.
         $attachments = TurnAttachments::admit($prompt, $additionalContent);
 
-        return $session->lock(function (Session $session) use ($prompt, $toolNames, $context, $attachments): AgentResponse {
+        return $session->fencedLock(function (Session $session) use ($prompt, $toolNames, $context, $attachments): AgentResponse {
             // The id comes FIRST, before anything that can throw.
             //
             // Mode resolution and provider config used to run ahead of it, so a
@@ -258,6 +259,9 @@ final readonly class AgentRuntime
 
                 return $agentResponse;
             } catch (Throwable $failure) {
+                if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
+                    throw $failure;
+                }
                 $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
 
                 event(new RunFailed(
@@ -304,7 +308,7 @@ final readonly class AgentRuntime
     {
         $attachments = TurnAttachments::admit($prompt, $additionalContent);
 
-        return $session->lock(function (Session $session) use ($prompt, $schema, $toolNames, $context, $attachments): StructuredAgentResponse {
+        return $session->fencedLock(function (Session $session) use ($prompt, $schema, $toolNames, $context, $attachments): StructuredAgentResponse {
             $runId = 'run_'.bin2hex(random_bytes(12));
 
             try {
@@ -437,6 +441,9 @@ final readonly class AgentRuntime
                     rootRunId: $run->rootRunId(),
                 );
             } catch (Throwable $failure) {
+                if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
+                    throw $failure;
+                }
                 $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
 
                 event(new RunFailed(

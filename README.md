@@ -1296,3 +1296,33 @@ existing stream without routing it through this package.
 
 Full analysis — including a gap comparison against `laravel/ai` — lives in the envelope at
 `.ai/discovery/laravel-ai-sdk-and-prism-harness.md`.
+
+## Fenced runtime stores
+
+Agent turns now require the optional `FencedSessionStore` capability on their
+ephemeral store. Built-in database and Redis stores, including the address-index
+wrapper, implement it. A custom store without it is refused before a run starts;
+ordinary `SessionStore::withLock()` remains available for other synchronous work.
+
+Stop and drain all old workers before upgrading, then restart them together.
+An old worker still uses unfenced state writes and can overwrite a new worker;
+mixing the two implementations in a rolling upgrade is unsafe. Database driver
+subclasses that override the old protected expiry-only acquire/release helpers
+must move to the UUID-based fenced capability; those old helpers are removed.
+
+Set the lease duration above the longest supported synchronous callback. A
+rejected terminal write discards the stale result; it cannot cancel external
+side effects that the callback already performed. Fencing does not renew leases.
+
+Custom stores must supply `withFencedLock()` and atomic `putIfOwned()`: the latter
+writes this session's ephemeral state only while its UUID owns an unexpired lease.
+Returning false writes nothing and produces `SessionLockLost`, with no terminal
+event. Use the backend's clock and an atomic compare/write (or a transaction
+locking the lease), and release only the matching UUID. A separate ownership
+read before a normal write is insufficient. Preserve existing pre-run
+configuration-failure events, which do not persist a run.
+
+For the database, the lease row is locked for the state transaction and the final
+UPDATE or initial INSERT also carries the token/expiry predicate. Redis uses a
+single Lua compare/write and native key expiration. This change does not add a
+streaming capability or require an unreleased core version.

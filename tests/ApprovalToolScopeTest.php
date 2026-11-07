@@ -270,7 +270,7 @@ final class ApprovalToolScopeTest extends TestCase
              * @return TReturn
              */
             #[Override]
-            public function lock(Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
+            public function fencedLock(Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
             {
                 if (! $this->scheduled) {
                     $this->scheduled = true;
@@ -284,7 +284,7 @@ final class ApprovalToolScopeTest extends TestCase
                     ], toolNames: ['scope_safe']);
                 }
 
-                return parent::lock($callback, $ttlSeconds, $waitSeconds);
+                return parent::fencedLock($callback, $ttlSeconds, $waitSeconds);
             }
         };
         self::assertNotSame($firstSession, $fresh);
