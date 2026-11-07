@@ -10,7 +10,9 @@ use Illuminate\Database\Eloquent\Model;
 use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\AgentTaskSource;
+use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Contracts\SessionStore;
+use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\Participants\ParticipantRef;
@@ -42,6 +44,9 @@ class Session
 {
     /** @var array<string, mixed>|null */
     protected ?array $cachedState = null;
+
+    /** @var (Closure(array<string, mixed>): bool)|null */
+    private ?Closure $writeFence = null;
 
     private bool $resolutionOnly = false;
 
@@ -476,6 +481,38 @@ class Session
     }
 
     /**
+     * Runtime acquisition with atomic state persistence; ordinary lock() remains
+     * available to consumers of the original synchronous store contract.
+     *
+     * @template TReturn
+     *
+     * @param  Closure(self): TReturn  $callback
+     * @return TReturn
+     */
+    public function fencedLock(Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
+    {
+        $this->assertWritableResolution();
+        if (! $this->ephemeral instanceof FencedSessionStore) {
+            throw new \LogicException('Agent runs require the ephemeral store to implement FencedSessionStore.');
+        }
+        $store = $this->ephemeral;
+
+        return $store->withFencedLock($this->key(), function (Closure $owned, string $token) use ($callback, $store): mixed {
+            $this->cachedState = null;
+            $previous = $this->writeFence;
+            $this->writeFence = fn (array $state): bool => $store->putIfOwned($this->key(), $token, $state, $this->ttlSeconds);
+            try {
+                $owned();
+
+                return $callback($this);
+            } finally {
+                $this->writeFence = $previous;
+                $this->cachedState = null;
+            }
+        }, $ttlSeconds, $waitSeconds);
+    }
+
+    /**
      * Run something that must not happen twice.
      *
      * Two workers can hold the same session at the same moment: a queued job
@@ -571,7 +608,14 @@ class Session
         $state = $this->state();
         $state[$key] = $value;
 
-        $this->ephemeral->put($this->ephemeralKey(), $state, $this->ttlSeconds);
+        if ($this->writeFence !== null) {
+            if (! ($this->writeFence)($state)) {
+                $this->cachedState = null;
+                throw SessionLockLost::afterRejectedWrite($this->key());
+            }
+        } else {
+            $this->ephemeral->put($this->ephemeralKey(), $state, $this->ttlSeconds);
+        }
         $this->cachedState = $state;
 
         return $this;

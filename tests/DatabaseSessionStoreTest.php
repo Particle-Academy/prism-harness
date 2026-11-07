@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Database\DatabaseManager;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Stores\DatabaseSessionStore;
 
@@ -45,9 +46,11 @@ it('keeps a payload with no ttl', function (): void {
 });
 
 it('stops serving an expired payload', function (): void {
-    store()->put('k', ['mode' => 'plan'], ttlSeconds: 60);
+    store()->put('k', ['mode' => 'plan'], ttlSeconds: 1);
 
-    $this->travel(61)->seconds();
+    // Expiry belongs to SQLite, so changing the worker's Carbon clock cannot
+    // advance it. Exercise the actual stored expiry without rewriting it.
+    usleep(1_100_000);
 
     // Expiry is enforced on read rather than by a sweeper, so a stale row can
     // never be served just because nothing has pruned it yet.
@@ -99,7 +102,8 @@ it('does not delete a lock a DIFFERENT worker now holds', function (): void {
 
     $store->withLock('k', function (): void {
         // A's lease lapses while A is still working.
-        $this->travel(11)->seconds();
+        DB::table('harness_session_state')->where('key', 'lock:k')
+            ->update(['expires_at' => DB::raw("datetime(CURRENT_TIMESTAMP, '-1 second')")]);
 
         // B reclaims it. Written directly against the table because PHP has no
         // second thread to run B in; this is byte for byte what B's own
@@ -107,10 +111,10 @@ it('does not delete a lock a DIFFERENT worker now holds', function (): void {
         DB::table('harness_session_state')->where('key', 'lock:k')->delete();
         DB::table('harness_session_state')->insert([
             'key' => 'lock:k',
-            'payload' => json_encode(['locked' => true]),
-            'expires_at' => now()->addSeconds(30),
-            'created_at' => now(),
-            'updated_at' => now(),
+            'payload' => json_encode(['locked' => true, 'owner' => (string) Str::uuid()]),
+            'expires_at' => DB::raw("datetime(CURRENT_TIMESTAMP, '30 seconds')"),
+            'created_at' => DB::raw('CURRENT_TIMESTAMP'),
+            'updated_at' => DB::raw('CURRENT_TIMESTAMP'),
         ]);
     }, ttlSeconds: 10, waitSeconds: 0);
 
@@ -194,10 +198,10 @@ it('reads its own written expiry back, with nothing planted by hand', function (
 
     $store->withLock('k', function () use ($store, &$reclaimed): void {
         // The holder's own lease lapses while it is still inside.
-        $this->travel(11)->seconds();
+        usleep(1_100_000);
 
         $reclaimed = $store->withLock('k', fn (): string => 'reclaimed', ttlSeconds: 10, waitSeconds: 0);
-    }, ttlSeconds: 10, waitSeconds: 0);
+    }, ttlSeconds: 1, waitSeconds: 0);
 
     expect($reclaimed)->toBe('reclaimed');
 });
@@ -205,18 +209,19 @@ it('reads its own written expiry back, with nothing planted by hand', function (
 it('reclaims a lock whose holder died', function (): void {
     $store = store();
 
-    // Simulate a worker that acquired the lock and was killed before releasing:
-    // the row is left behind with an expiry in the past.
-    $store->withLock('k', function (): void {
-        app(DatabaseManager::class)->connection()
-            ->table('harness_session_state')
-            ->where('key', 'lock:k')
-            ->update(['expires_at' => now()->subMinute()]);
-    });
+    // Seed an abandoned UUID row. Merely changing a live callback's expiry no
+    // longer simulates death: its owner-safe finally correctly releases it.
+    DB::table('harness_session_state')->insert([
+        'key' => 'lock:k',
+        'payload' => json_encode(['locked' => true, 'owner' => (string) Str::uuid()]),
+        'expires_at' => DB::raw("datetime(CURRENT_TIMESTAMP, '-60 seconds')"),
+        'created_at' => DB::raw('CURRENT_TIMESTAMP'),
+        'updated_at' => DB::raw('CURRENT_TIMESTAMP'),
+    ]);
 
-    // The abandoned row really is still there. Release no longer deletes a row
-    // that is not the one it inserted — which is what makes this an honest
-    // stand-in for a process that died, rather than a tidy exit.
+    // The abandoned row is still there. Native writer/expiry round-trip and
+    // actual interleaved holder release are exercised separately above and in
+    // FencedSessionStoreTest; this fixture measures reclaiming a dead holder.
     expect(DB::table('harness_session_state')->where('key', 'lock:k')->exists())->toBeTrue();
 
     // Without expiry-based reclamation, one dead worker would hold this

@@ -5,13 +5,22 @@ declare(strict_types=1);
 namespace Prism\Harness\Stores;
 
 use Closure;
+use Illuminate\Contracts\Database\Query\Expression as ExpressionContract;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Database\Query\Builder;
-use Illuminate\Database\QueryException;
+use Illuminate\Database\Query\Expression;
+use Illuminate\Database\Query\Grammars\MySqlGrammar;
+use Illuminate\Database\Query\Grammars\PostgresGrammar;
+use Illuminate\Database\Query\Grammars\SQLiteGrammar;
+use Illuminate\Database\Query\Grammars\SqlServerGrammar;
+use Illuminate\Database\Query\JoinClause;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
-use Prism\Harness\Contracts\SessionStore;
+use Illuminate\Support\Str;
+use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Enums\Durability;
 use Prism\Harness\Exceptions\SessionLocked;
+use Prism\Harness\Exceptions\SessionLockLost;
 
 /**
  * Session state in the database.
@@ -21,7 +30,7 @@ use Prism\Harness\Exceptions\SessionLocked;
  * trade for the state where losing it is a correctness failure rather than a
  * cache miss.
  */
-class DatabaseSessionStore implements SessionStore
+class DatabaseSessionStore implements FencedSessionStore
 {
     public function __construct(
         protected readonly ConnectionInterface $connection,
@@ -31,7 +40,12 @@ class DatabaseSessionStore implements SessionStore
     #[\Override]
     public function get(string $key): ?array
     {
-        $row = $this->query()->where('key', $key)->first();
+        $grammar = $this->query()->getGrammar();
+        $expiry = $this->leaseExpiry();
+        $expirySql = $expiry instanceof ExpressionContract ? (string) $expiry->getValue($grammar) : $grammar->wrap($expiry);
+        $nowSql = (string) $this->storeNow()->getValue($grammar);
+        $row = $this->query()->where('key', $key)->select('*')
+            ->selectRaw('CASE WHEN '.$expirySql.' <= '.$nowSql.' THEN 1 ELSE 0 END as harness_expired')->first();
 
         if ($row === null) {
             return null;
@@ -39,8 +53,14 @@ class DatabaseSessionStore implements SessionStore
 
         // Expiry is enforced on read rather than by a sweeper, so a stale row
         // can never be served just because nothing has pruned it yet.
-        if ($row->expires_at !== null && Carbon::parse($row->expires_at)->isPast()) {
-            $this->forget($key);
+        if ($row->expires_at !== null && ! $this->leaseExpiryIsValid($row->expires_at)) {
+            throw new \RuntimeException('The session state has an invalid expiry.');
+        }
+        if ((bool) $row->harness_expired) {
+            // Expired-read housekeeping is also a mutation boundary. Never
+            // delete a replacement that refreshed this key after the read.
+            $this->query()->where('key', $key)->where('expires_at', $row->expires_at)
+                ->where($this->leaseExpiry(), '<=', $this->storeNow())->delete();
 
             return null;
         }
@@ -57,9 +77,9 @@ class DatabaseSessionStore implements SessionStore
             ['key' => $key],
             [
                 'payload' => json_encode($payload),
-                'expires_at' => $ttlSeconds === null ? null : Carbon::now()->addSeconds($ttlSeconds),
-                'updated_at' => Carbon::now(),
-                'created_at' => Carbon::now(),
+                'expires_at' => $ttlSeconds === null ? null : $this->storeDeadline($ttlSeconds),
+                'updated_at' => $this->storeNow(),
+                'created_at' => $this->storeNow(),
             ],
         );
     }
@@ -73,114 +93,196 @@ class DatabaseSessionStore implements SessionStore
     #[\Override]
     public function withLock(string $key, Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
     {
-        $lockKey = 'lock:'.$key;
-        $deadline = microtime(true) + $waitSeconds;
+        return $this->withFencedLock($key, static fn (): mixed => $callback(), $ttlSeconds, $waitSeconds);
+    }
 
-        while (($heldUntil = $this->acquire($lockKey, $ttlSeconds)) === null) {
+    protected function acquireOwned(string $lockKey, string $token, int $ttlSeconds): bool
+    {
+        $this->sweepExpiredFencedHolder($lockKey);
+        try {
+            return $this->query()->insert([
+                'key' => $lockKey,
+                'payload' => json_encode(['locked' => true, 'owner' => $token]),
+                'expires_at' => $this->storeDeadline($ttlSeconds),
+                'created_at' => $this->storeNow(),
+                'updated_at' => $this->storeNow(),
+            ]);
+        } catch (UniqueConstraintViolationException) {
+            return false;
+        }
+    }
+
+    private function leaseExpiryIsValid(mixed $expiresAt): bool
+    {
+        if (! is_string($expiresAt) || ! $this->isCompleteTimestamp($expiresAt)) {
+            return false;
+        }
+        try {
+            Carbon::parse($expiresAt);
+
+            return true;
+        } catch (\Exception) {
+            // A complete-looking but invalid date is not proof of a live lease.
+            // Only parsing is caught: database/connection failures remain native.
+            return false;
+        }
+    }
+
+    #[\Override]
+    public function withFencedLock(string $key, Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
+    {
+        $this->assertPositiveLease($ttlSeconds);
+        $lockKey = 'lock:'.$key;
+        $token = (string) Str::uuid();
+        $deadline = microtime(true) + $waitSeconds;
+        while (! $this->acquireOwned($lockKey, $token, $ttlSeconds)) {
             if (microtime(true) >= $deadline) {
                 throw SessionLocked::forKey($key, $waitSeconds);
             }
-
             usleep(100_000);
         }
-
+        $owned = function () use ($key, $lockKey, $token): void {
+            $row = $this->query()->where('key', $lockKey)->where('payload->owner', $token)
+                ->where($this->leaseExpiry(), '>', $this->storeNow())->first();
+            if ($row === null || ! $this->leaseExpiryIsValid($row->expires_at)) {
+                throw SessionLockLost::forKey($key);
+            }
+        };
         try {
-            return $callback();
+            $owned();
+
+            return $callback($owned, $token);
         } finally {
-            $this->release($lockKey, $heldUntil);
+            $this->query()->where('key', $lockKey)->where('payload->owner', $token)->delete();
         }
+    }
+
+    #[\Override]
+    public function putIfOwned(string $sessionKey, string $token, array $payload, ?int $ttlSeconds = null): bool
+    {
+        $encoded = json_encode($payload, JSON_THROW_ON_ERROR);
+
+        // A transaction locks the actual lease row, including the first state
+        // creation and MySQL's unchanged-value case. The final mutation ALSO
+        // carries the owner/expiry predicate; no stale pre-read authorizes it.
+        return $this->connection->transaction(function () use ($sessionKey, $token, $encoded, $ttlSeconds): bool {
+            $lease = $this->ownedLeaseQuery($sessionKey, $token)->lockForUpdate()->first();
+            if ($lease === null || ! $this->leaseExpiryIsValid($lease->expires_at)) {
+                return false;
+            }
+            $stateKey = $sessionKey.':ephemeral';
+            $state = $this->query()->where('key', $stateKey)->lockForUpdate()->first();
+            if ($state === null) {
+                $now = (string) $this->storeNow()->getValue($this->query()->getGrammar());
+                $expiry = $ttlSeconds === null ? 'NULL'
+                    : (string) $this->storeDeadline($ttlSeconds)->getValue($this->query()->getGrammar());
+
+                // A pre-run configuration error never reaches this path. A
+                // reclaimed first-run lease cannot allocate even an empty row.
+                return $this->query()->insertUsing(
+                    ['key', 'payload', 'expires_at', 'created_at', 'updated_at'],
+                    $this->ownedLeaseQuery($sessionKey, $token)
+                        ->selectRaw('?, ?, '.$expiry.', '.$now.', '.$now, [$stateKey, $encoded]),
+                ) === 1;
+            }
+            $values = [
+                'payload' => $encoded,
+                'expires_at' => $ttlSeconds === null ? null : $this->storeDeadline($ttlSeconds),
+                'updated_at' => $this->storeNow(),
+            ];
+            if ($this->query()->getGrammar() instanceof MySqlGrammar) {
+                // A joined MySQL UPDATE requires an unambiguous target column.
+                $values = array_combine(array_map(fn (string $column): string => $this->table.'.'.$column, array_keys($values)), array_values($values));
+            }
+            if ($this->ownedStateQuery($sessionKey, $token)->update($values) === 1) {
+                return true;
+            }
+            if (! $this->query()->getGrammar() instanceof MySqlGrammar) {
+                return false;
+            }
+            // MySQL reports changed rows by default, so an idempotent owned
+            // write can report zero. The lease row remains locked throughout
+            // this transaction; accept only an identical current state under
+            // the same still-live owner, never a separate unfenced retry.
+            $current = $this->ownedStateQuery($sessionKey, $token);
+            $grammar = $this->query()->getGrammar();
+            $current->whereRaw($grammar->wrap($this->table.'.payload').' = '.$grammar->compileJsonValueCast('?'), [$encoded]);
+
+            return $current->exists();
+        });
+    }
+
+    private function ownedStateQuery(string $sessionKey, string $token): Builder
+    {
+        return $this->query()
+            ->join($this->table.' as harness_lease', function (JoinClause $join) use ($sessionKey): void {
+                $join->where('harness_lease.key', '=', 'lock:'.$sessionKey);
+            })
+            ->where($this->table.'.key', $sessionKey.':ephemeral')
+            ->where('harness_lease.payload->owner', $token)
+            ->where($this->leaseExpiry('harness_lease.expires_at'), '>', $this->storeNow());
+    }
+
+    private function ownedLeaseQuery(string $sessionKey, string $token): Builder
+    {
+        return $this->query()->where('key', 'lock:'.$sessionKey)->where('payload->owner', $token)
+            ->where($this->leaseExpiry(), '>', $this->storeNow());
+    }
+
+    private function assertPositiveLease(int $ttlSeconds): void
+    {
+        if ($ttlSeconds <= 0) {
+            throw new \InvalidArgumentException('A fenced lease must have a positive duration.');
+        }
+    }
+
+    private function storeNow(): ExpressionContract
+    {
+        $grammar = $this->query()->getGrammar();
+
+        return new Expression(match (true) {
+            $grammar instanceof PostgresGrammar => "(statement_timestamp() AT TIME ZONE 'UTC')",
+            $grammar instanceof SqlServerGrammar => 'SYSUTCDATETIME()',
+            default => 'CURRENT_TIMESTAMP',
+        });
+    }
+
+    private function storeDeadline(int $seconds): ExpressionContract
+    {
+        $grammar = $this->query()->getGrammar();
+
+        return new Expression(match (true) {
+            $grammar instanceof SQLiteGrammar => "datetime(CURRENT_TIMESTAMP, '$seconds seconds')",
+            $grammar instanceof MySqlGrammar => "DATE_ADD(CURRENT_TIMESTAMP, INTERVAL $seconds SECOND)",
+            $grammar instanceof PostgresGrammar => "(statement_timestamp() AT TIME ZONE 'UTC') + make_interval(secs => $seconds)",
+            $grammar instanceof SqlServerGrammar => "DATEADD(second, $seconds, SYSUTCDATETIME())",
+            default => throw new \LogicException('This database grammar does not support fenced session leases.'),
+        });
+    }
+
+    /** @param literal-string $column */
+    private function leaseExpiry(string $column = 'expires_at'): string|ExpressionContract
+    {
+        // SQLite stores dates as text: malformed complete-looking values must
+        // not become live merely because their bytes sort after a valid date.
+        return $this->query()->getGrammar() instanceof SQLiteGrammar
+            ? new Expression('datetime('.$column.')') : $column;
+    }
+
+    private function sweepExpiredFencedHolder(string $lockKey): void
+    {
+        $row = $this->query()->where('key', $lockKey)->first();
+        if ($row === null || ! $this->leaseExpiryIsValid($row->expires_at)) {
+            return;
+        }
+        $this->query()->where('key', $lockKey)->where('expires_at', $row->expires_at)
+            ->where($this->leaseExpiry(), '<=', $this->storeNow())->delete();
     }
 
     #[\Override]
     public function durability(): Durability
     {
         return Durability::Durable;
-    }
-
-    /**
-     * Claim the lock row, and return the expiry that proves it is OURS.
-     *
-     * The unique index on `key` is what makes this exclusive: two workers
-     * inserting the same key at once means one insert fails, rather than both
-     * believing they hold it. Checking-then-inserting would leave a gap between
-     * the two statements for exactly that race — and note the insert writes the
-     * key and its expiry in ONE statement, so there is never a moment where the
-     * row exists without an expiry for another worker to read as "expired in
-     * 1970" and sweep away.
-     *
-     * The returned expiry is the ownership proof; see {@see self::release()}.
-     * Null means the lock was not taken.
-     */
-    protected function acquire(string $lockKey, int $ttlSeconds): ?Carbon
-    {
-        $this->sweepExpiredHolder($lockKey);
-
-        $expiresAt = Carbon::now()->addSeconds($ttlSeconds);
-
-        try {
-            $this->query()->insert([
-                'key' => $lockKey,
-                'payload' => json_encode(['locked' => true]),
-                'expires_at' => $expiresAt,
-                'created_at' => Carbon::now(),
-                'updated_at' => Carbon::now(),
-            ]);
-
-            return $expiresAt;
-        } catch (QueryException) {
-            return null;
-        }
-    }
-
-    /**
-     * Delete the holder's row, but ONLY when it can be SHOWN to be abandoned.
-     *
-     * Done in PHP rather than as one `where expires_at < now()` delete, because
-     * the SQL version cannot tell a complete expiry from a broken one and the
-     * difference decides whether a live worker keeps its lock.
-     *
-     * EVERY PREFIX OF A TIMESTAMP IS AN EARLIER TIMESTAMP. A value that was
-     * truncated — by a torn write, a migration, a column resized under it —
-     * does not fail to compare; it compares as long ago, and under SQL it is
-     * worse than under a parser, because `'1735689' < '2026-…'` is true as a
-     * string comparison before anything has tried to read it as a date. So the
-     * sweep would delete a lock somebody is actively holding, and the two of
-     * them would run at once. A sibling port shipped exactly this.
-     *
-     * So: a value that is null, empty, or not a COMPLETE date-time is not
-     * evidence of anything, and the row is left alone. The caller then fails to
-     * acquire and waits, which surfaces as {@see SessionLocked} — loud,
-     * recoverable, and fixable by correcting the row. Deleting is the one
-     * answer with no way back, because the worker on the other side of it is
-     * still running.
-     *
-     * The delete is scoped to the exact value that was read, so a holder that
-     * reclaimed the row between the read and the delete keeps it.
-     */
-    protected function sweepExpiredHolder(string $lockKey): void
-    {
-        $row = $this->query()->where('key', $lockKey)->first();
-
-        if ($row === null) {
-            return;
-        }
-
-        $expiresAt = $row->expires_at;
-
-        // A lock row with no expiry cannot be shown to be abandoned either.
-        // Holding it forever is a wedged session; taking it is two workers.
-        if (! is_string($expiresAt) || ! $this->isCompleteTimestamp($expiresAt)) {
-            return;
-        }
-
-        if (! Carbon::parse($expiresAt)->isPast()) {
-            return;
-        }
-
-        $this->query()
-            ->where('key', $lockKey)
-            ->where('expires_at', $expiresAt)
-            ->delete();
     }
 
     /**
@@ -197,34 +299,6 @@ class DatabaseSessionStore implements SessionStore
     protected function isCompleteTimestamp(string $value): bool
     {
         return preg_match('/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/', $value) === 1;
-    }
-
-    /**
-     * Release the lock ONLY IF IT IS STILL THE ONE WE TOOK.
-     *
-     * Deleting by key alone is the bug this method exists to prevent, and it is
-     * not theoretical: a slow worker whose TTL lapsed mid-callback would delete
-     * the lock a DIFFERENT worker had legitimately reclaimed, and the next
-     * caller would walk in while that worker was still inside. One key, two
-     * holders — which is the only failure of this class that matters, because
-     * everything above it is exclusive only because this is.
-     *
-     * {@see RedisSessionStore::release()} has guarded
-     * against exactly this since it was written, with a random token and a
-     * compare-and-delete. This is the same guard, using the expiry as the
-     * token: a row that is still ours has the expiry WE inserted, and a
-     * reclaimer's expiry is necessarily later — it could only have taken the
-     * key after ours had passed, and it stamped its own from the time it did.
-     * So equality here means "nobody has taken this since", which is the whole
-     * question. No extra column, and it works on every driver, where comparing
-     * a JSON payload column for equality does not.
-     */
-    protected function release(string $lockKey, Carbon $heldUntil): void
-    {
-        $this->query()
-            ->where('key', $lockKey)
-            ->where('expires_at', $heldUntil)
-            ->delete();
     }
 
     /**
