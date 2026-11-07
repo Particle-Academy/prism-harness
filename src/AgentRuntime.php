@@ -205,14 +205,14 @@ final readonly class AgentRuntime
                 }
                 $response = $budget->maxCostUsd === null ? $generation->asText()
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
-                        function (TextResponse $response) use ($session, &$history, $runId): void {
-                            $session->thread()->record($this->newMessages($response, $history), $runId);
-                        }, function (array $messages) use ($session, &$history, $runId): void {
-                            $session->thread()->record($this->newMessageObjects($messages, $history), $runId);
+                        function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
+                        }, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                         });
                 if ($budget->maxCostUsd === null) {
-                    $session->thread()->record($this->newMessages($response, $history), $runId);
+                    $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
                 }
                 $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
                 if ($failed) {
@@ -383,16 +383,16 @@ final readonly class AgentRuntime
                 }
                 $response = $budget->maxCostUsd === null ? $generation->asStructured()
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
-                        function (StructuredResponse $response) use ($session, &$userMessage, $runId): void {
-                            $session->thread()->record(StructuredTranscript::of($response, $userMessage), $runId);
-                        }, function (array $messages) use ($session, &$history, &$userMessage, $runId): void {
-                            $session->thread()->record($this->newMessageObjects($messages, $history), $runId);
+                        function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
+                            $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
+                        }, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
                         });
 
                 if ($budget->maxCostUsd === null) {
-                    $session->thread()->record(StructuredTranscript::of($response, $userMessage), $runId);
+                    $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
                 }
 
                 $violation = $this->violationIn($schema, $response);
@@ -547,6 +547,7 @@ final readonly class AgentRuntime
         // ASSEMBLED BY CORE, NOT REBUILT HERE. See the loop below.
         /** @var array{messages: list<mixed>, response: TextResponse}|null $collected */
         $collected = null;
+        $tools = [];
         $finishReason = FinishReason::Unknown;
 
         try {
@@ -580,6 +581,7 @@ final readonly class AgentRuntime
                 }
                 $tools = $this->authorizer->allowed($session, $resolved);
             }
+            $tools = $this->approvalScopedOffer($session, $tools);
             if ($tools !== []) {
                 $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps : $this->requestSteps($session, $namedRun));
             }
@@ -651,7 +653,7 @@ final readonly class AgentRuntime
                 // and honest about how far it got.
                 $messages = [new UserMessage($prompt, $attachments), ...($collected['messages'] ?? [])];
 
-                $session->thread()->record($messages, $runId);
+                $this->recordTurn($session, $messages, $runId, $tools);
                 if (in_array($finishReason, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finishReason->value);
                     event(new RunFailed($session->key(), $runId, $finishReason->value));
@@ -713,10 +715,10 @@ final readonly class AgentRuntime
                 $generation->withTools($tools);
             }
             yield from $this->budgetedCalls($run, $provider, $model)->stream($generation, $run,
-                function (array $messages, TextResponse $response) use ($session, $prompt, $attachments, $runId, &$recorded, &$finish, &$steps, &$awaitingApproval): void {
-                    $session->thread()->record([
+                function (array $messages, TextResponse $response) use ($session, $prompt, $attachments, $runId, $tools, &$recorded, &$finish, &$steps, &$awaitingApproval): void {
+                    $this->recordTurn($session, [
                         ...(! $recorded && $prompt !== '' ? [new UserMessage($prompt, $attachments)] : []), ...$messages,
-                    ], $runId);
+                    ], $runId, $tools);
                     $recorded = true;
                     $finish = $response->finishReason;
                     $steps++;
@@ -725,8 +727,8 @@ final readonly class AgentRuntime
                             $awaitingApproval = true;
                         }
                     }
-                }, function (array $messages) use ($session, &$history, $runId, &$recorded): void {
-                    $session->thread()->record($this->newMessageObjects($messages, $history), $runId);
+                }, function (array $messages) use ($session, &$history, $runId, $tools, &$recorded): void {
+                    $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                     $history = $messages;
                     $recorded = true;
                 });
@@ -858,7 +860,7 @@ final readonly class AgentRuntime
     private function authorizedTools(AgentMode $mode, Session $session, ?array $toolNames, RunContext $run, string $runId): array
     {
         if ($session->agent() !== null) {
-            return $this->ownedOffer($mode, $session, $toolNames, $run, $runId)['tools'];
+            return $this->approvalScopedOffer($session, $this->ownedOffer($mode, $session, $toolNames, $run, $runId)['tools']);
         }
         $names = $this->toolNamesFor($mode, $toolNames);
         if ($mode->skills !== []) {
@@ -881,7 +883,30 @@ final readonly class AgentRuntime
             }
         }
 
-        return $this->authorizer->allowed($session, $resolved);
+        return $this->approvalScopedOffer($session, $this->authorizer->allowed($session, $resolved));
+    }
+
+    /**
+     * @param  list<Tool>  $tools
+     * @return list<Tool>
+     */
+    private function approvalScopedOffer(Session $session, array $tools): array
+    {
+        $scope = $session->thread()->approvalToolNames();
+
+        // Intersect AFTER resolving and authorizing the current mode, including
+        // builtins. A changed mode or registry cannot expand the stored offer.
+        return $scope === null ? $tools : array_values(array_filter($tools,
+            static fn (Tool $tool): bool => in_array($tool->name(), $scope, true)));
+    }
+
+    /**
+     * @param  iterable<Message>  $messages
+     * @param  list<Tool>  $tools
+     */
+    private function recordTurn(Session $session, iterable $messages, string $runId, array $tools): void
+    {
+        $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools));
     }
 
     /**

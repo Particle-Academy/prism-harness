@@ -14,6 +14,7 @@ use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
@@ -25,6 +26,7 @@ use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Throwable;
 
 /**
@@ -436,8 +438,9 @@ class Thread extends Model implements ThreadContract
      * the fact, which makes a tree impossible to reconstruct from storage.
      *
      * @param  iterable<Message>  $messages
+     * @param  list<string>|null  $toolNames  the actual offer, stored only beside pending approvals
      */
-    public function record(iterable $messages, ?string $runId = null): self
+    public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
@@ -456,7 +459,7 @@ class Thread extends Model implements ThreadContract
         // A turn that half-writes leaves a tool call with no result, which
         // replays to the model as an unanswered question rather than as an
         // error anyone can see.
-        return DB::transaction(function () use ($messages, $runId): self {
+        return DB::transaction(function () use ($messages, $runId, $toolNames): self {
             // Locks the thread ROW so a concurrent recorder waits instead of
             // reading the same max. A no-op on SQLite, which is why the suite
             // cannot exercise this and why the guarantee lives in the database.
@@ -465,16 +468,83 @@ class Thread extends Model implements ThreadContract
             $position = (int) $this->storedMessages()->max('position');
 
             foreach ($messages as $message) {
+                $payload = MessageMapper::toArray($message);
+                if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $toolNames !== null) {
+                    // Harness metadata on the same durable approval record.
+                    // MessageMapper does not send it back to the provider.
+                    $payload['harness_tool_names'] = array_values(array_unique($toolNames));
+                }
                 $this->storedMessages()->create([
                     'position' => ++$position,
                     'type' => MessageMapper::typeOf($message),
                     'run_id' => $runId,
-                    'payload' => MessageMapper::toArray($message),
+                    'payload' => $payload,
                 ]);
             }
 
             return $this->afterRecording();
         });
+    }
+
+    /**
+     * Scope of the approval at the transcript tail, including decisions that
+     * decide() just recorded. Read raw rows so compaction cannot erase it.
+     * A later assistant answer or user turn ends this approval's scope.
+     *
+     * @return list<string>|null null means there is no approval to resume
+     */
+    public function approvalToolNames(): ?array
+    {
+        $decisions = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            $payload = $stored->payload;
+            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
+                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
+                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                        $decisions[$response['approval_id']] ??= ($response['approved'] ?? false) === true;
+                    }
+                }
+
+                continue;
+            }
+            if ($stored->type === MessageMapper::TYPE_USER) {
+                return null;
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                continue;
+            }
+            $requests = $payload['tool_approval_requests'] ?? [];
+            if (! is_array($requests) || $requests === []) {
+                return null;
+            }
+            $scope = $payload['harness_tool_names'] ?? null;
+            if (is_array($scope) && array_is_list($scope) && array_filter($scope, static fn (mixed $name): bool => ! is_string($name) || $name === '' || $name === '*') === []) {
+                /** @var list<string> $scope */
+                return array_values(array_unique($scope));
+            }
+
+            // Older workers did not persist the offer. Never reconstruct the
+            // whole mode: only approved requests on this record are knowable.
+            // Constant diagnostic: no arguments, tool names or participant ids.
+            Log::warning('Pending approval has no valid stored tool scope; offering approved requests only.');
+            $names = [];
+            foreach ($requests as $request) {
+                if (is_array($request) && is_string($request['approval_id'] ?? null)
+                    && ($decisions[$request['approval_id']] ?? false)
+                    && is_string($request['tool_call_id'] ?? null)) {
+                    foreach ($payload['tool_calls'] ?? [] as $call) {
+                        if (is_array($call) && ($call['id'] ?? null) === $request['tool_call_id']
+                            && is_string($call['name'] ?? null) && $call['name'] !== '' && $call['name'] !== '*') {
+                            $names[] = $call['name'];
+                        }
+                    }
+                }
+            }
+
+            return array_values(array_unique($names));
+        }
+
+        return null;
     }
 
     private function afterRecording(): self
