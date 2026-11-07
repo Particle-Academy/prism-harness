@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Composer\InstalledVersions;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -336,7 +337,13 @@ final class ApprovalToolScopeTest extends TestCase
             return $data;
         };
         $sequence = Http::fakeSequence();
-        $knownGap = $initial && ($surface === 'structured' || ! $capped);
+        $coreVersion = InstalledVersions::getVersion('particle-academy/prism');
+        self::assertIsString($coreVersion);
+        // Core 0.147.0 preserves the pending call in an uncapped streamed
+        // transcript. Keep the old-core gap explicit; the released fix must
+        // exercise the positive persistence and stored-offer resume below.
+        $knownGap = $initial && ($surface === 'structured'
+            || (! $capped && version_compare($coreVersion, '0.147.0.0', '<')));
         $sequence->push($reply(1, 'scope_safe', $initial && $surface === 'stream'), 200,
             $initial && $surface === 'stream' ? ['Content-Type' => 'text/event-stream'] : []);
         foreach ([2, 3] as $index) {
@@ -385,7 +392,8 @@ final class ApprovalToolScopeTest extends TestCase
             $fresh->send('A later turn.', context: $context);
             self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $counts);
             Http::assertSentCount(3);
-            self::markTestIncomplete('G-229.2: initial '.$surface.($capped ? ' capped' : ' uncapped').' approval is not recorded; zero gated calls on initial turn, fresh-worker affirmative resume and later turn.');
+            $requirement = $surface === 'stream' ? ' (requires core >= 0.147.0)' : '';
+            self::markTestIncomplete('G-229.2: initial '.$surface.($capped ? ' capped' : ' uncapped').' approval is not recorded'.$requirement.'; zero gated calls on initial turn, fresh-worker affirmative resume and later turn.');
         }
         self::assertNotNull($pending, 'The native surface must actually persist a pending approval.');
         self::assertSame(['scope_safe'], $pending->payload['harness_tool_names'] ?? null);
