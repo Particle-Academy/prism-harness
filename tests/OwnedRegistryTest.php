@@ -9,6 +9,7 @@ use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\ContextRecall;
 use Prism\Harness\Exceptions\RegistrationCollision;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Exceptions\UnsafeAuthorizationConfiguration;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
@@ -391,15 +392,26 @@ it('bounds uncapped named turn shapes by the remaining shared allowance', functi
     app(ModeRegistry::class)->forAgent('support')->register('reply', ['tools' => ['tick'], 'max_steps' => 50], 'support')->setDefault('reply');
     $parent = RunContext::root('parent', new RunBudget(100, maxOutputTokensPerCall: 5));
     $parent->ledger->recordSteps(7);
-    $fake = Prism::fake(callBudgetResponses($shape, true, [0.0]));
+    // Three continuing responses are available; the shared agent ceiling
+    // permits only two admitted one-call requests, regardless of mode50.
+    $fake = Prism::fake(callBudgetResponses($shape, false, [0.0, 0.0, 0.0]));
     $session = app(PrismHarness::class)->forAgent('support')->for(Participant::create(['name' => 'Ada']))->session($shape);
-    callBudgetRun($shape, $session, $parent);
+    if ($shape === 'structured') {
+        // A budget-limited partial answer still has to satisfy the public
+        // structured schema contract; its two calls remain charged on failure.
+        expect(fn () => callBudgetRun($shape, $session, $parent))
+            ->toThrow(StructuredSchemaViolation::class);
+    } else {
+        callBudgetRun($shape, $session, $parent);
+    }
     $fake->assertRequest(function (array $requests): void {
-        expect($requests)->toHaveCount(1)
-            ->and($requests[0]->maxSteps())->toBe(2)
-            ->and($requests[0]->maxTokens())->toBe(5);
+        expect($requests)->toHaveCount(2);
+        foreach ($requests as $request) {
+            expect($request->maxSteps())->toBe(1)
+                ->and($request->maxTokens())->toBe(5);
+        }
     });
-    expect($parent->ledger->steps())->toBe(8)
+    expect($parent->ledger->steps())->toBe(9)
         ->and($parent->budget->maxSteps)->toBe(100);
 })->with(['send', 'structured', 'stream']);
 

@@ -2,7 +2,6 @@
 
 declare(strict_types=1);
 
-use Composer\InstalledVersions;
 use Illuminate\Http\Client\Factory;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
@@ -337,13 +336,10 @@ final class ApprovalToolScopeTest extends TestCase
             return $data;
         };
         $sequence = Http::fakeSequence();
-        $coreVersion = InstalledVersions::getVersion('particle-academy/prism');
-        self::assertIsString($coreVersion);
-        // Core 0.147.0 preserves the pending call in an uncapped streamed
-        // transcript. Keep the old-core gap explicit; the released fix must
-        // exercise the positive persistence and stored-offer resume below.
-        $knownGap = $initial && ($surface === 'structured'
-            || (! $capped && version_compare($coreVersion, '0.147.0.0', '<')));
+        // Shared streams now preserve the native approval identity at each
+        // one-call boundary, including on the minimum supported core. Initial
+        // structured transcript gaps remain separately recorded in G-229.2.
+        $knownGap = $initial && $surface === 'structured';
         $sequence->push($reply(1, 'scope_safe', $initial && $surface === 'stream'), 200,
             $initial && $surface === 'stream' ? ['Content-Type' => 'text/event-stream'] : []);
         foreach ([2, 3] as $index) {
@@ -380,9 +376,6 @@ final class ApprovalToolScopeTest extends TestCase
             // incomplete only AFTER proving the dropped call fails closed.
             self::assertNull($pending);
             self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $counts);
-            if ($surface === 'stream') {
-                self::assertNotNull($approvalId, 'A native approval event must actually have been emitted.');
-            }
             $fresh = app(PrismHarness::class)->for($participant)->session('chat');
             self::assertNotSame($session, $fresh);
             // Structured turns lose the approval id too. Even an affirmative
@@ -392,12 +385,14 @@ final class ApprovalToolScopeTest extends TestCase
             $fresh->send('A later turn.', context: $context);
             self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $counts);
             Http::assertSentCount(3);
-            $requirement = $surface === 'stream' ? ' (requires core >= 0.147.0)' : '';
-            self::markTestIncomplete('G-229.2: initial '.$surface.($capped ? ' capped' : ' uncapped').' approval is not recorded'.$requirement.'; zero gated calls on initial turn, fresh-worker affirmative resume and later turn.');
+            self::markTestIncomplete('G-229.2: initial '.$surface.($capped ? ' capped' : ' uncapped').' approval is not recorded; zero gated calls on initial turn, fresh-worker affirmative resume and later turn.');
         }
         self::assertNotNull($pending, 'The native surface must actually persist a pending approval.');
         self::assertSame(['scope_safe'], $pending->payload['harness_tool_names'] ?? null);
         self::assertCount(1, $pending->payload['tool_approval_requests']);
+        if ($initial && $surface === 'stream') {
+            self::assertSame($approvalId, $pending->payload['tool_approval_requests'][0]['approval_id']);
+        }
         self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $counts);
         $reloaded = app(PrismHarness::class)->for($participant)->session('chat');
         self::assertNotSame($session, $reloaded);

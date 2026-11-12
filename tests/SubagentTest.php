@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\Sessions\Session;
@@ -249,10 +250,14 @@ it('resumes the same child conversation from a cold worker', function (): void {
     // Requirement 9. The child's address is derived deterministically, so a
     // second worker resolving the tree lands on the SAME child thread rather
     // than starting a fresh one and losing what it already did.
-    Prism::fake([
-        TextResponseFake::make()->withText('first')->withMessages(collect([new AssistantMessage('first')])),
-        TextResponseFake::make()->withText('second')->withMessages(collect([new AssistantMessage('second')])),
-    ]);
+    config()->set('prism.providers.anthropic.api_key', 'synthetic-test-key');
+    require_once __DIR__.'/Support/CallBudgetHttpFixtures.php';
+    $firstReply = budgetHttpReply(1, true);
+    $firstReply['content'][0]['text'] = 'first';
+    $secondReply = budgetHttpReply(2, true);
+    $secondReply['content'][0]['text'] = 'second';
+    Http::preventStrayRequests();
+    Http::fakeSequence()->push($firstReply)->push($secondReply);
     $ada = Participant::create(['name' => 'Ada']);
     configureSubagentModes();
 
@@ -267,7 +272,13 @@ it('resumes the same child conversation from a cold worker', function (): void {
     $children = Thread::query()->where('scope', 'chat::sub::run_op')->get();
 
     expect($children)->toHaveCount(1)
-        ->and($children->first()->storedMessages()->count())->toBe(2);
+        ->and($children->first()->storedMessages()->orderBy('position')->get()->map(
+            fn ($message): array => ['type' => $message->type, 'content' => $message->payload['content']],
+        )->all())->toBe([
+            ['type' => 'user', 'content' => 'go'], ['type' => 'assistant', 'content' => 'first'],
+            ['type' => 'user', 'content' => 'again'], ['type' => 'assistant', 'content' => 'second'],
+        ]);
+    Http::assertSentCount(2);
 });
 
 /*
