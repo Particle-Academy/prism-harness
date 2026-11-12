@@ -27,6 +27,7 @@ use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Harness\Subagents\CallBudget;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Tools\ToolAuthorizer;
@@ -204,7 +205,15 @@ final readonly class AgentRuntime
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $response = $budget->maxCostUsd === null ? $generation->asText()
+                $stepOnly = $context !== null || $mode->subagents !== [];
+                $response = $budget->maxCostUsd === null
+                    ? ($stepOnly ? (new StepCalls)->text($generation, $run,
+                        function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
+                        }, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                            $history = $messages;
+                        }) : $generation->asText())
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -212,7 +221,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                         });
-                if ($budget->maxCostUsd === null) {
+                if ($budget->maxCostUsd === null && ! $stepOnly) {
                     $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
                 }
                 $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
@@ -222,12 +231,13 @@ final readonly class AgentRuntime
                     $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
                 }
 
-                // Charged AFTER the run, to the tree's shared account. A child
-                // spending here is what makes the parent's remaining budget
-                // shrink — see RunLedger on why one ledger is passed by
-                // reference rather than one per run.
+                // Shared trees charge each step before its provider call.
+                // Ordinary runs retain their aggregate accounting here; an
+                // uncapped run's reported cost is recorded once after the run.
                 if ($budget->maxCostUsd === null) {
-                    $run->ledger->recordSteps(count($response->steps));
+                    if (! $stepOnly) {
+                        $run->ledger->recordSteps(count($response->steps));
+                    }
                     $run->ledger->recordCost($this->costOf($response));
                 }
 
@@ -385,7 +395,16 @@ final readonly class AgentRuntime
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $response = $budget->maxCostUsd === null ? $generation->asStructured()
+                $stepOnly = $context !== null || $mode->subagents !== [];
+                $response = $budget->maxCostUsd === null
+                    ? ($stepOnly ? (new StepCalls)->structured($generation, $run,
+                        function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
+                            $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
+                        }, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                            $history = $messages;
+                            $userMessage = null;
+                        }) : $generation->asStructured())
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -395,7 +414,7 @@ final readonly class AgentRuntime
                             $userMessage = null;
                         });
 
-                if ($budget->maxCostUsd === null) {
+                if ($budget->maxCostUsd === null && ! $stepOnly) {
                     $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
                 }
 
@@ -413,7 +432,9 @@ final readonly class AgentRuntime
                 }
 
                 if ($budget->maxCostUsd === null) {
-                    $run->ledger->recordSteps(count($response->steps));
+                    if (! $stepOnly) {
+                        $run->ledger->recordSteps(count($response->steps));
+                    }
                     $run->ledger->recordCost($response->usage->cost);
                 }
 
@@ -529,11 +550,16 @@ final readonly class AgentRuntime
         // The lock is acquired and released around the generator by hand rather
         // than with `$session->lock()`: a closure cannot yield to this caller.
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+        if ($context !== null || $mode->subagents !== []) {
+            yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments);
+
+            return;
+        }
         $provider = $session->provider() ?? $this->stringConfig('provider', $session);
         $model = $session->model() ?? $this->stringConfig('model', $session);
         $runId = 'run_'.bin2hex(random_bytes(12));
 
-        $namedRun = $session->agent() === null ? null : $this->boundedAgentRun($session, $context ?? RunContext::root($runId, new RunBudget(
+        $namedRun = $session->agent() === null ? null : $this->boundedAgentRun($session, RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         )));
@@ -593,7 +619,7 @@ final readonly class AgentRuntime
                 $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps : $this->requestSteps($session, $namedRun));
             }
             $maxOutput = $namedRun === null
-                ? ($context === null ? $this->nullableIntConfig('max_output_tokens_per_call', $session) : $context->budget->maxOutputTokensPerCall)
+                ? $this->nullableIntConfig('max_output_tokens_per_call', $session)
                 : $namedRun->budget->maxOutputTokensPerCall;
             if ($maxOutput !== null) {
                 $generation->withMaxTokens($maxOutput);
@@ -682,6 +708,99 @@ final readonly class AgentRuntime
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $attachments
      * @return Generator<StreamEvent>
+     */
+    private function streamStepTree(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments): Generator
+    {
+        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+        $provider = $session->provider() ?? $this->stringConfig('provider', $session);
+        $model = $session->model() ?? $this->stringConfig('model', $session);
+        $runId = 'run_'.bin2hex(random_bytes(12));
+        $run = $context ?? RunContext::root($runId, new RunBudget(
+            maxSteps: $this->ceilingFor($session, $mode),
+            maxSeconds: $this->nullableIntConfig('max_seconds'),
+            maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
+        ));
+        $run = $this->boundedAgentRun($session, $run);
+        $session->beginRun($runId, $mode->name, $provider, $model);
+        event(new RunStarted($session->key(), $runId, $mode->name, $provider, $model,
+            $run->parentRunId, $run->rootRunId()));
+        $recorded = false;
+        $finish = FinishReason::Unknown;
+        $steps = 0;
+        $awaitingApproval = false;
+        $reportedCost = null;
+        $completedCall = false;
+        try {
+            $run = $this->observedRun($run);
+            $history = iterator_to_array($session->thread()->messages(), false);
+            $generation = Prism::text()->using($provider, $model)
+                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
+                ->withTelemetryMetadata(sessionId: $session->key());
+            if ($mode->providerOptions !== []) {
+                $generation->withProviderOptions($mode->providerOptions);
+            }
+            $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+            if ($systemPrompt !== '') {
+                $generation->withSystemPrompt($systemPrompt);
+            }
+            $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+            if ($tools !== []) {
+                $generation->withTools($tools);
+            }
+            if ($run->budget->maxOutputTokensPerCall !== null) {
+                $generation->withMaxTokens($run->budget->maxOutputTokensPerCall);
+            }
+            yield from (new StepCalls)->stream($generation, $run,
+                function (array $messages, TextResponse $response) use ($session, $prompt, $attachments, $runId, $tools, &$recorded, &$finish, &$steps, &$awaitingApproval, &$reportedCost, &$completedCall): void {
+                    $this->recordTurn($session, [
+                        ...(! $recorded && $prompt !== '' ? [new UserMessage($prompt, $attachments)] : []), ...$messages,
+                    ], $runId, $tools);
+                    $recorded = true;
+                    $completedCall = true;
+                    if (($cost = $this->costOf($response)) !== null) {
+                        $reportedCost = ($reportedCost ?? 0.0) + $cost;
+                    }
+                    $finish = $response->finishReason;
+                    $steps++;
+                    foreach ($messages as $message) {
+                        if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== []) {
+                            $awaitingApproval = true;
+                        }
+                    }
+                }, function (array $messages) use ($session, &$history, $runId, $tools, &$recorded): void {
+                    $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                    $history = $messages;
+                    $recorded = true;
+                });
+        } catch (Throwable $failure) {
+            $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
+            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
+
+            throw $failure;
+        } finally {
+            if ($completedCall) {
+                $run->ledger->recordCost($reportedCost);
+            }
+            if (($session->run()['status'] ?? null) === 'running') {
+                if (! $recorded && $prompt !== '') {
+                    $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
+                }
+                if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
+                    $session->failRun($runId, $finish->value);
+                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId()));
+                } else {
+                    $session->completeRun($runId, $finish->value);
+                    event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
+                        $run->parentRunId, $run->rootRunId()));
+                }
+            }
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $attachments
+     * @return Generator<int, StreamEvent>
      */
     private function streamCapped(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments): Generator
     {
@@ -1132,7 +1251,7 @@ final readonly class AgentRuntime
 
     private function requestSteps(Session $session, RunContext $run): int
     {
-        return $session->agent() === null ? $run->budget->maxSteps : max(0, $run->budget->maxSteps - $run->ledger->steps());
+        return max(0, $run->budget->maxSteps - $run->ledger->steps());
     }
 
     private function boundedAgentRun(Session $session, RunContext $run): RunContext

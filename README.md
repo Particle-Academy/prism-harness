@@ -747,6 +747,19 @@ no bound at all — it has a bound per node in a tree whose width it also contro
 receives the *smaller* of what it declares and what the tree has left, and its spend lands
 in the parent's account.
 
+`send()`, `sendStructured()` and `stream()` charge a shared tree's step before
+the provider call, so a tool that starts a child sees the parent's current step
+already spent. A child admitted after four of six tree steps can make at most
+two calls. Cancellation or expiry prevents the next call; a failed or abandoned
+request still consumes its admitted step.
+
+For explicit `RunContext` calls and modes declaring subagents, uncapped runs use
+one core generation per provider call to enforce that boundary. Core telemetry
+therefore has one generation span per call in these trees. Ordinary uncapped
+sessions without a context or subagents retain their existing wire sequence and
+generation grouping. Cost-capped calls retain their existing reservation and
+observer accounting.
+
 **A child's output is data, never instructions.** An ordinary tool returns a value its
 author chose; a subagent returns free text a model wrote, possibly after reading untrusted
 input, and it arrives where the parent has been reading its own instructions. So it comes
