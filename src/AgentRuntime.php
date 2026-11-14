@@ -7,6 +7,7 @@ namespace Prism\Harness;
 use Closure;
 use Generator;
 use Illuminate\Support\Collection;
+use Prism\Harness\Context\MemoryHooks;
 use Prism\Harness\Context\SummarisingCompaction;
 use Prism\Harness\Contracts\CallCostObserver;
 use Prism\Harness\Contracts\CompactionStrategy;
@@ -193,7 +194,7 @@ final readonly class AgentRuntime
                     $generation->withProviderOptions($mode->providerOptions);
                 }
 
-                $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+                $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
                 if ($systemPrompt !== '') {
                     $generation->withSystemPrompt($systemPrompt);
                 }
@@ -383,7 +384,7 @@ final readonly class AgentRuntime
                     $generation->withProviderOptions($mode->providerOptions);
                 }
 
-                $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+                $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
                 if ($systemPrompt !== '') {
                     $generation->withSystemPrompt($systemPrompt);
                 }
@@ -594,7 +595,7 @@ final readonly class AgentRuntime
                 $generation->withProviderOptions($mode->providerOptions);
             }
 
-            $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+            $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
             if ($systemPrompt !== '') {
                 $generation->withSystemPrompt($systemPrompt);
             }
@@ -739,7 +740,7 @@ final readonly class AgentRuntime
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);
             }
-            $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+            $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
             if ($systemPrompt !== '') {
                 $generation->withSystemPrompt($systemPrompt);
             }
@@ -832,7 +833,7 @@ final readonly class AgentRuntime
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);
             }
-            $systemPrompt = $this->skills->augmentPrompt($mode->systemPrompt, $mode->skills);
+            $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
             if ($systemPrompt !== '') {
                 $generation->withSystemPrompt($systemPrompt);
             }
@@ -1032,7 +1033,12 @@ final readonly class AgentRuntime
      */
     private function recordTurn(Session $session, iterable $messages, string $runId, array $tools): void
     {
+        // Materialised once: the thread and the observers both read it.
+        $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
         $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools));
+        // AFTER the durable record, so an observer can never lose a turn the
+        // thread kept, and its failure (isolated in MemoryHooks) cannot undo one.
+        app(MemoryHooks::class)->recorded($session, $runId, $messages);
     }
 
     /**

@@ -9,6 +9,7 @@ use Illuminate\Support\ServiceProvider;
 use Prism\Harness\Console\HarnessDoctorCommand;
 use Prism\Harness\Context\DiscardEvicted;
 use Prism\Harness\Context\KeepRecentTurns;
+use Prism\Harness\Context\MemoryHooks;
 use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\SummarisingCompaction;
 use Prism\Harness\Context\ToolPairGuard;
@@ -90,6 +91,10 @@ class PrismHarnessServiceProvider extends ServiceProvider
         });
 
         $this->app->singleton(EvictionSink::class, fn ($app): EvictionSink => new DiscardEvicted);
+
+        // Empty by default: no context is added and no turn is observed until an
+        // application registers a provider or observer (long-term memory, say).
+        $this->app->singleton(MemoryHooks::class, fn ($app): MemoryHooks => new MemoryHooks);
 
         $this->app->singleton(ToolPairGuard::class, fn ($app): ToolPairGuard => new ToolPairGuard);
 
