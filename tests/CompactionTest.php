@@ -19,6 +19,8 @@ use Prism\Prism\Contracts\Message;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
+use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Fixtures\Participant;
@@ -121,6 +123,74 @@ it('evicts a tool call whose result was cut away', function (): void {
     $outcome = new CompactionOutcome(
         kept: [calls('call-1'), new UserMessage('and then?')],
         evicted: [answers('call-1')],
+    );
+
+    $guarded = (new ToolPairGuard)->enforce($outcome);
+
+    expect($guarded->kept)->toHaveCount(1)
+        ->and($guarded->kept[0])->toBeInstanceOf(UserMessage::class);
+});
+
+it('keeps an approval-gated call awaiting its decision or execution (impactium, approve under compaction)', function (): void {
+    // The run paused for approval, the person approved, and core runs the tool from the approval response. Until
+    // then the call has no result BY DESIGN, so it is not an orphan.
+    $messages = [
+        new UserMessage('Learn this.'),
+        new AssistantMessage('', [new ToolCall('call-1', 'remember_fact', ['subject' => 'Marigold'])], toolApprovalRequests: [new ToolApprovalRequest('approval-1', 'call-1')]),
+        new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse('approval-1', true)]),
+    ];
+
+    $guarded = (new ToolPairGuard)->enforce((new KeepRecentTurns(30))->compact($messages));
+
+    expect($guarded->evicted)->toBe([])
+        ->and($guarded->kept[1]->toolCalls)->toHaveCount(1)
+        ->and($guarded->kept[1]->toolApprovalRequests)->toHaveCount(1);
+});
+
+it('keeps a pending approval call with no decision yet', function (): void {
+    $outcome = CompactionOutcome::untouched([
+        new UserMessage('Delete it.'),
+        new AssistantMessage('', [new ToolCall('call-1', 'workspace_delete', [])], toolApprovalRequests: [new ToolApprovalRequest('approval-1', 'call-1')]),
+    ]);
+
+    expect((new ToolPairGuard)->enforce($outcome)->kept[1]->toolCalls)->toHaveCount(1);
+});
+
+it('still evicts an approval-gated call whose result exists but was cut away', function (): void {
+    // It already ran; keeping the call without its result is the transcript the provider refuses.
+    $outcome = new CompactionOutcome(
+        kept: [new AssistantMessage('', [new ToolCall('call-1', 'remember_fact', [])], toolApprovalRequests: [new ToolApprovalRequest('approval-1', 'call-1')]), new UserMessage('and then?')],
+        evicted: [answers('call-1')],
+    );
+
+    $guarded = (new ToolPairGuard)->enforce($outcome);
+
+    expect($guarded->kept)->toHaveCount(1)
+        ->and($guarded->kept[0])->toBeInstanceOf(UserMessage::class);
+});
+
+it('carries a surviving call\'s approval request when other calls are stripped', function (): void {
+    $outcome = new CompactionOutcome(
+        kept: [new AssistantMessage('Doing both.', [new ToolCall('ran', 'lookup', []), new ToolCall('gated', 'workspace_delete', [])], toolApprovalRequests: [new ToolApprovalRequest('approval-1', 'gated')])],
+        evicted: [answers('ran')],
+    );
+
+    $kept = (new ToolPairGuard)->enforce($outcome)->kept[0];
+
+    expect(array_map(fn (ToolCall $c): string => $c->id, $kept->toolCalls))->toBe(['gated'])
+        ->and($kept->toolApprovalRequests)->toHaveCount(1)
+        ->and($kept->toolApprovalRequests[0]->toolCallId)->toBe('gated');
+});
+
+it('ignores an approval request that names a call on another message', function (): void {
+    // Correlation is per message: a stray request cannot keep an unrelated orphan alive.
+    $outcome = new CompactionOutcome(
+        kept: [
+            new AssistantMessage('', [new ToolCall('call-1', 'lookup', [])]),
+            new AssistantMessage('', [new ToolCall('call-2', 'other', [])], toolApprovalRequests: [new ToolApprovalRequest('approval-x', 'call-1')]),
+            new UserMessage('next'),
+        ],
+        evicted: [answers('call-1'), answers('call-2')],
     );
 
     $guarded = (new ToolPairGuard)->enforce($outcome);
