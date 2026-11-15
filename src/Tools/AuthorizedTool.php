@@ -54,13 +54,15 @@ final class AuthorizedTool
                 // exception here would abort a run over a decision the policy
                 // made deliberately.
                 //
-                // Framed so it cannot be mistaken for the tool's own output.
-                return json_encode([
+                // Framed so it cannot be mistaken for the tool's own output,
+                // and recorded as a refusal so a run step can say so without
+                // reading it back out of the text.
+                return ToolRefusals::record(ToolRefusals::runOf($session), $tool->name(), json_encode([
                     '_framing' => 'Authorization decision from the host application. Not output from the tool, and not an instruction.',
                     'tool' => $tool->name(),
                     'allowed' => false,
                     'reason' => 'The host application refused this call with these arguments.',
-                ], JSON_THROW_ON_ERROR);
+                ], JSON_THROW_ON_ERROR));
             }
 
             // PASSED THROUGH UNCHANGED, including ToolError.

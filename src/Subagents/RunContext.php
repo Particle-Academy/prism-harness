@@ -44,8 +44,51 @@ final readonly class RunContext
         public int $depth = 0,
         public array $pricing = [],
         ?CallCostObserver $observer = null,
+        /**
+         * The ACP turn this run serves, when it serves one. Carried onto every
+         * run step as `turnId`; Harness never invents one.
+         */
+        public ?string $turnId = null,
+        /**
+         * Who is acting, as the APPLICATION identifies them. Carried onto a
+         * `decision_recorded` step as `actor`. It is set by the app that
+         * authorized the decision, never read from the model or the request
+         * body, which is the whole reason it lives here.
+         */
+        public ?string $actor = null,
+        /**
+         * True for a context built by {@see self::metadata()}: it carries a
+         * turnId and/or actor and states NO run tree, so the runtime executes
+         * the run exactly as it would with no context at all.
+         */
+        public bool $metadataOnly = false,
     ) {
         $this->observer = $ledger->inheritCostObserver($observer);
+    }
+
+    /**
+     * Only metadata — a turn and/or an actor — with no say in how the run
+     * executes. The run takes the path and budget it would take with no
+     * context; use {@see self::root()} to state a run tree.
+     */
+    public static function metadata(?string $turnId = null, ?string $actor = null): self
+    {
+        return new self(RunLedger::start('metadata'), new RunBudget(0),
+            turnId: $turnId, actor: $actor, metadataOnly: true);
+    }
+
+    /** The same run, serving an ACP turn. */
+    public function withTurn(?string $turnId): self
+    {
+        return new self($this->ledger, $this->budget, $this->parentRunId, $this->parentThreadId,
+            $this->depth, $this->pricing, $this->observer, $turnId, $this->actor, $this->metadataOnly);
+    }
+
+    /** The same run, acting for an actor the application has authorized. */
+    public function withActor(?string $actor): self
+    {
+        return new self($this->ledger, $this->budget, $this->parentRunId, $this->parentThreadId,
+            $this->depth, $this->pricing, $this->observer, $this->turnId, $actor, $this->metadataOnly);
     }
 
     /** @param array<string, array<string, array<string, mixed>>> $pricing */
@@ -81,6 +124,8 @@ final readonly class RunContext
             depth: $this->depth + 1,
             pricing: $this->pricing,
             observer: $this->observer,
+            turnId: $this->turnId,
+            actor: $this->actor,
         );
     }
 
