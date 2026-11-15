@@ -7,6 +7,7 @@ namespace Prism\Harness\Context;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 
@@ -62,10 +63,20 @@ final class ToolPairGuard
         $keptCallIds = $this->callIds($outcome->kept);
         $keptResultIds = $this->resultIds($outcome->kept);
 
-        // The ids that survive are the ones present on BOTH sides.
-        $paired = array_intersect($keptCallIds, $keptResultIds);
+        // The ids that survive are the ones present on BOTH sides, plus calls still AWAITING an approval
+        // decision or its execution: core resolves those from the approval response, so they have no result
+        // yet by design. A call counts as awaiting only if its own message carries an approval request for it
+        // AND no result exists anywhere, kept or evicted. One that already ran but lost its result to the cut is
+        // still an orphan. (Without this, every approval-gated tool was stripped once compaction was on.)
+        $executed = [...$keptResultIds, ...$this->resultIds($outcome->evicted)];
+        $awaiting = array_values(array_diff($this->approvalCallIds($outcome->kept), $executed));
+        $paired = array_values(array_unique([...array_intersect($keptCallIds, $keptResultIds), ...$awaiting]));
+        $keptCallIds = array_values(array_unique($keptCallIds));
+        $keptResultIds = array_values(array_unique($keptResultIds));
 
-        if (count($paired) === count($keptCallIds) && count($paired) === count($keptResultIds)) {
+        $unpairedCalls = array_diff($keptCallIds, $paired);
+        $unpairedResults = array_diff($keptResultIds, $paired);
+        if ($unpairedCalls === [] && $unpairedResults === []) {
             return $outcome;
         }
 
@@ -108,7 +119,14 @@ final class ToolPairGuard
                 return null;
             }
 
-            return new AssistantMessage($message->content, $calls, $message->additionalContent);
+            // Approval requests follow their calls; dropping them would orphan the approval on the next send.
+            $kept = array_map(static fn (ToolCall $call): string => $call->id, $calls);
+            $approvals = array_values(array_filter(
+                $message->toolApprovalRequests,
+                static fn (ToolApprovalRequest $request): bool => in_array($request->toolCallId, $kept, true),
+            ));
+
+            return new AssistantMessage($message->content, $calls, $message->additionalContent, $approvals);
         }
 
         if ($message instanceof ToolResultMessage) {
@@ -145,6 +163,31 @@ final class ToolPairGuard
             if ($message instanceof AssistantMessage) {
                 foreach ($message->toolCalls as $call) {
                     $ids[] = $call->id;
+                }
+            }
+        }
+
+        return $ids;
+    }
+
+    /**
+     * Calls that carry an approval request on their own assistant message.
+     *
+     * @param  list<Message>  $messages
+     * @return list<string>
+     */
+    private function approvalCallIds(array $messages): array
+    {
+        $ids = [];
+
+        foreach ($messages as $message) {
+            if (! $message instanceof AssistantMessage) {
+                continue;
+            }
+            $calls = array_map(static fn (ToolCall $call): string => $call->id, $message->toolCalls);
+            foreach ($message->toolApprovalRequests as $request) {
+                if (in_array($request->toolCallId, $calls, true)) {
+                    $ids[] = $request->toolCallId;
                 }
             }
         }
