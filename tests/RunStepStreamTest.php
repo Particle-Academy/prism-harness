@@ -235,8 +235,13 @@ it('streams steps on all three runtime paths, with the run lineage each one has'
 
 it('measures a tool where it ran, from its call to its result', function (): void {
     $session = anthropicSteps(['tick']);
-    replaceCallBudgetTool((new Tool)->as('tick')->for('Count')->using(function (): string {
+    $ownMs = 0;
+    replaceCallBudgetTool((new Tool)->as('tick')->for('Count')->using(function () use (&$ownMs): string {
+        // The tool times itself: sleep granularity varies by platform, and the
+        // claim is that the step's duration covers the tool's own run.
+        $start = hrtime(true);
         usleep(30_000);
+        $ownMs = intdiv(hrtime(true) - $start, 1_000_000);
 
         return 'ticked';
     }));
@@ -253,7 +258,8 @@ it('measures a tool where it ran, from its call to its result', function (): voi
         ->and($result->data['ok'])->toBeTrue()
         ->and($result->data['result'])->toBe('ticked')
         ->and($result->data['refused'])->toBeFalse()
-        ->and($result->data['durationMs'])->toBeInt()->toBeGreaterThanOrEqual(30)
+        ->and($ownMs)->toBeGreaterThan(0)
+        ->and($result->data['durationMs'])->toBeInt()->toBeGreaterThanOrEqual($ownMs)
         ->and($result->data['durationExact'])->toBeTrue()
         ->and($result->seq)->toBeGreaterThan($call->seq);
 });
@@ -374,13 +380,14 @@ it('records every decision before any tool runs, then reports it first, continui
     $fresh = stepSession('approval');
     $stream = $fresh->streamDecision([new ToolApprovalResponse($request->data['approvalId'], true, 'looks fine')], $context);
 
-    // DURABLE BEFORE THE STREAM IS EVEN READ: a client that never reads it, or
-    // drops it now, has still recorded the decision.
+    // RECORDED WHEN THE STREAM STARTS, inside the session lock: a stream
+    // nobody iterates records nothing and holds no lock.
     $recorded = fn (): bool => Thread::query()->where('scope', 'approval')->firstOrFail()->storedMessages()->get()
         ->contains(fn ($row): bool => ($row->payload['tool_approval_responses'][0]['approval_id'] ?? null) === $request->data['approvalId']);
-    expect($recorded())->toBeTrue()
+    expect($recorded())->toBeFalse()
         ->and($ran['tick'])->toBe(0);
 
+    // At the first step it is durable, and still nothing has run.
     $first = $stream->current();
     expect($recorded())->toBeTrue()
         ->and($ran['tick'])->toBe(0)

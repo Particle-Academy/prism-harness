@@ -605,9 +605,10 @@ final readonly class AgentRuntime
     /**
      * Continue a run parked for approval, as tagged steps (G-284).
      *
-     * The decisions are ALREADY in the thread when this is called — the caller
-     * writes them first, through the same code as decide() — so this only
-     * reports them, then resumes the run on the step path, which resolves
+     * The session lock is taken first; then `$record` writes the decisions,
+     * through the same code as decide(), and reports where the parked run's
+     * sequence ended. Only then are they reported and the run resumed on the
+     * step path, which resolves
      * approvals from the thread. A dropped stream has lost nothing, and a
      * second resume finds every approved call already answered and runs none
      * of them again.
@@ -618,10 +619,34 @@ final readonly class AgentRuntime
      * @internal Called by Session::streamDecision().
      *
      * @param  list<ToolApprovalResponse>  $decisions
+     * @param  Closure(): array{?string, int}  $record  runs inside the lock
      * @return Generator<int, RunStep>
      */
-    public function streamDecisionSteps(Session $session, array $decisions, ?string $parkedRunId, int $lastSeq, ?RunContext $context): Generator
+    public function streamDecisionSteps(Session $session, array $decisions, Closure $record, ?RunContext $context): Generator
     {
+        // The lock FIRST, before the decisions are written or any provider is
+        // called. A held session refuses here, having changed nothing.
+        $release = $session->holdFencedLock($this->integerConfig('lock_ttl', 300, $session), $this->integerConfig('lock_wait', 0, $session));
+        try {
+            // Iterated rather than delegated with `yield from`, so an abandoned
+            // stream destroys the run (closing it out under the fence) BEFORE
+            // the lock is released.
+            foreach ($this->resumeLocked($session, $decisions, $record, $context) as $step) {
+                yield $step;
+            }
+        } finally {
+            $release();
+        }
+    }
+
+    /**
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @param  Closure(): array{?string, int}  $record
+     * @return Generator<int, RunStep>
+     */
+    private function resumeLocked(Session $session, array $decisions, Closure $record, ?RunContext $context): Generator
+    {
+        [$parkedRunId, $lastSeq] = $record();
         $tagger = new RunStepTagger($context?->turnId, buffered: true, seq: $lastSeq, resumeRunId: $parkedRunId);
         $actor = $context?->actor;
         $context = $this->executionContext($context);
@@ -664,6 +689,33 @@ final readonly class AgentRuntime
         // call, which is still before any run state exists.
         $attachments = TurnAttachments::admit($prompt, $additionalContent);
 
+        // THE SESSION LOCK, held for the whole iteration — every path below
+        // (plain, step tree, capped) runs inside it, as send() runs inside
+        // fencedLock(). Taken before any run state or provider call, so a
+        // session another request is running refuses with SessionLocked and
+        // nothing else happens.
+        $release = $session->holdFencedLock($this->integerConfig('lock_ttl', 300, $session), $this->integerConfig('lock_wait', 0, $session));
+        try {
+            // Iterated rather than delegated with `yield from`: when the
+            // consumer abandons the stream, the loop's iterator is freed before
+            // this `finally` runs, so the run is closed out — its state written
+            // under the fence — BEFORE the lock is released. Keys pass through.
+            foreach ($this->lockedStream($session, $prompt, $toolNames, $context, $attachments, $tagger) as $key => $event) {
+                yield $key => $event;
+            }
+        } finally {
+            $release();
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $attachments
+     * @return Generator<int, StreamEvent>
+     */
+    private function lockedStream(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
+    {
+
         if (($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null) {
             yield from $this->streamCapped($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
@@ -674,8 +726,6 @@ final readonly class AgentRuntime
             throw RunNotPermitted::callBudget('budget_observer_uncapped');
         }
 
-        // The lock is acquired and released around the generator by hand rather
-        // than with `$session->lock()`: a closure cannot yield to this caller.
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         if ($context !== null || $mode->subagents !== []) {
             yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);

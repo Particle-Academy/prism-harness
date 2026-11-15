@@ -6,11 +6,12 @@ namespace Prism\Harness\Sessions;
 
 use Closure;
 use Prism\Harness\Contracts\FencedSessionStore;
+use Prism\Harness\Contracts\HeldSessionLocks;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Enums\Durability;
 
 /** Records logical resources before their first write; reads never allocate an index entry. */
-final readonly class IndexedSessionStore implements FencedSessionStore
+final readonly class IndexedSessionStore implements HeldSessionLocks
 {
     public function __construct(
         private SessionStore $inner,
@@ -64,6 +65,34 @@ final readonly class IndexedSessionStore implements FencedSessionStore
 
             return $callback($owned, $token);
         }, $ttlSeconds, $waitSeconds);
+    }
+
+    public function acquireFencedLock(string $key, int $ttlSeconds, int $waitSeconds): string
+    {
+        $token = $this->heldLocks()->acquireFencedLock($key, $ttlSeconds, $waitSeconds);
+        try {
+            $this->index->resource($this->address, $this->slot, 'lock', $key);
+        } catch (\Throwable $failure) {
+            $this->heldLocks()->releaseFencedLock($key, $token);
+
+            throw $failure;
+        }
+
+        return $token;
+    }
+
+    public function releaseFencedLock(string $key, string $token): void
+    {
+        $this->heldLocks()->releaseFencedLock($key, $token);
+    }
+
+    private function heldLocks(): HeldSessionLocks
+    {
+        if (! $this->inner instanceof HeldSessionLocks) {
+            throw new \LogicException('Streaming agent runs require the ephemeral store to implement HeldSessionLocks.');
+        }
+
+        return $this->inner;
     }
 
     public function putIfOwned(string $sessionKey, string $token, array $payload, ?int $ttlSeconds = null): bool

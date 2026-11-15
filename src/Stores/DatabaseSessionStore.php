@@ -17,7 +17,7 @@ use Illuminate\Database\Query\JoinClause;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Str;
-use Prism\Harness\Contracts\FencedSessionStore;
+use Prism\Harness\Contracts\HeldSessionLocks;
 use Prism\Harness\Enums\Durability;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
@@ -30,7 +30,7 @@ use Prism\Harness\Exceptions\SessionLockLost;
  * trade for the state where losing it is a correctness failure rather than a
  * cache miss.
  */
-class DatabaseSessionStore implements FencedSessionStore
+class DatabaseSessionStore implements HeldSessionLocks
 {
     public function __construct(
         protected readonly ConnectionInterface $connection,
@@ -131,6 +131,18 @@ class DatabaseSessionStore implements FencedSessionStore
     #[\Override]
     public function withFencedLock(string $key, Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
     {
+        $token = $this->acquireFencedLock($key, $ttlSeconds, $waitSeconds);
+        $owned = fn () => $this->assertOwned($key, $token);
+        try {
+            return $callback($owned, $token);
+        } finally {
+            $this->releaseFencedLock($key, $token);
+        }
+    }
+
+    #[\Override]
+    public function acquireFencedLock(string $key, int $ttlSeconds, int $waitSeconds): string
+    {
         $this->assertPositiveLease($ttlSeconds);
         $lockKey = 'lock:'.$key;
         $token = (string) Str::uuid();
@@ -141,19 +153,29 @@ class DatabaseSessionStore implements FencedSessionStore
             }
             usleep(100_000);
         }
-        $owned = function () use ($key, $lockKey, $token): void {
-            $row = $this->query()->where('key', $lockKey)->where('payload->owner', $token)
-                ->where($this->leaseExpiry(), '>', $this->storeNow())->first();
-            if ($row === null || ! $this->leaseExpiryIsValid($row->expires_at)) {
-                throw SessionLockLost::forKey($key);
-            }
-        };
         try {
-            $owned();
+            $this->assertOwned($key, $token);
+        } catch (\Throwable $lost) {
+            $this->releaseFencedLock($key, $token);
 
-            return $callback($owned, $token);
-        } finally {
-            $this->query()->where('key', $lockKey)->where('payload->owner', $token)->delete();
+            throw $lost;
+        }
+
+        return $token;
+    }
+
+    #[\Override]
+    public function releaseFencedLock(string $key, string $token): void
+    {
+        $this->query()->where('key', 'lock:'.$key)->where('payload->owner', $token)->delete();
+    }
+
+    private function assertOwned(string $key, string $token): void
+    {
+        $row = $this->query()->where('key', 'lock:'.$key)->where('payload->owner', $token)
+            ->where($this->leaseExpiry(), '>', $this->storeNow())->first();
+        if ($row === null || ! $this->leaseExpiryIsValid($row->expires_at)) {
+            throw SessionLockLost::forKey($key);
         }
     }
 
