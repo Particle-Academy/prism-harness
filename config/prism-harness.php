@@ -23,6 +23,11 @@ return [
     'tools' => ['do_math' => null],
     'default_task_list' => 'default',
 
+    // Dispatch a RunStepped event for every run step (G-282). Off by default: a step carries tool arguments, tool
+    // results and model text, which any app recording or broadcasting all events would otherwise capture.
+    // streamSteps() and streamDecision() yield steps whether or not this is on.
+    'step_events' => (bool) env('HARNESS_STEP_EVENTS', false),
+
     /*
     |--------------------------------------------------------------------------
     | Default thread scope

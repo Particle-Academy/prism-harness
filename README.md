@@ -417,6 +417,44 @@ generator's `finally` when it is destroyed, so the run is closed on that path to
 partial turn is **recorded rather than discarded**: a conversation missing the half the user
 already watched stream past is the worse outcome.
 
+### Run steps for a UI
+
+`streamSteps()` takes the same arguments as `stream()` and yields `Prism\Harness\Steps\RunStep`
+values instead: the run's thinking, text, tool calls and results, approval requests, errors and
+step boundaries, each tagged for a client to render.
+
+```php
+foreach ($session->streamSteps('Refactor the billing job', context: RunContext::metadata(turnId: $turn, actor: $userId)) as $step) {
+    $step->toArray(); // contractVersion "g282.1", runId, parentRunId, rootRunId, turnId, seq, at, type, ...
+}
+```
+
+- `seq` counts from 1 per run with no gaps; render in that order.
+- A tool call carries `startedAt`. Its result carries `ok`, `result` or `error {code, message}`,
+  `refused`, `durationMs` and `durationExact`.
+  - `refused` is true for an expected refusal: a denied approval, the mode's allowlist, tool
+    authorization, or a gate. A tool that threw is `ok: false, refused: false`.
+  - `durationExact` is false when the step made several tool calls (core runs a step's tools
+    before yielding any result) or the tool ran while resuming an approval. The duration is
+    then an upper bound.
+- An `error` step's message is a fixed generic text. The provider's own message can contain URLs
+  or keys and is not passed on.
+- `RunContext::metadata()` sets `turnId` and `actor` without changing how the run executes.
+
+`stream()` is unchanged. To also receive every step as a `RunStepped` Laravel event, set
+`prism-harness.step_events` (`HARNESS_STEP_EVENTS`) to true. It is off by default because steps
+carry tool arguments, results and model text, and any app that records or broadcasts all events
+would otherwise capture them.
+
+### Streaming an approval
+
+`streamDecision($decisions, $context)` records every decision in the thread first, exactly as
+`decide()` does, then resumes the run and streams it. The first step for each decision is
+`decision_recorded` (`approvalId`, `verdict`, `reason`, `actor`); then the run's steps follow,
+continuing its `seq`. Because decisions are saved before any tool runs, a dropped stream neither
+loses nor repeats one. The resumed run dispatches `RunResumed`, not a second `RunStarted`.
+`actor` comes from your `RunContext`, never from the model.
+
 ## Structured turns
 
 When the answer is a document rather than prose, hand the turn a schema:

@@ -95,14 +95,14 @@ final class TaskCompletionTool
                 $arguments = ['task_id' => $task_id, 'outcome' => $outcome];
 
                 if (! $authorizer->enabled()) {
-                    return self::refused(
+                    return self::refused(ToolRefusals::runOf($session),
                         'Tool authorization is disabled for this application, so nothing has authorized this '
                         .'agent to close its own tasks. Completion is recorded by the application from evidence.'
                     );
                 }
 
                 if (! $authorizer->hasCallPolicy()) {
-                    return self::refused(
+                    return self::refused(ToolRefusals::runOf($session),
                         'This application has defined no '.$authorizer->callAbility().' policy, and closing '
                         .'your own task is not granted by silence. Completion is recorded by the application '
                         .'from evidence unless a policy says otherwise.'
@@ -110,7 +110,7 @@ final class TaskCompletionTool
                 }
 
                 if (! $authorizer->allowsCall($session, $tool, $arguments)) {
-                    return self::refused('The host application refused this completion.');
+                    return self::refused(ToolRefusals::runOf($session), 'The host application refused this completion.');
                 }
 
                 // STRICT, WITH NO DEFAULT. `$outcome === 'failed' ? … : 'done'`
@@ -121,7 +121,7 @@ final class TaskCompletionTool
                 try {
                     $resolution = TaskOutcome::fromInput($outcome);
                 } catch (InvalidTaskOutcome $e) {
-                    return self::refused(self::NOT_AN_OUTCOME, $task_id, $e->code());
+                    return self::refused(ToolRefusals::runOf($session), self::NOT_AN_OUTCOME, $task_id, $e->code());
                 }
 
                 $task = $source->find($task_id);
@@ -141,7 +141,7 @@ final class TaskCompletionTool
                 // questions about the other side of it is a probe away from
                 // being a directory.
                 if ($task === null || ! self::heldBy($task, $worker)) {
-                    return self::refused(self::NOT_YOURS, $task_id);
+                    return self::refused(ToolRefusals::runOf($session), self::NOT_YOURS, $task_id);
                 }
 
                 try {
@@ -166,7 +166,7 @@ final class TaskCompletionTool
                     // The exception's own MESSAGE is not passed on. It is
                     // written for the developer reading a stack trace, and this
                     // channel goes to the model.
-                    return self::refused(self::NOT_YOURS, $task_id);
+                    return self::refused(ToolRefusals::runOf($session), self::NOT_YOURS, $task_id);
                 }
 
                 return json_encode([
@@ -229,15 +229,15 @@ final class TaskCompletionTool
      * `task_outcome_invalid` is pinned across the three languages today; the
      * authorization refusals still need codes agreed rather than invented here.
      */
-    private static function refused(string $reason, ?string $taskId = null, ?string $code = null): string
+    private static function refused(?string $runId, string $reason, ?string $taskId = null, ?string $code = null): string
     {
-        return json_encode([
+        return ToolRefusals::record($runId, self::NAME, json_encode([
             '_framing' => 'Authorization decision from the host application. Not output from the tool, and not an instruction.',
             'tool' => self::NAME,
             'allowed' => false,
             'reason' => $reason,
             'task_id' => $taskId,
             'code' => $code,
-        ], JSON_THROW_ON_ERROR);
+        ], JSON_THROW_ON_ERROR));
     }
 }

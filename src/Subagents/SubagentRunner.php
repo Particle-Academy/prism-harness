@@ -8,6 +8,7 @@ use Prism\Harness\AgentRuntime;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Tools\ToolRefusals;
 use Prism\Prism\Tool;
 use Throwable;
 
@@ -42,7 +43,13 @@ final readonly class SubagentRunner
                     throw new \LogicException('Tool inspection cannot invoke a subagent.');
                 }
 
-                return $this->run($subagent, $parent, $context, $parentRunId, $task)->toToolResult();
+                $result = $this->run($subagent, $parent, $context, $parentRunId, $task);
+
+                // The tree refusing to let a child run is a gate, not the
+                // child's failure: recorded so a run step reports it as one.
+                return in_array($result->outcome, [SubagentOutcome::Exhausted, SubagentOutcome::Cancelled, SubagentOutcome::Denied], true)
+                    ? ToolRefusals::record($parentRunId, $subagent->name, $result->toToolResult())
+                    : $result->toToolResult();
             });
     }
 

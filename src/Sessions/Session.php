@@ -12,10 +12,12 @@ use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\AgentTaskSource;
 use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Contracts\SessionStore;
+use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\Participants\ParticipantRef;
+use Prism\Harness\Steps\RunStep;
 use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tasks\StoreTaskSource;
@@ -367,6 +369,32 @@ class Session
     }
 
     /**
+     * The same turn as {@see self::stream()}, delivered as tagged run steps.
+     *
+     * Every step names the run it belongs to (`runId`, `parentRunId`,
+     * `rootRunId`, and `turnId` when the RunContext carries one) and its place
+     * in that run (`seq`, from 1, with no gaps). Tool results carry how long the
+     * tool took where it ran, and whether it was REFUSED — denied, not allowed,
+     * gated — rather than failed. See {@see RunStep} for the shape.
+     *
+     * `stream()` is unchanged and yields core's events exactly as before; both
+     * dispatch a {@see RunStepped} event for every step.
+     *
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent  media sent with the prompt, as for send()
+     * @return Generator<int, RunStep>
+     */
+    public function streamSteps(string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): Generator
+    {
+        $this->assertWritableResolution();
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        yield from $this->runtime->streamSteps($this, $prompt, $toolNames, $additionalContent, $context);
+    }
+
+    /**
      * Answer a pending tool approval and continue the run.
      *
      * The decision is RECORDED IN THE THREAD, not held anywhere else. That is
@@ -423,15 +451,66 @@ class Session
             throw new \InvalidArgumentException('decide() needs at least one decision.');
         }
 
-        $this->thread()->record([
-            new ToolResultMessage(toolApprovalResponses: $decisions),
-        ], $this->run()['id'] ?? null);
+        $this->recordDecisions($decisions);
 
         // Resumed with an EMPTY prompt: the conversation already contains the
         // request, the decisions, and everything before them. A new prompt here
         // would be a second instruction competing with the one the tool call
         // came from.
         return $this->runtime->send($this, '', context: $context);
+    }
+
+    /**
+     * Answer pending approvals and continue the run AS IT HAPPENS (G-284).
+     *
+     * The same decisions as {@see self::decide()}, written to the thread by the
+     * same code and BEFORE this returns — not when the stream is first read —
+     * so a stream that is never read, or dropped half way, has still recorded
+     * every decision, and resuming again executes nothing twice.
+     *
+     * Yields one `decision_recorded` step per decision first, then the rest of
+     * the run as {@see self::streamSteps()} does. `seq` continues the parked
+     * run's sequence. The `actor` on a decision step is the RunContext's — the
+     * application's own statement of who decided — never anything from the
+     * model or the request.
+     *
+     * The same authorization rule as approve(): decide who may answer before
+     * calling.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @return Generator<int, RunStep>
+     */
+    public function streamDecision(array $decisions, ?RunContext $context = null): Generator
+    {
+        $this->assertWritableResolution();
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        if ($decisions === []) {
+            throw new \InvalidArgumentException('streamDecision() needs at least one decision.');
+        }
+
+        $parked = $this->run();
+        $parkedId = is_array($parked) && ($parked['status'] ?? null) !== 'running' && is_string($parked['id'] ?? null)
+            ? $parked['id'] : null;
+        $lastSeq = $parkedId !== null && is_int($parked['last_seq'] ?? null) ? $parked['last_seq'] : 0;
+
+        $this->recordDecisions($decisions);
+
+        return $this->runtime->streamDecisionSteps($this, $decisions, $parkedId, $lastSeq, $context);
+    }
+
+    /**
+     * Where decisions are made durable, for every path that takes them.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     */
+    protected function recordDecisions(array $decisions): void
+    {
+        $this->thread()->record([
+            new ToolResultMessage(toolApprovalResponses: $decisions),
+        ], $this->run()['id'] ?? null);
     }
 
     /**
@@ -478,6 +557,21 @@ class Session
     public function failRun(string $id, string $failure): self
     {
         return $this->finishRun($id, 'failed', ['failure' => $failure]);
+    }
+
+    /**
+     * The last run step `seq` this run emitted, so a resumed stream continues it.
+     *
+     * @internal
+     */
+    public function rememberStepSeq(string $id, int $seq): self
+    {
+        $run = $this->run();
+        if (! is_array($run) || ($run['id'] ?? null) !== $id) {
+            return $this;
+        }
+
+        return $this->write('run', [...$run, 'last_seq' => $seq]);
     }
 
     /**

@@ -13,7 +13,9 @@ use Prism\Harness\Contracts\CallCostObserver;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
+use Prism\Harness\Events\RunResumed;
 use Prism\Harness\Events\RunStarted;
+use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
@@ -22,6 +24,8 @@ use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Skills\SkillRegistry;
+use Prism\Harness\Steps\RunStep;
+use Prism\Harness\Steps\RunStepTagger;
 use Prism\Harness\Structured\SchemaCheck;
 use Prism\Harness\Structured\StructuredTranscript;
 use Prism\Harness\Subagents\BudgetedCalls;
@@ -32,6 +36,7 @@ use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Tools\ToolAuthorizer;
+use Prism\Harness\Tools\ToolRefusals;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Schema;
@@ -46,6 +51,7 @@ use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
 use Throwable;
 
@@ -108,8 +114,25 @@ final readonly class AgentRuntime
         // Refused BEFORE the lock and before a run exists: a bad attachment is a
         // mistake in the call, and it should not cost a run row, events or budget.
         $attachments = TurnAttachments::admit($prompt, $additionalContent);
+        $context = $this->executionContext($context);
+        $runId = null;
 
-        return $session->fencedLock(function (Session $session) use ($prompt, $toolNames, $context, $attachments): AgentResponse {
+        try {
+            return $this->sendLocked($session, $prompt, $toolNames, $context, $attachments, $runId);
+        } finally {
+            if ($runId !== null) {
+                ToolRefusals::forget($runId);
+            }
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $attachments
+     */
+    private function sendLocked(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, ?string &$runId): AgentResponse
+    {
+        return $session->fencedLock(function (Session $session) use ($prompt, $toolNames, $context, $attachments, &$runId): AgentResponse {
             // The id comes FIRST, before anything that can throw.
             //
             // Mode resolution and provider config used to run ahead of it, so a
@@ -318,8 +341,25 @@ final readonly class AgentRuntime
     public function sendStructured(Session $session, string $prompt, Schema $schema, ?array $toolNames = null, ?RunContext $context = null, array $additionalContent = []): StructuredAgentResponse
     {
         $attachments = TurnAttachments::admit($prompt, $additionalContent);
+        $context = $this->executionContext($context);
+        $runId = null;
 
-        return $session->fencedLock(function (Session $session) use ($prompt, $schema, $toolNames, $context, $attachments): StructuredAgentResponse {
+        try {
+            return $this->sendStructuredLocked($session, $prompt, $schema, $toolNames, $context, $attachments, $runId);
+        } finally {
+            if ($runId !== null) {
+                ToolRefusals::forget($runId);
+            }
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $attachments
+     */
+    private function sendStructuredLocked(Session $session, string $prompt, Schema $schema, ?array $toolNames, ?RunContext $context, array $attachments, ?string &$runId): StructuredAgentResponse
+    {
+        return $session->fencedLock(function (Session $session) use ($prompt, $schema, $toolNames, $context, $attachments, &$runId): StructuredAgentResponse {
             $runId = 'run_'.bin2hex(random_bytes(12));
 
             try {
@@ -533,13 +573,99 @@ final readonly class AgentRuntime
      */
     public function stream(Session $session, string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): Generator
     {
+        yield from $this->taggedStream($session, $prompt, $toolNames, $additionalContent, $this->executionContext($context),
+            new RunStepTagger($context?->turnId, buffered: false));
+    }
+
+    /**
+     * The same run as {@see self::stream()}, delivered as tagged {@see RunStep}s.
+     *
+     * The run is identical — the same paths, the same recording, the same
+     * events, including a {@see RunStepped} per step — and what the caller
+     * receives is the step stream instead of core's events. A core event with
+     * no step mapping is still observed by the run; it is just not forwarded.
+     *
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent
+     * @return Generator<int, RunStep>
+     */
+    public function streamSteps(Session $session, string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): Generator
+    {
+        $tagger = new RunStepTagger($context?->turnId, buffered: true);
+        foreach ($this->taggedStream($session, $prompt, $toolNames, $additionalContent, $this->executionContext($context), $tagger) as $event) {
+            foreach ($tagger->drain() as $step) {
+                yield $step;
+            }
+        }
+        foreach ($tagger->drain() as $step) {
+            yield $step;
+        }
+    }
+
+    /**
+     * Continue a run parked for approval, as tagged steps (G-284).
+     *
+     * The decisions are ALREADY in the thread when this is called — the caller
+     * writes them first, through the same code as decide() — so this only
+     * reports them, then resumes the run on the step path, which resolves
+     * approvals from the thread. A dropped stream has lost nothing, and a
+     * second resume finds every approved call already answered and runs none
+     * of them again.
+     *
+     * The resumed run keeps the parked run's id when the session still knows
+     * it, so `seq` continues from where that run's stream ended.
+     *
+     * @internal Called by Session::streamDecision().
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @return Generator<int, RunStep>
+     */
+    public function streamDecisionSteps(Session $session, array $decisions, ?string $parkedRunId, int $lastSeq, ?RunContext $context): Generator
+    {
+        $tagger = new RunStepTagger($context?->turnId, buffered: true, seq: $lastSeq, resumeRunId: $parkedRunId);
+        $actor = $context?->actor;
+        $context = $this->executionContext($context);
+        $runId = $tagger->claimRunId();
+        $tagger->bind($session->key(), $runId, $context?->parentRunId, $context?->rootRunId());
+        foreach ($decisions as $decision) {
+            // From the APP's run context, never from the model or the request.
+            $tagger->decision($decision->approvalId, $decision->approved, $decision->reason, $actor);
+        }
+        foreach ($tagger->drain() as $step) {
+            yield $step;
+        }
+
+        // The step path, always. It resolves approvals from the thread before
+        // any provider call and records the merge first, and it takes an empty
+        // prompt as "continue" rather than as a turn to record.
+        $capped = ($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null;
+        $events = $capped
+            ? $this->streamCapped($session, '', null, $context, [], $tagger)
+            : $this->streamStepTree($session, '', null, $context, [], $tagger);
+        foreach ($events as $event) {
+            foreach ($tagger->drain() as $step) {
+                yield $step;
+            }
+        }
+        foreach ($tagger->drain() as $step) {
+            yield $step;
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $additionalContent
+     * @return Generator<int, StreamEvent>
+     */
+    private function taggedStream(Session $session, string $prompt, ?array $toolNames, array $additionalContent, ?RunContext $context, RunStepTagger $tagger): Generator
+    {
         // First, before a run begins. A generator runs nothing until it is
         // iterated, so this refuses on the first iteration rather than at the
         // call, which is still before any run state exists.
         $attachments = TurnAttachments::admit($prompt, $additionalContent);
 
         if (($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null) {
-            yield from $this->streamCapped($session, $prompt, $toolNames, $context, $attachments);
+            yield from $this->streamCapped($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
             return;
         }
@@ -552,13 +678,15 @@ final readonly class AgentRuntime
         // than with `$session->lock()`: a closure cannot yield to this caller.
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         if ($context !== null || $mode->subagents !== []) {
-            yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments);
+            yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
             return;
         }
         $provider = $session->provider() ?? $this->stringConfig('provider', $session);
         $model = $session->model() ?? $this->stringConfig('model', $session);
-        $runId = 'run_'.bin2hex(random_bytes(12));
+        $runId = $tagger->claimRunId();
+        $tagger->bind($session->key(), $runId, null, null);
+        $tagger->history(fn (): iterable => $session->thread()->messages());
 
         $namedRun = $session->agent() === null ? null : $this->boundedAgentRun($session, RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
@@ -616,6 +744,7 @@ final readonly class AgentRuntime
                 $tools = $this->authorizer->allowed($session, $resolved);
             }
             $tools = $this->approvalScopedOffer($session, $tools);
+            $tagger->offered($this->toolNames($tools));
             if ($tools !== []) {
                 $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps : $this->requestSteps($session, $namedRun));
             }
@@ -658,6 +787,7 @@ final readonly class AgentRuntime
                         : ($event->usage === null ? FinishReason::Unknown : $event->finishReason);
                 }
 
+                $tagger->observe($event);
                 yield $event;
             }
         } catch (Throwable $failure) {
@@ -702,6 +832,8 @@ final readonly class AgentRuntime
                     ));
                 }
             }
+            $this->rememberSeq($session, $runId, $tagger);
+            ToolRefusals::forget($runId);
         }
     }
 
@@ -710,21 +842,26 @@ final readonly class AgentRuntime
      * @param  array<array-key, mixed>  $attachments
      * @return Generator<StreamEvent>
      */
-    private function streamStepTree(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments): Generator
+    private function streamStepTree(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
     {
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         $provider = $session->provider() ?? $this->stringConfig('provider', $session);
         $model = $session->model() ?? $this->stringConfig('model', $session);
-        $runId = 'run_'.bin2hex(random_bytes(12));
+        $runId = $tagger->claimRunId();
         $run = $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
+        $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId());
+        $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
-        event(new RunStarted($session->key(), $runId, $mode->name, $provider, $model,
-            $run->parentRunId, $run->rootRunId()));
+        // A parked run continued under its own id has already STARTED once;
+        // a second RunStarted for it would read as a new run.
+        event($tagger->resuming()
+            ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId())
+            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId()));
         $recorded = false;
         $finish = FinishReason::Unknown;
         $steps = 0;
@@ -745,13 +882,14 @@ final readonly class AgentRuntime
                 $generation->withSystemPrompt($systemPrompt);
             }
             $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+            $tagger->offered($this->toolNames($tools));
             if ($tools !== []) {
                 $generation->withTools($tools);
             }
             if ($run->budget->maxOutputTokensPerCall !== null) {
                 $generation->withMaxTokens($run->budget->maxOutputTokensPerCall);
             }
-            yield from (new StepCalls)->stream($generation, $run,
+            yield from $this->observed($tagger, (new StepCalls)->stream($generation, $run,
                 function (array $messages, TextResponse $response) use ($session, $prompt, $attachments, $runId, $tools, &$recorded, &$finish, &$steps, &$awaitingApproval, &$reportedCost, &$completedCall): void {
                     $this->recordTurn($session, [
                         ...(! $recorded && $prompt !== '' ? [new UserMessage($prompt, $attachments)] : []), ...$messages,
@@ -772,7 +910,7 @@ final readonly class AgentRuntime
                     $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                     $history = $messages;
                     $recorded = true;
-                });
+                }));
         } catch (Throwable $failure) {
             $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
             event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
@@ -795,6 +933,8 @@ final readonly class AgentRuntime
                         $run->parentRunId, $run->rootRunId()));
                 }
             }
+            $this->rememberSeq($session, $runId, $tagger);
+            ToolRefusals::forget($runId);
         }
     }
 
@@ -803,12 +943,12 @@ final readonly class AgentRuntime
      * @param  array<array-key, mixed>  $attachments
      * @return Generator<int, StreamEvent>
      */
-    private function streamCapped(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments): Generator
+    private function streamCapped(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
     {
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         $provider = $session->provider() ?? $this->stringConfig('provider', $session);
         $model = $session->model() ?? $this->stringConfig('model', $session);
-        $runId = 'run_'.bin2hex(random_bytes(12));
+        $runId = $tagger->claimRunId();
         $run = $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxCostUsd: $this->floatConfig('max_cost_usd'),
@@ -816,9 +956,14 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
+        $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId());
+        $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
-        event(new RunStarted($session->key(), $runId, $mode->name, $provider, $model,
-            $run->parentRunId, $run->rootRunId()));
+        // A parked run continued under its own id has already STARTED once;
+        // a second RunStarted for it would read as a new run.
+        event($tagger->resuming()
+            ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId())
+            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId()));
         $recorded = false;
         $finish = FinishReason::Unknown;
         $steps = 0;
@@ -838,10 +983,11 @@ final readonly class AgentRuntime
                 $generation->withSystemPrompt($systemPrompt);
             }
             $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+            $tagger->offered($this->toolNames($tools));
             if ($tools !== []) {
                 $generation->withTools($tools);
             }
-            yield from $this->budgetedCalls($run, $provider, $model)->stream($generation, $run,
+            yield from $this->observed($tagger, $this->budgetedCalls($run, $provider, $model)->stream($generation, $run,
                 function (array $messages, TextResponse $response) use ($session, $prompt, $attachments, $runId, $tools, &$recorded, &$finish, &$steps, &$awaitingApproval): void {
                     $this->recordTurn($session, [
                         ...(! $recorded && $prompt !== '' ? [new UserMessage($prompt, $attachments)] : []), ...$messages,
@@ -858,7 +1004,7 @@ final readonly class AgentRuntime
                     $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                     $history = $messages;
                     $recorded = true;
-                });
+                }));
         } catch (Throwable $failure) {
             $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
             event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
@@ -878,6 +1024,61 @@ final readonly class AgentRuntime
                         $run->parentRunId, $run->rootRunId()));
                 }
             }
+            $this->rememberSeq($session, $runId, $tagger);
+            ToolRefusals::forget($runId);
+        }
+    }
+
+    /**
+     * The context a run EXECUTES under.
+     *
+     * A context carrying only a turnId and/or an actor is metadata: the run
+     * takes exactly the path, and the budget, it would take with no context at
+     * all. Only a context that states a run tree changes how a run executes.
+     */
+    private function executionContext(?RunContext $context): ?RunContext
+    {
+        return $context?->metadataOnly === true ? null : $context;
+    }
+
+    /**
+     * Pass core's events through UNCHANGED, keys included, observing each.
+     *
+     * @param  iterable<array-key, StreamEvent>  $events
+     * @return Generator<array-key, StreamEvent>
+     */
+    private function observed(RunStepTagger $tagger, iterable $events): Generator
+    {
+        foreach ($events as $key => $event) {
+            $tagger->observe($event);
+            yield $key => $event;
+        }
+    }
+
+    /**
+     * @param  list<Tool>  $tools
+     * @return list<string>
+     */
+    private function toolNames(array $tools): array
+    {
+        return array_map(fn (Tool $tool): string => $tool->name(), $tools);
+    }
+
+    /**
+     * Where this run's step sequence ended, so a resumed run continues it.
+     *
+     * Last, and isolated: the run is already closed out, and failing to note
+     * a sequence number must not turn a finished run into a failed one.
+     */
+    private function rememberSeq(Session $session, string $runId, RunStepTagger $tagger): void
+    {
+        if ($tagger->seq() === 0) {
+            return;
+        }
+        try {
+            $session->rememberStepSeq($runId, $tagger->seq());
+        } catch (Throwable $failure) {
+            report($failure);
         }
     }
 
@@ -903,7 +1104,7 @@ final readonly class AgentRuntime
         }
 
         return $run->observer !== null ? $run : new RunContext($run->ledger, $run->budget,
-            $run->parentRunId, $run->parentThreadId, $run->depth, $run->pricing, $observer);
+            $run->parentRunId, $run->parentThreadId, $run->depth, $run->pricing, $observer, $run->turnId, $run->actor);
     }
 
     private function assertMeteredCompaction(RunBudget $budget): void
@@ -1279,6 +1480,7 @@ final readonly class AgentRuntime
             ),
             parentRunId: $run->parentRunId, parentThreadId: $run->parentThreadId,
             depth: $run->depth, pricing: $run->pricing, observer: $run->observer,
+            turnId: $run->turnId, actor: $run->actor,
         );
     }
 }
