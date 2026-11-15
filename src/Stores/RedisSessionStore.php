@@ -7,7 +7,7 @@ namespace Prism\Harness\Stores;
 use Closure;
 use Illuminate\Contracts\Redis\Factory as RedisFactory;
 use Illuminate\Support\Str;
-use Prism\Harness\Contracts\FencedSessionStore;
+use Prism\Harness\Contracts\HeldSessionLocks;
 use Prism\Harness\Enums\Durability;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
@@ -22,7 +22,7 @@ use Prism\Harness\Exceptions\SessionLockLost;
  * is a dropped tool approval, so the safe answer is the default and the
  * operator opts out of it.
  */
-class RedisSessionStore implements FencedSessionStore
+class RedisSessionStore implements HeldSessionLocks
 {
     public function __construct(
         protected readonly RedisFactory $redis,
@@ -95,6 +95,18 @@ class RedisSessionStore implements FencedSessionStore
     #[\Override]
     public function withFencedLock(string $key, Closure $callback, int $ttlSeconds = 10, int $waitSeconds = 5): mixed
     {
+        $token = $this->acquireFencedLock($key, $ttlSeconds, $waitSeconds);
+        $owned = fn () => $this->assertOwned($key, $token);
+        try {
+            return $callback($owned, $token);
+        } finally {
+            $this->releaseFencedLock($key, $token);
+        }
+    }
+
+    #[\Override]
+    public function acquireFencedLock(string $key, int $ttlSeconds, int $waitSeconds): string
+    {
         $this->assertPositiveLease($ttlSeconds);
         $lockKey = $this->prefix.'lock:'.$key;
         $token = (string) Str::uuid();
@@ -105,18 +117,28 @@ class RedisSessionStore implements FencedSessionStore
             }
             usleep(100_000);
         }
-        $owned = function () use ($key, $lockKey, $token): void {
-            // GET uses Redis's own expiration clock, as does the write script.
-            if ($this->connection()->get($lockKey) !== $token) {
-                throw SessionLockLost::forKey($key);
-            }
-        };
         try {
-            $owned();
+            $this->assertOwned($key, $token);
+        } catch (\Throwable $lost) {
+            $this->releaseFencedLock($key, $token);
 
-            return $callback($owned, $token);
-        } finally {
-            $this->release($lockKey, $token);
+            throw $lost;
+        }
+
+        return $token;
+    }
+
+    #[\Override]
+    public function releaseFencedLock(string $key, string $token): void
+    {
+        $this->release($this->prefix.'lock:'.$key, $token);
+    }
+
+    private function assertOwned(string $key, string $token): void
+    {
+        // GET uses Redis's own expiration clock, as does the write script.
+        if ($this->connection()->get($this->prefix.'lock:'.$key) !== $token) {
+            throw SessionLockLost::forKey($key);
         }
     }
 

@@ -448,11 +448,13 @@ would otherwise capture them.
 
 ### Streaming an approval
 
-`streamDecision($decisions, $context)` records every decision in the thread first, exactly as
-`decide()` does, then resumes the run and streams it. The first step for each decision is
+`streamDecision($decisions, $context)` records every decision in the thread when the stream
+starts, inside the session lock, exactly as `decide()` does. It then resumes the run and
+streams it. A stream nobody iterates records nothing, and a session another request holds
+throws `SessionLocked` without recording anything. The first step for each decision is
 `decision_recorded` (`approvalId`, `verdict`, `reason`, `actor`); then the run's steps follow,
-continuing its `seq`. Because decisions are saved before any tool runs, a dropped stream neither
-loses nor repeats one. The resumed run dispatches `RunResumed`, not a second `RunStarted`.
+continuing its `seq`. Because decisions are saved before any tool runs, a stream dropped after
+it started neither loses nor repeats one. The resumed run dispatches `RunResumed`, not a second `RunStarted`.
 `actor` comes from your `RunContext`, never from the model.
 
 ## Structured turns
@@ -1375,5 +1377,25 @@ configuration-failure events, which do not persist a run.
 
 For the database, the lease row is locked for the state transaction and the final
 UPDATE or initial INSERT also carries the token/expiry predicate. Redis uses a
-single Lua compare/write and native key expiration. This change does not add a
-streaming capability or require an unreleased core version.
+single Lua compare/write and native key expiration.
+
+### Streaming holds the session lock (breaking for custom stores)
+
+`stream()`, `streamSteps()` and `streamDecision()` hold the session's fenced lock for the
+whole iteration, as `send()` holds it for its call. Earlier releases took no lock while
+streaming, so two requests could run one session at once. The lock is taken on the first
+iteration, before any run state or provider call, using `lock_ttl` and `lock_wait`. A session
+that another request holds throws `SessionLocked` and makes no provider call. The lock is
+released when the stream ends, fails or is abandoned. If the lease lapses mid-stream, the next
+state write throws `SessionLockLost`; nothing is written without the lock. Set `lock_ttl` above
+your longest streamed turn.
+
+Holding a lock across yields needs `Prism\Harness\Contracts\HeldSessionLocks` on the ephemeral
+store: `acquireFencedLock($key, $ttlSeconds, $waitSeconds)` returns the fence token or throws
+`SessionLocked`, and `releaseFencedLock($key, $token)` releases only if that token still owns
+the lock. Use the same token semantics as `withFencedLock()` and `putIfOwned()`. The built-in
+database and Redis stores and the address-index wrapper implement it.
+
+**This is a breaking change for custom stores.** A store that implements `FencedSessionStore`
+but not `HeldSessionLocks` still works for `send()`, but streaming on it throws a
+`LogicException` before anything runs. `FencedSessionStore` itself is unchanged.

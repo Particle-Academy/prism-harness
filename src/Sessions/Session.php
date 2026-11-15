@@ -11,6 +11,7 @@ use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\AgentTaskSource;
 use Prism\Harness\Contracts\FencedSessionStore;
+use Prism\Harness\Contracts\HeldSessionLocks;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\SessionLockLost;
@@ -464,9 +465,16 @@ class Session
      * Answer pending approvals and continue the run AS IT HAPPENS (G-284).
      *
      * The same decisions as {@see self::decide()}, written to the thread by the
-     * same code and BEFORE this returns — not when the stream is first read —
-     * so a stream that is never read, or dropped half way, has still recorded
-     * every decision, and resuming again executes nothing twice.
+     * same code, WHEN THE STREAM STARTS: on its first iteration, once the
+     * session lock is held and before any tool runs or any provider is called.
+     * Recording at call time instead would write into a session another
+     * request may be running, and would leave a lock held by a stream nobody
+     * iterates. A stream that is never iterated records nothing; one dropped
+     * after it started has recorded every decision, and resuming again executes
+     * nothing twice.
+     *
+     * Throws SessionLocked, having recorded nothing, while another request
+     * holds the session.
      *
      * Yields one `decision_recorded` step per decision first, then the rest of
      * the run as {@see self::streamSteps()} does. `seq` continues the parked
@@ -491,14 +499,18 @@ class Session
             throw new \InvalidArgumentException('streamDecision() needs at least one decision.');
         }
 
-        $parked = $this->run();
-        $parkedId = is_array($parked) && ($parked['status'] ?? null) !== 'running' && is_string($parked['id'] ?? null)
-            ? $parked['id'] : null;
-        $lastSeq = $parkedId !== null && is_int($parked['last_seq'] ?? null) ? $parked['last_seq'] : 0;
+        return $this->runtime->streamDecisionSteps($this, $decisions, function () use ($decisions): array {
+            // Inside the held lock: the run state read here is the one the
+            // lock protects, and the decisions are durable before anything runs.
+            $parked = $this->run();
+            $parkedId = is_array($parked) && ($parked['status'] ?? null) !== 'running' && is_string($parked['id'] ?? null)
+                ? $parked['id'] : null;
+            $lastSeq = $parkedId !== null && is_int($parked['last_seq'] ?? null) ? $parked['last_seq'] : 0;
 
-        $this->recordDecisions($decisions);
+            $this->recordDecisions($decisions);
 
-        return $this->runtime->streamDecisionSteps($this, $decisions, $parkedId, $lastSeq, $context);
+            return [$parkedId, $lastSeq];
+        }, $context);
     }
 
     /**
@@ -572,6 +584,49 @@ class Session
         }
 
         return $this->write('run', [...$run, 'last_seq' => $seq]);
+    }
+
+    /**
+     * Take this session's fenced lock and HOLD it until the returned release is
+     * called — the same lock and fencing as {@see self::fencedLock()}, for a
+     * streamed run, which cannot live inside a callback because a closure
+     * cannot yield to whoever is iterating the stream.
+     *
+     * While held, every state write goes through `putIfOwned()` with this
+     * lock's token, exactly as inside fencedLock(): a lease that lapses
+     * mid-stream turns the next write into SessionLockLost, never a silent
+     * unfenced write. The release restores the previous fence, drops cached
+     * state and releases the lock; calling it again does nothing.
+     *
+     * @internal Called by the streaming runtime.
+     *
+     * @return Closure(): void
+     */
+    public function holdFencedLock(int $ttlSeconds = 10, int $waitSeconds = 5): Closure
+    {
+        $this->assertWritableResolution();
+        if (! $this->ephemeral instanceof HeldSessionLocks) {
+            throw new \LogicException('Streaming agent runs require the ephemeral store to implement HeldSessionLocks.');
+        }
+        $store = $this->ephemeral;
+        $key = $this->key();
+        $token = $store->acquireFencedLock($key, $ttlSeconds, $waitSeconds);
+
+        // Re-read inside the lock, as fencedLock() does.
+        $this->cachedState = null;
+        $previous = $this->writeFence;
+        $this->writeFence = fn (array $state): bool => $store->putIfOwned($key, $token, $state, $this->ttlSeconds);
+        $released = false;
+
+        return function () use ($store, $key, $token, $previous, &$released): void {
+            if ($released) {
+                return;
+            }
+            $released = true;
+            $this->writeFence = $previous;
+            $this->cachedState = null;
+            $store->releaseFencedLock($key, $token);
+        };
     }
 
     /**

@@ -10,6 +10,7 @@ use Illuminate\Database\SqlServerConnection;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Sessions\DatabaseAddressIndex;
 use Prism\Harness\Sessions\IndexedSessionStore;
 use Prism\Harness\Sessions\SessionAddress;
@@ -396,5 +397,53 @@ final class FencedSessionStoreTest extends TestCase
             self::assertFalse($store->putIfOwned('expired', $token, ['must' => 'not-allocate']));
             self::assertArrayNotHasKey('harness:expired:ephemeral', $commands->values);
         }, ttlSeconds: 10, waitSeconds: 0);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function heldStores(): iterable
+    {
+        yield 'database' => ['database'];
+        yield 'redis' => ['redis'];
+    }
+
+    #[DataProvider('heldStores')]
+    public function test_a_held_lock_is_the_fenced_lock_split_in_two(string $driver): void
+    {
+        if ($driver === 'redis') {
+            $commands = new FencedRedisCommands;
+            $factory = Mockery::mock(RedisFactory::class);
+            $factory->shouldReceive('connection')->with('default')->andReturn($commands);
+            $store = new RedisSessionStore($factory);
+        } else {
+            $store = new DatabaseSessionStore(DB::connection());
+        }
+
+        $token = $store->acquireFencedLock('held', 10, 0);
+        // The same lock withFencedLock() takes, and the same token fences writes.
+        self::assertTrue($store->putIfOwned('held', $token, ['run' => ['status' => 'running']], 30));
+        self::assertFalse($store->putIfOwned('held', 'someone-else', ['must' => 'not-write']));
+        try {
+            $store->withFencedLock('held', static fn (): null => null, waitSeconds: 0);
+            self::fail('A held lock must refuse a second holder.');
+        } catch (SessionLocked) {
+        }
+        try {
+            $store->acquireFencedLock('held', 10, 0);
+            self::fail('A held lock must refuse a second held acquisition.');
+        } catch (SessionLocked) {
+        }
+
+        // Released only by its owner.
+        $store->releaseFencedLock('held', 'someone-else');
+        try {
+            $store->acquireFencedLock('held', 10, 0);
+            self::fail('A foreign token must not release the lock.');
+        } catch (SessionLocked) {
+        }
+        $store->releaseFencedLock('held', $token);
+        self::assertFalse($store->putIfOwned('held', $token, ['must' => 'not-write-after-release']));
+        $next = $store->acquireFencedLock('held', 10, 0);
+        self::assertNotSame($token, $next);
+        $store->releaseFencedLock('held', $next);
     }
 }
