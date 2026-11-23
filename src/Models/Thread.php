@@ -547,6 +547,40 @@ class Thread extends Model implements ThreadContract
         return null;
     }
 
+    /**
+     * The model steps the run paused at the transcript tail has already
+     * taken, or null when nothing at the tail is waiting on an approval.
+     *
+     * A run that pauses for a person and is resumed is the SAME run, so its
+     * step limit continues rather than starting again. Counted from the raw
+     * stored rows (one assistant row per model step since the turn's user
+     * row), so the count survives a reload, another worker and a deploy, and
+     * compaction cannot erase it.
+     */
+    public function approvalRunSteps(): ?int
+    {
+        $paused = null;
+        $steps = 0;
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            if ($stored->type === MessageMapper::TYPE_USER) {
+                break;
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                continue;
+            }
+            if ($paused === null) {
+                $requests = $stored->payload['tool_approval_requests'] ?? [];
+                $paused = is_array($requests) && $requests !== [];
+                if (! $paused) {
+                    return null;
+                }
+            }
+            $steps++;
+        }
+
+        return $paused === true ? $steps : null;
+    }
+
     private function afterRecording(): self
     {
 
