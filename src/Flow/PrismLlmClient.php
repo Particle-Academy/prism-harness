@@ -168,9 +168,17 @@ final class PrismLlmClient implements LlmClient
 
         foreach ($steps as $step) {
             foreach ($step->toolCalls as $call) {
+                $arguments = $this->arguments($call);
+
+                // The workflow runs what it is handed, so a call whose arguments
+                // could not be read is not handed over at all.
+                if ($arguments === null) {
+                    continue;
+                }
+
                 $calls[] = [
                     'name' => $call->name,
-                    'arguments' => $this->arguments($call),
+                    'arguments' => $arguments,
                     'id' => $call->id,
                 ];
             }
@@ -180,20 +188,17 @@ final class PrismLlmClient implements LlmClient
     }
 
     /**
-     * @return array<string, mixed>
+     * @return array<string, mixed>|null null when the arguments cannot be used
      */
-    private function arguments(object $call): array
+    private function arguments(object $call): ?array
     {
         try {
             $arguments = $call->arguments();
         } catch (Throwable) {
-            // Malformed arguments are the model's mistake, not this adapter's.
-            // An empty set lets the node invoke the tool and fail on its own
-            // validation, which reports better than an exception from here.
-            return [];
+            return null;
         }
 
-        return is_array($arguments) ? $arguments : [];
+        return is_array($arguments) ? $arguments : null;
     }
 
     /**
