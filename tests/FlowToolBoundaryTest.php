@@ -715,6 +715,91 @@ it('lets a loop finish inside the session step limit, and starts a new count aft
     }
 });
 
+/** @return array{0: list<FlowNode>, 1: list<FlowEdge>} */
+function sequentialToolNodes(int $pairs): array
+{
+    $nodes = [];
+    $edges = [];
+
+    for ($i = 1; $i <= $pairs; $i++) {
+        $nodes[] = new FlowNode(id: "l{$i}", type: 'llm_call', config: ['prompt' => 'go', 'provider' => 'openai', 'model' => 'gpt-4o', 'tools' => ['plain']]);
+        $nodes[] = new FlowNode(id: "t{$i}", type: 'tool_use', config: ['tool' => 'plain', 'args' => '{{ $json.tool_calls.0.arguments }}']);
+        $edges[] = new FlowEdge("m{$i}", "l{$i}", "t{$i}");
+
+        if ($i > 1) {
+            $previous = $i - 1;
+            $edges[] = new FlowEdge("n{$i}", "t{$previous}", "l{$i}");
+        }
+    }
+
+    return [$nodes, $edges];
+}
+
+function runToolNodes(Session $session, array $nodes, array $edges): RunResult
+{
+    [$llm, $invoker] = flowAdapters($session);
+    $deps = new ExecutorDeps(llm: $llm, tools: $invoker);
+    $registry = Builtin::executors($deps);
+    $registry->bind('agent', new AgentExecutor($deps->llm, $deps->tools));
+
+    return (new FlowRunner)->run(new FlowGraph($nodes, $edges), $registry);
+}
+
+it('runs separate model and tool nodes past the session step limit', function (): void {
+    $session = flowSession();
+    $session->usingMaxSteps(2);
+    $this->replies = [flowCall('plain'), flowCall('plain'), flowCall('plain')];
+    [$nodes, $edges] = sequentialToolNodes(3);
+
+    $result = runToolNodes($session, $nodes, $edges);
+
+    expect($result->ok)->toBeTrue()
+        ->and($this->ran['plain'])->toBe(3)
+        ->and($this->hosts)->toHaveCount(3);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('still holds an agent loop to the limit after separate nodes', function (): void {
+    $session = flowSession();
+    $session->usingMaxSteps(2);
+    $this->replies = [flowCall('plain'), flowCall('plain'), flowCall('plain'), flowCall('plain'), flowCall('plain')];
+    [$nodes, $edges] = sequentialToolNodes(2);
+    $nodes[] = new FlowNode(id: 'a', type: 'agent', config: ['prompt' => 'go', 'model' => 'gpt-4o', 'tools' => ['plain'], 'max_steps' => 5]);
+    $edges[] = new FlowEdge('to-agent', 't2', 'a');
+
+    $result = runToolNodes($session, $nodes, $edges);
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('step limit')
+        ->and($this->ran['plain'])->toBe(4)
+        ->and($this->hosts)->toHaveCount(4);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('does not let a separate model call restart an agent loop count', function (): void {
+    $session = flowSession();
+    $session->usingMaxSteps(2);
+    [$llm] = flowAdapters($session);
+    $this->replies = [flowCall('plain'), flowCall('plain'), flowCall('plain')];
+
+    $llm->complete('go', ['tools' => ['plain']]);
+    $llm->complete('separate', ['provider' => 'openai', 'tools' => ['plain']]);
+    $llm->complete('Tool results: []', ['tools' => ['plain']]);
+
+    expect(fn () => $llm->complete('Tool results: []', ['tools' => ['plain']]))
+        ->toThrow(ToolNotAvailable::class, 'step limit');
+});
+
+it('counts a tool-result continuation as the loop even when it names a provider', function (): void {
+    $session = flowSession();
+    $session->usingMaxSteps(1);
+    [$llm] = flowAdapters($session);
+    $this->replies = [flowCall('plain')];
+
+    $llm->complete('go', ['tools' => ['plain']]);
+
+    expect(fn () => $llm->complete('Tool results: []', ['provider' => 'openai', 'tools' => ['plain']]))
+        ->toThrow(ToolNotAvailable::class, 'step limit');
+});
+
 it('fails the node on a sole call with unreadable arguments', function (): void {
     $this->replies = [flowCall('plain', '{not json'), flowText()];
 
