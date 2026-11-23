@@ -115,9 +115,10 @@ final class PrismLlmClient implements LlmClient
         }
 
         $tools = $this->requestedTools($options);
+        $loopStep = $tools !== [] && $this->isAgentLoopStep($prompt, $options);
 
         if ($tools !== []) {
-            $this->countLoopStep();
+            $this->countStep($loopStep);
             // Schemas only, from FlowToolset::offered(). Core has nothing here
             // it could run: HarnessToolInvoker is the one place a workflow's
             // tool executes.
@@ -145,7 +146,10 @@ final class PrismLlmClient implements LlmClient
 
         $this->admitStep($response->steps, $tools);
         $calls = $this->toolCalls($response->steps);
-        $this->loopOpen = $calls !== [];
+
+        if ($loopStep) {
+            $this->loopOpen = $calls !== [];
+        }
 
         if ($calls !== []) {
             // Undeclared by the contract and read by AgentExecutor. Emitted
@@ -195,18 +199,45 @@ final class PrismLlmClient implements LlmClient
     }
 
     /**
+     * Whether this call is a step of an `agent` node's loop.
+     *
+     * fancy-flow calls this client the same way for `agent` and `llm_call`, and
+     * differs in two observable ways: `llm_call` always passes a provider and
+     * `agent` never does, and an agent's later steps send the tool results as
+     * their prompt. Either one marks a loop, so a change to one of them in the
+     * engine does not release an agent from the limit.
+     *
+     * @param  array<string, mixed>  $options
+     */
+    private function isAgentLoopStep(string $prompt, array $options): bool
+    {
+        return ! array_key_exists('provider', $options)
+            || str_starts_with($prompt, 'Tool results: [');
+    }
+
+    /**
      * Hold a workflow's agent loop to the session's step limit.
      *
-     * fancy-flow owns the loop and does not tell this client which one a call
-     * belongs to, so a loop is read from its shape: a step that handed back tool
-     * calls is continued by the next. A loop left unfinished by a failed node
-     * counts against the next call once, and refusing resets the count.
+     * A step that handed back tool calls is continued by the next. A loop left
+     * unfinished by a failed node counts against the next call once, and
+     * refusing resets the count. A separate model node is one step of its own:
+     * it neither adds to a loop's count nor restarts it, so the number of such
+     * nodes is bounded by the workflow and not by this limit.
      */
-    private function countLoopStep(): void
+    private function countStep(bool $loopStep): void
     {
+        $limit = $this->toolset?->stepLimit() ?? 1;
+
+        if (! $loopStep) {
+            if ($limit < 1) {
+                throw ToolNotAvailable::stepLimit($limit);
+            }
+
+            return;
+        }
+
         $this->loopSteps = $this->loopOpen ? $this->loopSteps + 1 : 1;
         $this->loopOpen = false;
-        $limit = $this->toolset?->stepLimit() ?? 1;
 
         if ($this->loopSteps > $limit) {
             $this->loopSteps = 0;
