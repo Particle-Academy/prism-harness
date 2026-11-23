@@ -124,7 +124,7 @@ it('requires exactly one StepFinish provenance and a valid final stream total', 
                 }
             }
         }
-    });
+    }, true);
     $session = callBudgetSession()->usingProvider('openrouter');
     $observer = new CostObserver;
     $run = routerBillingContext($observer);
