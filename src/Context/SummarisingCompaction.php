@@ -96,9 +96,13 @@ final class SummarisingCompaction implements CompactionStrategy
         private readonly string $model = 'claude-haiku-4-5-20251001',
         private readonly int $keep = 20,
         private readonly int $summaryWords = 200,
-        private readonly Provider $provider = Provider::Anthropic,
+        /** A core provider, or the name of one registered with Prism (a custom provider included). */
+        private readonly string|Provider $provider = Provider::Anthropic,
         ?SummaryBudget $budget = null,
     ) {
+        if ($provider === '') {
+            throw new \InvalidArgumentException('SummarisingCompaction needs a nonempty provider name.');
+        }
         if ($keep < 1) {
             throw new \InvalidArgumentException('SummarisingCompaction needs to keep at least one message.');
         }

@@ -53,6 +53,7 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
             'budget_input_unbounded' => 'The capped call contains input without a configured token bound.',
             'budget_compaction_unmetered' => 'Model-based compaction is not metered; disable it before using a hard cost cap.',
             'budget_observer_uncapped' => 'A call cost observer requires a hard cost cap.',
+            'agent_spend_ceiling_exceeded' => "The next model call would exceed this agent's spend ceiling.",
             default => 'The next model call would exceed the remaining cost budget.',
         });
         $failure->errorCode = $code;

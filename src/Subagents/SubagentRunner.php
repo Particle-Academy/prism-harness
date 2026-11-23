@@ -6,6 +6,8 @@ namespace Prism\Harness\Subagents;
 
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Modes\AgentMode;
+use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolRefusals;
@@ -32,18 +34,18 @@ final readonly class SubagentRunner
         private AgentRuntime $runtime,
     ) {}
 
-    public function tool(Subagent $subagent, Session $parent, ?RunContext $context, string $parentRunId): Tool
+    public function tool(Subagent $subagent, Session $parent, ?RunContext $context, string $parentRunId, ?AgentMode $parentMode = null): Tool
     {
         return (new Tool)
             ->as($subagent->name)
             ->for($subagent->description)
             ->withStringParameter('task', 'What the subagent should do, stated as a complete instruction. It does not see this conversation.')
-            ->using(function (string $task) use ($subagent, $parent, $context, $parentRunId): string {
+            ->using(function (string $task) use ($subagent, $parent, $context, $parentRunId, $parentMode): string {
                 if ($context === null) {
                     throw new \LogicException('Tool inspection cannot invoke a subagent.');
                 }
 
-                $result = $this->run($subagent, $parent, $context, $parentRunId, $task);
+                $result = $this->run($subagent, $parent, $context, $parentRunId, $task, $parentMode);
 
                 // The tree refusing to let a child run is a gate, not the
                 // child's failure: recorded so a run step reports it as one.
@@ -59,6 +61,7 @@ final readonly class SubagentRunner
         RunContext $context,
         string $parentRunId,
         string $task,
+        ?AgentMode $parentMode = null,
     ): SubagentResult {
         $childRunId = 'run_'.bin2hex(random_bytes(12));
 
@@ -75,7 +78,17 @@ final readonly class SubagentRunner
             );
         }
 
-        $childContext = $context->forChild($subagent, $parentRunId, $parent->thread()->getKey());
+        // The child runs in the agent the declaration names, or the parent's.
+        // ModeRegistry already refused an agent the parent mode does not list.
+        $childAgent = $subagent->agent ?? $parent->agent();
+        $childContext = $context->forChild($subagent, $parentRunId, $parent->thread()->getKey())
+            ->withBinding(ChildBinding::for(
+                $subagent,
+                $parent->provider(),
+                $parent->model(),
+                $parentMode ?? $this->modeOf($parent),
+                sameAgent: $childAgent === $parent->agent(),
+            ));
 
         // Refused BEFORE the child's address is built. Two modes that name each
         // other as subagents form a cycle that budgets would eventually stop,
@@ -106,7 +119,7 @@ final readonly class SubagentRunner
         }
 
         try {
-            $child = $this->harness->forAgent($parent->agent())->session(
+            $child = $this->harness->forAgent($childAgent)->session(
                 $parent->participant(), $subagent->scopeUnder($parent->scope()), $parent->actor(),
             );
             $child->usingMode($subagent->mode);
@@ -154,5 +167,20 @@ final readonly class SubagentRunner
                 sprintf('The subagent failed with %s. The details are in the application log.', $e::class),
             );
         }
+    }
+
+    /**
+     * The parent's mode, for a caller that did not hand it over.
+     *
+     * Only an UNCONFIGURED mode is tolerated, as "no parent-mode tier": a
+     * direct caller may run a subagent beneath a session whose mode was never
+     * configured. A configured but malformed mode still throws.
+     */
+    private function modeOf(Session $parent): ?AgentMode
+    {
+        $modes = app(ModeRegistry::class)->forAgent($parent->agent());
+        $name = $parent->mode() ?? $modes->default();
+
+        return in_array($name, $modes->names(), true) ? $modes->resolve($name) : null;
     }
 }

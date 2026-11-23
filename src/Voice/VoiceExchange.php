@@ -106,8 +106,9 @@ final readonly class VoiceExchange
         private string $transcribeModel = 'whisper-1',
         private string $speakModel = 'tts-1',
         private string $voice = 'alloy',
-        private Provider $transcribeProvider = Provider::OpenAI,
-        private Provider $speakProvider = Provider::OpenAI,
+        /** A core provider, or the name of one registered with Prism (a custom provider included). */
+        private string|Provider $transcribeProvider = Provider::OpenAI,
+        private string|Provider $speakProvider = Provider::OpenAI,
         /**
          * Permit audio the harness must dereference — a path, a disk, a URL.
          *
@@ -116,7 +117,11 @@ final readonly class VoiceExchange
          * exactly like the safe one at the call site.
          */
         private bool $allowReferencedAudio = false,
-    ) {}
+    ) {
+        if ($transcribeProvider === '' || $speakProvider === '') {
+            throw new \InvalidArgumentException('VoiceExchange needs nonempty provider names.');
+        }
+    }
 
     /**
      * Hear an utterance. Returns what was said.

@@ -92,6 +92,11 @@ final readonly class AgentRuntime
                     throw new \InvalidArgumentException('Agent provider/model defaults must be nonempty strings or null.');
                 }
             }
+            if (array_key_exists('spend_ceiling', $options) && $options['spend_ceiling'] !== null
+                && (! (is_int($options['spend_ceiling']) || is_float($options['spend_ceiling']))
+                    || ! is_finite((float) $options['spend_ceiling']) || $options['spend_ceiling'] <= 0)) {
+                throw new \InvalidArgumentException('Agent spend_ceiling must be a positive finite number of USD or null.');
+            }
             foreach (['max_steps_ceiling', 'max_output_tokens_per_call'] as $key) {
                 if (array_key_exists($key, $options) && $options[$key] !== null && (! is_int($options[$key]) || $options[$key] < 1)) {
                     throw new \InvalidArgumentException('Agent step/output ceilings must be positive integers or null.');
@@ -145,8 +150,7 @@ final readonly class AgentRuntime
 
             try {
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-                $provider = $session->provider() ?? $this->stringConfig('provider', $session);
-                $model = $session->model() ?? $this->stringConfig('model', $session);
+                [$provider, $model] = $this->bindingFor($session, $mode, $context);
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
                 // run the session never started trips its own state guard —
@@ -161,6 +165,7 @@ final readonly class AgentRuntime
                     exception: $failure::class,
                     parentRunId: $context?->parentRunId,
                     rootRunId: $context?->rootRunId(),
+                    harnessAgent: $session->agent(),
                 ));
 
                 throw $failure;
@@ -187,6 +192,7 @@ final readonly class AgentRuntime
                 model: $model,
                 parentRunId: $run->parentRunId,
                 rootRunId: $run->rootRunId(),
+                harnessAgent: $session->agent(),
             ));
 
             // The tree's allowance, not this node's wish. A child was already
@@ -194,7 +200,7 @@ final readonly class AgentRuntime
             // was spawned; this re-checks at the moment of spending, because a
             // sibling may have consumed the remainder in between.
             $stop = $run->ledger->exhaustion($budget);
-            if ($budget->maxCostUsd === null && $stop !== null) {
+            if (! $run->capped() && $stop !== null) {
                 $session->failRun($runId, 'budget');
 
                 throw RunNotPermitted::exhausted($stop);
@@ -202,7 +208,7 @@ final readonly class AgentRuntime
 
             try {
                 $run = $this->observedRun($run);
-                $this->assertMeteredCompaction($budget);
+                $this->assertMeteredCompaction($run);
                 // The history is read HERE, once, and handed to Prism as
                 // messages rather than as a Thread. See newMessages() for why
                 // this run has to know exactly which message objects it sent.
@@ -224,13 +230,13 @@ final readonly class AgentRuntime
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
+                    $generation->withTools($tools)->withMaxSteps(! $run->capped() ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
                 $stepOnly = $context !== null || $mode->subagents !== [];
-                $response = $budget->maxCostUsd === null
+                $response = ! $run->capped()
                     ? ($stepOnly ? (new StepCalls)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -245,7 +251,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                         });
-                if ($budget->maxCostUsd === null && ! $stepOnly) {
+                if (! $run->capped() && ! $stepOnly) {
                     $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
                 }
                 $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
@@ -258,7 +264,7 @@ final readonly class AgentRuntime
                 // Shared trees charge each step before its provider call.
                 // Ordinary runs retain their aggregate accounting here; an
                 // uncapped run's reported cost is recorded once after the run.
-                if ($budget->maxCostUsd === null) {
+                if (! $run->capped()) {
                     if (! $stepOnly) {
                         $run->ledger->recordSteps(count($response->steps));
                     }
@@ -274,7 +280,7 @@ final readonly class AgentRuntime
 
                 if ($failed) {
                     event(new RunFailed($session->key(), $runId, $response->finishReason->value,
-                        $run->parentRunId, $run->rootRunId()));
+                        $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 } else {
                     event(new RunFinished(
                         sessionKey: $session->key(),
@@ -288,6 +294,7 @@ final readonly class AgentRuntime
                         awaitingApproval: $agentResponse->awaitingApproval(),
                         parentRunId: $run->parentRunId,
                         rootRunId: $run->rootRunId(),
+                        harnessAgent: $session->agent(),
                     ));
                 }
 
@@ -304,6 +311,7 @@ final readonly class AgentRuntime
                     exception: $failure::class,
                     parentRunId: $run->parentRunId,
                     rootRunId: $run->rootRunId(),
+                    harnessAgent: $session->agent(),
                 ));
 
                 throw $failure;
@@ -364,8 +372,7 @@ final readonly class AgentRuntime
 
             try {
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-                $provider = $session->provider() ?? $this->stringConfig('provider', $session);
-                $model = $session->model() ?? $this->stringConfig('model', $session);
+                [$provider, $model] = $this->bindingFor($session, $mode, $context);
             } catch (Throwable $failure) {
                 // As in send(): no run exists yet, so there is no run state to
                 // fail — only an event to fire.
@@ -375,6 +382,7 @@ final readonly class AgentRuntime
                     exception: $failure::class,
                     parentRunId: $context?->parentRunId,
                     rootRunId: $context?->rootRunId(),
+                    harnessAgent: $session->agent(),
                 ));
 
                 throw $failure;
@@ -399,10 +407,11 @@ final readonly class AgentRuntime
                 model: $model,
                 parentRunId: $run->parentRunId,
                 rootRunId: $run->rootRunId(),
+                harnessAgent: $session->agent(),
             ));
 
             $stop = $run->ledger->exhaustion($budget);
-            if ($budget->maxCostUsd === null && $stop !== null) {
+            if (! $run->capped() && $stop !== null) {
                 $session->failRun($runId, 'budget');
 
                 throw RunNotPermitted::exhausted($stop);
@@ -410,7 +419,7 @@ final readonly class AgentRuntime
 
             try {
                 $run = $this->observedRun($run);
-                $this->assertMeteredCompaction($budget);
+                $this->assertMeteredCompaction($run);
                 $history = iterator_to_array($session->thread()->messages(), false);
                 $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
 
@@ -431,13 +440,13 @@ final readonly class AgentRuntime
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
+                    $generation->withTools($tools)->withMaxSteps(! $run->capped() ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
                 $stepOnly = $context !== null || $mode->subagents !== [];
-                $response = $budget->maxCostUsd === null
+                $response = ! $run->capped()
                     ? ($stepOnly ? (new StepCalls)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -455,7 +464,7 @@ final readonly class AgentRuntime
                             $userMessage = null;
                         });
 
-                if ($budget->maxCostUsd === null && ! $stepOnly) {
+                if (! $run->capped() && ! $stepOnly) {
                     $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
                 }
 
@@ -472,7 +481,7 @@ final readonly class AgentRuntime
                     $session->completeRun($runId, $response->finishReason->value, $this->structuredToolCallNames($response));
                 }
 
-                if ($budget->maxCostUsd === null) {
+                if (! $run->capped()) {
                     if (! $stepOnly) {
                         $run->ledger->recordSteps(count($response->steps));
                     }
@@ -481,7 +490,7 @@ final readonly class AgentRuntime
 
                 if ($failed) {
                     event(new RunFailed($session->key(), $runId, $response->finishReason->value,
-                        $run->parentRunId, $run->rootRunId()));
+                        $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 } else {
                     event(new RunFinished(
                         sessionKey: $session->key(),
@@ -493,6 +502,7 @@ final readonly class AgentRuntime
                         awaitingApproval: false,
                         parentRunId: $run->parentRunId,
                         rootRunId: $run->rootRunId(),
+                        harnessAgent: $session->agent(),
                     ));
                 }
 
@@ -514,6 +524,7 @@ final readonly class AgentRuntime
                     exception: $failure::class,
                     parentRunId: $run->parentRunId,
                     rootRunId: $run->rootRunId(),
+                    harnessAgent: $session->agent(),
                 ));
 
                 throw $failure;
@@ -651,7 +662,7 @@ final readonly class AgentRuntime
         $actor = $context?->actor;
         $context = $this->executionContext($context);
         $runId = $tagger->claimRunId();
-        $tagger->bind($session->key(), $runId, $context?->parentRunId, $context?->rootRunId());
+        $tagger->bind($session->key(), $runId, $context?->parentRunId, $context?->rootRunId(), $session->agent());
         foreach ($decisions as $decision) {
             // From the APP's run context, never from the model or the request.
             $tagger->decision($decision->approvalId, $decision->approved, $decision->reason, $actor);
@@ -663,7 +674,7 @@ final readonly class AgentRuntime
         // The step path, always. It resolves approvals from the thread before
         // any provider call and records the merge first, and it takes an empty
         // prompt as "continue" rather than as a turn to record.
-        $capped = ($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null;
+        $capped = $this->takesPricedPath($session, $context);
         $events = $capped
             ? $this->streamCapped($session, '', null, $context, [], $tagger)
             : $this->streamStepTree($session, '', null, $context, [], $tagger);
@@ -716,7 +727,7 @@ final readonly class AgentRuntime
     private function lockedStream(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
     {
 
-        if (($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null) {
+        if ($this->takesPricedPath($session, $context)) {
             yield from $this->streamCapped($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
             return;
@@ -732,10 +743,9 @@ final readonly class AgentRuntime
 
             return;
         }
-        $provider = $session->provider() ?? $this->stringConfig('provider', $session);
-        $model = $session->model() ?? $this->stringConfig('model', $session);
+        [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
-        $tagger->bind($session->key(), $runId, null, null);
+        $tagger->bind($session->key(), $runId, null, null, $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
 
         $namedRun = $session->agent() === null ? null : $this->boundedAgentRun($session, RunContext::root($runId, new RunBudget(
@@ -754,6 +764,7 @@ final readonly class AgentRuntime
             mode: $mode->name,
             provider: $provider,
             model: $model,
+            harnessAgent: $session->agent(),
         ));
 
         // ASSEMBLED BY CORE, NOT REBUILT HERE. See the loop below.
@@ -847,6 +858,7 @@ final readonly class AgentRuntime
                 sessionKey: $session->key(),
                 runId: $runId,
                 exception: $failure::class,
+                harnessAgent: $session->agent(),
             ));
 
             throw $failure;
@@ -870,7 +882,7 @@ final readonly class AgentRuntime
                 $this->recordTurn($session, $messages, $runId, $tools);
                 if (in_array($finishReason, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finishReason->value);
-                    event(new RunFailed($session->key(), $runId, $finishReason->value));
+                    event(new RunFailed($session->key(), $runId, $finishReason->value, harnessAgent: $session->agent()));
                 } else {
                     $session->completeRun($runId, $finishReason->value);
                     event(new RunFinished(
@@ -879,6 +891,7 @@ final readonly class AgentRuntime
                         finishReason: $finishReason->value,
                         steps: count($collected['response']->steps ?? []),
                         awaitingApproval: false,
+                        harnessAgent: $session->agent(),
                     ));
                 }
             }
@@ -895,8 +908,7 @@ final readonly class AgentRuntime
     private function streamStepTree(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
     {
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        $provider = $session->provider() ?? $this->stringConfig('provider', $session);
-        $model = $session->model() ?? $this->stringConfig('model', $session);
+        [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
         $run = $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
@@ -904,14 +916,14 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
-        $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId());
+        $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
         event($tagger->resuming()
-            ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId())
-            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId()));
+            ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
+            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
         $recorded = false;
         $finish = FinishReason::Unknown;
         $steps = 0;
@@ -963,7 +975,7 @@ final readonly class AgentRuntime
                 }));
         } catch (Throwable $failure) {
             $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
-            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
+            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
 
             throw $failure;
         } finally {
@@ -976,11 +988,11 @@ final readonly class AgentRuntime
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
-                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId()));
+                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 } else {
                     $session->completeRun($runId, $finish->value);
                     event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
-                        $run->parentRunId, $run->rootRunId()));
+                        $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 }
             }
             $this->rememberSeq($session, $runId, $tagger);
@@ -996,8 +1008,7 @@ final readonly class AgentRuntime
     private function streamCapped(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
     {
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        $provider = $session->provider() ?? $this->stringConfig('provider', $session);
-        $model = $session->model() ?? $this->stringConfig('model', $session);
+        [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
         $run = $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
@@ -1006,21 +1017,21 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
-        $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId());
+        $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
         event($tagger->resuming()
-            ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId())
-            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId()));
+            ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
+            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
         $recorded = false;
         $finish = FinishReason::Unknown;
         $steps = 0;
         $awaitingApproval = false;
         try {
             $run = $this->observedRun($run);
-            $this->assertMeteredCompaction($run->budget);
+            $this->assertMeteredCompaction($run);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
@@ -1057,7 +1068,7 @@ final readonly class AgentRuntime
                 }));
         } catch (Throwable $failure) {
             $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
-            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
+            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
 
             throw $failure;
         } finally {
@@ -1067,11 +1078,11 @@ final readonly class AgentRuntime
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
-                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId()));
+                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 } else {
                     $session->completeRun($runId, $finish->value);
                     event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
-                        $run->parentRunId, $run->rootRunId()));
+                        $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 }
             }
             $this->rememberSeq($session, $runId, $tagger);
@@ -1149,17 +1160,16 @@ final readonly class AgentRuntime
         if ($observer === null) {
             return $run;
         }
-        if ($run->budget->maxCostUsd === null) {
+        if (! $run->capped()) {
             throw RunNotPermitted::callBudget('budget_observer_uncapped');
         }
 
-        return $run->observer !== null ? $run : new RunContext($run->ledger, $run->budget,
-            $run->parentRunId, $run->parentThreadId, $run->depth, $run->pricing, $observer, $run->turnId, $run->actor);
+        return $run->observer !== null ? $run : $run->withBudget($run->budget, $observer);
     }
 
-    private function assertMeteredCompaction(RunBudget $budget): void
+    private function assertMeteredCompaction(RunContext $run): void
     {
-        if ($budget->maxCostUsd !== null && app(CompactionStrategy::class) instanceof SummarisingCompaction) {
+        if ($run->capped() && app(CompactionStrategy::class) instanceof SummarisingCompaction) {
             throw RunNotPermitted::callBudget('budget_compaction_unmetered');
         }
     }
@@ -1208,7 +1218,7 @@ final readonly class AgentRuntime
                 if ($view->agent() === null) {
                     $names[] = $subagent->name;
                 }
-                $additional[$subagent->name] = ['tool' => ($this->subagentRunner)()->tool($subagent, $view, $run, $runId), 'owner' => 'harness.subagent', 'source' => 'builtin'];
+                $additional[$subagent->name] = ['tool' => ($this->subagentRunner)()->tool($subagent, $view, $run, $runId, $mode), 'owner' => 'harness.subagent', 'source' => 'builtin'];
             }
             $detailed = $this->tools->resolveDetailed($names, $view, $additional);
             $resolved = [];
@@ -1383,7 +1393,7 @@ final readonly class AgentRuntime
         $tools = [];
 
         foreach ($mode->subagents as $subagent) {
-            $tools[$subagent->name] = $runner->tool($subagent, $session, $run, $runId);
+            $tools[$subagent->name] = $runner->tool($subagent, $session, $run, $runId, $mode);
         }
 
         return $tools;
@@ -1513,24 +1523,61 @@ final readonly class AgentRuntime
 
     private function boundedAgentRun(Session $session, RunContext $run): RunContext
     {
+        // The label comes from the SESSION, so every run — a delegated child
+        // included — charges the agent it actually runs as.
         if ($session->agent() === null) {
-            return $run;
+            return $run->agent === null && $run->agentCeilingUsd === null ? $run : $run->forAgent(null, null);
         }
         $steps = $this->nullableIntConfig('max_steps_ceiling', $session);
         $output = $this->nullableIntConfig('max_output_tokens_per_call', $session);
         $budget = $run->budget;
 
-        return new RunContext(
-            ledger: $run->ledger,
-            budget: new RunBudget(
-                maxSteps: $steps === null ? $budget->maxSteps : min($budget->maxSteps, $run->ledger->steps() + $steps),
-                maxCostUsd: $budget->maxCostUsd,
-                maxSeconds: $budget->maxSeconds,
-                maxOutputTokensPerCall: $output === null ? $budget->maxOutputTokensPerCall : min($budget->maxOutputTokensPerCall ?? $output, $output),
-            ),
-            parentRunId: $run->parentRunId, parentThreadId: $run->parentThreadId,
-            depth: $run->depth, pricing: $run->pricing, observer: $run->observer,
-            turnId: $run->turnId, actor: $run->actor,
-        );
+        return $run->withBudget(new RunBudget(
+            maxSteps: $steps === null ? $budget->maxSteps : min($budget->maxSteps, $run->ledger->steps() + $steps),
+            maxCostUsd: $budget->maxCostUsd,
+            maxSeconds: $budget->maxSeconds,
+            maxOutputTokensPerCall: $output === null ? $budget->maxOutputTokensPerCall : min($budget->maxOutputTokensPerCall ?? $output, $output),
+        ))->forAgent($session->agent(), $this->agentCeiling($session));
+    }
+
+    /** A named agent's `spend_ceiling`, validated at construction; null for the legacy namespace. */
+    private function agentCeiling(Session $session): ?float
+    {
+        $agent = $session->agent();
+        $ceiling = $agent === null ? null : (is_array($this->agents[$agent] ?? null) ? ($this->agents[$agent]['spend_ceiling'] ?? null) : null);
+
+        return is_int($ceiling) || is_float($ceiling) ? (float) $ceiling : null;
+    }
+
+    /**
+     * Whether a stream must take the priced path before its run context exists.
+     *
+     * @see RunContext::capped()
+     */
+    private function takesPricedPath(Session $session, ?RunContext $context): bool
+    {
+        return ($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null
+            || $this->agentCeiling($session) !== null;
+    }
+
+    /**
+     * The provider and model this run requests, per field (G-321 E).
+     *
+     * A root run: session override, then the mode, then the agent default,
+     * then the global default. A subagent's child: see {@see ChildBinding} —
+     * the child session's own override slot is not read.
+     *
+     * @return array{string, string}
+     */
+    private function bindingFor(Session $session, AgentMode $mode, ?RunContext $context): array
+    {
+        $child = $context?->binding;
+
+        return [
+            ($child === null ? $session->provider() : $child->provider)
+                ?? $mode->provider ?? $child->parentModeProvider ?? $this->stringConfig('provider', $session),
+            ($child === null ? $session->model() : $child->model)
+                ?? $mode->model ?? $child->parentModeModel ?? $this->stringConfig('model', $session),
+        ];
     }
 }

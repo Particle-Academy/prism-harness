@@ -38,6 +38,19 @@ final class RunLedger
 
     private int $reservationSequence = 0;
 
+    /**
+     * Which agent each open reservation belongs to, and what each agent has
+     * been charged. LABELS on the one account, not accounts: a reservation
+     * still counts against the tree first, and every charge still lands in
+     * the tree's own total.
+     *
+     * @var array<int, string>
+     */
+    private array $reservationAgents = [];
+
+    /** @var array<string, float> */
+    private array $agentCosts = [];
+
     private ?CallCostObserver $observer = null;
 
     public function __construct(
@@ -76,21 +89,53 @@ final class RunLedger
         return $this->observer;
     }
 
-    /** Admission and reservation happen together, before a provider or nested tool can spend. */
-    public function reserveCost(RunBudget $budget, float $worstCase): int
+    /**
+     * Admission and reservation happen together, before a provider or nested tool can spend.
+     *
+     * A call must fit the tree's cost cap when there is one AND, for a named
+     * agent with a `spend_ceiling`, that agent's charged plus reserved spend in
+     * this same ledger. Either refusal happens before the provider request.
+     */
+    public function reserveCost(RunBudget $budget, float $worstCase, ?string $agent = null, ?float $agentCeilingUsd = null): int
     {
-        if (! is_finite($worstCase) || $worstCase < 0 || $budget->maxCostUsd === null
-            || ! is_finite($budget->maxCostUsd) || $budget->maxCostUsd < 0
-            || $this->costUsd + $this->reservedCostUsd() + $worstCase > $budget->maxCostUsd) {
+        $treeCapped = $budget->maxCostUsd !== null;
+        if (! is_finite($worstCase) || $worstCase < 0 || (! $treeCapped && $agentCeilingUsd === null)
+            || ($treeCapped && (! is_finite($budget->maxCostUsd) || $budget->maxCostUsd < 0
+                || $this->costUsd + $this->reservedCostUsd() + $worstCase > $budget->maxCostUsd))) {
             throw RunNotPermitted::callBudget('call_budget_exceeded');
+        }
+        if ($agentCeilingUsd !== null && ($agent === null || ! is_finite($agentCeilingUsd) || $agentCeilingUsd <= 0
+            || $this->agentCostUsd($agent) + $this->agentReservedUsd($agent) + $worstCase > $agentCeilingUsd)) {
+            throw RunNotPermitted::callBudget('agent_spend_ceiling_exceeded');
         }
 
         $this->assertCallAvailable($budget);
 
         $id = ++$this->reservationSequence;
         $this->reservations[$id] = $worstCase;
+        if ($agent !== null) {
+            $this->reservationAgents[$id] = $agent;
+        }
 
         return $id;
+    }
+
+    /** What calls labelled with this agent have been charged in this tree. */
+    public function agentCostUsd(string $agent): float
+    {
+        return $this->agentCosts[$agent] ?? 0.0;
+    }
+
+    private function agentReservedUsd(string $agent): float
+    {
+        $reserved = 0.0;
+        foreach ($this->reservationAgents as $id => $label) {
+            if ($label === $agent) {
+                $reserved += $this->reservations[$id];
+            }
+        }
+
+        return $reserved;
     }
 
     /** Check cancellation/steps/time before resolving an approved side effect, then again before spending. */
@@ -119,6 +164,11 @@ final class RunLedger
         }
         $cost ??= $this->reservations[$reservation];
         unset($this->reservations[$reservation]);
+        $agent = $this->reservationAgents[$reservation] ?? null;
+        unset($this->reservationAgents[$reservation]);
+        if ($agent !== null) {
+            $this->agentCosts[$agent] = ($this->agentCosts[$agent] ?? 0.0) + max(0.0, $cost);
+        }
         $this->recordCost($cost);
 
         return max(0.0, $cost);
@@ -130,7 +180,7 @@ final class RunLedger
         if (! array_key_exists($reservation, $this->reservations)) {
             throw new \LogicException('The call reservation has already been settled.');
         }
-        unset($this->reservations[$reservation]);
+        unset($this->reservations[$reservation], $this->reservationAgents[$reservation]);
     }
 
     public function elapsedSeconds(): float

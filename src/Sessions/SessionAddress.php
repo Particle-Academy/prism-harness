@@ -33,9 +33,15 @@ final readonly class SessionAddress
         }
     }
 
+    /** Whether a string is an agent id exactly as written: never trimmed or case-folded. */
+    public static function isAgent(string $agent): bool
+    {
+        return preg_match('/\A[a-z][a-z0-9_-]{0,63}\z/D', $agent) === 1;
+    }
+
     public static function validateAgent(?string $agent): void
     {
-        if ($agent !== null && preg_match('/\A[a-z][a-z0-9_-]{0,63}\z/D', $agent) !== 1) {
+        if ($agent !== null && ! self::isAgent($agent)) {
             throw new InvalidArgumentException('Harness namespace must be a configured lowercase identifier of 1–64 ASCII bytes.');
         }
     }
