@@ -66,6 +66,9 @@ use Throwable;
 
 final readonly class AgentRuntime
 {
+    /** The run id on decisions made for a workflow node, which has no harness run. */
+    private const FLOW_RUN = 'flow';
+
     /** The host tool policy, replaceable live; the runtime itself stays readonly. */
     private ToolPolicySlot $policySlot;
 
@@ -1249,11 +1252,23 @@ final readonly class AgentRuntime
 
         foreach ($resolved as $name => $tool) {
             if ($mode->needsApproval($name)) {
-                $resolved[$name] = (clone $tool)->requiresApproval(true);
+                $resolved[$name] = $this->gated($session, $tool, self::FLOW_RUN);
             }
         }
 
         return $this->approvalScopedOffer($session, $this->authorizer->allowed($session, $resolved));
+    }
+
+    /**
+     * Record that a workflow node was refused a call that needs approval.
+     *
+     * @internal Called through {@see FlowToolset}.
+     *
+     * @param  array<string, mixed>  $arguments
+     */
+    public function recordFlowRefusal(Session $session, Tool $tool, array $arguments): void
+    {
+        $this->emitToolDecision(ToolDenied::class, $session, self::FLOW_RUN, $tool, $tool->name(), $arguments, 'policy');
     }
 
     /**

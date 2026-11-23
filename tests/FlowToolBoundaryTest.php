@@ -11,8 +11,11 @@ use FancyFlow\Schema\FlowEdge;
 use FancyFlow\Schema\FlowGraph;
 use FancyFlow\Schema\FlowNode;
 use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Http;
+use Prism\Harness\AgentRuntime;
+use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Exceptions\UnboundFlowTools;
 use Prism\Harness\Flow\HarnessAgentExecutor;
@@ -22,6 +25,7 @@ use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolAuthorizer;
+use Prism\Harness\Tools\ToolPolicy;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Tests\Fixtures\Participant;
@@ -392,6 +396,91 @@ it('applies a named agent\'s own mode, approval marks and authorization', functi
     $invoker->invoke('refused', ['target' => 'x']);
 
     expect($runs)->toBe(['open' => 1, 'held' => 0, 'hidden' => 0, 'refused' => 0]);
+});
+
+it('runs a mode-gated tool once when the tool policy allows it', function (string $shape): void {
+    app(AgentRuntime::class)->setToolPolicy(ToolPolicy::fromArray(['revision' => 'r1', 'allow' => [['tool' => 'mode_gated']], 'honor' => true]));
+    $this->replies = [flowCall('mode_gated'), flowText()];
+
+    $result = runFlowShape($shape, 'mode_gated', flowSession());
+
+    expect($result->ok)->toBeTrue()
+        ->and($this->ran['mode_gated'])->toBe(1);
+})->with(['agent', 'llm_call then tool_use'])
+    ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('refuses a mode-gated tool the tool policy does not list, and records it', function (string $shape): void {
+    app(AgentRuntime::class)->setToolPolicy(ToolPolicy::fromArray(['revision' => 'r2', 'allow' => [['tool' => 'plain']], 'honor' => true]));
+    $denied = [];
+    Event::listen(ToolDenied::class, function (ToolDenied $event) use (&$denied): void {
+        $denied[] = $event->tool;
+    });
+    $this->replies = [flowCall('mode_gated'), flowText()];
+
+    $result = runFlowShape($shape, 'mode_gated', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['mode_gated'])->toBe(0)
+        ->and($denied)->toBe(['mode_gated']);
+})->with(['agent', 'llm_call then tool_use'])
+    ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('keeps a tool\'s own approval setting when the tool policy lists it', function (): void {
+    config()->set('prism-harness.agent.modes.flow.requires_approval', ['mode_gated', 'gated_closure']);
+    app(AgentRuntime::class)->setToolPolicy(ToolPolicy::fromArray(['revision' => 'r3', 'allow' => [['tool' => 'gated_closure']], 'honor' => true]));
+    $invoker = flowSession()->flowTools()->toolInvoker();
+
+    expect(fn () => $invoker->invoke('gated_closure', ['target' => 'prod']))->toThrow(ToolNotAvailable::class, 'needs approval')
+        ->and($this->ran['gated_closure'])->toBe(0);
+});
+
+it('applies a tool policy revoked after the toolset was built', function (): void {
+    $runtime = app(AgentRuntime::class);
+    $runtime->setToolPolicy(ToolPolicy::fromArray(['revision' => 'r4', 'allow' => [['tool' => 'mode_gated']], 'honor' => true]));
+    $invoker = flowSession()->flowTools()->toolInvoker();
+
+    expect($invoker->invoke('mode_gated', ['target' => 'x']))->toBe('ran');
+
+    $runtime->setToolPolicy(ToolPolicy::fromArray(['revision' => 'r5', 'allow' => [], 'honor' => true]));
+
+    expect(fn () => $invoker->invoke('mode_gated', ['target' => 'x']))->toThrow(ToolNotAvailable::class, 'needs approval')
+        ->and($this->ran['mode_gated'])->toBe(1);
+});
+
+it('does not treat a person\'s recorded approval as permission for a workflow node', function (): void {
+    // The handler runs inside approve(), the one moment the thread holds an
+    // approval with no result yet, and tries the same call through the workflow.
+    config()->set('prism-harness.agent.modes.flow.tools', ['approved_call']);
+    config()->set('prism-harness.agent.modes.flow.requires_approval', ['approved_call']);
+    $session = flowSession();
+    $invoker = $session->flowTools()->toolInvoker();
+    $runs = 0;
+    $outcome = null;
+    app(ToolRegistry::class)->register(
+        (new Tool)->as('approved_call')->for('Probe.')->withStringParameter('target', 'Target')
+            ->using(function (string $target) use (&$runs, &$outcome, $invoker): string {
+                $runs++;
+                if ($runs === 1) {
+                    try {
+                        $invoker->invoke('approved_call', ['target' => $target]);
+                        $outcome = 'ran';
+                    } catch (ToolNotAvailable $refused) {
+                        $outcome = $refused->getMessage();
+                    }
+                }
+
+                return 'ran';
+            }),
+    );
+    $this->replies = [flowCall('approved_call'), flowText()];
+
+    $pending = $session->send('go')->pendingApprovals();
+    expect($pending)->toHaveCount(1);
+
+    $session->approve($pending[0]);
+
+    expect($runs)->toBe(1)
+        ->and($outcome)->toContain('needs approval');
 });
 
 it('offers the model no subagent through the workflow boundary', function (): void {

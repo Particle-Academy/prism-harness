@@ -58,6 +58,8 @@ final class HarnessToolInvoker implements ToolInvoker
 
         try {
             if ($tools[$tool]->needsApproval($args)) {
+                $this->toolset->refused($tools[$tool], $args);
+
                 throw ToolNotAvailable::awaitingApproval($tool);
             }
 

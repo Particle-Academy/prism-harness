@@ -352,6 +352,16 @@ class Session
     }
 
     /**
+     * @internal Called through {@see FlowToolset}.
+     *
+     * @param  array<string, mixed>  $arguments
+     */
+    public function recordFlowRefusal(Tool $tool, array $arguments): void
+    {
+        $this->runtime?->recordFlowRefusal($this, $tool, $arguments);
+    }
+
+    /**
      * Take a turn whose answer is a document.
      *
      * The same run as `send()` — the mode's system prompt, tools and budget all

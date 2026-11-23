@@ -74,6 +74,16 @@ final class FlowToolset
         return $tools;
     }
 
+    /**
+     * @internal Called by {@see HarnessToolInvoker}.
+     *
+     * @param  array<string, mixed>  $arguments
+     */
+    public function refused(Tool $tool, array $arguments): void
+    {
+        $this->session->recordFlowRefusal($tool, $arguments);
+    }
+
     /** @return list<string> */
     public function names(): array
     {
