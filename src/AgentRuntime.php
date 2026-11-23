@@ -24,6 +24,7 @@ use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
+use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Flow\FlowToolset;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
@@ -1216,59 +1217,205 @@ final readonly class AgentRuntime
     }
 
     /**
-     * The tools a workflow may run for this session: the current mode's, with
-     * its approval marks and the application's authorization applied.
-     *
-     * Subagents are left out. A subagent call spends from a run budget, and a
-     * workflow node has no run to charge.
+     * What a workflow may offer the model for this session: each tool's name,
+     * description and schema, with nothing that can execute.
      *
      * @internal Read through {@see FlowToolset}.
      *
      * @param  list<string>|null  $toolNames  narrows the mode, and cannot widen it
      * @return list<Tool>
      */
-    public function flowTools(Session $session, ?array $toolNames = null): array
+    public function flowOffer(Session $session, ?array $toolNames = null): array
     {
-        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-
-        if ($session->agent() !== null) {
-            $offer = $this->ownedOffer($mode, $session, $toolNames, inspection: true);
-            $tools = [];
-            foreach ($offer['tools'] as $index => $tool) {
-                if ($offer['descriptors'][$index]['owner'] !== 'harness.subagent') {
-                    $tools[] = $tool;
-                }
+        return array_map(static function (array $entry): Tool {
+            $tool = $entry['tool'];
+            $copy = (new Tool)->as($tool->name())->for($tool->description())->clientExecuted();
+            foreach ($tool->parameters() as $name => $schema) {
+                $copy->withParameter($schema, in_array($name, $tool->requiredParameters(), true));
+            }
+            $options = $tool->providerOptions();
+            if (is_array($options)) {
+                $copy->withProviderOptions($options);
             }
 
-            return $this->approvalScopedOffer($session, $tools);
-        }
-
-        $names = $this->toolNamesFor($mode, $toolNames);
-        if ($mode->skills !== []) {
-            $names[] = 'skill_read';
-        }
-        $subagents = array_map(static fn ($subagent): string => $subagent->name, array_values($mode->subagents));
-        $resolved = $this->tools->resolve(array_values(array_unique(array_diff($names, $subagents))), $session);
-
-        foreach ($resolved as $name => $tool) {
-            if ($mode->needsApproval($name)) {
-                $resolved[$name] = $this->gated($session, $tool, self::FLOW_RUN);
-            }
-        }
-
-        return $this->approvalScopedOffer($session, $this->authorizer->allowed($session, $resolved));
+            return $copy;
+        }, array_values($this->flowEntries($session, $toolNames)));
     }
 
     /**
-     * Record that a workflow node was refused a call that needs approval.
+     * Decide one model step as a whole, before any of its calls is handed over.
      *
      * @internal Called through {@see FlowToolset}.
      *
-     * @param  array<string, mixed>  $arguments
+     * @param  list<string>|null  $toolNames
+     * @param  list<string>  $offered  what this request offered the model
+     * @param  list<array{name: string, id: string, arguments: array<array-key, mixed>|null}>  $calls
+     *
+     * @throws ToolNotAvailable when any call in the step may not run
      */
-    public function recordFlowRefusal(Session $session, Tool $tool, array $arguments): void
+    public function admitFlowCalls(Session $session, ?array $toolNames, array $offered, array $calls): void
+    {
+        $entries = $this->flowEntries($session, $toolNames);
+        $ids = [];
+        $admitted = [];
+
+        foreach ($calls as $call) {
+            $name = $call['name'];
+            if (isset($ids[$call['id']])) {
+                throw ToolNotAvailable::repeatedCall($name);
+            }
+            $ids[$call['id']] = true;
+            if (! in_array($name, $offered, true) || ! isset($entries[$name])) {
+                throw ToolNotAvailable::named($name, $offered);
+            }
+            if ($call['arguments'] === null) {
+                throw ToolNotAvailable::unreadableArguments($name);
+            }
+            $admitted[] = [$entries[$name], $call['arguments']];
+        }
+
+        $refusal = null;
+        foreach ($admitted as [$entry, $arguments]) {
+            $refused = $this->flowRefusal($session, $entry, $arguments);
+            $refusal ??= $refused;
+        }
+
+        if ($refusal instanceof ToolNotAvailable) {
+            throw $refusal;
+        }
+    }
+
+    /**
+     * Run one workflow tool call, deciding it again at the moment it runs.
+     *
+     * @internal Called through {@see FlowToolset}.
+     *
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $arguments
+     *
+     * @throws ToolNotAvailable when the call may not run
+     */
+    public function runFlowTool(Session $session, ?array $toolNames, string $name, array $arguments): mixed
+    {
+        $entries = $this->flowEntries($session, $toolNames);
+
+        if (! isset($entries[$name])) {
+            throw ToolNotAvailable::named($name, array_keys($entries));
+        }
+
+        $refusal = $this->flowRefusal($session, $entries[$name], $arguments);
+
+        if ($refusal instanceof ToolNotAvailable) {
+            throw $refusal;
+        }
+
+        if ($entries[$name]['gated']) {
+            $this->emitToolDecision(ToolAutoAllowed::class, $session, self::FLOW_RUN, $entries[$name]['tool'], $name, $arguments, 'policy');
+        }
+
+        return $entries[$name]['tool']->handle(...$arguments);
+    }
+
+    /**
+     * The most model steps one workflow loop may take on this session.
+     *
+     * @internal Called through {@see FlowToolset}.
+     */
+    public function flowStepLimit(Session $session): int
+    {
+        $session->forgetCachedState();
+
+        return $this->ceilingFor($session, $this->modes->forAgent($session->agent())->resolve($session->mode()));
+    }
+
+    /**
+     * The tools a workflow may run right now, read fresh from the session's
+     * store. Subagents are left out: a subagent call spends from a run budget,
+     * and a workflow node has no run to charge.
+     *
+     * @param  list<string>|null  $toolNames
+     * @return array<string, array{tool: Tool, gated: bool}>
+     */
+    private function flowEntries(Session $session, ?array $toolNames): array
+    {
+        $session->forgetCachedState();
+        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+
+        [$resolved, $offered] = $session->resolveReadOnly($mode->name, function (Session $view) use ($mode, $toolNames): array {
+            $wantsSkills = $toolNames === null || in_array('skill_read', $toolNames, true);
+            $names = $this->toolNamesFor($mode, $toolNames);
+            $additional = [];
+            if ($view->agent() === null && $mode->skills !== [] && $wantsSkills) {
+                $names[] = 'skill_read';
+            }
+            if ($view->agent() !== null && $wantsSkills && in_array('skill_read', $mode->tools, true)) {
+                $additional['skill_read'] = ['tool' => $this->skills->readerTool($mode->skills), 'owner' => 'harness', 'source' => 'builtin'];
+            }
+            $subagents = array_map(static fn ($subagent): string => $subagent->name, array_values($mode->subagents));
+            $detailed = $this->tools->resolveDetailed(array_values(array_unique(array_diff($names, $subagents))), $view, $additional);
+            $resolved = [];
+            foreach (array_diff_key($detailed, array_flip($subagents)) as $name => $entry) {
+                $resolved[$name] = $entry['tool'];
+            }
+            if ($view->agent() !== null && isset($resolved['complete_task'])) {
+                $authorizer = $this->authorizer->forSession($view);
+                if (! $authorizer->enabled() || ! $authorizer->hasCallPolicy()) {
+                    throw new \LogicException('Named task completion requires enabled authorization and an explicit call policy.');
+                }
+            }
+
+            return [$resolved, $this->authorizer->allowed($view, $resolved)];
+        });
+
+        $entries = [];
+        foreach ($this->approvalScopedOffer($session, $offered) as $tool) {
+            $name = $tool->name();
+            $entries[$name] = ['tool' => $resolved[$name], 'gated' => $mode->needsApproval($name)];
+        }
+
+        return $entries;
+    }
+
+    /**
+     * Why this call may not run, or null. Records each refusal.
+     *
+     * @param  array{tool: Tool, gated: bool}  $entry
+     * @param  array<array-key, mixed>  $arguments
+     */
+    private function flowRefusal(Session $session, array $entry, array $arguments): ?ToolNotAvailable
+    {
+        $tool = $entry['tool'];
+
+        foreach (array_keys($arguments) as $key) {
+            if (is_int($key) || preg_match('/\A[+-]?[0-9]+\z/', $key) === 1) {
+                return $this->recordFlowRefusal($session, $tool, $arguments, 'arguments', ToolNotAvailable::positionalArguments($tool->name()));
+            }
+        }
+
+        try {
+            if ($tool->needsApproval($arguments)) {
+                return $this->recordFlowRefusal($session, $tool, $arguments, 'approval', ToolNotAvailable::awaitingApproval($tool->name()));
+            }
+            if (! $this->authorizer->allowsCall($session, $tool, $arguments)) {
+                return $this->recordFlowRefusal($session, $tool, $arguments, 'authorization', ToolNotAvailable::refusedByPolicy($tool->name()));
+            }
+            // Read last, so a change made while the checks above ran still counts.
+            if ($entry['gated'] && ! $this->toolPolicy()->allows($this->tools->declarationOf($tool))) {
+                return $this->recordFlowRefusal($session, $tool, $arguments, 'approval', ToolNotAvailable::awaitingApproval($tool->name()));
+            }
+        } catch (Throwable $failure) {
+            return $this->recordFlowRefusal($session, $tool, $arguments, 'check_failed', ToolNotAvailable::failed($tool->name(), $failure));
+        }
+
+        return null;
+    }
+
+    /** @param array<array-key, mixed> $arguments */
+    private function recordFlowRefusal(Session $session, Tool $tool, array $arguments, string $reason, ToolNotAvailable $refusal): ToolNotAvailable
     {
         $this->emitToolDecision(ToolDenied::class, $session, self::FLOW_RUN, $tool, $tool->name(), $arguments, 'policy');
+
+        return $refusal;
     }
 
     /**

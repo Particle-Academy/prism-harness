@@ -44,6 +44,12 @@ final class PrismLlmClient implements LlmClient
 
     private readonly ?FlowToolset $toolset;
 
+    /** Model steps taken by the workflow loop in progress. */
+    private int $loopSteps = 0;
+
+    /** Whether the last step handed tool calls back, so the next one continues its loop. */
+    private bool $loopOpen = false;
+
     /**
      * @param  FlowToolset|array{}  $tools  from {@see Session::flowTools()}; empty for a call with no tools
      *
@@ -70,6 +76,12 @@ final class PrismLlmClient implements LlmClient
      */
     public function complete(string $prompt, array $options = []): array
     {
+        if ($this->session?->thread()->approvalToolNames() !== null) {
+            // The thread ends on a turn a person is deciding. Sending it would
+            // make core settle that turn from inside a workflow.
+            throw ToolNotAvailable::sessionAwaitingApproval();
+        }
+
         $provider = $this->stringOption($options, 'provider')
             ?? $this->session?->provider()
             ?? $this->defaultProvider
@@ -105,12 +117,11 @@ final class PrismLlmClient implements LlmClient
         $tools = $this->requestedTools($options);
 
         if ($tools !== []) {
-            // The model sees each tool's schema and core runs none of them:
-            // HarnessToolInvoker is the one place a workflow's tool executes.
-            $pending->withTools(array_map(
-                static fn (Tool $tool): Tool => (clone $tool)->clientExecuted(),
-                $tools,
-            ));
+            $this->countLoopStep();
+            // Schemas only, from FlowToolset::offered(). Core has nothing here
+            // it could run: HarnessToolInvoker is the one place a workflow's
+            // tool executes.
+            $pending->withTools($tools);
             // ONE step. fancy-flow owns the loop: AgentExecutor invokes the
             // tools itself and calls back.
             $pending->withMaxSteps(1);
@@ -132,7 +143,9 @@ final class PrismLlmClient implements LlmClient
             ],
         ];
 
-        $calls = $this->withinOffer($this->toolCalls($response->steps), $response->steps, $tools);
+        $this->admitStep($response->steps, $tools);
+        $calls = $this->toolCalls($response->steps);
+        $this->loopOpen = $calls !== [];
 
         if ($calls !== []) {
             // Undeclared by the contract and read by AgentExecutor. Emitted
@@ -164,7 +177,10 @@ final class PrismLlmClient implements LlmClient
             return [];
         }
 
-        $available = $this->toolset->tools();
+        $available = [];
+        foreach ($this->toolset->offered() as $tool) {
+            $available[$tool->name()] = $tool;
+        }
         $tools = [];
 
         foreach ($requested as $name) {
@@ -179,44 +195,59 @@ final class PrismLlmClient implements LlmClient
     }
 
     /**
-     * The calls a workflow may be handed: those naming a tool this request
-     * offered, with arguments that could be read.
+     * Hold a workflow's agent loop to the session's step limit.
      *
-     * @param  list<array<string, mixed>>  $calls
+     * fancy-flow owns the loop and does not tell this client which one a call
+     * belongs to, so a loop is read from its shape: a step that handed back tool
+     * calls is continued by the next. A loop left unfinished by a failed node
+     * counts against the next call once, and refusing resets the count.
+     */
+    private function countLoopStep(): void
+    {
+        $this->loopSteps = $this->loopOpen ? $this->loopSteps + 1 : 1;
+        $this->loopOpen = false;
+        $limit = $this->toolset?->stepLimit() ?? 1;
+
+        if ($this->loopSteps > $limit) {
+            $this->loopSteps = 0;
+
+            throw ToolNotAvailable::stepLimit($limit);
+        }
+    }
+
+    /**
+     * Decide the whole step before any of its calls reaches the workflow.
+     *
      * @param  iterable<mixed>  $steps
      * @param  list<Tool>  $offered
-     * @return list<array<string, mixed>>
      *
-     * @throws ToolNotAvailable when the model named a tool it was not offered
+     * @throws ToolNotAvailable when any call in the step may not run
      */
-    private function withinOffer(array $calls, iterable $steps, array $offered): array
+    private function admitStep(iterable $steps, array $offered): void
     {
-        $names = array_map(static fn (Tool $tool): string => $tool->name(), $offered);
-
-        foreach ($calls as $call) {
-            if (! in_array($call['name'], $names, true)) {
-                throw ToolNotAvailable::named((string) $call['name'], $names);
-            }
-        }
-
-        $unreadable = [];
+        $calls = [];
 
         foreach ($steps as $step) {
             foreach ($step->toolCalls as $call) {
                 try {
-                    if (! is_array($call->arguments())) {
-                        $unreadable[$call->id] = true;
-                    }
+                    $arguments = $call->arguments();
                 } catch (Throwable) {
-                    $unreadable[$call->id] = true;
+                    $arguments = null;
                 }
+
+                $calls[] = ['name' => (string) $call->name, 'id' => (string) $call->id, 'arguments' => is_array($arguments) ? $arguments : null];
             }
         }
 
-        return array_values(array_filter(
-            $calls,
-            static fn (array $call): bool => ! isset($unreadable[$call['id']]),
-        ));
+        if ($calls === []) {
+            return;
+        }
+
+        if (! $this->toolset instanceof FlowToolset) {
+            throw ToolNotAvailable::named($calls[0]['name'], []);
+        }
+
+        $this->toolset->admit(array_map(static fn (Tool $tool): string => $tool->name(), $offered), $calls);
     }
 
     /**

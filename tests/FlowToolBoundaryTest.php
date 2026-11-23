@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Events\ToolDenied;
+use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Exceptions\UnboundFlowTools;
 use Prism\Harness\Flow\HarnessAgentExecutor;
@@ -43,6 +44,8 @@ use Tests\Fixtures\Participant;
  */
 
 const FLOW_ENGINE_SKIP = 'Needs the real fancy-flow engine: install tools/engine-fixture/fancy-flow (PHP 8.4).';
+
+const FLOW_REFUSAL_EVENT = 'Prism\Harness\Events\ToolDenied';
 
 function flowEngineMissing(): bool
 {
@@ -393,7 +396,7 @@ it('applies a named agent\'s own mode, approval marks and authorization', functi
         ->and(fn () => $invoker->invoke('hidden', ['target' => 'x']))->toThrow(ToolNotAvailable::class)
         ->and(fn () => $invoker->invoke('worker', ['target' => 'x']))->toThrow(ToolNotAvailable::class);
 
-    $invoker->invoke('refused', ['target' => 'x']);
+    expect(fn () => $invoker->invoke('refused', ['target' => 'x']))->toThrow(ToolNotAvailable::class, 'call policy');
 
     expect($runs)->toBe(['open' => 1, 'held' => 0, 'hidden' => 0, 'refused' => 0]);
 });
@@ -492,4 +495,308 @@ it('offers the model no subagent through the workflow boundary', function (): vo
 
     expect($names)->toContain('plain')
         ->and($names)->not->toContain('helper');
+});
+
+final class FlowInvokableTool extends Tool
+{
+    public function __construct(string $name, private Closure $hit)
+    {
+        $this->as($name)->for('Probe.')->withStringParameter('target', 'Target');
+    }
+
+    public function __invoke(string $target): string
+    {
+        ($this->hit)();
+
+        return 'ran';
+    }
+}
+
+/** A real turn paused on a tool, with the decision recorded and no result yet. */
+function flowPausedApproved(string $tool, string $key = 'paused'): Session
+{
+    config()->set('prism-harness.agent.lock_wait', 0);
+    test()->replies = [flowCall($tool)];
+    $session = flowSession($key);
+    $pending = $session->send('go')->pendingApprovals();
+    expect($pending)->toHaveCount(1);
+
+    flowSession($key)->lock(function () use ($session, $pending): void {
+        try {
+            $session->approve($pending[0]);
+        } catch (SessionLocked) {
+            // The decision is written before the resume asks for the lock.
+        }
+    }, 10, 0);
+
+    return $session;
+}
+
+function flowStep(array ...$calls): array
+{
+    return flowReply(array_map(
+        fn (array $call): array => ['id' => 'fc_'.$call[1], 'type' => 'function_call', 'status' => 'completed', 'arguments' => $call[2] ?? '{"target":"prod"}', 'call_id' => $call[1], 'name' => $call[0]],
+        $calls,
+    ));
+}
+
+it('leaves a waiting turn to the session', function (string $policy): void {
+    $runs = 0;
+    app(ToolRegistry::class)->register(new FlowInvokableTool('class_gated', function () use (&$runs): void {
+        $runs++;
+    }));
+    config()->set('prism-harness.agent.modes.flow.tools', ['class_gated']);
+    config()->set('prism-harness.agent.modes.flow.requires_approval', ['class_gated']);
+    if ($policy === 'refused by the call policy') {
+        config()->set('prism-harness.agent.authorize_tools', true);
+        app()->forgetInstance(ToolAuthorizer::class);
+        Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+        Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => false);
+    }
+    $session = flowPausedApproved('class_gated');
+    $client = $session->flowTools()->llmClient('openai', 'gpt-4o');
+
+    foreach ([1, 2, 3] as $attempt) {
+        $this->replies = [flowText()];
+        try {
+            $client->complete('go', ['tools' => ['class_gated']]);
+        } catch (ToolNotAvailable) {
+            // Refusing is the expected outcome; running is not.
+        }
+    }
+
+    expect($runs)->toBe(0);
+})->with(['approved', 'refused by the call policy']);
+
+it('refuses a model call while the session is waiting on an approval', function (): void {
+    config()->set('prism-harness.agent.modes.flow.tools', ['mode_gated']);
+    $session = flowPausedApproved('mode_gated');
+    $this->replies = [flowText()];
+    $before = count($this->hosts);
+
+    expect(fn () => $session->flowTools()->llmClient('openai', 'gpt-4o')->complete('go', ['tools' => ['mode_gated']]))
+        ->toThrow(ToolNotAvailable::class, 'waiting on an approval')
+        ->and(count($this->hosts))->toBe($before);
+});
+
+it('accepts named arguments only', function (array $arguments): void {
+    $invoker = flowSession()->flowTools()->toolInvoker();
+
+    expect(fn () => $invoker->invoke('gated_closure', $arguments))->toThrow(ToolNotAvailable::class, 'named arguments')
+        ->and(fn () => $invoker->invoke('plain', $arguments))->toThrow(ToolNotAvailable::class, 'named arguments')
+        ->and($this->ran['gated_closure'])->toBe(0)
+        ->and($this->ran['plain'])->toBe(0);
+})->with([
+    'list' => [['prod']],
+    'string zero' => [['0' => 'prod']],
+    'mixed' => [['target' => 'safe', 1 => 'prod']],
+    'negative' => [['-1' => 'prod']],
+    'padded digits' => [['01' => 'prod']],
+    'signed' => [['+1' => 'prod']],
+]);
+
+it('accepts named arguments only across a model step', function (string $arguments): void {
+    $this->replies = [flowStep(['plain', 'c1'], ['gated_closure', 'c2', $arguments]), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession(), ['plain', 'gated_closure']);
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['plain'])->toBe(0)
+        ->and($this->ran['gated_closure'])->toBe(0);
+})->with(['{"0":"prod"}', '["prod"]'])
+    ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('reads a mode changed through another session object', function (): void {
+    $key = 'stale-mode';
+    $held = flowSession($key);
+    $held->mode();
+    $invoker = $held->flowTools()->toolInvoker();
+    expect($invoker->invoke('plain', ['target' => 'x']))->toBe('ran');
+
+    flowSession($key)->usingMode('narrow');
+
+    expect(fn () => $invoker->invoke('plain', ['target' => 'x']))->toThrow(ToolNotAvailable::class)
+        ->and($this->ran['plain'])->toBe(1);
+});
+
+it('runs nothing from a step that holds a call needing approval', function (string $gated): void {
+    $this->replies = [flowStep(['plain', 'c1'], [$gated, 'c2']), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession(), ['plain', $gated]);
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['plain'])->toBe(0)
+        ->and($this->ran[$gated])->toBe(0);
+})->with(['gated_bool', 'gated_closure', 'mode_gated'])
+    ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('runs nothing from a step the call policy refuses part of', function (): void {
+    config()->set('prism-harness.agent.authorize_tools', true);
+    app()->forgetInstance(ToolAuthorizer::class);
+    Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn ($user, Session $session, Tool $tool): bool => $tool->name() !== 'call_refused');
+    $this->replies = [flowStep(['plain', 'c1'], ['call_refused', 'c2']), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession(), ['plain', 'call_refused']);
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['plain'])->toBe(0)
+        ->and($this->ran['call_refused'])->toBe(0);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('runs nothing from a step that repeats a call id', function (): void {
+    $this->replies = [flowStep(['plain', 'dup'], ['plain', 'dup']), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['plain'])->toBe(0);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('runs nothing from a step with an unreadable call beside a valid one', function (): void {
+    $this->replies = [flowStep(['plain', 'c1'], ['plain', 'c2', '{not json']), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['plain'])->toBe(0);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('fails the node when the call policy refuses, so nothing downstream runs', function (): void {
+    config()->set('prism-harness.agent.authorize_tools', true);
+    app()->forgetInstance(ToolAuthorizer::class);
+    Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn ($user, Session $session, Tool $tool): bool => $tool->name() !== 'call_refused');
+    [$llm, $invoker] = flowAdapters(flowSession());
+    $registry = Builtin::executors(new ExecutorDeps(llm: $llm, tools: $invoker));
+
+    $result = (new FlowRunner)->run(new FlowGraph([
+        new FlowNode(id: 't', type: 'tool_use', config: ['tool' => 'call_refused', 'args' => ['target' => 'prod']]),
+        new FlowNode(id: 'n', type: 'tool_use', config: ['tool' => 'plain', 'args' => ['target' => 'after']]),
+    ], [new FlowEdge('e', 't', 'n')]), $registry);
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['call_refused'])->toBe(0)
+        ->and($this->ran['plain'])->toBe(0);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('offers skill_read only when the narrowing list names it', function (): void {
+    config()->set('prism-harness.agent.modes.flow.skills', ['guide']);
+    $session = flowSession();
+
+    expect($session->flowTools([])->names())->toBe([])
+        ->and($session->flowTools(['plain'])->names())->toBe(['plain'])
+        ->and($session->flowTools()->names())->toContain('skill_read')
+        ->and($session->flowTools(['skill_read'])->names())->toBe(['skill_read']);
+});
+
+it('holds an agent loop to the session step limit', function (): void {
+    $session = flowSession();
+    $session->usingMaxSteps(1);
+    $this->replies = [flowCall('plain'), flowCall('plain'), flowCall('plain'), flowText()];
+
+    $result = runFlowShape('agent', 'plain', $session);
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('step limit')
+        ->and($this->ran['plain'])->toBe(1)
+        ->and($this->hosts)->toHaveCount(1);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('lets a loop finish inside the session step limit, and starts a new count afterwards', function (): void {
+    $session = flowSession();
+    $session->usingMaxSteps(2);
+    [$llm] = flowAdapters($session);
+
+    foreach ([1, 2] as $loop) {
+        $this->replies = [flowCall('plain'), flowText()];
+        expect($llm->complete('go', ['tools' => ['plain']]))->toHaveKey('tool_calls');
+        expect($llm->complete('Tool results: []', ['tools' => ['plain']]))->not->toHaveKey('tool_calls');
+    }
+});
+
+it('fails the node on a sole call with unreadable arguments', function (): void {
+    $this->replies = [flowCall('plain', '{not json'), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('could not be read')
+        ->and($this->ran['plain'])->toBe(0);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('exposes no runnable tool through the public toolset', function (): void {
+    $toolset = flowSession()->flowTools();
+
+    expect(method_exists($toolset, 'tools'))->toBeFalse()
+        ->and(method_exists($toolset, 'offered'))->toBeTrue();
+
+    foreach ($toolset->offered() as $tool) {
+        expect($tool::class)->toBe(Tool::class)
+            ->and($tool->isClientExecuted())->toBeTrue()
+            ->and($tool->hasApprovalConfigured())->toBeFalse()
+            ->and($tool->handle(target: 'x'))->not->toBe('ran');
+    }
+
+    expect(array_sum($this->ran))->toBe(0);
+});
+
+it('keeps each offered tool\'s schema', function (): void {
+    app(ToolRegistry::class)->register(
+        (new Tool)->as('schema_tool')->for('Described.')
+            ->withStringParameter('a', 'First')
+            ->withNumberParameter('b', 'Second', required: false)
+            ->withProviderOptions(['strict' => true])
+            ->using(fn (string $a): string => $a),
+    );
+    config()->set('prism-harness.agent.modes.flow.tools', ['schema_tool']);
+    $toolset = flowSession()->flowTools();
+
+    expect(method_exists($toolset, 'offered'))->toBeTrue();
+
+    $offered = $toolset->offered()[0];
+
+    expect($offered->description())->toBe('Described.')
+        ->and(array_keys($offered->parameters()))->toBe(['a', 'b'])
+        ->and($offered->requiredParameters())->toBe(['a'])
+        ->and($offered->providerOptions('strict'))->toBeTrue();
+});
+
+it('records a refused workflow call once, as a refusal and with no arguments', function (): void {
+    $seen = [];
+    Event::listen(FLOW_REFUSAL_EVENT, function (object $event) use (&$seen): void {
+        $seen[] = $event;
+    });
+    $asked = 0;
+    if (class_exists('Prism\Harness\Events\ToolApprovalAsked')) {
+        Event::listen('Prism\Harness\Events\ToolApprovalAsked', function () use (&$asked): void {
+            $asked++;
+        });
+    }
+    $invoker = flowSession()->flowTools()->toolInvoker();
+
+    expect(fn () => $invoker->invoke('mode_gated', ['target' => 'TOP-SECRET']))->toThrow(ToolNotAvailable::class);
+
+    expect($seen)->toHaveCount(1)
+        ->and($seen[0]->tool)->toBe('mode_gated')
+        ->and($seen[0]->runId)->toBe('flow')
+        ->and(json_encode($seen[0]))->not->toContain('TOP-SECRET')
+        ->and($asked)->toBe(0);
+});
+
+it('applies a tool policy revoked while the call policy is deciding', function (): void {
+    config()->set('prism-harness.agent.authorize_tools', true);
+    app()->forgetInstance(ToolAuthorizer::class);
+    app()->forgetInstance(AgentRuntime::class);
+    Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+    Gate::define(ToolAuthorizer::CALL_ABILITY, function (): bool {
+        app(AgentRuntime::class)->setToolPolicy(ToolPolicy::fromArray(['revision' => 'r7', 'allow' => [], 'honor' => true]));
+
+        return true;
+    });
+    app(AgentRuntime::class)->setToolPolicy(ToolPolicy::fromArray(['revision' => 'r6', 'allow' => [['tool' => 'mode_gated']], 'honor' => true]));
+    $invoker = flowSession()->flowTools()->toolInvoker();
+
+    expect(fn () => $invoker->invoke('mode_gated', ['target' => 'x']))->toThrow(ToolNotAvailable::class, 'needs approval')
+        ->and($this->ran['mode_gated'])->toBe(0);
 });

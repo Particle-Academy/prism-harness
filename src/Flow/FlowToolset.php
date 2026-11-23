@@ -12,7 +12,7 @@ use Prism\Prism\Tool;
 /**
  * The tools one session may use from a workflow.
  *
- * It holds a session and an optional list of names, and no tools. Every read
+ * It holds a session and an optional list of names, and no tools. Every use
  * asks the session again, so a workflow that resumes later sees the session's
  * current mode and authorization rather than what was true when it was built.
  * The names can only narrow what the session offers.
@@ -62,32 +62,47 @@ final class FlowToolset
         return $this->session;
     }
 
-    /** @return array<string, Tool> what the session offers right now, by name */
-    public function tools(): array
-    {
-        $tools = [];
-
-        foreach ($this->session->offeredFlowTools($this->names) as $tool) {
-            $tools[$tool->name()] = $tool;
-        }
-
-        return $tools;
-    }
-
     /**
-     * @internal Called by {@see HarnessToolInvoker}.
+     * What the session offers right now, as schemas with nothing that can run.
      *
-     * @param  array<string, mixed>  $arguments
+     * @return list<Tool>
      */
-    public function refused(Tool $tool, array $arguments): void
+    public function offered(): array
     {
-        $this->session->recordFlowRefusal($tool, $arguments);
+        return $this->session->flowRuntime()->flowOffer($this->session, $this->names);
     }
 
     /** @return list<string> */
     public function names(): array
     {
-        return array_keys($this->tools());
+        return array_map(static fn (Tool $tool): string => $tool->name(), $this->offered());
+    }
+
+    /**
+     * @internal Called by {@see PrismLlmClient}.
+     *
+     * @param  list<string>  $offered
+     * @param  list<array{name: string, id: string, arguments: array<array-key, mixed>|null}>  $calls
+     */
+    public function admit(array $offered, array $calls): void
+    {
+        $this->session->flowRuntime()->admitFlowCalls($this->session, $this->names, $offered, $calls);
+    }
+
+    /**
+     * @internal Called by {@see HarnessToolInvoker}.
+     *
+     * @param  array<array-key, mixed>  $arguments
+     */
+    public function run(string $tool, array $arguments): mixed
+    {
+        return $this->session->flowRuntime()->runFlowTool($this->session, $this->names, $tool, $arguments);
+    }
+
+    /** @internal Called by {@see PrismLlmClient}. */
+    public function stepLimit(): int
+    {
+        return $this->session->flowRuntime()->flowStepLimit($this->session);
     }
 
     public function llmClient(?string $provider = null, ?string $model = null): PrismLlmClient
