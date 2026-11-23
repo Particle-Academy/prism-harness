@@ -46,22 +46,16 @@ final class HarnessToolInvoker implements ToolInvoker
      */
     public function invoke(string $tool, array $args = []): mixed
     {
-        $tools = $this->toolset?->tools() ?? [];
-
-        if (! isset($tools[$tool])) {
+        if (! $this->toolset instanceof FlowToolset) {
             // Thrown rather than returned as an error string. A model that
             // reads "unknown tool" as a result will try a different name and
             // burn the step budget guessing; the node should fail so the
             // workflow author sees which name was wrong.
-            throw ToolNotAvailable::named($tool, array_keys($tools));
+            throw ToolNotAvailable::named($tool, []);
         }
 
         try {
-            if ($tools[$tool]->needsApproval($args)) {
-                throw ToolNotAvailable::awaitingApproval($tool);
-            }
-
-            $result = $tools[$tool]->handle(...$args);
+            $result = $this->toolset->run($tool, $args);
 
             if ($result instanceof ToolError) {
                 // Prism has a first-class failure VALUE as well as exceptions:

@@ -336,19 +336,20 @@ class Session
         return FlowToolset::of($this, $toolNames);
     }
 
-    /**
-     * @internal Read through {@see FlowToolset}.
-     *
-     * @param  list<string>|null  $toolNames
-     * @return list<Tool>
-     */
-    public function offeredFlowTools(?array $toolNames = null): array
+    /** @internal The workflow toolset's route to the runtime. */
+    public function flowRuntime(): AgentRuntime
     {
         if (! $this->runtime instanceof AgentRuntime) {
             throw new \LogicException('This Harness session has no agent runtime.');
         }
 
-        return $this->runtime->flowTools($this, $toolNames);
+        return $this->runtime;
+    }
+
+    /** @internal Makes the next read come from the store, for a long-held session. */
+    public function forgetCachedState(): void
+    {
+        $this->cachedState = null;
     }
 
     /**

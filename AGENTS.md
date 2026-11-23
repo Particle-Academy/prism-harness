@@ -48,8 +48,10 @@ you re-check; a stale version number there is worse than none.
 `$session->flowTools()`, then `->llmClient()` and `->toolInvoker()`. The adapter
 constructors refuse a plain array of tools with `UnboundFlowTools`. The toolset
 holds no tools: each read asks the session, so the current mode, approval marks
-and authorization apply. A call that needs approval fails its node, because a
-workflow node cannot ask a person.
+and authorization apply. A model step is decided whole before any call is
+handed over, so a step holding a call that may not run runs nothing. A call that
+needs approval fails its node, because a workflow node cannot ask a person. An
+agent loop is held to the session's step limit. Build the adapters per run.
 
 There is one test whose entire job is to fail loudly if either side is renamed
 locally (`it('implements the contract fancy-flow actually declares')`). It
@@ -67,8 +69,8 @@ here rather than left for the next person to discover.
 **`withMaxSteps(1)` and `clientExecuted()` when tools are present.** fancy-flow's
 `AgentExecutor` owns the loop — it invokes tools itself and calls back. The step
 cap alone does not stop core running a tool inside that step, so the client
-offers `clientExecuted()` clones and `HarnessToolInvoker` is the one place a
-workflow's tool runs.
+offers schema-only copies and `HarnessToolInvoker` is the one place a workflow's
+tool runs.
 
 **`tool_calls` is emitted on the result array.** As of fancy-flow-php v0.42.0
 this is declared on their contract; before that it was undeclared and read
