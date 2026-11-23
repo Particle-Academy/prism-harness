@@ -14,7 +14,8 @@ final readonly class RunStarted extends HarnessEvent
         public string $model,
         ?string $parentRunId = null,
         ?string $rootRunId = null,
+        ?string $harnessAgent = null,
     ) {
-        parent::__construct($sessionKey, $runId, $parentRunId, $rootRunId);
+        parent::__construct($sessionKey, $runId, $parentRunId, $rootRunId, $harnessAgent);
     }
 }

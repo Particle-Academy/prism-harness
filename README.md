@@ -88,7 +88,7 @@ remain editable by default; set prism-harness.addresses.immutable_legacy_threads
 to true to opt into the same immutability guard for those rows.
 
 Configure scalar overrides under agents.support (using your agent's id):
-provider, model, max_steps_ceiling,
+provider, model, spend_ceiling, max_steps_ceiling,
 max_output_tokens_per_call, lock_ttl, lock_wait, default_scope, default_task_list
 and ephemeral_ttl. Unset values fall back globally; a nullable field's explicit
 null clears its default. Step/output caps narrow the existing parent ledger and
@@ -587,6 +587,82 @@ rather than running without the option you believe is on.
 Extended thinking survives a stored thread: the signature Anthropic needs on a later tool-use
 turn is recorded with the assistant message and replayed with it.
 
+## Provider and model per mode, subagent and agent
+
+Several agents can share one app, each on its own provider and model. A mode and a subagent
+declaration each take an optional `provider` and `model`, next to the agent's own defaults:
+
+```php
+'agents' => [
+    'planner' => [
+        'owner' => 'app',
+        'model' => 'claude-sonnet-4-5',
+        'modes' => [
+            'plan' => [
+                'model' => 'claude-opus-4-1',        // this mode only
+                'tools' => ['research', 'audit'],     // named agents offer listed subagents
+                'agents' => ['auditor'],              // agents this mode may delegate to
+                'subagents' => [
+                    'research' => ['mode' => 'research', 'model' => 'claude-haiku-4-5'],
+                    'audit' => ['mode' => 'audit', 'agent' => 'auditor'],
+                ],
+            ],
+            'research' => ['system_prompt' => 'You research and report.'],
+        ],
+    ],
+    'auditor' => [
+        'owner' => 'app',
+        'provider' => 'my-vllm',                      // any name Prism resolves, custom included
+        'model' => 'local-auditor',
+        'spend_ceiling' => 0.50,                      // USD, per root run tree
+        'max_output_tokens_per_call' => 2048,
+        'modes' => ['audit' => ['system_prompt' => 'You audit.']],
+    ],
+],
+```
+
+Provider and model resolve **separately**, so a mode naming only a model keeps the agent's
+provider. For a run:
+
+1. the session override (`usingProvider()` / `usingModel()`);
+2. the mode;
+3. the agent's default;
+4. the global `agent.provider` / `agent.model`.
+
+For a subagent's child run:
+
+1. the parent session's override, **only** if the subagent declares
+   `'inherit_session_model' => true`;
+2. the subagent declaration's `provider` / `model`;
+3. the mode the child runs in;
+4. the parent's mode, only when the child runs in the parent's agent;
+5. the child agent's default, then the global default.
+
+A parent session's override is not inherited by default. It was chosen for one session, and a
+child running on it would spend against a choice nobody made for the child. A parent mode's
+model does not cross into another agent, because that agent usually exists for its provider.
+The child session's own override slot is not read: the runner owns that address.
+
+**Delegating to another agent is declared, never inherited.** A subagent with `'agent' => 'auditor'`
+is accepted only when the parent mode lists `auditor` in `agents`. Otherwise the mode is refused
+when it loads, before any provider request. Agent ids are checked exactly as written. A padded
+or mixed-case id (`' auditor'`, `'Auditor'`) is refused, never trimmed or case-folded, because
+folding would let a lookalike name select another agent's authority. The subagent's `mode` is
+looked up in the agent it runs in.
+
+**`spend_ceiling` caps one agent inside the shared ledger.** It is not a second account. Each
+model call by that agent must fit the tree's `max_cost_usd`, when one is set, **and** the agent's
+charged and reserved spend in the same root ledger. A call that does not fit is refused with
+`agent_spend_ceiling_exceeded` before its request. A subagent refused this way returns to its
+parent as an `exhausted` result, and the parent carries on. A ceiling puts that agent's calls on
+the priced path, so the provider/model needs a `pricing` entry and the agent needs
+`max_output_tokens_per_call`. An unpriced custom provider is refused with `budget_unpriced`.
+The ceiling applies per root run tree. Per-day windows and per-agent cost observers are not
+implemented.
+
+`SummarisingCompaction` and `VoiceExchange` take a provider name as well as the `Provider`
+enum, so a custom provider works there too.
+
 ## Voice
 
 Press-to-talk: one utterance in, one answer out, against an ordinary session.
@@ -728,6 +804,10 @@ and an event may end up on a screen.
 
 Every event carries `run_id`, `parent_run_id` and `root_run_id` — the same identifiers on the
 stored rows — so an existing live stream can be joined to this record without adopting it.
+
+A run in a named agent adds `harness_agent` to `correlation()`, and a delegated child carries its
+own agent. Legacy runs keep exactly the fields above. The name is deliberately not `agentId`,
+so it cannot be confused with agent-integrations' presence id. The two are unrelated.
 
 ## Checking your configuration
 

@@ -232,7 +232,7 @@ final readonly class StepCalls
 
     private function assertUncapped(RunContext $run): void
     {
-        if ($run->budget->maxCostUsd !== null || $run->observer !== null
+        if ($run->capped() || $run->observer !== null
             || $run->ledger->inheritCostObserver(null) !== null) {
             throw RunNotPermitted::callBudget('step_only_requires_uncapped_tree');
         }

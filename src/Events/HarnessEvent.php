@@ -25,6 +25,14 @@ abstract readonly class HarnessEvent
         public string $runId,
         public ?string $parentRunId = null,
         public ?string $rootRunId = null,
+        /**
+         * The named agent the run belongs to; null in the legacy namespace.
+         *
+         * Called `harness_agent`, never `agentId`, so it cannot be confused
+         * with agent-integrations' presence id. The two are unrelated and the
+         * harness never maps one onto the other.
+         */
+        public ?string $harnessAgent = null,
     ) {}
 
     /**
@@ -32,11 +40,15 @@ abstract readonly class HarnessEvent
      */
     public function correlation(): array
     {
-        return [
+        $correlation = [
             'session_key' => $this->sessionKey,
             'run_id' => $this->runId,
             'parent_run_id' => $this->parentRunId,
             'root_run_id' => $this->rootRunId ?? $this->runId,
         ];
+
+        // Emitted for a named agent only: legacy correlation keeps exactly the
+        // fields it always had, so a consumer comparing it whole is unaffected.
+        return $this->harnessAgent === null ? $correlation : [...$correlation, 'harness_agent' => $this->harnessAgent];
     }
 }

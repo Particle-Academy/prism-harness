@@ -36,6 +36,8 @@ final class RunStepTagger
 {
     private ?string $sessionKey = null;
 
+    private ?string $harnessAgent = null;
+
     private ?string $runId;
 
     private ?string $parentRunId = null;
@@ -92,9 +94,10 @@ final class RunStepTagger
         return $this->runId ??= 'run_'.bin2hex(random_bytes(12));
     }
 
-    public function bind(string $sessionKey, string $runId, ?string $parentRunId, ?string $rootRunId): void
+    public function bind(string $sessionKey, string $runId, ?string $parentRunId, ?string $rootRunId, ?string $harnessAgent = null): void
     {
         $this->sessionKey = $sessionKey;
+        $this->harnessAgent = $harnessAgent;
         $this->runId = $runId;
         $this->parentRunId = $parentRunId;
         $this->rootRunId = $rootRunId ?? $runId;
@@ -301,7 +304,7 @@ final class RunStepTagger
         }
 
         try {
-            event(new RunStepped($this->sessionKey ?? '', $step));
+            event(new RunStepped($this->sessionKey ?? '', $step, $this->harnessAgent));
         } catch (Throwable $listenerFailure) {
             // Observation only. A listener that throws must not stop or alter
             // the run it is watching.

@@ -62,6 +62,22 @@ final readonly class RunContext
          * the run exactly as it would with no context at all.
          */
         public bool $metadataOnly = false,
+        /**
+         * Where a subagent's child takes its provider and model from; null for
+         * any run the subagent runner did not start. See {@see ChildBinding}.
+         */
+        public ?ChildBinding $binding = null,
+        /**
+         * The named agent this run belongs to — the `harness_agent` its spend
+         * is labelled with in the shared ledger. Set by the runtime from the
+         * session, never by a caller's claim, so a child labels its own spend.
+         */
+        public ?string $agent = null,
+        /**
+         * That agent's `spend_ceiling`, in USD, against the SAME root ledger.
+         * A second limit on one account, never a second account.
+         */
+        public ?float $agentCeilingUsd = null,
     ) {
         $this->observer = $ledger->inheritCostObserver($observer);
     }
@@ -81,14 +97,68 @@ final readonly class RunContext
     public function withTurn(?string $turnId): self
     {
         return new self($this->ledger, $this->budget, $this->parentRunId, $this->parentThreadId,
-            $this->depth, $this->pricing, $this->observer, $turnId, $this->actor, $this->metadataOnly);
+            $this->depth, $this->pricing, $this->observer, $turnId, $this->actor, $this->metadataOnly,
+            $this->binding, $this->agent, $this->agentCeilingUsd);
     }
 
     /** The same run, acting for an actor the application has authorized. */
     public function withActor(?string $actor): self
     {
         return new self($this->ledger, $this->budget, $this->parentRunId, $this->parentThreadId,
-            $this->depth, $this->pricing, $this->observer, $this->turnId, $actor, $this->metadataOnly);
+            $this->depth, $this->pricing, $this->observer, $this->turnId, $actor, $this->metadataOnly,
+            $this->binding, $this->agent, $this->agentCeilingUsd);
+    }
+
+    /** The same run, as the subagent runner binds a child's provider and model. */
+    public function withBinding(ChildBinding $binding): self
+    {
+        return $this->rebuild(binding: $binding);
+    }
+
+    /** The same run, labelled as a named agent's and held to its ceiling. */
+    public function forAgent(?string $agent, ?float $ceilingUsd): self
+    {
+        return $this->rebuild(agent: $agent, agentCeilingUsd: $ceilingUsd, labelled: true);
+    }
+
+    /** The same run, under a different budget or observer, keeping everything else. */
+    public function withBudget(RunBudget $budget, ?CallCostObserver $observer = null): self
+    {
+        return $this->rebuild(budget: $budget, observer: $observer);
+    }
+
+    /**
+     * Whether a model call in this run must be priced and reserved: a cost cap
+     * on the tree, or a spend ceiling on the agent.
+     */
+    public function capped(): bool
+    {
+        return $this->budget->maxCostUsd !== null || $this->agentCeilingUsd !== null;
+    }
+
+    private function rebuild(
+        ?RunBudget $budget = null,
+        ?CallCostObserver $observer = null,
+        ?ChildBinding $binding = null,
+        ?string $agent = null,
+        ?float $agentCeilingUsd = null,
+        bool $labelled = false,
+    ): self {
+        return new self(
+            ledger: $this->ledger,
+            budget: $budget ?? $this->budget,
+            parentRunId: $this->parentRunId,
+            parentThreadId: $this->parentThreadId,
+            depth: $this->depth,
+            pricing: $this->pricing,
+            observer: $observer ?? $this->observer,
+            turnId: $this->turnId,
+            actor: $this->actor,
+            metadataOnly: $this->metadataOnly,
+            binding: $binding ?? $this->binding,
+            agent: $labelled ? $agent : $this->agent,
+            agentCeilingUsd: $labelled ? $agentCeilingUsd : $this->agentCeilingUsd,
+        );
     }
 
     /** @param array<string, array<string, array<string, mixed>>> $pricing */

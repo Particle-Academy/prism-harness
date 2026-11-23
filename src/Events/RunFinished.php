@@ -22,7 +22,8 @@ final readonly class RunFinished extends HarnessEvent
         public bool $awaitingApproval,
         ?string $parentRunId = null,
         ?string $rootRunId = null,
+        ?string $harnessAgent = null,
     ) {
-        parent::__construct($sessionKey, $runId, $parentRunId, $rootRunId);
+        parent::__construct($sessionKey, $runId, $parentRunId, $rootRunId, $harnessAgent);
     }
 }

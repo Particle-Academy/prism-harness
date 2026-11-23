@@ -317,7 +317,7 @@ final readonly class BudgetedCalls
         $model = $request->model();
         $estimate = $this->price->estimate($request, $provider, $kind);
         $call = new CallReservation($callId, $providerKey, $model, $estimate->worstCaseUsd, $kind, $estimate->diagnostics);
-        $reservation = $run->ledger->reserveCost($run->budget, $call->worstCaseUsd);
+        $reservation = $run->ledger->reserveCost($run->budget, $call->worstCaseUsd, $run->agent, $run->agentCeilingUsd);
         try {
             $run->observer?->reserving($call, $run);
         } catch (Throwable $failure) {

@@ -14,6 +14,9 @@ final readonly class AgentMode
      * @param  array<string, Subagent>  $subagents  nested agents this mode may call, by name
      * @param  list<string>  $requiresApproval  tools that must not run until a human says so
      * @param  array<string, mixed>  $providerOptions  passed to Prism's withProviderOptions() on every run in this mode
+     * @param  ?string  $provider  the provider a run in this mode uses unless the session overrides it
+     * @param  ?string  $model  the model, falling back on its own: a mode naming only a model keeps the agent's provider
+     * @param  list<string>  $agents  named agents a subagent of this mode may run in; declared here, never inherited
      */
     public function __construct(
         public string $name,
@@ -24,6 +27,9 @@ final readonly class AgentMode
         public array $subagents = [],
         public array $requiresApproval = [],
         public array $providerOptions = [],
+        public ?string $provider = null,
+        public ?string $model = null,
+        public array $agents = [],
     ) {}
 
     /**

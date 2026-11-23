@@ -27,6 +27,27 @@ final readonly class Subagent
          * subagent's name.
          */
         public ?string $scopeSuffix = null,
+        /**
+         * The provider and model the child runs on. They win over every mode,
+         * the child's and the parent's, and lose only to a parent session
+         * override this declaration asked to inherit.
+         */
+        public ?string $provider = null,
+        public ?string $model = null,
+        /**
+         * The named agent the child runs in; null keeps the parent's. Another
+         * agent is valid only when the parent MODE lists it in `agents`, which
+         * ModeRegistry checks when the mode loads.
+         */
+        public ?string $agent = null,
+        /**
+         * Whether the child takes the parent SESSION's provider/model override.
+         *
+         * Off by default. An override is a choice one session's user made, and
+         * a child that silently ran on it would spend against a choice nobody
+         * made for the child.
+         */
+        public bool $inheritSessionModel = false,
     ) {}
 
     /**
@@ -45,6 +66,10 @@ final readonly class Subagent
             mode: is_string($mode) && $mode !== '' ? $mode : $name,
             budget: RunBudget::fromArray($config),
             scopeSuffix: is_string($config['scope'] ?? null) ? $config['scope'] : null,
+            provider: is_string($config['provider'] ?? null) && $config['provider'] !== '' ? $config['provider'] : null,
+            model: is_string($config['model'] ?? null) && $config['model'] !== '' ? $config['model'] : null,
+            agent: is_string($config['agent'] ?? null) ? $config['agent'] : null,
+            inheritSessionModel: ($config['inherit_session_model'] ?? false) === true,
         );
     }
 

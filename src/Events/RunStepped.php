@@ -19,7 +19,8 @@ final readonly class RunStepped extends HarnessEvent
     public function __construct(
         string $sessionKey,
         public RunStep $step,
+        ?string $harnessAgent = null,
     ) {
-        parent::__construct($sessionKey, $step->runId, $step->parentRunId, $step->rootRunId);
+        parent::__construct($sessionKey, $step->runId, $step->parentRunId, $step->rootRunId, $harnessAgent);
     }
 }

@@ -19,7 +19,8 @@ final readonly class RunFailed extends HarnessEvent
         public string $exception,
         ?string $parentRunId = null,
         ?string $rootRunId = null,
+        ?string $harnessAgent = null,
     ) {
-        parent::__construct($sessionKey, $runId, $parentRunId, $rootRunId);
+        parent::__construct($sessionKey, $runId, $parentRunId, $rootRunId, $harnessAgent);
     }
 }
