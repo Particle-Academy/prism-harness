@@ -24,6 +24,7 @@ use Prism\Harness\Sessions\DatabaseAddressIndex;
 use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
+use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
@@ -645,6 +646,62 @@ class Thread extends Model implements ThreadContract
         }
 
         return null;
+    }
+
+    /**
+     * How many calls of the turn paused at the transcript tail a person
+     * approved, for this tool and these arguments, that have no result yet.
+     *
+     * @internal The evidence a gated tool requires before it runs.
+     */
+    public function approvedCallsAwaitingResult(string $name, string $argumentsDigest): int
+    {
+        $approved = [];
+        $finished = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            $payload = $stored->payload;
+            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
+                foreach ($payload['tool_results'] ?? [] as $result) {
+                    if (is_array($result) && is_string($result['tool_call_id'] ?? null)) {
+                        $finished[$result['tool_call_id']] = true;
+                    }
+                }
+                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
+                    if (is_array($response) && is_string($response['approval_id'] ?? null) && ($response['approved'] ?? false) === true) {
+                        $approved[$response['approval_id']] = true;
+                    }
+                }
+
+                continue;
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                return 0;
+            }
+
+            $approvedCallIds = [];
+            foreach ($payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && is_string($request['approval_id'] ?? null) && isset($approved[$request['approval_id']])
+                    && is_string($request['tool_call_id'] ?? null)) {
+                    $approvedCallIds[$request['tool_call_id']] = true;
+                }
+            }
+
+            $count = 0;
+            foreach ($payload['tool_calls'] ?? [] as $call) {
+                if (! is_array($call) || ! is_string($call['id'] ?? null) || ! isset($approvedCallIds[$call['id']])
+                    || isset($finished[$call['id']]) || ($call['name'] ?? null) !== $name) {
+                    continue;
+                }
+                $arguments = $call['arguments'] ?? [];
+                if (CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments) === $argumentsDigest) {
+                    $count++;
+                }
+            }
+
+            return $count;
+        }
+
+        return 0;
     }
 
     private function afterRecording(): self

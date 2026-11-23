@@ -14,12 +14,14 @@ use Prism\Harness\Events\ToolAutoAllowed;
 use Prism\Harness\Events\ToolDecision;
 use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\ToolPolicyRefused;
+use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolPolicy;
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Exceptions\PrismException;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Tests\Fixtures\Participant;
@@ -443,4 +445,157 @@ it('keeps the scope and tier the policy decides on when the authorizer is enable
 })->with([
     'a provider tool, unscoped entry' => ['plain', ['tool' => 'read']],
     'a destructive provider tool' => ['destructive', ['server' => 'files', 'tool' => 'read']],
+]);
+
+it('does not run a gated call when recording the approval request fails', function (Throwable $failure): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')]);
+    runtimeUsing(ToolPolicy::none());
+    Event::listen(ToolApprovalAsked::class, function () use ($failure): void {
+        throw $failure;
+    });
+    policyModel([['read', ['a' => '1']]]);
+
+    try {
+        policySession()->send('go');
+    } catch (Throwable) {
+        // Stopping the run is an acceptable outcome. Running the tool is not.
+    }
+
+    expect(PolicyRan::$names)->toBe([]);
+})->with([
+    'a Prism exception' => fn (): Throwable => new PrismException('listener failed'),
+    'a runtime exception' => fn (): Throwable => new RuntimeException('listener failed'),
+]);
+
+it('still asks for a listed tool whose own approval check says yes', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')->requiresApproval(fn (array $arguments): bool => ($arguments['a'] ?? '') === 'sensitive')]);
+    runtimeUsing(allowOnly([['tool' => 'read']]));
+    policyModel([['read', ['a' => 'sensitive']]]);
+
+    $response = policySession()->send('go');
+
+    expect($response->awaitingApproval())->toBeTrue()
+        ->and(PolicyRan::$names)->toBe([])
+        ->and(decisionTypes())->toBe(['tool_approval_asked']);
+});
+
+it('runs a listed tool without asking when its own approval check says no', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')->requiresApproval(fn (array $arguments): bool => ($arguments['a'] ?? '') === 'sensitive')]);
+    runtimeUsing(allowOnly([['tool' => 'read']]));
+    policyModel([['read', ['a' => 'routine']]]);
+
+    expect(policySession()->send('go')->awaitingApproval())->toBeFalse()
+        ->and(PolicyRan::$names)->toBe(['read'])
+        ->and(decisionTypes())->toBe(['tool_auto_allowed']);
+});
+
+it('still asks for a listed tool that always requires approval', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')->requiresApproval()]);
+    runtimeUsing(allowOnly([['tool' => 'read']]));
+    policyModel([['read']]);
+
+    expect(policySession()->send('go')->awaitingApproval())->toBeTrue()
+        ->and(PolicyRan::$names)->toBe([]);
+});
+
+it('does not run a listed tool whose own approval check fails', function (Throwable $failure): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')->requiresApproval(function () use ($failure): bool {
+        throw $failure;
+    })]);
+    runtimeUsing(allowOnly([['tool' => 'read']]));
+    policyModel([['read']]);
+
+    try {
+        policySession()->send('go');
+    } catch (Throwable) {
+        // Stopping the run is an acceptable outcome. Running the tool is not.
+    }
+
+    expect(PolicyRan::$names)->toBe([]);
+})->with([
+    'a Prism exception' => fn (): Throwable => new PrismException('check failed'),
+    'a runtime exception' => fn (): Throwable => new RuntimeException('check failed'),
+]);
+
+it('runs a call a person approved, once, when its own approval check said yes', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')->requiresApproval(fn (array $arguments): bool => true)]);
+    runtimeUsing(allowOnly([['tool' => 'read']]));
+    policyModel([['read', ['a' => '1']]]);
+    $pending = policySession()->send('go')->pendingApprovals();
+
+    policySession()->decide([new ToolApprovalResponse($pending[0]->approvalId, true)]);
+
+    expect(PolicyRan::$names)->toBe(['read']);
+});
+
+it('runs each of two identical calls a person approved', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')]);
+    runtimeUsing(ToolPolicy::none());
+    policyModel([['read', ['a' => '1']], ['read', ['a' => '1']]]);
+    $pending = policySession()->send('go')->pendingApprovals();
+
+    policySession()->decide([
+        new ToolApprovalResponse($pending[0]->approvalId, true),
+        new ToolApprovalResponse($pending[1]->approvalId, true),
+    ]);
+
+    expect(PolicyRan::$names)->toBe(['read', 'read']);
+});
+
+it('runs only the approved one of two identical calls', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')]);
+    runtimeUsing(ToolPolicy::none());
+    policyModel([['read', ['a' => '1']], ['read', ['a' => '1']]]);
+    $pending = policySession()->send('go')->pendingApprovals();
+
+    policySession()->decide([
+        new ToolApprovalResponse($pending[0]->approvalId, true),
+        new ToolApprovalResponse($pending[1]->approvalId, false, 'no'),
+    ]);
+
+    expect(PolicyRan::$names)->toBe(['read']);
+});
+
+it('runs a call a person approved for a named agent, and not one denied', function (bool $approved, array $ran): void {
+    config()->set('prism-harness.agents', ['support' => []]);
+    app(ToolRegistry::class)->forAgent('support')->register(policyTool('lookup'), 'support');
+    app(ModeRegistry::class)->forAgent('support')->register('reply', ['tools' => ['*'], 'requires_approval' => ['*']], 'support')->setDefault('reply');
+    policyModel([['lookup', ['a' => '1']]]);
+    $participant = Participant::query()->firstOrCreate(['name' => 'Ada']);
+    $session = fn (): Session => app(PrismHarness::class)->forAgent('support')->for($participant)->session('named');
+
+    $pending = $session()->send('go')->pendingApprovals();
+    $session()->decide([new ToolApprovalResponse($pending[0]->approvalId, $approved, $approved ? null : 'no')]);
+
+    expect(PolicyRan::$names)->toBe($ran);
+})->with([
+    'approved' => [true, ['lookup']],
+    'denied' => [false, []],
+]);
+
+it('runs an approved call whatever shape its arguments take', function (array $arguments): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')]);
+    runtimeUsing(ToolPolicy::none());
+    policyModel([['read', $arguments]]);
+    $pending = policySession()->send('go')->pendingApprovals();
+
+    policySession()->decide([new ToolApprovalResponse($pending[0]->approvalId, true)]);
+
+    expect(PolicyRan::$names)->toBe(['read']);
+})->with([
+    'none' => [[]],
+    'nested' => [['b' => ['z' => 1, 'a' => [true, null]], 'a' => 'x']],
+    'unicode' => [['a' => "caf\u{00E9} \u{1F600}"]],
+    'a float' => [['a' => 1.5]],
+    'a whole float' => [['a' => 2.0]],
+    'an empty list' => [['a' => []]],
 ]);
