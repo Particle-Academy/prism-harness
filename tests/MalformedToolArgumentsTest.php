@@ -10,13 +10,10 @@ use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
-use Prism\Prism\ValueObjects\ToolCall;
 use Tests\Fixtures\Participant;
 
 // Driven through Session::send() and Prism's real OpenAI handler over faked
-// HTTP. The rule lives in core, so this needs a core that has it.
-$coreHasTheRule = method_exists(ToolCall::class, 'hasMalformedArguments');
-$skipReason = 'Needs a particle-academy/prism release that reports unparseable tool arguments.';
+// HTTP. The rule lives in core, which has it from 0.152.
 
 beforeEach(function (): void {
     config()->set('prism.providers.openai.api_key', 'sk-test');
@@ -93,7 +90,7 @@ it('reaches no approval check and no handler on unparseable arguments', function
     'truncated JSON' => ['{"amount": 5'],
     'a number' => ['5'],
     'a list' => ['[1,2]'],
-])->skip(! $coreHasTheRule, $skipReason);
+]);
 
 it('asks nobody when the mode gates the tool', function (): void {
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['transfer']);
@@ -107,7 +104,7 @@ it('asks nobody when the mode gates the tool', function (): void {
         ->and($this->checks)->toBe(0)
         ->and($this->runs)->toBe(0);
     Event::assertNotDispatched(ToolApprovalAsked::class);
-})->skip(! $coreHasTheRule, $skipReason);
+});
 
 it('streams a malformed call as a failed step without crashing', function (string $arguments): void {
     config()->set('prism.providers.openai.api_format', 'chat_completions');
@@ -136,7 +133,7 @@ it('streams a malformed call as a failed step without crashing', function (strin
 })->with([
     'truncated JSON' => ['{"amount": 5'],
     'a number' => ['5'],
-])->skip(! $coreHasTheRule, $skipReason);
+]);
 
 function flowCompletion(string $arguments): array
 {
@@ -156,7 +153,7 @@ it('does not hand a workflow an unparseable call to invoke', function (): void {
 it('does not hand a workflow a non-object call to invoke', function (string $arguments): void {
     expect(fn (): array => flowCompletion($arguments))->toThrow(ToolNotAvailable::class)
         ->and($this->runs)->toBe(0);
-})->with(['a number' => ['5'], 'a list' => ['[1,2]']])->skip(! $coreHasTheRule, $skipReason);
+})->with(['a number' => ['5'], 'a list' => ['[1,2]']]);
 
 it('still hands a workflow a well-formed call', function (): void {
     $result = flowCompletion('{"amount":"5"}');
@@ -190,4 +187,4 @@ it('runs nothing for an argument key that could bind by position', function (str
     'an integer key beside a name' => ['{"0":"500","note":"x"}'],
     'a name beside an integer key' => ['{"note":"x","1":"500"}'],
     'a negative integer key' => ['{"-1":"500"}'],
-])->skip(! $coreHasTheRule, $skipReason);
+]);
