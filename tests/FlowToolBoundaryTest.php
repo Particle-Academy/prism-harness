@@ -58,9 +58,9 @@ function flowReply(array $output): array
     ];
 }
 
-function flowCall(string $name, string $arguments = '{"target":"prod"}'): array
+function flowCall(string $name, string $arguments = '{"target":"prod"}', int $call = 1): array
 {
-    return flowReply([['id' => 'fc_1', 'type' => 'function_call', 'status' => 'completed', 'arguments' => $arguments, 'call_id' => 'call_1', 'name' => $name]]);
+    return flowReply([['id' => "fc_{$call}", 'type' => 'function_call', 'status' => 'completed', 'arguments' => $arguments, 'call_id' => "call_{$call}", 'name' => $name]]);
 }
 
 function flowText(): array
@@ -660,7 +660,7 @@ function runToolNodes(Session $session, array $nodes, array $edges): RunResult
 it('runs separate model and tool nodes past the session step limit', function (): void {
     $session = flowSession();
     $session->usingMaxSteps(2);
-    $this->replies = [flowCall('plain'), flowCall('plain'), flowCall('plain')];
+    $this->replies = [flowCall('plain', call: 1), flowCall('plain', call: 2), flowCall('plain', call: 3)];
     [$nodes, $edges] = sequentialToolNodes(3);
 
     $result = runToolNodes($session, $nodes, $edges);
@@ -673,7 +673,7 @@ it('runs separate model and tool nodes past the session step limit', function ()
 it('still holds an agent loop to the limit after separate nodes', function (): void {
     $session = flowSession();
     $session->usingMaxSteps(2);
-    $this->replies = [flowCall('plain'), flowCall('plain'), flowCall('plain'), flowCall('plain'), flowCall('plain')];
+    $this->replies = array_map(fn (int $call): array => flowCall('plain', call: $call), range(1, 5));
     [$nodes, $edges] = sequentialToolNodes(2);
     $nodes[] = new FlowNode(id: 'a', type: 'agent', config: ['prompt' => 'go', 'model' => 'gpt-4o', 'tools' => ['plain'], 'max_steps' => 5]);
     $edges[] = new FlowEdge('to-agent', 't2', 'a');
@@ -711,6 +711,91 @@ it('counts a tool-result continuation as the loop even when it names a provider'
     expect(fn () => $llm->complete('Tool results: []', ['provider' => 'openai', 'tools' => ['plain']]))
         ->toThrow(ToolNotAvailable::class, 'step limit');
 });
+
+it('refuses a call id that already ran in an earlier step of the loop', function (): void {
+    $this->replies = [flowCall('plain', call: 7), flowCall('plain', call: 7), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('repeated a call id')
+        ->and($this->ran['plain'])->toBe(1)
+        ->and($this->hosts)->toHaveCount(2);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('refuses a call id that already ran in an earlier node of the run', function (): void {
+    $this->replies = [flowCall('plain', call: 7), flowCall('plain', call: 7)];
+    [$nodes, $edges] = sequentialToolNodes(2);
+
+    $result = runToolNodes(flowSession(), $nodes, $edges);
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('repeated a call id')
+        ->and($this->ran['plain'])->toBe(1)
+        ->and($this->hosts)->toHaveCount(2);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('refuses a repeated result id under a new item id', function (): void {
+    $first = flowCall('plain', call: 7);
+    $second = flowCall('plain', call: 7);
+    $second['output'][0]['id'] = 'fc_other';
+    $this->replies = [$first, $second, flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('repeated a call id')
+        ->and($this->ran['plain'])->toBe(1);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('runs every step of a loop whose call ids differ', function (): void {
+    $this->replies = [flowCall('plain', call: 1), flowCall('plain', call: 2), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeTrue()
+        ->and($this->ran['plain'])->toBe(2)
+        ->and($this->hosts)->toHaveCount(3);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('lets a separate run use a call id an earlier run used', function (): void {
+    $session = flowSession();
+
+    $this->replies = [flowCall('plain', call: 7), flowText()];
+    expect(runFlowShape('agent', 'plain', $session)->ok)->toBeTrue();
+
+    $this->replies = [flowCall('plain', call: 7), flowText()];
+    expect(runFlowShape('agent', 'plain', $session)->ok)->toBeTrue()
+        ->and($this->ran['plain'])->toBe(2);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('does not read a call as repeated when it was never run', function (): void {
+    $session = flowSession();
+    [$llm, $invoker] = flowAdapters($session);
+    $this->replies = [flowCall('plain', call: 7), flowCall('plain', call: 7)];
+
+    $llm->complete('go', ['tools' => ['plain']]);
+    $llm->complete('go', ['tools' => ['plain']]);
+    $invoker->invoke('plain', ['target' => 'prod']);
+
+    expect($this->ran['plain'])->toBe(1);
+});
+
+it('runs repeated calls on a provider that sends no call ids', function (): void {
+    config()->set('prism.providers.gemini.api_key', 'not-a-key');
+    config()->set('prism.providers.gemini.url', 'https://flow-boundary.invalid/v1');
+    $session = flowSession();
+    $session->usingProvider('gemini');
+    $call = ['candidates' => [['finishReason' => 'STOP', 'content' => ['role' => 'model', 'parts' => [['functionCall' => ['name' => 'plain', 'args' => ['target' => 'prod']]]]]]], 'usageMetadata' => ['promptTokenCount' => 1, 'candidatesTokenCount' => 1], 'modelVersion' => 'm'];
+    $text = ['candidates' => [['finishReason' => 'STOP', 'content' => ['role' => 'model', 'parts' => [['text' => 'done']]]]], 'usageMetadata' => ['promptTokenCount' => 1, 'candidatesTokenCount' => 1], 'modelVersion' => 'm'];
+    $this->replies = [$call, $call, $text];
+
+    $result = runFlowShape('agent', 'plain', $session);
+
+    expect($result->ok)->toBeTrue()
+        ->and($this->ran['plain'])->toBe(2)
+        ->and($this->hosts)->toHaveCount(3);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
 
 it('fails the node on a sole call with unreadable arguments', function (): void {
     $this->replies = [flowCall('plain', '{not json'), flowText()];

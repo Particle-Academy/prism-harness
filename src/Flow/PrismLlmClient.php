@@ -144,7 +144,7 @@ final class PrismLlmClient implements LlmClient
             ],
         ];
 
-        $this->admitStep($response->steps, $tools);
+        $this->admitStep($response->steps, $tools, $provider);
         $calls = $this->toolCalls($response->steps);
 
         if ($loopStep) {
@@ -254,7 +254,7 @@ final class PrismLlmClient implements LlmClient
      *
      * @throws ToolNotAvailable when any call in the step may not run
      */
-    private function admitStep(iterable $steps, array $offered): void
+    private function admitStep(iterable $steps, array $offered, mixed $provider): void
     {
         $calls = [];
 
@@ -266,7 +266,12 @@ final class PrismLlmClient implements LlmClient
                     $arguments = null;
                 }
 
-                $calls[] = ['name' => (string) $call->name, 'id' => (string) $call->id, 'arguments' => is_array($arguments) ? $arguments : null];
+                $calls[] = [
+                    'name' => (string) $call->name,
+                    'id' => (string) $call->id,
+                    'arguments' => is_array($arguments) ? $arguments : null,
+                    'callIds' => $this->callIds($call, $provider),
+                ];
             }
         }
 
@@ -279,6 +284,25 @@ final class PrismLlmClient implements LlmClient
         }
 
         $this->toolset->admit(array_map(static fn (Tool $tool): string => $tool->name(), $offered), $calls);
+    }
+
+    /**
+     * The ids that identify this call. Gemini and Vertex send none, and core
+     * fills the id with the tool's name, so on those a repeat is an ordinary
+     * second call. An empty id identifies nothing on any provider.
+     *
+     * @return list<string>
+     */
+    private function callIds(object $call, mixed $provider): array
+    {
+        if (in_array($provider, ['gemini', 'vertex'], true)) {
+            return [];
+        }
+
+        return array_values(array_unique(array_filter(
+            [(string) $call->id, (string) ($call->resultId ?? '')],
+            static fn (string $id): bool => $id !== '',
+        )));
     }
 
     /**

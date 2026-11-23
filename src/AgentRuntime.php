@@ -1262,10 +1262,11 @@ final readonly class AgentRuntime
      *
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $arguments
+     * @param  (callable(): void)|null  $starting  called once the call is allowed, just before its handler
      *
      * @throws ToolNotAvailable when the call may not run
      */
-    public function runFlowTool(Session $session, ?array $toolNames, string $name, array $arguments): mixed
+    public function runFlowTool(Session $session, ?array $toolNames, string $name, array $arguments, ?callable $starting = null): mixed
     {
         $entries = $this->flowEntries($session, $toolNames);
 
@@ -1277,6 +1278,10 @@ final readonly class AgentRuntime
 
         if ($refusal instanceof ToolNotAvailable) {
             throw $refusal;
+        }
+
+        if ($starting !== null) {
+            $starting();
         }
 
         return $entries[$name]['tool']->handle(...$arguments);
