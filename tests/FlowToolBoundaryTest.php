@@ -885,6 +885,118 @@ it('runs repeated calls on a provider that sends no call ids', function (): void
         ->and($this->hosts)->toHaveCount(3);
 })->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
 
+/** A reply holding these calls, in the shape of a provider that issues no call ids. */
+function idlessCalls(string $provider, string $tool, array $argumentSets): array
+{
+    if ($provider === 'ollama') {
+        return [
+            'model' => 'm', 'created_at' => '2026-01-01T00:00:00Z', 'done' => true, 'done_reason' => 'stop', 'prompt_eval_count' => 1, 'eval_count' => 1,
+            'message' => ['role' => 'assistant', 'content' => '', 'tool_calls' => array_map(
+                fn (array $arguments): array => ['function' => ['name' => $tool, 'arguments' => $arguments]],
+                $argumentSets,
+            )],
+        ];
+    }
+
+    return [
+        'modelVersion' => 'm', 'usageMetadata' => ['promptTokenCount' => 1, 'candidatesTokenCount' => 1],
+        'candidates' => [['finishReason' => 'STOP', 'content' => ['role' => 'model', 'parts' => array_map(
+            fn (array $arguments): array => ['functionCall' => ['name' => $tool, 'args' => $arguments]],
+            $argumentSets,
+        )]]],
+    ];
+}
+
+function idlessText(string $provider): array
+{
+    return $provider === 'ollama'
+        ? ['model' => 'm', 'created_at' => '2026-01-01T00:00:00Z', 'done' => true, 'done_reason' => 'stop', 'prompt_eval_count' => 1, 'eval_count' => 1, 'message' => ['role' => 'assistant', 'content' => 'done']]
+        : ['modelVersion' => 'm', 'usageMetadata' => ['promptTokenCount' => 1, 'candidatesTokenCount' => 1], 'candidates' => [['finishReason' => 'STOP', 'content' => ['role' => 'model', 'parts' => [['text' => 'done']]]]]];
+}
+
+function idlessSession(string $provider): Session
+{
+    config()->set('prism.providers.gemini.api_key', 'not-a-key');
+    config()->set('prism.providers.gemini.url', 'https://flow-boundary.invalid/v1');
+    config()->set('prism.providers.ollama.url', 'https://flow-boundary.invalid');
+    config()->set('prism.providers.vertex.project_id', 'p');
+    config()->set('prism.providers.vertex.access_token', 'not-a-key');
+
+    $session = flowSession();
+    $session->usingProvider($provider);
+
+    return $session;
+}
+
+/** Vertex builds its own host, which the fake still answers. */
+function forgetVertexHosts(object $test, string $provider): void
+{
+    if ($provider === 'vertex') {
+        expect(array_unique($test->hosts))->toBe(['us-central1-aiplatform.googleapis.com']);
+        $test->hosts = [];
+    }
+}
+
+it('runs parallel calls to one tool on a provider without call ids', function (string $provider, array $argumentSets): void {
+    $session = idlessSession($provider);
+    $this->replies = [idlessCalls($provider, 'plain', $argumentSets), idlessText($provider)];
+
+    $result = runFlowShape('agent', 'plain', $session);
+    $requests = count($this->hosts);
+    forgetVertexHosts($this, $provider);
+
+    expect($result->ok)->toBeTrue()
+        ->and($this->ran['plain'])->toBe(2)
+        ->and($requests)->toBe(2);
+})->with(['gemini', 'vertex', 'ollama'])->with([
+    'different arguments' => [[['target' => 'a'], ['target' => 'b']]],
+    'the same arguments' => [[['target' => 'a'], ['target' => 'a']]],
+])->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('still decides every parallel call on a provider without call ids', function (string $provider): void {
+    $session = idlessSession($provider);
+    $this->replies = [idlessCalls($provider, 'gated_closure', [['target' => 'staging'], ['target' => 'prod']]), idlessText($provider)];
+
+    $result = runFlowShape('agent', 'gated_closure', $session);
+    forgetVertexHosts($this, $provider);
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('needs approval')
+        ->and($this->ran['gated_closure'])->toBe(0);
+})->with(['gemini', 'vertex', 'ollama'])->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('does not treat an id equal to the tool name as an id', function (): void {
+    $call = fn (string $target): array => ['id' => 'plain', 'type' => 'function_call', 'status' => 'completed', 'arguments' => json_encode(['target' => $target]), 'call_id' => 'plain', 'name' => 'plain'];
+    $this->replies = [flowReply([$call('a'), $call('b')]), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeTrue()
+        ->and($this->ran['plain'])->toBe(2);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('still refuses a real id repeated inside one step', function (): void {
+    $call = fn (string $target): array => ['id' => 'fc_9', 'type' => 'function_call', 'status' => 'completed', 'arguments' => json_encode(['target' => $target]), 'call_id' => 'call_9', 'name' => 'plain'];
+    $this->replies = [flowReply([$call('a'), $call('b')]), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('repeated a call id')
+        ->and($this->ran['plain'])->toBe(0);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('still refuses a real result id repeated inside one step under new item ids', function (): void {
+    $call = fn (string $item, string $target): array => ['id' => $item, 'type' => 'function_call', 'status' => 'completed', 'arguments' => json_encode(['target' => $target]), 'call_id' => 'call_9', 'name' => 'plain'];
+    $this->replies = [flowReply([$call('fc_a', 'a'), $call('fc_b', 'b')]), flowText()];
+
+    $result = runFlowShape('agent', 'plain', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('repeated a call id')
+        ->and($this->ran['plain'])->toBe(0);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
 it('fails the node on a sole call with unreadable arguments', function (): void {
     $this->replies = [flowCall('plain', '{not json'), flowText()];
 

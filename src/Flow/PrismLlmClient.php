@@ -144,7 +144,7 @@ final class PrismLlmClient implements LlmClient
             ],
         ];
 
-        $this->admitStep($response->steps, $tools, $provider);
+        $this->admitStep($response->steps, $tools);
         $calls = $this->toolCalls($response->steps);
 
         if ($loopStep) {
@@ -254,7 +254,7 @@ final class PrismLlmClient implements LlmClient
      *
      * @throws ToolNotAvailable when any call in the step may not run
      */
-    private function admitStep(iterable $steps, array $offered, mixed $provider): void
+    private function admitStep(iterable $steps, array $offered): void
     {
         $calls = [];
 
@@ -270,7 +270,7 @@ final class PrismLlmClient implements LlmClient
                     'name' => (string) $call->name,
                     'id' => (string) $call->id,
                     'arguments' => is_array($arguments) ? $arguments : null,
-                    'callIds' => $this->callIds($call, $provider),
+                    'callIds' => $this->callIds($call),
                 ];
             }
         }
@@ -287,21 +287,20 @@ final class PrismLlmClient implements LlmClient
     }
 
     /**
-     * The ids that identify this call. Gemini and Vertex send none, and core
-     * fills the id with the tool's name, so on those a repeat is an ordinary
-     * second call. An empty id identifies nothing on any provider.
+     * The ids the provider issued for this call. A provider with no call ids
+     * leaves the field empty or core fills it with the tool's name, and neither
+     * tells two calls apart, so neither counts. Such calls are all distinct and
+     * have no protection from the repeated-id check.
      *
      * @return list<string>
      */
-    private function callIds(object $call, mixed $provider): array
+    private function callIds(object $call): array
     {
-        if (in_array($provider, ['gemini', 'vertex'], true)) {
-            return [];
-        }
+        $name = (string) $call->name;
 
         return array_values(array_unique(array_filter(
             [(string) $call->id, (string) ($call->resultId ?? '')],
-            static fn (string $id): bool => $id !== '',
+            static fn (string $id): bool => $id !== '' && $id !== $name,
         )));
     }
 
