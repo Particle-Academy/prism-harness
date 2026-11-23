@@ -71,5 +71,5 @@ it('holds every agent-binding corpus row', function (array $case): void {
 })->with(agentBindingCases());
 
 it('runs every row of the corpus', function (): void {
-    expect(agentBindingCases())->toHaveCount(18);
+    expect(agentBindingCases())->toHaveCount(20);
 });
