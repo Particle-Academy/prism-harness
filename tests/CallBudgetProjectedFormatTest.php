@@ -208,7 +208,7 @@ it('fails closed when a declared format throws without exposing its error', func
             throw new LogicException('synthetic-private-format-error');
         }
     };
-    app(PrismManager::class)->extend('anthropic', static fn ($app, array $config): Provider => $provider);
+    app(PrismManager::class)->extend('anthropic', static fn ($app, array $config): Provider => $provider, true);
 
     try {
         callBudgetRun('send', $session, $run, [Image::fromBase64('YWJj', 'image/png')]);
@@ -363,7 +363,7 @@ it('exposes the fixed reason at native host admission after one projection and b
     ], observer: $observer);
     $inner = Prism::text()->using('anthropic', 'budget-model', ['api_key' => 'offline-only'])->provider();
     $wrapper = $declared ? declaredFormatTestDecorator($inner, 'anthropic-messages') : new ProjectedFormatTestDecorator($inner);
-    app(PrismManager::class)->extend('anthropic', static fn ($app, array $config): Provider => $wrapper);
+    app(PrismManager::class)->extend('anthropic', static fn ($app, array $config): Provider => $wrapper, true);
     $observer->before = function (CallReservation $call) use ($wrapper, $declared, $shape): void {
         Http::assertNothingSent();
         expect($call->diagnostics)->toBe($declared ? [] : [CallBudgetDiagnostic::ProjectedImageFormatUnknown])
