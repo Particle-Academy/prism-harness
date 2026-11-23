@@ -520,6 +520,7 @@ class Session
      */
     protected function recordDecisions(array $decisions): void
     {
+        $this->runtime?->recordToolDecisions($this, $decisions);
         $this->thread()->record([
             new ToolResultMessage(toolApprovalResponses: $decisions),
         ], $this->run()['id'] ?? null);

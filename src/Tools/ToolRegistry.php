@@ -6,11 +6,13 @@ namespace Prism\Harness\Tools;
 
 use Closure;
 use LogicException;
+use Prism\Harness\Contracts\DeclaresToolScope;
 use Prism\Harness\Exceptions\RegistrationCollision;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Support\RegistrationOwner;
 use Prism\Prism\Tool;
+use WeakMap;
 
 final class ToolRegistry
 {
@@ -35,9 +37,18 @@ final class ToolRegistry
     /** @var array<string, self> */
     private array $agents = [];
 
+    /**
+     * Which provider each provider-sourced tool came from (G-326). Kept on the
+     * ROOT, so a tool resolved through an agent view is still known.
+     *
+     * @var WeakMap<Tool, string>
+     */
+    private WeakMap $scopes;
+
     public function __construct(private readonly ?string $agent = null, private readonly ?self $root = null, private readonly bool $refuseDuplicates = false)
     {
         SessionAddress::validateAgent($agent);
+        $this->scopes = new WeakMap;
     }
 
     public function forAgent(?string $agent): self
@@ -149,6 +160,43 @@ final class ToolRegistry
         return $this->agent !== null || $this->refuseDuplicates;
     }
 
+    /**
+     * The statically registered tools, for what they declare about themselves
+     * (G-326): see {@see DeclaresToolScope}.
+     *
+     * @return list<Tool>
+     */
+    public function declarations(): array
+    {
+        return array_values($this->tools);
+    }
+
+    /**
+     * What a resolved tool declares for the host tool policy (G-326), with its
+     * server as the REGISTRY knows it.
+     *
+     * A tool that came out of a provider is scoped to the provider's registered
+     * name, whatever {@see DeclaresToolScope::toolServer()} says: a bridge that
+     * forgets to declare a server, or a tool that claims another server's name,
+     * cannot make a provider's tool look native or look like it came from
+     * somewhere else. The claim is OVERRIDDEN rather than refused: refusing
+     * would let one tool with a bad claim take every tool of every provider out
+     * of the run, and once overridden the claim has no effect anyway. Only a
+     * natively registered tool can have no server.
+     *
+     * @return array{name: string, server: ?string, tier: ?string}
+     */
+    public function declarationOf(Tool $tool): array
+    {
+        $declared = ToolPolicy::declarationOf($tool);
+        $root = $this->root ?? $this;
+        if (isset($root->scopes[$tool])) {
+            $declared['server'] = $root->scopes[$tool];
+        }
+
+        return $declared;
+    }
+
     /** @return list<string> */
     public function names(): array
     {
@@ -195,11 +243,13 @@ final class ToolRegistry
             $metadata[$name] = ['owner' => $owner, 'source' => $entry['source']];
         }
         if ($session instanceof Session) {
-            foreach ($this->providers as $registration) {
+            $scopes = ($this->root ?? $this)->scopes;
+            foreach ($this->providers as $server => $registration) {
                 foreach (($registration['provider'])($session) as $tool) {
                     if ($this->strict() && isset($metadata[$tool->name()])) {
                         throw new RegistrationCollision($this->agent, $tool->name(), $metadata[$tool->name()]['owner'], $registration['owner']);
                     }
+                    $scopes[$tool] = (string) $server;
                     $provided[$tool->name()] = $tool;
                     $metadata[$tool->name()] = ['owner' => $registration['owner'], 'source' => 'provider'];
                 }
