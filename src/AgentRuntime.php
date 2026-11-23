@@ -1609,16 +1609,24 @@ final readonly class AgentRuntime
      * marked, and runs without a request. Otherwise: it asks a person, as
      * before. At the moment a marked call would run the policy is read again,
      * so a revoke since the step began refuses it rather than letting it run.
+     *
+     * The list lifts the MODE's gate only. A tool's own approval setting is
+     * still consulted, so a listed tool the application says needs a person
+     * for these arguments still asks.
+     *
+     * A call that is neither marked nor approved in the thread does not run.
      */
     private function gated(Session $session, Tool $tool, string $runId): Tool
     {
         /** @var list<string> $marked */
         $marked = [];
+        /** @var array<string, int> $approvedRuns */
+        $approvedRuns = [];
         // What the policy decides on: the server as the REGISTRY knows it, so
         // a provider's tool is scoped to its provider whatever it claims.
         $declared = $this->tools->declarationOf($tool);
         $gate = (clone $tool)->requiresApproval(function (array $arguments) use ($session, $tool, $declared, $runId, &$marked): bool {
-            if ($this->toolPolicy()->allows($declared)) {
+            if ($this->toolPolicy()->allows($declared) && ! $tool->needsApproval($arguments)) {
                 $marked[] = CanonicalJson::digest($arguments);
 
                 return false;
@@ -1628,12 +1636,20 @@ final readonly class AgentRuntime
             return true;
         });
 
-        return $gate->using(function (...$args) use ($session, $tool, $declared, $runId, &$marked) {
+        return $gate->using(function (...$args) use ($session, $tool, $declared, $runId, &$marked, &$approvedRuns) {
             $digest = CanonicalJson::digest($args);
             $index = array_search($digest, $marked, true);
             if ($index === false) {
-                // Not marked by the policy, so a person approved it; that
-                // decision was recorded when it was written.
+                // Not marked by the policy, so it runs only on a person's
+                // recorded approval, and once for each one.
+                $used = $approvedRuns[$digest] ?? 0;
+                if ($used >= $session->thread()->approvedCallsAwaitingResult($tool->name(), $digest)) {
+                    $this->emitToolDecision(ToolDenied::class, $session, $runId, $tool, $tool->name(), $args, 'policy');
+
+                    return 'Not run: this call needs approval, and none is recorded.';
+                }
+                $approvedRuns[$digest] = $used + 1;
+
                 return $tool->handle(...$args);
             }
             unset($marked[$index]);
