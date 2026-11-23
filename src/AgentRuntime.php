@@ -1219,7 +1219,7 @@ final readonly class AgentRuntime
      *
      * @param  list<string>|null  $toolNames
      * @param  list<string>  $offered  what this request offered the model
-     * @param  list<array{name: string, id: string, arguments: array<array-key, mixed>|null}>  $calls
+     * @param  list<array{name: string, id: string, arguments: array<array-key, mixed>|null, callIds?: list<string>}>  $calls
      *
      * @throws ToolNotAvailable when any call in the step may not run
      */
@@ -1231,10 +1231,16 @@ final readonly class AgentRuntime
 
         foreach ($calls as $call) {
             $name = $call['name'];
-            if (isset($ids[$call['id']])) {
-                throw ToolNotAvailable::repeatedCall($name);
+            // Only an id the provider issued can repeat. A call without one is
+            // distinct, and every check below still applies to it.
+            foreach ($call['callIds'] ?? [] as $callId) {
+                if (isset($ids[$callId])) {
+                    throw ToolNotAvailable::repeatedCall($name);
+                }
             }
-            $ids[$call['id']] = true;
+            foreach ($call['callIds'] ?? [] as $callId) {
+                $ids[$callId] = true;
+            }
             if (! in_array($name, $offered, true) || ! isset($entries[$name])) {
                 throw ToolNotAvailable::named($name, $offered);
             }
