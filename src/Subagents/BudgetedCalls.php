@@ -8,6 +8,7 @@ use Closure;
 use Generator;
 use Illuminate\Support\Collection;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Support\ToolCallArguments;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Providers\Provider;
@@ -294,7 +295,7 @@ final readonly class BudgetedCalls
         $refused = [];
         foreach ($response->toolCalls as $call) {
             if (! isset($answered[$call->id])) {
-                $refused[] = new ToolResult($call->id, $call->name, $call->arguments(),
+                $refused[] = new ToolResult($call->id, $call->name, ToolCallArguments::recordable($call)->arguments(),
                     'Not run: model step failed ('.$finish->value.').', $call->resultId);
             }
         }

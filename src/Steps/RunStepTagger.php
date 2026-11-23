@@ -7,6 +7,7 @@ namespace Prism\Harness\Steps;
 use Closure;
 use Illuminate\Support\Carbon;
 use Prism\Harness\Events\RunStepped;
+use Prism\Harness\Support\ToolCallArguments;
 use Prism\Harness\Tools\ToolRefusals;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Streaming\Events\ErrorEvent;
@@ -165,7 +166,7 @@ final class RunStepTagger
             $this->emit(RunStep::TOOL_CALL, [
                 'toolCallId' => $event->toolCall->id,
                 'name' => $event->toolCall->name,
-                'args' => $event->toolCall->argumentsAsObject(),
+                'args' => ToolCallArguments::recordable($event->toolCall)->argumentsAsObject(),
                 'startedAt' => $this->timestamp(),
             ]);
         } elseif ($event instanceof ToolResultEvent) {
