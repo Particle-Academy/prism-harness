@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Flow;
 
 use LogicException;
+use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Exceptions\UnboundFlowTools;
 use Prism\Harness\Sessions\Session;
 use Prism\Prism\Tool;
@@ -17,10 +18,20 @@ use Prism\Prism\Tool;
  * current mode and authorization rather than what was true when it was built.
  * The names can only narrow what the session offers.
  *
+ * Build one per workflow run, and take both adapters from it: it remembers
+ * which call ids have run, for that run only and in memory. A run resumed in
+ * another process starts with none.
+ *
  * Obtain one with {@see Session::flowTools()}.
  */
 final class FlowToolset
 {
+    /** @var array<string, true> The call ids whose handler has started in this run. */
+    private array $ranCallIds = [];
+
+    /** @var array<int, array{name: string, arguments: array<array-key, mixed>, callIds: list<string>}> */
+    private array $handedOver = [];
+
     /** @param list<string>|null $names */
     private function __construct(
         private readonly Session $session,
@@ -82,11 +93,27 @@ final class FlowToolset
      * @internal Called by {@see PrismLlmClient}.
      *
      * @param  list<string>  $offered
-     * @param  list<array{name: string, id: string, arguments: array<array-key, mixed>|null}>  $calls
+     * @param  list<array{name: string, id: string, arguments: array<array-key, mixed>|null, callIds?: list<string>}>  $calls
+     *
+     * @throws ToolNotAvailable when a call's id has already run, before anything in the step does
      */
     public function admit(array $offered, array $calls): void
     {
+        foreach ($calls as $call) {
+            foreach ($call['callIds'] ?? [] as $callId) {
+                if (isset($this->ranCallIds[$callId])) {
+                    throw ToolNotAvailable::repeatedCall($call['name']);
+                }
+            }
+        }
+
         $this->session->flowRuntime()->admitFlowCalls($this->session, $this->names, $offered, $calls);
+
+        foreach ($calls as $call) {
+            if (($call['callIds'] ?? []) !== [] && $call['arguments'] !== null) {
+                $this->handedOver[] = ['name' => $call['name'], 'arguments' => $call['arguments'], 'callIds' => $call['callIds']];
+            }
+        }
     }
 
     /**
@@ -96,7 +123,13 @@ final class FlowToolset
      */
     public function run(string $tool, array $arguments): mixed
     {
-        return $this->session->flowRuntime()->runFlowTool($this->session, $this->names, $tool, $arguments);
+        return $this->session->flowRuntime()->runFlowTool(
+            $this->session,
+            $this->names,
+            $tool,
+            $arguments,
+            fn () => $this->recordRun($tool, $arguments),
+        );
     }
 
     /** @internal Called by {@see PrismLlmClient}. */
@@ -113,6 +146,28 @@ final class FlowToolset
     public function toolInvoker(): HarnessToolInvoker
     {
         return new HarnessToolInvoker($this);
+    }
+
+    /**
+     * Mark the call this invocation answers. The engine passes a name and
+     * arguments and no id, so it is matched to the oldest call handed over
+     * with the same two. An invocation matching none is not a model's call.
+     *
+     * @param  array<array-key, mixed>  $arguments
+     */
+    private function recordRun(string $tool, array $arguments): void
+    {
+        foreach ($this->handedOver as $index => $call) {
+            if ($call['name'] === $tool && $call['arguments'] === $arguments) {
+                foreach ($call['callIds'] as $callId) {
+                    $this->ranCallIds[$callId] = true;
+                }
+
+                unset($this->handedOver[$index]);
+
+                return;
+            }
+        }
     }
 
     private function __clone() {}
