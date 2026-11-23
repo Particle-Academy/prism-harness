@@ -183,6 +183,7 @@ final readonly class AgentRuntime
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
             $run = $this->boundedAgentRun($session, $run);
+            $this->continuePausedSteps($session, $prompt, $context, $run);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -395,6 +396,7 @@ final readonly class AgentRuntime
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
             $run = $this->boundedAgentRun($session, $run);
+            $this->continuePausedSteps($session, $prompt, $context, $run);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -748,8 +750,13 @@ final readonly class AgentRuntime
             maxSteps: $this->ceilingFor($session, $mode),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         )));
+        $pausedSteps = $this->pausedSteps($session, $prompt, $context);
+        $namedRun?->ledger->recordSteps($pausedSteps);
         if ($namedRun !== null && ($stop = $namedRun->ledger->exhaustion($namedRun->budget)) !== null) {
             throw RunNotPermitted::exhausted($stop);
+        }
+        if ($namedRun === null && $pausedSteps >= $mode->maxSteps) {
+            throw RunNotPermitted::exhausted(sprintf('step budget exhausted (%d of %d used)', $pausedSteps, $mode->maxSteps));
         }
 
         $session->beginRun($runId, $mode->name, $provider, $model);
@@ -802,7 +809,7 @@ final readonly class AgentRuntime
             $tools = $this->approvalScopedOffer($session, $tools);
             $tagger->offered($this->toolNames($tools));
             if ($tools !== []) {
-                $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps : $this->requestSteps($session, $namedRun));
+                $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps - $pausedSteps : $this->requestSteps($session, $namedRun));
             }
             $maxOutput = $namedRun === null
                 ? $this->nullableIntConfig('max_output_tokens_per_call', $session)
@@ -910,6 +917,7 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
+        $this->continuePausedSteps($session, $prompt, $context, $run);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
@@ -1012,6 +1020,7 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
+        $this->continuePausedSteps($session, $prompt, $context, $run);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
@@ -1719,6 +1728,28 @@ final readonly class AgentRuntime
         $options = $session->agent() === null ? [] : ($this->agents[$session->agent()] ?? []);
 
         return is_array($options) && array_key_exists($key, $options) ? $options[$key] : ($this->config[$key] ?? null);
+    }
+
+    /**
+     * Steps the paused run has already taken, when this turn resumes it.
+     *
+     * A resume (an empty prompt with an approval waiting at the tail) is the
+     * same run, so it continues that run's step count and never opens a new
+     * allowance. A new prompt is a new run. A child run is left alone: its
+     * steps are already on the tree ledger its caller passes back in.
+     */
+    private function pausedSteps(Session $session, string $prompt, ?RunContext $context): int
+    {
+        if ($prompt !== '' || $context !== null) {
+            return 0;
+        }
+
+        return $session->thread()->approvalRunSteps() ?? 0;
+    }
+
+    private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run): void
+    {
+        $run->ledger->recordSteps($this->pausedSteps($session, $prompt, $context));
     }
 
     private function requestSteps(Session $session, RunContext $run): int
