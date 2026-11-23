@@ -174,3 +174,22 @@ it('still checks and runs a well-formed call', function (): void {
 
     expect($this->checks)->toBe(1)->and($this->runs)->toBe(1);
 });
+
+it('runs nothing for an argument key that could bind by position', function (string $arguments): void {
+    Http::preventStrayRequests();
+    fakeTransferCall($arguments);
+
+    $response = sendToTransfer();
+
+    expect($this->checks)->toBe(0)
+        ->and($this->runs)->toBe(0)
+        ->and($response->awaitingApproval())->toBeFalse()
+        ->and(Http::recorded())->toHaveCount(2)
+        ->and(followUpItem('function_call')['arguments'])->toBe('{}');
+})->with([
+    'one integer key' => ['{"0":"500"}'],
+    'a one-item list' => ['["500"]'],
+    'an integer key beside a name' => ['{"0":"500","note":"x"}'],
+    'a name beside an integer key' => ['{"note":"x","1":"500"}'],
+    'a negative integer key' => ['{"-1":"500"}'],
+])->skip(! $coreHasTheRule, $skipReason);
