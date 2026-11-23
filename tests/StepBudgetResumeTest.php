@@ -17,8 +17,7 @@ use Tests\Fixtures\Participant;
 // The step limit belongs to the RUN. A run that pauses for a person and is
 // resumed is the same run, so every resume continues the same count rather than
 // starting a new one. Driven through Prism's real provider handlers over faked
-// HTTP, entered through Session::send() / approve() / streamSteps() /
-// streamDecision(), with a model that asks for a gated tool on every step.
+// HTTP, entered through Session::send() / approve() / streamDecision(), with a model that asks for a gated tool on every step.
 
 const STEP_BUDGET_MAX = 3;
 const STEP_BUDGET_APPROVALS = 6;
@@ -48,7 +47,12 @@ beforeEach(function (): void {
     Http::fake(function (Request $request) use (&$calls) {
         $calls++;
         if (str_contains($request->url(), 'anthropic')) {
-            return Http::response(anthropicToolUseSse('toolu_'.$calls), 200, ['Content-Type' => 'text/event-stream']);
+            // Streamed when the request asks for it, as a real handler does.
+            return ($request->data()['stream'] ?? false) === true
+                ? Http::response(anthropicToolUseSse('toolu_'.$calls), 200, ['Content-Type' => 'text/event-stream'])
+                : Http::response(['id' => 'msg_'.$calls, 'type' => 'message', 'role' => 'assistant', 'model' => 'claude-test',
+                    'content' => [['type' => 'tool_use', 'id' => 'toolu_'.$calls, 'name' => 'weather', 'input' => new stdClass]],
+                    'stop_reason' => 'tool_use', 'stop_sequence' => null, 'usage' => ['input_tokens' => 1, 'output_tokens' => 1]]);
         }
 
         return Http::response([
@@ -139,12 +143,12 @@ it('never takes more than max_steps model steps across approvals resumed from pe
         ->and($last)->toBeInstanceOf(RunNotPermitted::class);
 });
 
-it('holds through streamSteps() and streamDecision() resumes too', function (): void {
+it('holds through streamDecision() resumes too', function (): void {
     config()->set('prism-harness.agent.provider', 'anthropic');
     config()->set('prism-harness.agent.model', 'claude-test');
-    foreach (stepBudgetSession(true)->streamSteps('What is the weather?') as $step) {
-        // drained
-    }
+    // Parked by send(): a plain streamed turn only parks on newer cores, and
+    // the resume below always takes the step path, which every core supports.
+    stepBudgetSession(true)->send('What is the weather?');
     $pending = stepBudgetPending();
     expect($pending)->toBeString();
     $refused = null;
