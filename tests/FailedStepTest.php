@@ -52,7 +52,7 @@ it('does not buy another step after a failed stream with answered calls', functi
         }
     };
     $provider->fault = $fault;
-    app(PrismManager::class)->extend('anthropic', fn () => $provider);
+    app(PrismManager::class)->extend('anthropic', fn () => $provider, true);
     $observer = new CostObserver;
     $base = callBudgetContext(1.0);
     $run = new RunContext($base->ledger, $base->budget, pricing: $base->pricing, observer: $observer);
@@ -93,7 +93,7 @@ it('still continues a successful old-core Stop with answered tools', function ()
             }
         }
     };
-    app(PrismManager::class)->extend('anthropic', fn () => $provider);
+    app(PrismManager::class)->extend('anthropic', fn () => $provider, true);
     $observer = new CostObserver;
     $base = callBudgetContext(1.0);
     $run = new RunContext($base->ledger, $base->budget, pricing: $base->pricing, observer: $observer);
@@ -134,7 +134,7 @@ it('executes a valid approved call but never one from a failed step', function (
         }
     };
     $provider->failed = $failed;
-    app(PrismManager::class)->extend('anthropic', fn () => $provider);
+    app(PrismManager::class)->extend('anthropic', fn () => $provider, true);
     $observer = new CostObserver;
     $base = callBudgetContext(1.0);
     $run = new RunContext($base->ledger, $base->budget, pricing: $base->pricing, observer: $observer);
