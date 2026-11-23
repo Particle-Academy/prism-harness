@@ -23,7 +23,8 @@ use Tests\Fixtures\Participant;
 // written by hand before any language recorded. This runner drives the real
 // runtime through Prism's OpenAI handler over faked HTTP: the model asks for
 // the row's calls, then answers. Every tool needs approval by mode; a tool
-// with `server` is provided at resolve time, as an MCP bridge provides one.
+// with `provider` is supplied at resolve time by a provider registered under
+// that name, as an MCP bridge supplies one, and `server` on it is only its claim.
 
 /** Which corpus tools ran. Static because a tool closure outlives the test's scope. */
 final class CorpusRan
@@ -38,7 +39,7 @@ function toolPolicyCorpus(): array
     return json_decode((string) file_get_contents(__DIR__.'/Fixtures/harness-tool-policy.json'), true)['cases'];
 }
 
-/** @param array{name: string, server?: string, tier?: string} $spec */
+/** @param array{name: string, server?: string, provider?: string, tier?: string} $spec */
 function corpusTool(array $spec): Tool
 {
     $tool = new class extends Tool implements DeclaresToolScope
@@ -91,11 +92,11 @@ function recordToolPolicyRow(array $row): array
     $static = [];
     $provided = [];
     foreach ($row['tools'] as $spec) {
-        isset($spec['server']) ? $provided[] = corpusTool($spec) : $static[] = corpusTool($spec);
+        isset($spec['provider']) ? $provided[$spec['provider']][] = corpusTool($spec) : $static[] = corpusTool($spec);
     }
     app(ToolRegistry::class)->registerMany($static);
-    if ($provided !== []) {
-        app(ToolRegistry::class)->registerProvider(fn (): array => $provided, 'mcp');
+    foreach ($provided as $name => $tools) {
+        app(ToolRegistry::class)->registerProvider(fn (): array => $tools, 'mcp', $name);
     }
 
     $count = 0;

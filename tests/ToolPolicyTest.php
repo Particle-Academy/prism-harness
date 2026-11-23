@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\DeclaresToolScope;
@@ -16,6 +17,7 @@ use Prism\Harness\Exceptions\ToolPolicyRefused;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\CanonicalJson;
+use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolPolicy;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
@@ -243,7 +245,7 @@ it('asks for a tool whose name is a homoglyph of the listed one', function (): v
 
 it('never lets an unscoped entry match an MCP tool named like a native one', function (?string $server, bool $runs): void {
     policyTools(['search']);
-    app(ToolRegistry::class)->registerProvider(fn (): array => [mcpTool('search', 'web')], 'mcp.web');
+    app(ToolRegistry::class)->registerProvider(fn (): array => [mcpTool('search', 'web')], 'mcp.web', 'web');
     runtimeUsing(allowOnly([$server === null ? ['tool' => 'search'] : ['server' => $server, 'tool' => 'search']]));
     policyModel([['search']]);
 
@@ -266,7 +268,7 @@ it('never lets a scoped entry match the native tool of the same name', function 
 
 it('asks for a destructive MCP tool even when it is listed', function (): void {
     policyTools(['drop']);
-    app(ToolRegistry::class)->registerProvider(fn (): array => [mcpTool('drop', 'db', 'destructive')], 'mcp.db');
+    app(ToolRegistry::class)->registerProvider(fn (): array => [mcpTool('drop', 'db', 'destructive')], 'mcp.db', 'db');
     runtimeUsing(allowOnly([['server' => 'db', 'tool' => 'drop']]));
     policyModel([['drop']]);
 
@@ -367,3 +369,78 @@ it('formats canonical JSON per RFC 8785', function (): void {
         ->and(CanonicalJson::encode(['s' => "a\"b\\c\n\u{0001}\u{2028}"]))->toBe("{\"s\":\"a\\\"b\\\\c\\n\\u0001\u{2028}\"}")
         ->and(CanonicalJson::encode([2.0 ** 60, 1e20, 9007199254740991]))->toBe('[1152921504606847000,100000000000000000000,9007199254740991]');
 });
+
+// A tool that reaches the agent through a provider is scoped by the registry.
+// An MCP bridge registers a PROVIDER. Whether its tools count as MCP tools must
+// not depend on the bridge remembering to declare a server, or on what a tool
+// claims about itself: the registry scopes them with the provider's registered
+// name. Only a natively registered tool matches an unscoped entry.
+
+it('never lets an unscoped entry match a provider tool that declares no server', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerProvider(fn (): array => [policyTool('read')], null, 'files');
+    runtimeUsing(allowOnly([['tool' => 'read']]));
+    policyModel([['read']]);
+
+    expect(policySession()->send('go')->awaitingApproval())->toBeTrue()
+        ->and(PolicyRan::$names)->toBe([])
+        ->and($this->decisions)->toHaveCount(1)
+        ->and($this->decisions[0])->toMatchArray(['type' => 'tool_approval_asked', 'server' => 'files', 'tool' => 'read']);
+});
+
+it('matches a provider tool by its provider name', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerProvider(fn (): array => [policyTool('read')], null, 'files');
+    runtimeUsing(allowOnly([['server' => 'files', 'tool' => 'read']]));
+    policyModel([['read']]);
+
+    expect(policySession()->send('go')->awaitingApproval())->toBeFalse()
+        ->and(PolicyRan::$names)->toBe(['read'])
+        ->and($this->decisions[0])->toMatchArray(['type' => 'tool_auto_allowed', 'server' => 'files', 'tool' => 'read']);
+});
+
+it('gives a provider tool claiming another server its provider name instead', function (array $entry, bool $runs): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerProvider(fn (): array => [mcpTool('read', 'files')], null, 'scratch');
+    runtimeUsing(allowOnly([$entry]));
+    policyModel([['read']]);
+
+    expect(policySession()->send('go')->awaitingApproval())->toBe(! $runs)
+        ->and(PolicyRan::$names)->toBe($runs ? ['read'] : [])
+        ->and($this->decisions[0]['server'])->toBe('scratch');
+})->with([
+    'the claimed server' => [['server' => 'files', 'tool' => 'read'], false],
+    'an unscoped entry' => [['tool' => 'read'], false],
+    'its real provider' => [['server' => 'scratch', 'tool' => 'read'], true],
+]);
+
+it('lets an unscoped entry match only a native tool when a provider has the same name', function (): void {
+    // In PHP a provider's tool shadows a static one of the same name (G-160),
+    // so the provider's tool is the one offered, and the unscoped entry must
+    // not reach it.
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')]);
+    app(ToolRegistry::class)->registerProvider(fn (): array => [policyTool('read')], null, 'files');
+    runtimeUsing(allowOnly([['tool' => 'read']]));
+    policyModel([['read']]);
+
+    expect(policySession()->send('go')->awaitingApproval())->toBeTrue()
+        ->and(PolicyRan::$names)->toBe([])
+        ->and($this->decisions[0]['server'])->toBe('files');
+});
+
+it('keeps the scope and tier the policy decides on when the authorizer is enabled', function (string $kind, array $entry): void {
+    config()->set('prism-harness.agent.authorize_tools', true);
+    Gate::define(ToolAuthorizer::ABILITY, fn ($user = null, ...$arguments): bool => true);
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerProvider(
+        fn (): array => [$kind === 'destructive' ? mcpTool('read', 'files', 'destructive') : policyTool('read')], null, 'files');
+    runtimeUsing(allowOnly([$entry]));
+    policyModel([['read']]);
+
+    expect(policySession()->send('go')->awaitingApproval())->toBeTrue()
+        ->and(PolicyRan::$names)->toBe([]);
+})->with([
+    'a provider tool, unscoped entry' => ['plain', ['tool' => 'read']],
+    'a destructive provider tool' => ['destructive', ['server' => 'files', 'tool' => 'read']],
+]);

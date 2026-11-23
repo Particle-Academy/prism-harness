@@ -1614,8 +1614,11 @@ final readonly class AgentRuntime
     {
         /** @var list<string> $marked */
         $marked = [];
-        $gate = (clone $tool)->requiresApproval(function (array $arguments) use ($session, $tool, $runId, &$marked): bool {
-            if ($this->toolPolicy()->allows($tool)) {
+        // What the policy decides on: the server as the REGISTRY knows it, so
+        // a provider's tool is scoped to its provider whatever it claims.
+        $declared = $this->tools->declarationOf($tool);
+        $gate = (clone $tool)->requiresApproval(function (array $arguments) use ($session, $tool, $declared, $runId, &$marked): bool {
+            if ($this->toolPolicy()->allows($declared)) {
                 $marked[] = CanonicalJson::digest($arguments);
 
                 return false;
@@ -1625,7 +1628,7 @@ final readonly class AgentRuntime
             return true;
         });
 
-        return $gate->using(function (...$args) use ($session, $tool, $runId, &$marked) {
+        return $gate->using(function (...$args) use ($session, $tool, $declared, $runId, &$marked) {
             $digest = CanonicalJson::digest($args);
             $index = array_search($digest, $marked, true);
             if ($index === false) {
@@ -1635,7 +1638,7 @@ final readonly class AgentRuntime
             }
             unset($marked[$index]);
             $marked = array_values($marked);
-            if (! $this->toolPolicy()->allows($tool)) {
+            if (! $this->toolPolicy()->allows($declared)) {
                 $this->emitToolDecision(ToolDenied::class, $session, $runId, $tool, $tool->name(), $args, 'policy');
 
                 return 'Not run: this call needs approval, and the tool policy no longer allows it.';
@@ -1682,7 +1685,7 @@ final readonly class AgentRuntime
             sessionKey: $session->key(),
             runId: $runId,
             policyRevision: $this->toolPolicy()->revision,
-            server: $tool === null ? null : ToolPolicy::declarationOf($tool)['server'],
+            server: $tool === null ? null : $this->tools->declarationOf($tool)['server'],
             tool: $name,
             argsDigest: CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments),
             decidedBy: $decidedBy,

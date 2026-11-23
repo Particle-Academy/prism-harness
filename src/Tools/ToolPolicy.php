@@ -132,8 +132,13 @@ final class ToolPolicy
      * False when the policy is not honoured, when the tool is malformed or not
      * in normal form, reserved for the person, or declares `destructive`, and
      * when no entry names exactly this server and tool.
+     *
+     * Pass {@see ToolRegistry::declarationOf()} for a resolved tool: a Tool on
+     * its own only carries what it claims about its server.
+     *
+     * @param  Tool|array{name?: mixed, server?: mixed, tier?: mixed}  $tool
      */
-    public function allows(Tool $tool): bool
+    public function allows(Tool|array $tool): bool
     {
         $declared = self::declarationOf($tool);
         if (! $this->honor || ! self::isExactName($declared['name']) || self::isPersonOnly($declared['name']) || $declared['tier'] === 'destructive') {
