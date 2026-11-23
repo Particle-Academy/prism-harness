@@ -581,6 +581,72 @@ class Thread extends Model implements ThreadContract
         return $paused === true ? $steps : null;
     }
 
+    /**
+     * The calls of the approval paused at the transcript tail that have no
+     * recorded decision, oldest first. Empty when nothing is waiting.
+     *
+     * @return list<array{name: string, arguments: mixed}>
+     */
+    public function unansweredApprovals(): array
+    {
+        $answered = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            $payload = $stored->payload;
+            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
+                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
+                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                        $answered[$response['approval_id']] = true;
+                    }
+                }
+
+                continue;
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                return [];
+            }
+            $calls = [];
+            foreach ($payload['tool_calls'] ?? [] as $call) {
+                if (is_array($call) && is_string($call['id'] ?? null) && is_string($call['name'] ?? null)) {
+                    $calls[$call['id']] = ['name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
+                }
+            }
+            $unanswered = [];
+            foreach ($payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && is_string($request['approval_id'] ?? null) && ! isset($answered[$request['approval_id']])
+                    && is_string($request['tool_call_id'] ?? null) && isset($calls[$request['tool_call_id']])) {
+                    $unanswered[] = $calls[$request['tool_call_id']];
+                }
+            }
+
+            return $unanswered;
+        }
+
+        return [];
+    }
+
+    /**
+     * The call an approval id was requested for, or null.
+     *
+     * @return array{name: string, arguments: mixed}|null
+     */
+    public function approvalCall(string $approvalId): ?array
+    {
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position', 'desc')->cursor() as $stored) {
+            $payload = $stored->payload;
+            foreach ($payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && ($request['approval_id'] ?? null) === $approvalId) {
+                    foreach ($payload['tool_calls'] ?? [] as $call) {
+                        if (is_array($call) && ($call['id'] ?? null) === ($request['tool_call_id'] ?? false) && is_string($call['name'] ?? null)) {
+                            return ['name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
     private function afterRecording(): self
     {
 

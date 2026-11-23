@@ -16,6 +16,11 @@ use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunResumed;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Events\RunStepped;
+use Prism\Harness\Events\ToolApprovalAsked;
+use Prism\Harness\Events\ToolApproved;
+use Prism\Harness\Events\ToolAutoAllowed;
+use Prism\Harness\Events\ToolDecision;
+use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
@@ -35,7 +40,10 @@ use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\TurnAttachments;
+use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolAuthorizer;
+use Prism\Harness\Tools\ToolPolicy;
+use Prism\Harness\Tools\ToolPolicySlot;
 use Prism\Harness\Tools\ToolRefusals;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
@@ -57,6 +65,9 @@ use Throwable;
 
 final readonly class AgentRuntime
 {
+    /** The host tool policy, replaceable live; the runtime itself stays readonly. */
+    private ToolPolicySlot $policySlot;
+
     /** @param array<string, mixed> $config */
     public function __construct(
         private ModeRegistry $modes,
@@ -82,6 +93,7 @@ final readonly class AgentRuntime
         /** @var array<string, mixed> */
         private array $agents = [],
     ) {
+        $this->policySlot = new ToolPolicySlot;
         foreach ($agents as $agent => $options) {
             SessionAddress::validateAgent($agent);
             if (! is_array($options)) {
@@ -182,7 +194,7 @@ final readonly class AgentRuntime
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
             $run = $this->boundedAgentRun($session, $run);
-            $this->continuePausedSteps($session, $prompt, $context, $run);
+            $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -398,7 +410,7 @@ final readonly class AgentRuntime
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
             $run = $this->boundedAgentRun($session, $run);
-            $this->continuePausedSteps($session, $prompt, $context, $run);
+            $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -754,7 +766,7 @@ final readonly class AgentRuntime
             maxSteps: $this->ceilingFor($session, $mode),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         )));
-        $pausedSteps = $this->pausedSteps($session, $prompt, $context);
+        $pausedSteps = $this->pausedSteps($session, $prompt, $context, $runId);
         $namedRun?->ledger->recordSteps($pausedSteps);
         if ($namedRun !== null && ($stop = $namedRun->ledger->exhaustion($namedRun->budget)) !== null) {
             throw RunNotPermitted::exhausted($stop);
@@ -806,7 +818,7 @@ final readonly class AgentRuntime
                 $resolved = $this->tools->resolve(array_values(array_unique($names)), $session);
                 foreach ($resolved as $name => $tool) {
                     if ($mode->needsApproval($name)) {
-                        $resolved[$name] = (clone $tool)->requiresApproval(true);
+                        $resolved[$name] = $this->gated($session, $tool, $runId);
                     }
                 }
                 $tools = $this->authorizer->allowed($session, $resolved);
@@ -923,7 +935,7 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
-        $this->continuePausedSteps($session, $prompt, $context, $run);
+        $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
@@ -1025,7 +1037,7 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         ));
         $run = $this->boundedAgentRun($session, $run);
-        $this->continuePausedSteps($session, $prompt, $context, $run);
+        $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
@@ -1232,7 +1244,7 @@ final readonly class AgentRuntime
             $detailed = $this->tools->resolveDetailed($names, $view, $additional);
             $resolved = [];
             foreach ($detailed as $name => $entry) {
-                $resolved[$name] = $mode->needsApproval($name) ? (clone $entry['tool'])->requiresApproval(true) : $entry['tool'];
+                $resolved[$name] = $mode->needsApproval($name) ? $this->gated($view, $entry['tool'], $runId) : $entry['tool'];
             }
             if ($view->agent() !== null && isset($resolved['complete_task'])) {
                 $authorizer = $this->authorizer->forSession($view);
@@ -1276,7 +1288,7 @@ final readonly class AgentRuntime
         // offered and stopping the run on a request nobody can grant.
         foreach ($resolved as $name => $tool) {
             if ($mode->needsApproval($name)) {
-                $resolved[$name] = (clone $tool)->requiresApproval(true);
+                $resolved[$name] = $this->gated($session, $tool, $runId);
             }
         }
 
@@ -1533,18 +1545,149 @@ final readonly class AgentRuntime
      * allowance. A new prompt is a new run. A child run is left alone: its
      * steps are already on the tree ledger its caller passes back in.
      */
-    private function pausedSteps(Session $session, string $prompt, ?RunContext $context): int
+    private function pausedSteps(Session $session, string $prompt, ?RunContext $context, string $runId): int
     {
         if ($prompt !== '' || $context !== null) {
             return 0;
         }
+        $steps = $session->thread()->approvalRunSteps();
+        if ($steps !== null) {
+            // A call nobody answered is refused by the resume; record that a
+            // person did not approve it, as for a denial.
+            foreach ($session->thread()->unansweredApprovals() as $call) {
+                $this->emitToolDecision(ToolDenied::class, $session, $runId, $this->declaredTool($session, $call['name']), $call['name'], $call['arguments'], 'person');
+            }
+        }
 
-        return $session->thread()->approvalRunSteps() ?? 0;
+        return $steps ?? 0;
     }
 
-    private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run): void
+    private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run, string $runId): void
     {
-        $run->ledger->recordSteps($this->pausedSteps($session, $prompt, $context));
+        $run->ledger->recordSteps($this->pausedSteps($session, $prompt, $context, $runId));
+    }
+
+    /**
+     * The host tool policy in force (G-326).
+     *
+     * Configured by `prism-harness.agent.tool_policy` (the shared JSON shape)
+     * or set with {@see self::setToolPolicy()}; `ToolPolicy::none()` otherwise.
+     * Validated against the registered tools when first read.
+     */
+    public function toolPolicy(): ToolPolicy
+    {
+        return $this->policySlot->policy ??= $this->admitPolicy(isset($this->config['tool_policy'])
+            ? ToolPolicy::fromArray($this->config['tool_policy'])
+            : ToolPolicy::none());
+    }
+
+    /**
+     * Replace the host tool policy (G-326). Never reachable from a tool.
+     *
+     * Applies from the next tool call. A call already waiting on a person
+     * keeps waiting: a policy that would now allow it does not run it. A call
+     * the old policy allowed that has not started yet is refused, not run,
+     * when the new policy no longer allows it, so a revoke takes effect at
+     * once. A policy naming a registered tool that declares `destructive`
+     * throws ToolPolicyRefused and the old policy stays.
+     */
+    public function setToolPolicy(ToolPolicy $policy): void
+    {
+        $this->policySlot->policy = $this->admitPolicy($policy);
+    }
+
+    private function admitPolicy(ToolPolicy $policy): ToolPolicy
+    {
+        return ToolPolicy::fromArray($policy->toArray(), $this->tools->declarations());
+    }
+
+    /**
+     * A clone of an approval-gated tool whose approval is decided PER CALL by
+     * the host policy, through core's own approval mechanism: no second one.
+     *
+     * Core asks the closure when it meets the call. Allowed: the call is
+     * marked, and runs without a request. Otherwise: it asks a person, as
+     * before. At the moment a marked call would run the policy is read again,
+     * so a revoke since the step began refuses it rather than letting it run.
+     */
+    private function gated(Session $session, Tool $tool, string $runId): Tool
+    {
+        /** @var list<string> $marked */
+        $marked = [];
+        $gate = (clone $tool)->requiresApproval(function (array $arguments) use ($session, $tool, $runId, &$marked): bool {
+            if ($this->toolPolicy()->allows($tool)) {
+                $marked[] = CanonicalJson::digest($arguments);
+
+                return false;
+            }
+            $this->emitToolDecision(ToolApprovalAsked::class, $session, $runId, $tool, $tool->name(), $arguments, 'person');
+
+            return true;
+        });
+
+        return $gate->using(function (...$args) use ($session, $tool, $runId, &$marked) {
+            $digest = CanonicalJson::digest($args);
+            $index = array_search($digest, $marked, true);
+            if ($index === false) {
+                // Not marked by the policy, so a person approved it; that
+                // decision was recorded when it was written.
+                return $tool->handle(...$args);
+            }
+            unset($marked[$index]);
+            $marked = array_values($marked);
+            if (! $this->toolPolicy()->allows($tool)) {
+                $this->emitToolDecision(ToolDenied::class, $session, $runId, $tool, $tool->name(), $args, 'policy');
+
+                return 'Not run: this call needs approval, and the tool policy no longer allows it.';
+            }
+            $this->emitToolDecision(ToolAutoAllowed::class, $session, $runId, $tool, $tool->name(), $args, 'policy');
+
+            return $tool->handle(...$args);
+        });
+    }
+
+    /**
+     * Record each decision a person made, as it is written (G-326).
+     *
+     * @internal Called by Session when decisions are recorded.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     */
+    public function recordToolDecisions(Session $session, array $decisions): void
+    {
+        foreach ($decisions as $decision) {
+            $call = $session->thread()->approvalCall($decision->approvalId);
+            if ($call === null) {
+                continue;
+            }
+            $this->emitToolDecision($decision->approved ? ToolApproved::class : ToolDenied::class, $session,
+                (string) ($session->run()['id'] ?? ''), $this->declaredTool($session, $call['name']), $call['name'], $call['arguments'], 'person');
+        }
+    }
+
+    /** The registered tool a stored call names, for what it declares; null when it no longer resolves. */
+    private function declaredTool(Session $session, string $name): ?Tool
+    {
+        try {
+            return $this->tools->resolveDetailed([$name], $session)[$name]['tool'] ?? null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param class-string<ToolDecision> $event */
+    private function emitToolDecision(string $event, Session $session, string $runId, ?Tool $tool, string $name, mixed $arguments, string $decidedBy): void
+    {
+        event(new $event(
+            sessionKey: $session->key(),
+            runId: $runId,
+            policyRevision: $this->toolPolicy()->revision,
+            server: $tool === null ? null : ToolPolicy::declarationOf($tool)['server'],
+            tool: $name,
+            argsDigest: CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments),
+            decidedBy: $decidedBy,
+            harnessAgent: $session->agent(),
+        ));
     }
 
     private function requestSteps(Session $session, RunContext $run): int

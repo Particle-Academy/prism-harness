@@ -6,6 +6,7 @@ namespace Prism\Harness\Tools;
 
 use Closure;
 use LogicException;
+use Prism\Harness\Contracts\DeclaresToolScope;
 use Prism\Harness\Exceptions\RegistrationCollision;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionAddress;
@@ -147,6 +148,17 @@ final class ToolRegistry
     private function strict(): bool
     {
         return $this->agent !== null || $this->refuseDuplicates;
+    }
+
+    /**
+     * The statically registered tools, for what they declare about themselves
+     * (G-326): see {@see DeclaresToolScope}.
+     *
+     * @return list<Tool>
+     */
+    public function declarations(): array
+    {
+        return array_values($this->tools);
     }
 
     /** @return list<string> */
