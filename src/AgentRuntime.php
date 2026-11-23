@@ -24,6 +24,7 @@ use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
+use Prism\Harness\Flow\FlowToolset;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
@@ -1209,6 +1210,50 @@ final readonly class AgentRuntime
         $mode = $this->modes->forAgent($session->agent())->resolve($modeName ?? $session->mode());
 
         return $this->ownedOffer($mode, $session, null, inspection: true)['descriptors'];
+    }
+
+    /**
+     * The tools a workflow may run for this session: the current mode's, with
+     * its approval marks and the application's authorization applied.
+     *
+     * Subagents are left out. A subagent call spends from a run budget, and a
+     * workflow node has no run to charge.
+     *
+     * @internal Read through {@see FlowToolset}.
+     *
+     * @param  list<string>|null  $toolNames  narrows the mode, and cannot widen it
+     * @return list<Tool>
+     */
+    public function flowTools(Session $session, ?array $toolNames = null): array
+    {
+        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+
+        if ($session->agent() !== null) {
+            $offer = $this->ownedOffer($mode, $session, $toolNames, inspection: true);
+            $tools = [];
+            foreach ($offer['tools'] as $index => $tool) {
+                if ($offer['descriptors'][$index]['owner'] !== 'harness.subagent') {
+                    $tools[] = $tool;
+                }
+            }
+
+            return $this->approvalScopedOffer($session, $tools);
+        }
+
+        $names = $this->toolNamesFor($mode, $toolNames);
+        if ($mode->skills !== []) {
+            $names[] = 'skill_read';
+        }
+        $subagents = array_map(static fn ($subagent): string => $subagent->name, array_values($mode->subagents));
+        $resolved = $this->tools->resolve(array_values(array_unique(array_diff($names, $subagents))), $session);
+
+        foreach ($resolved as $name => $tool) {
+            if ($mode->needsApproval($name)) {
+                $resolved[$name] = (clone $tool)->requiresApproval(true);
+            }
+        }
+
+        return $this->approvalScopedOffer($session, $this->authorizer->allowed($session, $resolved));
     }
 
     /**

@@ -6,9 +6,8 @@ namespace Prism\Harness\Flow;
 
 use FancyFlow\Nodes\Support\ToolInvoker;
 use Prism\Harness\Exceptions\ToolNotAvailable;
-use Prism\Harness\Tools\ToolAuthorizer;
-use Prism\Harness\Tools\ToolRegistry;
-use Prism\Prism\Tool;
+use Prism\Harness\Exceptions\UnboundFlowTools;
+use Prism\Harness\Sessions\Session;
 use Prism\Prism\ValueObjects\ToolError;
 use Throwable;
 
@@ -18,20 +17,9 @@ use Throwable;
  * OPTIONAL, for the same reason as {@see PrismLlmClient}: fancy-flow needs PHP
  * 8.4 and this package supports 8.2.
  *
- * THE ALLOWLIST IS THE CONSTRUCTOR, and that is a deliberate limit rather than
- * a design. What exists is the set handed in, and a name outside it is refused.
- *
- * That is weaker than a permission model and stronger than the alternative: an
- * invoker that resolved tools from a container would let a workflow author name
- * any bound tool, including ones the flow was never meant to reach.
- *
- * WHAT IS STILL MISSING, precisely — this comment previously said the package
- * had no tool registry and no permission model, and both now exist
- * ({@see ToolRegistry}, {@see ToolAuthorizer}).
- * Neither is consulted HERE. The authorizer filters the tools *offered* to a
- * run; once a tool is in this constructor it can be invoked any number of times
- * with any arguments, and nothing asks whether this caller MAY run it with
- * THESE arguments. That checkpoint is what attaches here.
+ * What it can run is what {@see FlowToolset} says the session offers at the
+ * moment of the call. A call that needs approval fails the node, because a
+ * workflow node has no way to ask a person.
  *
  * A tool's result is returned as the node's value. It is NOT interpreted here:
  * whatever the tool returned is what the workflow sees and what the model is
@@ -39,10 +27,17 @@ use Throwable;
  */
 final class HarnessToolInvoker implements ToolInvoker
 {
+    private readonly ?FlowToolset $toolset;
+
     /**
-     * @param  array<string, Tool>  $tools  the only tools this invoker will run, by name
+     * @param  FlowToolset|array{}  $tools  from {@see Session::flowTools()}
+     *
+     * @throws UnboundFlowTools when given tools that did not come from a session
      */
-    public function __construct(private readonly array $tools = []) {}
+    public function __construct(array|FlowToolset $tools = [])
+    {
+        $this->toolset = FlowToolset::from($tools);
+    }
 
     /**
      * @param  array<string, mixed>  $args
@@ -51,16 +46,22 @@ final class HarnessToolInvoker implements ToolInvoker
      */
     public function invoke(string $tool, array $args = []): mixed
     {
-        if (! isset($this->tools[$tool])) {
+        $tools = $this->toolset?->tools() ?? [];
+
+        if (! isset($tools[$tool])) {
             // Thrown rather than returned as an error string. A model that
             // reads "unknown tool" as a result will try a different name and
             // burn the step budget guessing; the node should fail so the
             // workflow author sees which name was wrong.
-            throw ToolNotAvailable::named($tool, array_keys($this->tools));
+            throw ToolNotAvailable::named($tool, array_keys($tools));
         }
 
         try {
-            $result = $this->tools[$tool]->handle(...$args);
+            if ($tools[$tool]->needsApproval($args)) {
+                throw ToolNotAvailable::awaitingApproval($tool);
+            }
+
+            $result = $tools[$tool]->handle(...$args);
 
             if ($result instanceof ToolError) {
                 // Prism has a first-class failure VALUE as well as exceptions:

@@ -7,6 +7,31 @@ uses(TestCase::class)->in(__DIR__);
 
 /*
 |--------------------------------------------------------------------------
+| The real fancy-flow engine, when its fixture is installed
+|--------------------------------------------------------------------------
+|
+| tools/engine-fixture/fancy-flow pins one exact release. The Flow engine job
+| installs it without running its scripts; everywhere else it is absent, the
+| contracts below are mirrored, and the engine tests skip by name.
+|
+*/
+
+$flowEngine = dirname(__DIR__).'/tools/engine-fixture/fancy-flow/vendor/particle-academy/fancy-flow-php/src';
+
+if (is_dir($flowEngine)) {
+    spl_autoload_register(static function (string $class) use ($flowEngine): void {
+        if (str_starts_with($class, 'FancyFlow\\')) {
+            $file = $flowEngine.'/'.str_replace('\\', '/', substr($class, strlen('FancyFlow\\'))).'.php';
+
+            if (is_file($file)) {
+                require_once $file;
+            }
+        }
+    });
+}
+
+/*
+|--------------------------------------------------------------------------
 | fancy-flow contracts
 |--------------------------------------------------------------------------
 |

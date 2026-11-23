@@ -6,7 +6,10 @@ use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Flow\HarnessAgentExecutor;
 use Prism\Harness\Flow\HarnessToolInvoker;
 use Prism\Harness\Flow\PrismLlmClient;
+use Prism\Harness\PrismHarness;
+use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Tests\Fixtures\Participant;
 
 /**
  * The fancy-flow bridge.
@@ -16,19 +19,39 @@ use Prism\Prism\Tool;
  * these run across the whole matrix. That mirroring is the risk, and it is
  * checked against the real package rather than assumed: see the note there.
  */
+
+/**
+ * An invoker built the supported way: from a session whose mode offers these.
+ *
+ * @param  list<Tool>  $tools
+ */
+function bridgeInvoker(array $tools): HarnessToolInvoker
+{
+    $names = array_map(fn (Tool $tool): string => $tool->name(), $tools);
+    config()->set('prism-harness.agent.default', 'bridge');
+    config()->set('prism-harness.agent.modes.bridge', ['tools' => $names, 'max_steps' => 1]);
+    app(ToolRegistry::class)->registerMany($tools);
+
+    return app(PrismHarness::class)
+        ->for(Participant::query()->firstOrCreate(['name' => 'Ada']))
+        ->session('bridge')
+        ->flowTools()
+        ->toolInvoker();
+}
+
 it('refuses a tool it was never given', function (): void {
     // Thrown, not returned. A model handed "unknown tool" as a RESULT treats it
     // as information and spends the step budget guessing at an allowlist it
     // cannot see, while the workflow author who wrote the wrong name sees only
     // a poor answer.
-    $invoker = new HarnessToolInvoker(['search' => (new Tool)->as('search')->for('x')->using(fn (): string => 'ok')]);
+    $invoker = bridgeInvoker([(new Tool)->as('search')->for('x')->using(fn (): string => 'ok')]);
 
     expect(fn (): mixed => $invoker->invoke('delete_everything'))
         ->toThrow(ToolNotAvailable::class);
 });
 
 it('names what it does have, so the wrong name is obvious', function (): void {
-    $invoker = new HarnessToolInvoker(['search' => (new Tool)->as('search')->for('x')->using(fn (): string => 'ok')]);
+    $invoker = bridgeInvoker([(new Tool)->as('search')->for('x')->using(fn (): string => 'ok')]);
 
     expect(fn (): mixed => $invoker->invoke('serch'))
         ->toThrow(ToolNotAvailable::class, 'available: search');
@@ -42,8 +65,8 @@ it('distinguishes an empty invoker from a wrong name', function (): void {
 });
 
 it('runs a tool it was given and returns its value untouched', function (): void {
-    $invoker = new HarnessToolInvoker([
-        'echo' => (new Tool)->as('echo')->for('echo')->withStringParameter('word', 'w')->using(fn (string $word): string => $word),
+    $invoker = bridgeInvoker([
+        (new Tool)->as('echo')->for('echo')->withStringParameter('word', 'w')->using(fn (string $word): string => $word),
     ]);
 
     expect($invoker->invoke('echo', ['word' => 'hello']))->toBe('hello');
@@ -58,8 +81,8 @@ it('raises when a tool fails, rather than passing the failure on as data', funct
     //
     // This is why the ToolError branch exists, and why it is the branch that
     // fires for a throwing tool.
-    $invoker = new HarnessToolInvoker([
-        'broken' => (new Tool)->as('broken')->for('x')->using(function (): string {
+    $invoker = bridgeInvoker([
+        (new Tool)->as('broken')->for('x')->using(function (): string {
             throw new RuntimeException('the underlying thing failed');
         }),
     ]);
