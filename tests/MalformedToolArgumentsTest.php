@@ -6,7 +6,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentResponse;
 use Prism\Harness\Events\ToolApprovalAsked;
-use Prism\Harness\Flow\PrismLlmClient;
+use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
@@ -142,21 +142,19 @@ function flowCompletion(string $arguments): array
 {
     fakeTransferCall($arguments);
 
-    return (new PrismLlmClient('openai', 'gpt-4o', null, ['transfer' => app(ToolRegistry::class)->resolve(['transfer'])['transfer']]))
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('flow-arguments');
+
+    return $session->flowTools(['transfer'])->llmClient('openai', 'gpt-4o')
         ->complete('Send it.', ['tools' => ['transfer']]);
 }
 
 it('does not hand a workflow an unparseable call to invoke', function (): void {
-    $result = flowCompletion('{"amount": 5');
-
-    expect($result['tool_calls'] ?? [])->toBe([])
+    expect(fn (): array => flowCompletion('{"amount": 5'))->toThrow(ToolNotAvailable::class)
         ->and($this->runs)->toBe(0);
 });
 
 it('does not hand a workflow a non-object call to invoke', function (string $arguments): void {
-    $result = flowCompletion($arguments);
-
-    expect($result['tool_calls'] ?? [])->toBe([])
+    expect(fn (): array => flowCompletion($arguments))->toThrow(ToolNotAvailable::class)
         ->and($this->runs)->toBe(0);
 })->with(['a number' => ['5'], 'a list' => ['[1,2]']])->skip(! $coreHasTheRule, $skipReason);
 

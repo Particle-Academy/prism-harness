@@ -34,6 +34,41 @@ final class ToolNotAvailable extends RuntimeException
         return new self("The flow asked for the tool [{$tool}], which was not offered to it ({$offered}).");
     }
 
+    public static function awaitingApproval(string $tool): self
+    {
+        return new self("The tool [{$tool}] needs approval, which a workflow node cannot give. Run it through a session turn, where a person can approve it.");
+    }
+
+    public static function refusedByPolicy(string $tool): self
+    {
+        return new self("The application's call policy refused the tool [{$tool}] for this workflow node.");
+    }
+
+    public static function positionalArguments(string $tool): self
+    {
+        return new self("The tool [{$tool}] takes named arguments, and this call used positional ones.");
+    }
+
+    public static function unreadableArguments(string $tool): self
+    {
+        return new self("The arguments of a call to the tool [{$tool}] could not be read, so nothing in that step ran.");
+    }
+
+    public static function repeatedCall(string $tool): self
+    {
+        return new self("A model step repeated a call id for the tool [{$tool}], so nothing in that step ran.");
+    }
+
+    public static function sessionAwaitingApproval(): self
+    {
+        return new self('This session is waiting on an approval. Finish that turn before a workflow uses the session.');
+    }
+
+    public static function stepLimit(int $limit): self
+    {
+        return new self("This workflow loop reached the session's step limit of {$limit}.");
+    }
+
     public static function reported(string $tool, string $message): self
     {
         // Distinct wording from failed(): this tool did not crash, it returned
