@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Prism\Harness\Flow;
 
 use FancyFlow\Nodes\Support\LlmClient;
+use Prism\Harness\Exceptions\ToolNotAvailable;
+use Prism\Harness\Exceptions\UnboundFlowTools;
 use Prism\Harness\Sessions\Session;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Tool;
@@ -38,15 +40,29 @@ use Throwable;
  */
 final class PrismLlmClient implements LlmClient
 {
+    private readonly ?Session $session;
+
+    private readonly ?FlowToolset $toolset;
+
     /**
-     * @param  array<string, Tool>  $tools  the tools this client may offer, by name
+     * @param  FlowToolset|array{}  $tools  from {@see Session::flowTools()}; empty for a call with no tools
+     *
+     * @throws UnboundFlowTools when given tools that did not come from a session
      */
     public function __construct(
         private readonly ?string $defaultProvider = null,
         private readonly ?string $defaultModel = null,
-        private readonly ?Session $session = null,
-        private readonly array $tools = [],
-    ) {}
+        ?Session $session = null,
+        array|FlowToolset $tools = [],
+    ) {
+        $this->toolset = FlowToolset::from($tools);
+
+        if ($this->toolset instanceof FlowToolset && $session instanceof Session && $session !== $this->toolset->session()) {
+            throw UnboundFlowTools::otherSession();
+        }
+
+        $this->session = $session ?? $this->toolset?->session();
+    }
 
     /**
      * @param  array<string, mixed>  $options
@@ -89,11 +105,14 @@ final class PrismLlmClient implements LlmClient
         $tools = $this->requestedTools($options);
 
         if ($tools !== []) {
-            $pending->withTools($tools);
+            // The model sees each tool's schema and core runs none of them:
+            // HarnessToolInvoker is the one place a workflow's tool executes.
+            $pending->withTools(array_map(
+                static fn (Tool $tool): Tool => (clone $tool)->clientExecuted(),
+                $tools,
+            ));
             // ONE step. fancy-flow owns the loop: AgentExecutor invokes the
-            // tools itself and calls back. Letting Prism run its own loop here
-            // would execute tools twice — once inside Prism and once in the
-            // node — and hide half the trace from the workflow's audit.
+            // tools itself and calls back.
             $pending->withMaxSteps(1);
         }
 
@@ -113,7 +132,7 @@ final class PrismLlmClient implements LlmClient
             ],
         ];
 
-        $calls = $this->toolCalls($response->steps);
+        $calls = $this->withinOffer($this->toolCalls($response->steps), $response->steps, $tools);
 
         if ($calls !== []) {
             // Undeclared by the contract and read by AgentExecutor. Emitted
@@ -141,21 +160,63 @@ final class PrismLlmClient implements LlmClient
     {
         $requested = $options['tools'] ?? null;
 
-        if (! is_array($requested) || $requested === []) {
+        if (! is_array($requested) || $requested === [] || ! $this->toolset instanceof FlowToolset) {
             return [];
         }
 
+        $available = $this->toolset->tools();
         $tools = [];
 
         foreach ($requested as $name) {
             $name = is_array($name) ? ($name['name'] ?? null) : $name;
 
-            if (is_string($name) && isset($this->tools[$name])) {
-                $tools[] = $this->tools[$name];
+            if (is_string($name) && isset($available[$name])) {
+                $tools[] = $available[$name];
             }
         }
 
         return $tools;
+    }
+
+    /**
+     * The calls a workflow may be handed: those naming a tool this request
+     * offered, with arguments that could be read.
+     *
+     * @param  list<array<string, mixed>>  $calls
+     * @param  iterable<mixed>  $steps
+     * @param  list<Tool>  $offered
+     * @return list<array<string, mixed>>
+     *
+     * @throws ToolNotAvailable when the model named a tool it was not offered
+     */
+    private function withinOffer(array $calls, iterable $steps, array $offered): array
+    {
+        $names = array_map(static fn (Tool $tool): string => $tool->name(), $offered);
+
+        foreach ($calls as $call) {
+            if (! in_array($call['name'], $names, true)) {
+                throw ToolNotAvailable::named((string) $call['name'], $names);
+            }
+        }
+
+        $unreadable = [];
+
+        foreach ($steps as $step) {
+            foreach ($step->toolCalls as $call) {
+                try {
+                    if (! is_array($call->arguments())) {
+                        $unreadable[$call->id] = true;
+                    }
+                } catch (Throwable) {
+                    $unreadable[$call->id] = true;
+                }
+            }
+        }
+
+        return array_values(array_filter(
+            $calls,
+            static fn (array $call): bool => ! isset($unreadable[$call['id']]),
+        ));
     }
 
     /**

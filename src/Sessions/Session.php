@@ -16,6 +16,7 @@ use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
+use Prism\Harness\Flow\FlowToolset;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\Steps\RunStep;
@@ -24,6 +25,7 @@ use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tasks\StoreTaskSource;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Streaming\Events\StreamEvent;
+use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
@@ -310,6 +312,43 @@ class Session
         }
 
         return $this->runtime->send($this, $prompt, $toolNames, $context, $additionalContent);
+    }
+
+    /**
+     * This session's tools, for fancy-flow's `llm_call`, `tool_use` and `agent`
+     * nodes. Build the workflow adapters from what this returns:
+     *
+     *     $tools = $session->flowTools();
+     *     $llm = $tools->llmClient();
+     *     $invoker = $tools->toolInvoker();
+     *
+     * A tool that needs approval fails its node, because a workflow node cannot
+     * ask a person. Use a session turn for those.
+     *
+     * @param  list<string>|null  $toolNames  narrows the mode, and cannot widen it
+     */
+    public function flowTools(?array $toolNames = null): FlowToolset
+    {
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        return FlowToolset::of($this, $toolNames);
+    }
+
+    /**
+     * @internal Read through {@see FlowToolset}.
+     *
+     * @param  list<string>|null  $toolNames
+     * @return list<Tool>
+     */
+    public function offeredFlowTools(?array $toolNames = null): array
+    {
+        if (! $this->runtime instanceof AgentRuntime) {
+            throw new \LogicException('This Harness session has no agent runtime.');
+        }
+
+        return $this->runtime->flowTools($this, $toolNames);
     }
 
     /**

@@ -34,6 +34,11 @@ final class ToolNotAvailable extends RuntimeException
         return new self("The flow asked for the tool [{$tool}], which was not offered to it ({$offered}).");
     }
 
+    public static function awaitingApproval(string $tool): self
+    {
+        return new self("The tool [{$tool}] needs approval, which a workflow node cannot give. Run it through a session turn, where a person can approve it.");
+    }
+
     public static function reported(string $tool, string $message): self
     {
         // Distinct wording from failed(): this tool did not crash, it returned

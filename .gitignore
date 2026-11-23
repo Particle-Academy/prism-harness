@@ -6,5 +6,7 @@ composer.lock
 /tools/engine-fixture/fancy-formula/vendor/
 !/tools/engine-fixture/fancy-formula-real/composer.lock
 /tools/engine-fixture/fancy-formula-real/vendor/
+!/tools/engine-fixture/fancy-flow/composer.lock
+/tools/engine-fixture/fancy-flow/vendor/
 .phpunit.result.cache
 .phpstan.cache
