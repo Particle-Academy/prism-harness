@@ -749,6 +749,52 @@ class Thread extends Model implements ThreadContract
         return 0;
     }
 
+    /**
+     * Every pending approval at the transcript tail, with the tool it was
+     * asked for and the digest of its stored arguments (G-360). Read from the
+     * thread only: a plan binds to these ids and to no other.
+     *
+     * @internal
+     *
+     * @return list<array{id: string, name: string, digest: string}>
+     */
+    public function pendingApprovalCalls(): array
+    {
+        $calls = [];
+        foreach ($this->pendingApprovalIds() as $id) {
+            $call = $this->approvalCall($id);
+            if ($call === null) {
+                continue;
+            }
+            $arguments = $call['arguments'];
+            $calls[] = ['id' => $id, 'name' => $call['name'],
+                'digest' => CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments)];
+        }
+
+        return $calls;
+    }
+
+    /**
+     * Every recorded decision, by approval id: true when approved (G-360).
+     *
+     * @internal
+     *
+     * @return array<string, bool>
+     */
+    public function approvalDecisions(): array
+    {
+        $decided = [];
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_TOOL_RESULT)->reorder('position')->cursor() as $stored) {
+            foreach ($stored->payload['tool_approval_responses'] ?? [] as $response) {
+                if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                    $decided[$response['approval_id']] ??= ($response['approved'] ?? false) === true;
+                }
+            }
+        }
+
+        return $decided;
+    }
+
     private function afterRecording(): self
     {
 

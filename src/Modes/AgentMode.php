@@ -30,6 +30,8 @@ final readonly class AgentMode
         public ?string $provider = null,
         public ?string $model = null,
         public array $agents = [],
+        /** Whether runs in this mode may keep an agent plan (G-360). Off unless set. */
+        public bool $plans = false,
     ) {}
 
     /**

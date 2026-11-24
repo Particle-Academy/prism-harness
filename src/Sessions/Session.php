@@ -15,11 +15,14 @@ use Prism\Harness\Contracts\HeldSessionLocks;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\ApprovalNotPending;
+use Prism\Harness\Exceptions\PlansDisabled;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Flow\FlowToolset;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\Participants\ParticipantRef;
+use Prism\Harness\Plans\PlanHandle;
+use Prism\Harness\Plans\Plans;
 use Prism\Harness\Steps\RunStep;
 use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Subagents\RunContext;
@@ -293,6 +296,59 @@ class Session
             list: $this->key(),
             leaseSeconds: $this->taskLeaseSeconds,
         );
+    }
+
+    /**
+     * This session's agent plan (G-360).
+     *
+     * Plans are optional and off unless the host turns on
+     * `prism-harness.plans.enabled` AND the session's mode sets `plans`.
+     *
+     * @throws PlansDisabled
+     */
+    public function plan(): PlanHandle
+    {
+        $this->assertWritableResolution();
+
+        return app(Plans::class)->handle($this);
+    }
+
+    /**
+     * Where this session's plan is stored: the durable store, always. A
+     * half-finished plan that vanished on a deploy would read as finished.
+     *
+     * @internal
+     */
+    public function planStore(): SessionStore
+    {
+        return $this->durable;
+    }
+
+    /**
+     * Hold the plan driver's lock, so one advance runs at a time per session.
+     * A second advance gets SessionLocked and does nothing.
+     *
+     * @internal
+     *
+     * @return Closure(): void
+     */
+    public function holdPlanLock(int $ttlSeconds): Closure
+    {
+        $this->assertWritableResolution();
+        if (! $this->ephemeral instanceof HeldSessionLocks) {
+            throw new \LogicException('Plans require the ephemeral store to implement HeldSessionLocks.');
+        }
+        $store = $this->ephemeral;
+        $key = $this->key().':plan-advance';
+        $token = $store->acquireFencedLock($key, $ttlSeconds, 0);
+        $released = false;
+
+        return function () use ($store, $key, $token, &$released): void {
+            if (! $released) {
+                $released = true;
+                $store->releaseFencedLock($key, $token);
+            }
+        };
     }
 
     /**
@@ -582,6 +638,10 @@ class Session
         $this->thread()->record([
             new ToolResultMessage(toolApprovalResponses: $decisions),
         ], $this->run()['id'] ?? null);
+
+        // A plan held on one of these approvals reads the decision from the
+        // thread, before the run resumes (G-360).
+        app(Plans::class)->decided($this);
     }
 
     /**
@@ -864,9 +924,15 @@ class Session
             throw new \LogicException('Harness run state changed while the run was active.');
         }
 
-        return $this->write('run', [
+        $this->write('run', [
             ...$run, ...$details, 'status' => $status, 'finished_at' => now()->toIso8601String(),
         ]);
+
+        // G-360: when the run is over, the plan reads the thread it left:
+        // the approvals the run staged, and the ones a new message ended.
+        app(Plans::class)->afterTurn($this);
+
+        return $this;
     }
 
     protected function ephemeralKey(): string

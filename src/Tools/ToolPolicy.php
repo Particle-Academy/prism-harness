@@ -44,6 +44,9 @@ final class ToolPolicy
     /** Verbs whose tools belong to the person: confirmation and approval. */
     private const RESERVED_VERBS = ['confirm', 'reject', 'accept', 'approve', 'deny'];
 
+    /** The agent plan tools (G-360): a plan is a person's agreement, never auto-allowed. */
+    public const RESERVED_TOOLS = ['plan_draft', 'plan_propose_change', 'plan_pause_for_person', 'plan_complete_step'];
+
     /** @param list<array{server?: string, tool: string}> $allow */
     private function __construct(
         public readonly string $revision,
@@ -199,11 +202,21 @@ final class ToolPolicy
         return preg_match('/^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}\z/', $name) === 1;
     }
 
-    /** A confirmation or approval tool: any token is a reserved verb. Invalid UTF-8 counts as reserved. */
+    /**
+     * A confirmation or approval tool: any token is a reserved verb, or the
+     * name is a plan tool (G-360). Invalid UTF-8 counts as reserved.
+     *
+     * The plan tools are named here because the verb tokeniser does not catch
+     * them: a plan_draft or a plan change that a policy let run without asking
+     * would be a plan no person approved.
+     */
     public static function isPersonOnly(string $name): bool
     {
         $normalised = self::normalise($name);
         if ($normalised === null) {
+            return true;
+        }
+        if (in_array(strtolower($normalised), self::RESERVED_TOOLS, true)) {
             return true;
         }
         foreach (preg_split('/[_.:-]+/', $normalised) ?: [] as $segment) {

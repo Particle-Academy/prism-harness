@@ -151,6 +151,12 @@ final class ModeRegistry
         }
 
         $agents = $this->agentsFor($name, $mode);
+        // G-360: a mode opts in to agent plans. Anything but true or false is
+        // refused, so a string "false" cannot quietly turn plans on.
+        $plans = $mode['plans'] ?? false;
+        if (! is_bool($plans)) {
+            throw new InvalidArgumentException(sprintf('Harness mode [%s] declares a malformed plans flag: expected true or false.', $name));
+        }
 
         return new AgentMode(
             $name,
@@ -164,6 +170,7 @@ final class ModeRegistry
             self::bindingValue($mode, 'provider', sprintf('Harness mode [%s] declares a malformed provider/model: expected a nonempty string or null.', $name)),
             self::bindingValue($mode, 'model', sprintf('Harness mode [%s] declares a malformed provider/model: expected a nonempty string or null.', $name)),
             $agents,
+            $plans,
         );
     }
 
