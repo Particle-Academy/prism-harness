@@ -199,7 +199,7 @@ final readonly class AgentRuntime
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
-            $run = $this->boundedAgentRun($session, $run);
+            $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $budget = $run->budget;
 
@@ -222,7 +222,7 @@ final readonly class AgentRuntime
             if (! $run->capped() && $stop !== null) {
                 $session->failRun($runId, 'budget');
 
-                throw RunNotPermitted::exhausted($stop);
+                throw $run->ledger->refusal($stop);
             }
 
             try {
@@ -415,7 +415,7 @@ final readonly class AgentRuntime
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             ));
-            $run = $this->boundedAgentRun($session, $run);
+            $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $budget = $run->budget;
 
@@ -434,7 +434,7 @@ final readonly class AgentRuntime
             if (! $run->capped() && $stop !== null) {
                 $session->failRun($runId, 'budget');
 
-                throw RunNotPermitted::exhausted($stop);
+                throw $run->ledger->refusal($stop);
             }
 
             try {
@@ -1975,6 +1975,46 @@ final readonly class AgentRuntime
             decidedBy: $decidedBy,
             harnessAgent: $session->agent(),
         ));
+    }
+
+    /**
+     * A workflow agent node's run: the smaller of this session's own step
+     * ceiling and what the workflow has left, on the workflow's ledger
+     * (G-348). Any other run is returned unchanged.
+     */
+    private function workflowNodeRun(Session $session, AgentMode $mode, RunContext $run): RunContext
+    {
+        if (! $run->workflowNode) {
+            return $run;
+        }
+
+        return $run->forWorkflowNode(false)->withBudget((new RunBudget(
+            maxSteps: $this->ceilingFor($session, $mode),
+            maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
+        ))->nestedWithin($run->budget, $run->ledger));
+    }
+
+    /**
+     * A workflow model call's run on the workflow's ledger (G-348): labelled
+     * with the session's named agent and held to its `spend_ceiling` and
+     * output limit, with the host's cost observer attached. The same rules an
+     * ordinary turn gets, so a workflow is not a way around them.
+     *
+     * @internal Called by {@see PrismLlmClient}.
+     */
+    public function flowRun(?Session $session, RunContext $run): RunContext
+    {
+        return $this->observedRun($session === null ? $run : $this->boundedAgentRun($session, $run));
+    }
+
+    /**
+     * The trusted price of one workflow model call, from the one price list.
+     *
+     * @internal Called by {@see PrismLlmClient}.
+     */
+    public function flowCallBudget(RunContext $run, string $provider, string $model): CallBudget
+    {
+        return CallBudget::forRun($run, $provider, $model, $this->pricing);
     }
 
     private function requestSteps(Session $session, RunContext $run): int

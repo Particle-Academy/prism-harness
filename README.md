@@ -1153,6 +1153,58 @@ Observers are trusted host code; their own model calls and billing are not meter
 worker cannot run `settled`, so hosts must expire or reconcile stale durable reservations.
 The observer does not turn the in-memory ledger into a distributed account by itself.
 
+## Workflow budgets
+
+A fancy-flow workflow run has one budget, on by default: 100 model calls and 100 tool
+calls per run. Every `llm_call`, every step of an `agent` node (and of its subagents),
+and every tool the workflow runs draws from it, across `for_each` items, subflow levels,
+retries, resumes and parallel workers. A refused call sends nothing and runs nothing, and
+fails its node with the code `workflow_budget_exhausted`.
+
+```php
+'workflow' => [
+    'max_steps' => 100,        // model calls per run
+    'max_tool_calls' => 100,   // tool handlers per run
+    'max_cost_usd' => null,    // null uses agent.max_cost_usd
+    'max_seconds' => null,
+    'store' => 'database',     // shared by every worker; 'memory' for one process
+],
+```
+
+Bind the Harness to the run so the budget is keyed by the engine's run key:
+
+```php
+use FancyFlow\Engine\FlowRunner;
+use FancyFlow\Registry\Builtin;
+use FancyFlow\Runtime\RunOptions;
+use Prism\Harness\Flow\HarnessFlowExecutors;
+
+$registry = Builtin::executors($deps);
+HarnessFlowExecutors::register($registry,
+    tools: $session->flowTools(),
+    limits: ['max_steps' => 20],                    // optional, this run only
+    workflow: $metadata['harness_budget'] ?? [],    // optional, from the saved workflow
+);
+
+(new FlowRunner)->run($graph, $registry, options: new RunOptions(run: $runKey));
+```
+
+The config is the ceiling. Host limits and a workflow's `harness_budget` can only lower
+it; a workflow that asks for more gets the configured value and a warning in its run log.
+The limits are fixed when a run first opens its budget, so a resume after a deploy cannot
+raise them.
+
+Workflow model calls are priced and capped like turns: `pricing`, the cost cap,
+`agent.max_output_tokens_per_call`, the `cost_observer` and a named agent's
+`spend_ceiling` all apply.
+
+A run with no run key is given one, saved with its session, so a retry or resume through
+that session continues the same budget. To start a fresh budget for a new keyless run on
+the same session, call `app(WorkflowBudgets::class)->startSessionRun($session)`.
+
+Money reserved by a worker that died mid-call stays reserved until you reconcile the run's
+row in `harness_workflow_budgets`.
+
 ## Task lists
 
 An agent given a goal has to keep working across many requests until the goal is met. It

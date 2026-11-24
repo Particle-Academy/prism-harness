@@ -25,6 +25,8 @@ final class RunLedger
 {
     private int $steps = 0;
 
+    private int $toolCalls = 0;
+
     private float $costUsd = 0.0;
 
     private int $unmeteredRuns = 0;
@@ -53,10 +55,119 @@ final class RunLedger
 
     private ?CallCostObserver $observer = null;
 
+    /** Set for a ledger shared across processes; see {@see LedgerGuard}. */
+    private ?LedgerGuard $guard = null;
+
+    private bool $guarding = false;
+
     public function __construct(
         public readonly string $rootRunId,
-        private readonly float $startedAt = 0.0,
+        private float $startedAt = 0.0,
     ) {}
+
+    /**
+     * @internal Bind this ledger to the shared account it caches (G-348).
+     */
+    public function guardedBy(LedgerGuard $guard): self
+    {
+        $this->guard = $guard;
+
+        return $this;
+    }
+
+    /**
+     * @internal The totals a {@see LedgerGuard} stores.
+     *
+     * @return array{steps: int, tool_calls: int, cost_usd: float, unmetered: int, cancelled: bool, cancel_reason: ?string, reservations: array<int, float>, reservation_agents: array<int, string>, reservation_sequence: int, agent_costs: array<string, float>, started_at: float}
+     */
+    public function snapshot(): array
+    {
+        return [
+            'steps' => $this->steps,
+            'tool_calls' => $this->toolCalls,
+            'cost_usd' => $this->costUsd,
+            'unmetered' => $this->unmeteredRuns,
+            'cancelled' => $this->cancelled,
+            'cancel_reason' => $this->cancelReason,
+            'reservations' => $this->reservations,
+            'reservation_agents' => $this->reservationAgents,
+            'reservation_sequence' => $this->reservationSequence,
+            'agent_costs' => $this->agentCosts,
+            'started_at' => $this->startedAt,
+        ];
+    }
+
+    /**
+     * @internal Load totals a {@see LedgerGuard} stored.
+     *
+     * @param  array<string, mixed>  $state
+     */
+    public function restore(array $state): void
+    {
+        $this->steps = self::int($state['steps'] ?? 0);
+        $this->toolCalls = self::int($state['tool_calls'] ?? 0);
+        $this->costUsd = self::float($state['cost_usd'] ?? 0.0);
+        $this->unmeteredRuns = self::int($state['unmetered'] ?? 0);
+        $this->cancelled = ($state['cancelled'] ?? false) === true;
+        $this->cancelReason = isset($state['cancel_reason']) && is_string($state['cancel_reason']) ? $state['cancel_reason'] : null;
+        $this->reservations = [];
+        $this->reservationAgents = [];
+        $this->agentCosts = [];
+        foreach (is_array($state['reservations'] ?? null) ? $state['reservations'] : [] as $id => $amount) {
+            $this->reservations[(int) $id] = self::float($amount);
+        }
+        foreach (is_array($state['reservation_agents'] ?? null) ? $state['reservation_agents'] : [] as $id => $agent) {
+            if (is_string($agent)) {
+                $this->reservationAgents[(int) $id] = $agent;
+            }
+        }
+        foreach (is_array($state['agent_costs'] ?? null) ? $state['agent_costs'] : [] as $agent => $cost) {
+            $this->agentCosts[(string) $agent] = self::float($cost);
+        }
+        $this->reservationSequence = self::int($state['reservation_sequence'] ?? 0);
+        $this->startedAt = self::float($state['started_at'] ?? $this->startedAt);
+    }
+
+    private static function int(mixed $value): int
+    {
+        return is_numeric($value) ? (int) $value : 0;
+    }
+
+    private static function float(mixed $value): float
+    {
+        return is_numeric($value) ? (float) $value : 0.0;
+    }
+
+    /**
+     * The refusal for a run that may not spend again. A shared workflow
+     * ledger records it as the run's exhaustion and names it as such.
+     */
+    public function refusal(string $reason): RunNotPermitted
+    {
+        return $this->guard === null || $this->guarding
+            ? RunNotPermitted::exhausted($reason)
+            : $this->guard->refusal($this, $reason);
+    }
+
+    /**
+     * @template T
+     *
+     * @param  \Closure(): T  $operation
+     * @return T
+     */
+    private function guarded(\Closure $operation): mixed
+    {
+        if ($this->guard === null || $this->guarding) {
+            return $operation();
+        }
+
+        $this->guarding = true;
+        try {
+            return $this->guard->atomically($this, $operation);
+        } finally {
+            $this->guarding = false;
+        }
+    }
 
     public static function start(string $rootRunId): self
     {
@@ -65,17 +176,23 @@ final class RunLedger
 
     public function steps(): int
     {
-        return $this->steps;
+        return $this->guarded(fn (): int => $this->steps);
+    }
+
+    /** Workflow tool handlers started in this tree (G-348). Sessions never count them. */
+    public function toolCalls(): int
+    {
+        return $this->guarded(fn (): int => $this->toolCalls);
     }
 
     public function costUsd(): float
     {
-        return $this->costUsd;
+        return $this->guarded(fn (): float => $this->costUsd);
     }
 
     public function reservedCostUsd(): float
     {
-        return array_sum($this->reservations);
+        return $this->guarded(fn (): float => array_sum($this->reservations));
     }
 
     /** Once selected, the tree's observer cannot be dropped or replaced by a child context. */
@@ -97,6 +214,11 @@ final class RunLedger
      * this same ledger. Either refusal happens before the provider request.
      */
     public function reserveCost(RunBudget $budget, float $worstCase, ?string $agent = null, ?float $agentCeilingUsd = null): int
+    {
+        return $this->guarded(fn (): int => $this->reserveCostNow($budget, $worstCase, $agent, $agentCeilingUsd));
+    }
+
+    private function reserveCostNow(RunBudget $budget, float $worstCase, ?string $agent, ?float $agentCeilingUsd): int
     {
         $treeCapped = $budget->maxCostUsd !== null;
         if (! is_finite($worstCase) || $worstCase < 0 || (! $treeCapped && $agentCeilingUsd === null)
@@ -123,7 +245,7 @@ final class RunLedger
     /** What calls labelled with this agent have been charged in this tree. */
     public function agentCostUsd(string $agent): float
     {
-        return $this->agentCosts[$agent] ?? 0.0;
+        return $this->guarded(fn (): float => $this->agentCosts[$agent] ?? 0.0);
     }
 
     private function agentReservedUsd(string $agent): float
@@ -141,10 +263,17 @@ final class RunLedger
     /** Check cancellation/steps/time before resolving an approved side effect, then again before spending. */
     public function assertCallAvailable(RunBudget $budget): void
     {
+        $this->guarded(function () use ($budget): void {
+            $this->assertCallAvailableNow($budget);
+        });
+    }
+
+    private function assertCallAvailableNow(RunBudget $budget): void
+    {
         // Cost admission uses >, allowing an exact fit (including a genuinely
         // free call). Preserve the legacy >= exhaustion API for its callers.
         $stop = $this->unmeteredRuns > 0 ? $this->exhaustion($budget)
-            : $this->exhaustion(new RunBudget($budget->maxSteps, maxSeconds: $budget->maxSeconds));
+            : $this->exhaustion(new RunBudget($budget->maxSteps, maxSeconds: $budget->maxSeconds, maxToolCalls: $budget->maxToolCalls));
         if ($stop !== null) {
             throw RunNotPermitted::exhausted($stop);
         }
@@ -158,6 +287,11 @@ final class RunLedger
 
     /** Settle and return this call's charge, independently of other calls sharing the ledger. */
     public function chargeReservation(int $reservation, ?float $cost): float
+    {
+        return $this->guarded(fn (): float => $this->chargeReservationNow($reservation, $cost));
+    }
+
+    private function chargeReservationNow(int $reservation, ?float $cost): float
     {
         if (! array_key_exists($reservation, $this->reservations)) {
             throw new \LogicException('The call reservation has already been settled.');
@@ -177,10 +311,12 @@ final class RunLedger
     /** A host veto happened before any provider request, so nothing was spent. */
     public function releaseCost(int $reservation): void
     {
-        if (! array_key_exists($reservation, $this->reservations)) {
-            throw new \LogicException('The call reservation has already been settled.');
-        }
-        unset($this->reservations[$reservation], $this->reservationAgents[$reservation]);
+        $this->guarded(function () use ($reservation): void {
+            if (! array_key_exists($reservation, $this->reservations)) {
+                throw new \LogicException('The call reservation has already been settled.');
+            }
+            unset($this->reservations[$reservation], $this->reservationAgents[$reservation]);
+        });
     }
 
     public function elapsedSeconds(): float
@@ -190,7 +326,42 @@ final class RunLedger
 
     public function recordSteps(int $steps): void
     {
-        $this->steps += max(0, $steps);
+        $this->guarded(function () use ($steps): void {
+            $this->steps += max(0, $steps);
+        });
+    }
+
+    /**
+     * Admit one model step and charge it, in one decision (G-348). A shared
+     * ledger takes both under one hold, so two workers cannot both take the
+     * last step.
+     */
+    public function takeStep(RunBudget $budget): void
+    {
+        $this->guarded(function () use ($budget): void {
+            $this->assertCallAvailableNow($budget);
+            $this->steps++;
+        });
+    }
+
+    /** Admit one workflow tool handler and charge it, in one decision (G-348). */
+    public function takeToolCall(RunBudget $budget): void
+    {
+        $this->guarded(function () use ($budget): void {
+            $this->assertCallAvailableNow($budget);
+            $this->toolCalls++;
+        });
+    }
+
+    /**
+     * One workflow tool handler is about to start (G-348). Charged before the
+     * handler and never refunded, whether it succeeds or throws.
+     */
+    public function recordToolCall(): void
+    {
+        $this->guarded(function (): void {
+            $this->toolCalls++;
+        });
     }
 
     /**
@@ -205,18 +376,20 @@ final class RunLedger
      */
     public function recordCost(?float $usd): void
     {
-        if ($usd === null) {
-            $this->unmeteredRuns++;
+        $this->guarded(function () use ($usd): void {
+            if ($usd === null) {
+                $this->unmeteredRuns++;
 
-            return;
-        }
+                return;
+            }
 
-        $this->costUsd += max(0.0, $usd);
+            $this->costUsd += max(0.0, $usd);
+        });
     }
 
     public function unmeteredRuns(): int
     {
-        return $this->unmeteredRuns;
+        return $this->guarded(fn (): int => $this->unmeteredRuns);
     }
 
     /**
@@ -230,23 +403,26 @@ final class RunLedger
      */
     public function cancel(string $reason = 'cancelled'): void
     {
-        $this->cancelled = true;
-        $this->cancelReason = $reason;
+        $this->guarded(function () use ($reason): void {
+            $this->cancelled = true;
+            $this->cancelReason = $reason;
+        });
     }
 
     public function cancelled(): bool
     {
-        return $this->cancelled;
+        return $this->guarded(fn (): bool => $this->cancelled);
     }
 
     public function cancelReason(): ?string
     {
-        return $this->cancelReason;
+        return $this->guarded(fn (): ?string => $this->cancelReason);
     }
 
     public function remainingCost(RunBudget $budget): ?float
     {
-        return $budget->maxCostUsd === null ? null : max(0.0, $budget->maxCostUsd - $this->costUsd - $this->reservedCostUsd());
+        return $this->guarded(fn (): ?float => $budget->maxCostUsd === null ? null
+            : max(0.0, $budget->maxCostUsd - $this->costUsd - array_sum($this->reservations)));
     }
 
     public function remainingSeconds(RunBudget $budget): ?int
@@ -266,12 +442,21 @@ final class RunLedger
      */
     public function exhaustion(RunBudget $budget): ?string
     {
+        return $this->guarded(fn (): ?string => $this->exhaustionNow($budget));
+    }
+
+    private function exhaustionNow(RunBudget $budget): ?string
+    {
         if ($this->cancelled) {
             return $this->cancelReason ?? 'cancelled';
         }
 
         if ($this->steps >= $budget->maxSteps) {
             return sprintf('step budget exhausted (%d of %d used)', $this->steps, $budget->maxSteps);
+        }
+
+        if ($budget->maxToolCalls !== null && $this->toolCalls >= $budget->maxToolCalls) {
+            return sprintf('tool call budget exhausted (%d of %d used)', $this->toolCalls, $budget->maxToolCalls);
         }
 
         if ($budget->maxCostUsd !== null && $this->unmeteredRuns > 0) {

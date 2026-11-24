@@ -307,10 +307,16 @@ final readonly class BudgetedCalls
             $response->meta, collect($messages), $response->additionalContent, $response->raw)];
     }
 
-    /** @param 'text'|'structured'|'stream' $kind
+    /**
+     * Price, admit and reserve one call before its request. Shared with the
+     * workflow client so the two paths cannot drift (G-348).
+     *
+     * @internal
+     *
+     * @param  'text'|'structured'|'stream'  $kind
      * @return array{int, CallReservation}
      */
-    private function reserve(RunContext $run, TextRequest|StructuredRequest $request, string $kind, Provider $provider): array
+    public function reserve(RunContext $run, TextRequest|StructuredRequest $request, string $kind, Provider $provider): array
     {
         $callId = bin2hex(random_bytes(16));
         $providerKey = $request->provider() ?? throw new \LogicException('A capped call needs a provider.');
@@ -331,10 +337,12 @@ final readonly class BudgetedCalls
     /**
      * An untrusted usage is still reported to the observer, but never priced.
      *
+     * @internal Shared with the workflow client (G-348).
+     *
      * @param  'completed'|'failed'|'abandoned'  $outcome
      * @param  array<string, mixed>  $additionalContent
      */
-    private function settle(RunContext $run, int $reservation, CallReservation $call, ?Usage $usage, string $outcome, bool $trusted = true, array $additionalContent = []): void
+    public function settle(RunContext $run, int $reservation, CallReservation $call, ?Usage $usage, string $outcome, bool $trusted = true, array $additionalContent = []): void
     {
         $cost = $trusted ? $this->price->costOf($usage, $additionalContent) : null;
         $charged = $run->ledger->chargeReservation($reservation, $cost);

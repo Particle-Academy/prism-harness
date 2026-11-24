@@ -186,7 +186,7 @@ jobs:
       - name: Run the workflow tests through the real engine
         env:
           HARNESS_REQUIRE_FLOW_ENGINE: '1'
-        run: vendor/bin/pest tests/FlowToolBoundaryTest.php tests/FlowBridgeTest.php
+        run: vendor/bin/pest tests/FlowToolBoundaryTest.php tests/FlowBridgeTest.php tests/WorkflowBudgetTest.php
 
   third-party:
     name: Third-party dependency allowlist

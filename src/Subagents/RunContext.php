@@ -78,6 +78,12 @@ final readonly class RunContext
          * A second limit on one account, never a second account.
          */
         public ?float $agentCeilingUsd = null,
+        /**
+         * True for the context a workflow hands one of its agent nodes
+         * (G-348). The runtime narrows it to the smaller of the session's own
+         * step ceiling and what the workflow has left, then clears the flag.
+         */
+        public bool $workflowNode = false,
     ) {
         $this->observer = $ledger->inheritCostObserver($observer);
     }
@@ -98,7 +104,7 @@ final readonly class RunContext
     {
         return new self($this->ledger, $this->budget, $this->parentRunId, $this->parentThreadId,
             $this->depth, $this->pricing, $this->observer, $turnId, $this->actor, $this->metadataOnly,
-            $this->binding, $this->agent, $this->agentCeilingUsd);
+            $this->binding, $this->agent, $this->agentCeilingUsd, $this->workflowNode);
     }
 
     /** The same run, acting for an actor the application has authorized. */
@@ -106,7 +112,13 @@ final readonly class RunContext
     {
         return new self($this->ledger, $this->budget, $this->parentRunId, $this->parentThreadId,
             $this->depth, $this->pricing, $this->observer, $this->turnId, $actor, $this->metadataOnly,
-            $this->binding, $this->agent, $this->agentCeilingUsd);
+            $this->binding, $this->agent, $this->agentCeilingUsd, $this->workflowNode);
+    }
+
+    /** @internal The context one workflow agent node runs under; see {@see self::$workflowNode}. */
+    public function forWorkflowNode(bool $node = true): self
+    {
+        return $this->rebuild(workflowNode: $node);
     }
 
     /** The same run, as the subagent runner binds a child's provider and model. */
@@ -143,6 +155,7 @@ final readonly class RunContext
         ?string $agent = null,
         ?float $agentCeilingUsd = null,
         bool $labelled = false,
+        ?bool $workflowNode = null,
     ): self {
         return new self(
             ledger: $this->ledger,
@@ -158,6 +171,7 @@ final readonly class RunContext
             binding: $binding ?? $this->binding,
             agent: $labelled ? $agent : $this->agent,
             agentCeilingUsd: $labelled ? $agentCeilingUsd : $this->agentCeilingUsd,
+            workflowNode: $workflowNode ?? $this->workflowNode,
         );
     }
 
