@@ -599,3 +599,63 @@ it('runs an approved call whatever shape its arguments take', function (array $a
     'a whole float' => [['a' => 2.0]],
     'an empty list' => [['a' => []]],
 ]);
+
+/**
+ * Every odd request asks for `read`, every even one answers: each send() in a
+ * test gets the same model.
+ */
+function policyModelPerTurn(): void
+{
+    $count = 0;
+    Http::fake(function (Request $request) use (&$count) {
+        $count++;
+        $output = $count % 2 === 1
+            ? [['id' => 'fc_'.$count, 'type' => 'function_call', 'status' => 'completed',
+                'arguments' => '{"a":"x"}', 'call_id' => 'call_'.$count, 'name' => 'read']]
+            : [['id' => 'msg_'.$count, 'type' => 'message', 'status' => 'completed', 'role' => 'assistant',
+                'content' => [['type' => 'output_text', 'annotations' => [], 'text' => 'done', 'refusal' => null]]]];
+
+        return Http::response(['id' => 'resp_'.$count, 'object' => 'response', 'created_at' => 1741989983, 'status' => 'completed',
+            'model' => 'gpt-4o-2024-08-06', 'output' => $output,
+            'usage' => ['input_tokens' => 1, 'input_tokens_details' => ['cached_tokens' => 0], 'output_tokens' => 1, 'output_tokens_details' => ['reasoning_tokens' => 0], 'total_tokens' => 2]]);
+    });
+}
+
+function policyScopeSession(string $name): Session
+{
+    return app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => $name]))->session('chat');
+}
+
+it('ends a policy set with setToolPolicy() with the request or job that set it', function (): void {
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')]);
+    policyModelPerTurn();
+
+    // Job A: its tenant lets `read` run without asking.
+    app(AgentRuntime::class)->setToolPolicy(allowOnly([['tool' => 'read']]));
+    expect(policyScopeSession('Ada')->send('go')->awaitingApproval())->toBeFalse()
+        ->and(PolicyRan::$names)->toBe(['read']);
+
+    // What Octane does before each request and a queue worker before each job.
+    app()->forgetScopedInstances();
+
+    // Job B, same process, another tenant that never allowed it: a person is asked.
+    $response = policyScopeSession('Bob')->send('go');
+
+    expect($response->awaitingApproval())->toBeTrue()
+        ->and(PolicyRan::$names)->toBe(['read'])
+        ->and(app(AgentRuntime::class)->toolPolicy()->revision)->toBe('');
+});
+
+it('keeps the deployment policy from config across requests and jobs', function (): void {
+    config()->set('prism-harness.agent.tool_policy', ['revision' => 'deploy', 'allow' => [['tool' => 'read']], 'honor' => true]);
+    policyTools(['read']);
+    app(ToolRegistry::class)->registerMany([policyTool('read')]);
+    policyModelPerTurn();
+
+    expect(policyScopeSession('Ada')->send('go')->awaitingApproval())->toBeFalse();
+    app()->forgetScopedInstances();
+    expect(policyScopeSession('Bob')->send('go')->awaitingApproval())->toBeFalse()
+        ->and(PolicyRan::$names)->toBe(['read', 'read'])
+        ->and(app(AgentRuntime::class)->toolPolicy()->revision)->toBe('deploy');
+});
