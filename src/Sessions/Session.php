@@ -325,8 +325,9 @@ class Session
      * A tool that needs approval fails its node, because a workflow node cannot
      * ask a person. Use a session turn for those.
      *
-     * Each tool call holds the session lock while it runs, as a turn does. When
-     * another turn holds it, the call does not run and its node fails.
+     * Each tool call and each model call holds the session lock while it runs,
+     * as a turn does. When another turn holds it, nothing is read, sent, run or
+     * written, and the node fails.
      *
      * @param  list<string>|null  $toolNames  narrows the mode, and cannot widen it
      */
