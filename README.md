@@ -1198,8 +1198,9 @@ Workflow model calls are priced and capped like turns: `pricing`, the cost cap,
 `agent.max_output_tokens_per_call`, the `cost_observer` and a named agent's
 `spend_ceiling` all apply.
 
-A run with no run key is given one, saved with its session, so a retry or resume through
-that session continues the same budget. To start a fresh budget for a new keyless run on
+A run with no run key is given one, saved for its session, so a retry or resume through
+that session continues the same budget. Two workers making the first call at once get the
+same key. To start a fresh budget for a new keyless run on
 the same session, call `app(WorkflowBudgets::class)->startSessionRun($session)`.
 
 Money reserved by a worker that died mid-call stays reserved until you reconcile the run's
