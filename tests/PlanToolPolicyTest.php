@@ -21,7 +21,6 @@ it('refuses a policy that names a plan tool, in any spelling', function (string 
     'trailing NBSP' => "plan_draft\u{00A0}",
     'leading ZWSP' => "\u{200B}plan_draft",
     'Cyrillic a' => "pl\u{0430}n_draft",
-    'scoped to a server' => 'plan_draft',
 ]);
 
 it('never lets a plan tool run under a policy, even one built without the tool list', function (): void {

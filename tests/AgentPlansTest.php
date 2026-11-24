@@ -276,6 +276,9 @@ it('never infers completion: a turn that ends with a polite question goes back t
         G360::text('Shall I go ahead?');
         expect(G360::session()->plan()->advance()->status)->toBe('ran');
     }
+    // Spare replies, so a driver that kept going would show here as a wrong outcome.
+    G360::text('spare');
+    G360::text('spare');
     $outcome = G360::session()->plan()->advance();
     $plan = g360Plan();
 
@@ -285,7 +288,7 @@ it('never infers completion: a turn that ends with a polite question goes back t
         ->and($plan['counters']['settledWithoutTool'])->toBe(3)
         ->and($plan['counters']['settledByTool'])->toBe(0)
         // and no further model call was made.
-        ->and(G360::$queue)->toBe([]);
+        ->and(G360::$queue)->toHaveCount(2);
 });
 
 it('blocks a plan that runs out of advances, and will not resume it', function (): void {
@@ -296,9 +299,11 @@ it('blocks a plan that runs out of advances, and will not resume it', function (
         G360::text('ok');
         G360::session()->plan()->advance();
     }
+    G360::text('spare');
     $outcome = G360::session()->plan()->advance();
 
-    expect($outcome->status)->toBe('blocked')->and($outcome->reason)->toBe('budget');
+    expect($outcome->status)->toBe('blocked')->and($outcome->reason)->toBe('budget')
+        ->and(G360::$queue)->toHaveCount(1);
     expect(fn () => G360::session()->plan()->resume(g360Actor()))
         ->toThrow(PlanRefused::class, PlanRefusal::message('plan.not_resumable'));
 });

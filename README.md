@@ -1327,6 +1327,13 @@ session slot does. A half-finished task list that vanishes on a deploy is indist
 from a finished one: the next run resolves the same session, finds nothing to do, and
 reports success having dropped the rest of its work.
 
+## Agent plans
+
+Optional, and off unless the host and the mode turn them on. An agent drafts a
+plan, a person approves it, and `$session->plan()->advance()` runs one step per
+turn. A plan step is a separate thing from a task in the list above, and a done
+plan step never closes a task. See [docs/plans.md](docs/plans.md).
+
 ## What it is for
 
 Applications where **the agent is the product** and the session is long-lived — an interactive
