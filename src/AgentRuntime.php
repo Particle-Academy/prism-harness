@@ -641,8 +641,8 @@ final readonly class AgentRuntime
      * sequence ended. Only then are they reported and the run resumed on the
      * step path, which resolves
      * approvals from the thread. A dropped stream has lost nothing, and a
-     * second resume finds every approved call already answered and runs none
-     * of them again.
+     * second decision for the same approval is refused before it is recorded,
+     * because that approval is no longer pending (G-354).
      *
      * The resumed run keeps the parked run's id when the session still knows
      * it, so `seq` continues from where that run's stream ended.

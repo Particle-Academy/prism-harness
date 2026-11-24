@@ -626,6 +626,51 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
+     * The approval ids the run paused at the transcript tail is still waiting
+     * on: issued by the last assistant step and not yet answered (G-354).
+     *
+     * Read from the raw stored rows, newest first, so compaction cannot erase
+     * it. A user turn, or an assistant step that asked nothing, ends the scope:
+     * nothing before it is pending. An id answered once is no longer pending.
+     *
+     * @return list<string>
+     */
+    public function pendingApprovalIds(): array
+    {
+        $answered = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            $payload = $stored->payload;
+            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
+                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
+                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                        $answered[$response['approval_id']] = true;
+                    }
+                }
+
+                continue;
+            }
+            if ($stored->type === MessageMapper::TYPE_USER) {
+                return [];
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                continue;
+            }
+
+            $pending = [];
+            foreach ($payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && is_string($request['approval_id'] ?? null) && $request['approval_id'] !== ''
+                    && ! isset($answered[$request['approval_id']])) {
+                    $pending[] = $request['approval_id'];
+                }
+            }
+
+            return array_values(array_unique($pending));
+        }
+
+        return [];
+    }
+
+    /**
      * The call an approval id was requested for, or null.
      *
      * @return array{name: string, arguments: mixed}|null

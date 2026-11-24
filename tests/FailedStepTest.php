@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
@@ -150,7 +151,14 @@ it('executes a valid approved call but never one from a failed step', function (
     }
     $provider->assertCallCount(1);
     expect($observer->settlements)->toHaveCount(1);
-    $session->approve('failed-approval', context: $run);
+    if ($failed) {
+        // The failed step's approval was never recorded, so it is not pending
+        // and the decision is refused before any provider call (G-354).
+        expect(fn () => $session->approve('failed-approval', context: $run))->toThrow(ApprovalNotPending::class);
+        $provider->assertCallCount(1);
+    } else {
+        $session->approve('failed-approval', context: $run);
+    }
     expect($tools)->toBe($failed ? 0 : 1);
 })->with([false, true]);
 

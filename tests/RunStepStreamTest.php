@@ -11,6 +11,7 @@ use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunResumed;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Events\RunStepped;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
@@ -423,16 +424,20 @@ it('records every decision before any tool runs, then reports it first, continui
         ->and($fresh->run()['status'])->toBe('completed');
 });
 
-it('runs nothing twice when the same decision is streamed again', function (): void {
+it('refuses the same decision streamed again, and runs nothing twice', function (): void {
     [$session, $parked, $ran] = parkOnApproval(finals: 2);
     $approvalId = stepsOfType($parked, RunStep::APPROVAL_REQUEST)[0]->data['approvalId'];
 
     collectSteps(stepSession('approval')->streamDecision([new ToolApprovalResponse($approvalId, true)]));
-    $again = collectSteps(stepSession('approval')->streamDecision([new ToolApprovalResponse($approvalId, true)]));
+    $rows = stepSession('approval')->thread()->storedMessages()->count();
+
+    // Already answered, so no longer pending: refused before anything is
+    // recorded or sent (G-354).
+    expect(fn () => collectSteps(stepSession('approval')->streamDecision([new ToolApprovalResponse($approvalId, true)])))
+        ->toThrow(ApprovalNotPending::class);
 
     expect($ran['tick'])->toBe(1)
-        ->and($again[0]->type)->toBe(RunStep::DECISION_RECORDED)
-        ->and(stepsOfType($again, RunStep::TOOL_RESULT))->toBe([]);
+        ->and(stepSession('approval')->thread()->storedMessages()->count())->toBe($rows);
 });
 
 it('reports a denied decision, and the call it denied as refused', function (): void {

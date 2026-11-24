@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use PHPUnit\Framework\Attributes\DataProvider;
 use Prism\Harness\AgentRuntime;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
@@ -379,12 +380,19 @@ final class ApprovalToolScopeTest extends TestCase
             $fresh = app(PrismHarness::class)->for($participant)->session('chat');
             self::assertNotSame($session, $fresh);
             // Structured turns lose the approval id too. Even an affirmative
-            // response cannot recover a call absent from durable approval data.
-            $fresh->decide([new ToolApprovalResponse($approvalId ?? 'lost-structured-approval', true)], context: $context);
+            // response cannot recover a call absent from durable approval data:
+            // it is not pending, so it is refused before any request (G-354).
+            try {
+                $fresh->decide([new ToolApprovalResponse($approvalId ?? 'lost-structured-approval', true)], context: $context);
+                self::fail('A decision for an approval that was never recorded must be refused.');
+            } catch (ApprovalNotPending) {
+                // Refused, having sent and written nothing.
+            }
             self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $counts);
+            Http::assertSentCount(1);
             $fresh->send('A later turn.', context: $context);
             self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $counts);
-            Http::assertSentCount(3);
+            Http::assertSentCount(2);
             self::markTestIncomplete('G-229.2: initial '.$surface.($capped ? ' capped' : ' uncapped').' approval is not recorded; zero gated calls on initial turn, fresh-worker affirmative resume and later turn.');
         }
         self::assertNotNull($pending, 'The native surface must actually persist a pending approval.');
