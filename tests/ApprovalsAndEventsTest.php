@@ -7,6 +7,7 @@ use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Modes\ModeRegistry;
+use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
@@ -14,6 +15,7 @@ use Prism\Prism\Testing\TextResponseFake;
 use Prism\Prism\Text\Step;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\Meta;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolCall;
@@ -80,6 +82,16 @@ it('reads a paused run as awaiting approval rather than as a failure', function 
         ->and($response->pendingApprovals()[0]->approvalId)->toBe('apr_1');
 });
 
+/** A turn paused on one approval, as a run that asked a person leaves the thread. */
+function parkOnStoredApproval(Session $session, string $approvalId): void
+{
+    // A decision must answer an approval the run actually issued (G-354).
+    $session->thread()->record([
+        new UserMessage('go'),
+        new AssistantMessage('', [new ToolCall('call_1', 'execute_op', [])], toolApprovalRequests: [new ToolApprovalRequest($approvalId, 'call_1')]),
+    ]);
+}
+
 it('records an approval decision in the thread so another worker can read it', function (): void {
     // Storage, not memory. The approval granted this morning has to be visible
     // to the worker that resumes tonight, after a deploy.
@@ -87,6 +99,7 @@ it('records an approval decision in the thread so another worker can read it', f
         TextResponseFake::make()->withText('resumed')->withMessages(collect([new AssistantMessage('resumed')])),
     ]);
     $session = harness()->for(Participant::create(['name' => 'Ada']))->session('chat');
+    parkOnStoredApproval($session, 'apr_1');
 
     $session->approve('apr_1', true, 'looks fine');
 
@@ -105,6 +118,7 @@ it('records a denial as a decision rather than as an absence', function (): void
     // answered" and "a person said no" are different facts.
     Prism::fake([TextResponseFake::make()->withText('ok')]);
     $session = harness()->for(Participant::create(['name' => 'Ada']))->session('chat');
+    parkOnStoredApproval($session, 'apr_2');
 
     $session->deny('apr_2', 'not on production');
 

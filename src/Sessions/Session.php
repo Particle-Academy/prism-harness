@@ -14,6 +14,7 @@ use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Contracts\HeldSessionLocks;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Events\RunStepped;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Flow\FlowToolset;
@@ -484,7 +485,13 @@ class Session
      * The same authorization rule as approve(): decide who may answer before
      * calling.
      *
+     * Every decision must name an approval this session is waiting on. An id
+     * the run never issued, or one already answered, throws
+     * ApprovalNotPending before any provider call or write (G-354).
+     *
      * @param  list<ToolApprovalResponse>  $decisions
+     *
+     * @throws ApprovalNotPending
      */
     public function decide(array $decisions, ?RunContext $context = null): AgentResponse
     {
@@ -514,8 +521,11 @@ class Session
      * Recording at call time instead would write into a session another
      * request may be running, and would leave a lock held by a stream nobody
      * iterates. A stream that is never iterated records nothing; one dropped
-     * after it started has recorded every decision, and resuming again executes
-     * nothing twice.
+     * after it started has recorded every decision, and streaming the same
+     * decision again is refused, since that approval is no longer pending.
+     *
+     * Throws ApprovalNotPending, having recorded and sent nothing, for an id
+     * the run never issued or one already answered (G-354).
      *
      * Throws SessionLocked, having recorded nothing, while another request
      * holds the session.
@@ -564,10 +574,41 @@ class Session
      */
     protected function recordDecisions(array $decisions): void
     {
+        // BEFORE anything is written or emitted, and so before any provider
+        // call: a decision answers a question the run asked (G-354).
+        $this->assertDecisionsPending($decisions);
+
         $this->runtime?->recordToolDecisions($this, $decisions);
         $this->thread()->record([
             new ToolResultMessage(toolApprovalResponses: $decisions),
         ], $this->run()['id'] ?? null);
+    }
+
+    /**
+     * Refuse every decision unless each names an approval this session is
+     * waiting on, once (G-354).
+     *
+     * An id the run never issued, or one already answered, is not an answer to
+     * anything. Accepted, it closed a pending call as unanswered, so a bogus
+     * decision cancelled the person's real one; with nothing pending, it
+     * started a model turn with no new user message, in which an ungated tool
+     * could run. The whole batch is refused, with nothing recorded, when any
+     * one of its decisions does not name a pending approval.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     *
+     * @throws ApprovalNotPending
+     */
+    protected function assertDecisionsPending(array $decisions): void
+    {
+        $pending = array_fill_keys($this->thread()->pendingApprovalIds(), true);
+        foreach ($decisions as $decision) {
+            if (! isset($pending[$decision->approvalId])) {
+                throw ApprovalNotPending::forId($decision->approvalId);
+            }
+            // Answered once: the same id again in this batch is a repeat.
+            unset($pending[$decision->approvalId]);
+        }
     }
 
     /**

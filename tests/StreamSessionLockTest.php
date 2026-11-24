@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Enums\Durability;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Models\Thread;
@@ -91,10 +92,16 @@ it('frees the lock when the stream completes', function (string $surface): void 
     fakeAnswers();
     $session = lockedSession();
 
-    runSurface($session, $surface, null);
+    if ($surface === 'streamDecision') {
+        // The probe id was never issued: refused inside the lock (G-354),
+        // having called no provider, so the next turn gets the first answer.
+        expect(fn () => runSurface($session, $surface, null))->toThrow(ApprovalNotPending::class);
+    } else {
+        runSurface($session, $surface, null);
+    }
 
     // Took the lock, and gave it back: a held lock would refuse this.
-    expect(lockedSession()->send('next')->text())->toBe('answer 2')
+    expect(lockedSession()->send('next')->text())->toBe($surface === 'streamDecision' ? 'answer 1' : 'answer 2')
         ->and(lockedSession()->lock(fn (): string => 'free', waitSeconds: 0))->toBe('free');
 })->with(['stream', 'streamSteps', 'streamDecision']);
 

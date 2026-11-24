@@ -454,7 +454,9 @@ streams it. A stream nobody iterates records nothing, and a session another requ
 throws `SessionLocked` without recording anything. The first step for each decision is
 `decision_recorded` (`approvalId`, `verdict`, `reason`, `actor`); then the run's steps follow,
 continuing its `seq`. Because decisions are saved before any tool runs, a stream dropped after
-it started neither loses nor repeats one. The resumed run dispatches `RunResumed`, not a second `RunStarted`.
+it started neither loses nor repeats one: streaming the same decision again is refused with
+`ApprovalNotPending`, because that approval has already been answered. The resumed run
+dispatches `RunResumed`, not a second `RunStarted`.
 `actor` comes from your `RunContext`, never from the model.
 
 ## Structured turns
@@ -780,6 +782,13 @@ A single pending call can be answered with `$session->approve($pending)` or
 `$session->deny($pending, 'not on production')`. Answer several with `decide()`: each
 `approve()` or `deny()` continues the run, and Prism denies by default any call still without an
 answer, so answering them one at a time refuses the rest.
+
+**A decision must answer an approval the session is waiting on.** `approve()`, `deny()`,
+`decide()` and `streamDecision()` throw `Prism\Harness\Exceptions\ApprovalNotPending` for an
+approval id the run never issued, or one already answered, and refuse the whole batch when any
+one decision is like that. The refusal comes before any provider request, any write to the
+thread and any change to a pending approval, so a made-up id cannot cancel a real one, and a
+decision with nothing pending starts no model turn.
 
 **The decision is a row, not a promise.** It is recorded in the thread, so the approval a
 person grants this morning is readable by whichever worker resumes tonight — a different
