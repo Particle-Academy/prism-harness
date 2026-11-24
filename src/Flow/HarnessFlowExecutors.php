@@ -71,7 +71,7 @@ final class HarnessFlowExecutors
 
     /**
      * The account a node charges: the engine's run key when there is one;
-     * otherwise the key saved with the session; otherwise one held for this
+     * otherwise the key saved for the session; otherwise one held for this
      * registration's process.
      *
      * @param  array<string, mixed>  $limits

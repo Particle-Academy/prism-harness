@@ -235,7 +235,7 @@ final class PrismLlmClient implements LlmClient
 
     /**
      * The workflow run this client charges (G-348): the one it was given, else
-     * its toolset's (saved with the session), else one held for this process.
+     * its toolset's (saved for the session), else one held for this process.
      */
     private function budget(): WorkflowBudget
     {

@@ -15,7 +15,9 @@ use FancyFlow\Runtime\RunResult;
 use FancyFlow\Schema\FlowEdge;
 use FancyFlow\Schema\FlowGraph;
 use FancyFlow\Schema\FlowNode;
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
@@ -550,3 +552,30 @@ it('lets a later open lower a running budget and never raise it', function (): v
         ->and($lowered->limits->maxSteps)->toBe(3)
         ->and(app(WorkflowBudgets::class)->open('deployed')->limits->maxSteps)->toBe(3);
 });
+
+// Decision 2, under a race: two workers make the first call of a run with no
+// id on the same session at the same moment.
+it('gives two workers racing for a keyless session the same key and one budget', function (): void {
+    config()->set('prism-harness.workflow.max_steps', 1);
+    $graph = wfChain(1);
+    $second = null;
+    $armed = true;
+
+    // Worker A's first read or write of the stored key has happened, and
+    // nothing after it yet. Worker B runs its whole first call right there.
+    DB::listen(function (QueryExecuted $query) use (&$armed, &$second, $graph): void {
+        if (! $armed || ! preg_match('/harness_session_state|harness_workflow_budgets/', $query->sql)) {
+            return;
+        }
+        $armed = false;
+        app()->forgetInstance(WorkflowBudgets::class);
+        $second = wfRun($graph, wfRegistry(wfSession()), null);
+    });
+
+    $first = wfRun($graph, wfRegistry(wfSession()), null);
+
+    expect($armed)->toBeFalse()
+        ->and($this->requests)->toBe(1)
+        ->and([$first->ok, $second?->ok])->toContain(false)
+        ->and((string) ($first->error ?? $second?->error))->toContain(WF_EXHAUSTED);
+})->skip(fn (): bool => wfEngineMissing(), WF_ENGINE_SKIP);

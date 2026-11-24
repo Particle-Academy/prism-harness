@@ -18,15 +18,17 @@ use Prism\Harness\Stores\MemoryWorkflowLedgerStore;
  *
  * A run is identified by the engine's run key, which fancy-flow keeps the same
  * across retries, resumes, workers and nested lanes. A run with no usable key
- * is given one by the Harness and the key is saved with the session, so a
+ * is given one by the Harness and the key is saved for the session, so a
  * retry or resume in that session continues the same budget rather than
- * starting a fresh one. Call {@see self::startSessionRun()} to begin a new
+ * starting a fresh one. The key is created in one locked step of the budget
+ * store, so two workers making a session's first call at once get the same
+ * key and share one budget. Call {@see self::startSessionRun()} to begin a new
  * workflow run on a session whose runs carry no key.
  */
 final class WorkflowBudgets
 {
-    /** The session capability the Harness-created run key is saved under. */
-    public const SESSION_CAPABILITY = 'harness_workflow_budget';
+    /** Prefix of the budget-store record holding a session's Harness-created run key. */
+    public const SESSION_RECORD = 'harness-session-run:';
 
     /**
      * @param  array<string, mixed>  $config  `prism-harness.workflow`
@@ -72,10 +74,10 @@ final class WorkflowBudgets
      */
     public function startSessionRun(Session $session): string
     {
-        $key = 'harness:'.bin2hex(random_bytes(16));
-        $session->usingCapability(self::SESSION_CAPABILITY, ['run_key' => $key]);
+        $key = self::newSessionRunKey();
 
-        return $key;
+        return $this->store->transact(self::SESSION_RECORD.$session->key(), ['run_key' => $key],
+            static fn (array $state): array => [[...$state, 'run_key' => $key], $key]);
     }
 
     /**
@@ -90,9 +92,23 @@ final class WorkflowBudgets
     /** The key a session's unidentified workflow runs share, created on first use. */
     public function sessionRunKey(Session $session): string
     {
-        $key = $session->capability(self::SESSION_CAPABILITY)['run_key'] ?? null;
+        // Insert-if-absent and read under one hold: whichever worker creates
+        // the record first, every worker reads back the same key.
+        return $this->store->transact(self::SESSION_RECORD.$session->key(), ['run_key' => self::newSessionRunKey()],
+            static function (array $state): array {
+                $key = $state['run_key'] ?? null;
+                if (! is_string($key) || $key === '') {
+                    $key = self::newSessionRunKey();
+                    $state['run_key'] = $key;
+                }
 
-        return is_string($key) && $key !== '' ? $key : $this->startSessionRun($session);
+                return [$state, $key];
+            });
+    }
+
+    private static function newSessionRunKey(): string
+    {
+        return 'harness:'.bin2hex(random_bytes(16));
     }
 
     /**
