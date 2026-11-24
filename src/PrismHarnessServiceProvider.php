@@ -7,6 +7,7 @@ namespace Prism\Harness;
 use Illuminate\Contracts\Auth\Access\Gate;
 use Illuminate\Support\ServiceProvider;
 use Prism\Harness\Console\HarnessDoctorCommand;
+use Prism\Harness\Console\PlansReapCommand;
 use Prism\Harness\Context\DiscardEvicted;
 use Prism\Harness\Context\KeepRecentTurns;
 use Prism\Harness\Context\MemoryHooks;
@@ -23,6 +24,8 @@ use Prism\Harness\Flow\WorkflowBudgets;
 use Prism\Harness\Math\DoMathManager;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Participants\ParticipantAdapters;
+use Prism\Harness\Plans\PlanContextProvider;
+use Prism\Harness\Plans\Plans;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Skills\SkillRegistry;
@@ -98,7 +101,14 @@ class PrismHarnessServiceProvider extends ServiceProvider
 
         // Empty by default: no context is added and no turn is observed until an
         // application registers a provider or observer (long-term memory, say).
-        $this->app->singleton(MemoryHooks::class, fn ($app): MemoryHooks => new MemoryHooks);
+        //
+        // One exception, which adds nothing either until it is turned on: the
+        // agent plan context (G-360). It is registered always and checks
+        // `plans.enabled` and the mode's flag on every call, so config set
+        // after boot is read correctly; off, it returns ''.
+        $this->app->singleton(MemoryHooks::class, fn ($app): MemoryHooks => (new MemoryHooks)
+            ->provide(new PlanContextProvider($app->make(Plans::class))));
+        $this->app->singleton(Plans::class, fn ($app): Plans => new Plans);
 
         $this->app->singleton(ToolPairGuard::class, fn ($app): ToolPairGuard => new ToolPairGuard);
 
@@ -259,7 +269,7 @@ class PrismHarnessServiceProvider extends ServiceProvider
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
         if ($this->app->runningInConsole()) {
-            $this->commands([HarnessDoctorCommand::class]);
+            $this->commands([HarnessDoctorCommand::class, PlansReapCommand::class]);
 
             $this->publishes([
                 __DIR__.'/../config/prism-harness.php' => config_path('prism-harness.php'),

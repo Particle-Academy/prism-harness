@@ -6,6 +6,7 @@ namespace Prism\Harness\Console;
 
 use Illuminate\Console\Command;
 use Prism\Harness\Modes\ModeRegistry;
+use Prism\Harness\Plans\Plans;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
@@ -35,6 +36,7 @@ final class HarnessDoctorCommand extends Command
         $problems += $this->checkStores($stores);
         $problems += $this->checkAuthorizer();
         $problems += $this->checkModes($modes, $tools);
+        $problems += $this->checkPlanReaper();
 
         $this->newLine();
 
@@ -136,5 +138,39 @@ final class HarnessDoctorCommand extends Command
         }
 
         return $problems;
+    }
+
+    /**
+     * G-360: a plan driven by a queue needs a reaper, or one lost job stops
+     * the plan for ever with nothing to show for it. With plans on and a
+     * queue that is not `sync`, a missing or stale reaper heartbeat fails.
+     */
+    private function checkPlanReaper(): int
+    {
+        $plans = app(Plans::class);
+        if (! $plans->enabled()) {
+            return 0;
+        }
+        try {
+            $staleAfter = $plans->limits()->staleAfter;
+        } catch (Throwable $e) {
+            $this->components->twoColumnDetail('<fg=red>plans</>', $e->getMessage());
+
+            return 1;
+        }
+        if (config('queue.default') === 'sync') {
+            $this->components->twoColumnDetail('plans', 'enabled; the queue is sync, so no reaper is needed');
+
+            return 0;
+        }
+        $beat = $plans->heartbeat();
+        if ($beat === null || $plans->now() - $beat['at'] > 3 * $staleAfter) {
+            $this->components->twoColumnDetail('<fg=red>plans</>', 'enabled with a queue, and the plan reaper has not run recently. Schedule harness:plans:reap.');
+
+            return 1;
+        }
+        $this->components->twoColumnDetail('plans', 'enabled; the plan reaper is running');
+
+        return 0;
     }
 }

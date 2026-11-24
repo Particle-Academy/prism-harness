@@ -29,6 +29,8 @@ use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Flow\FlowToolset;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
+use Prism\Harness\Plans\PlanMachine;
+use Prism\Harness\Plans\Plans;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Skills\SkillRegistry;
@@ -623,14 +625,36 @@ final readonly class AgentRuntime
     public function streamSteps(Session $session, string $prompt, ?array $toolNames = null, array $additionalContent = [], ?RunContext $context = null): Generator
     {
         $tagger = new RunStepTagger($context?->turnId, buffered: true);
-        foreach ($this->taggedStream($session, $prompt, $toolNames, $additionalContent, $this->executionContext($context), $tagger) as $event) {
+        $unwatch = $this->watchPlan($session, $tagger);
+        try {
+            foreach ($this->taggedStream($session, $prompt, $toolNames, $additionalContent, $this->executionContext($context), $tagger) as $event) {
+                foreach ($tagger->drain() as $step) {
+                    yield $step;
+                }
+            }
             foreach ($tagger->drain() as $step) {
                 yield $step;
             }
+        } finally {
+            $unwatch();
         }
-        foreach ($tagger->drain() as $step) {
-            yield $step;
+    }
+
+    /**
+     * Mix `plan_updated` steps into this stream when the host turned them on
+     * (G-360, contract g282.3). Off by default: the stream then stays g282.1.
+     *
+     * @return Closure(): void the unwatch
+     */
+    private function watchPlan(Session $session, RunStepTagger $tagger): Closure
+    {
+        $plans = app(Plans::class);
+        if (! $plans->enabledFor($session) || ! $plans->limits()->runSteps) {
+            return static function (): void {};
         }
+        $tagger->plans(fn (): ?array => $plans->load($session));
+
+        return $plans->watch($session->key(), fn (array $plan) => $tagger->planUpdated($plan));
     }
 
     /**
@@ -679,6 +703,20 @@ final readonly class AgentRuntime
     {
         [$parkedRunId, $lastSeq] = $record();
         $tagger = new RunStepTagger($context?->turnId, buffered: true, seq: $lastSeq, resumeRunId: $parkedRunId);
+        $unwatch = $this->watchPlan($session, $tagger);
+        try {
+            yield from $this->resumeTagged($session, $decisions, $context, $tagger);
+        } finally {
+            $unwatch();
+        }
+    }
+
+    /**
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @return Generator<int, RunStep>
+     */
+    private function resumeTagged(Session $session, array $decisions, ?RunContext $context, RunStepTagger $tagger): Generator
+    {
         $actor = $context?->actor;
         $context = $this->executionContext($context);
         $runId = $tagger->claimRunId();
@@ -826,6 +864,10 @@ final readonly class AgentRuntime
                     if ($mode->needsApproval($name)) {
                         $resolved[$name] = $this->gated($session, $tool, $runId);
                     }
+                }
+                // G-360: the plan tools, after the mode's gate, as in authorizedTools().
+                foreach (app(Plans::class)->tools($session, $mode->name) as $name => $tool) {
+                    $resolved[$name] = $tool;
                 }
                 $tools = $this->authorizer->allowed($session, $resolved);
             }
@@ -1509,10 +1551,19 @@ final readonly class AgentRuntime
                 }
                 $additional[$subagent->name] = ['tool' => ($this->subagentRunner)()->tool($subagent, $view, $run, $runId, $mode), 'owner' => 'harness.subagent', 'source' => 'builtin'];
             }
+            // G-360: the plan tools, when the host and this mode turned plans on.
+            if (! $inspection) {
+                foreach (app(Plans::class)->tools($view, $mode->name) as $name => $tool) {
+                    $names[] = $name;
+                    $additional[$name] = ['tool' => $tool, 'owner' => 'harness.plans', 'source' => 'builtin'];
+                }
+            }
             $detailed = $this->tools->resolveDetailed($names, $view, $additional);
             $resolved = [];
             foreach ($detailed as $name => $entry) {
-                $resolved[$name] = $mode->needsApproval($name) ? $this->gated($view, $entry['tool'], $runId) : $entry['tool'];
+                // Plan tools gate themselves (G-360); the mode's gate never wraps them.
+                $resolved[$name] = $mode->needsApproval($name) && ! in_array($name, PlanMachine::TOOLS, true)
+                    ? $this->gated($view, $entry['tool'], $runId) : $entry['tool'];
             }
             if ($view->agent() !== null && isset($resolved['complete_task'])) {
                 $authorizer = $this->authorizer->forSession($view);
@@ -1558,6 +1609,14 @@ final readonly class AgentRuntime
             if ($mode->needsApproval($name)) {
                 $resolved[$name] = $this->gated($session, $tool, $runId);
             }
+        }
+
+        // G-360: the plan tools, when the host and this mode turned plans on.
+        // Added AFTER the mode's gate: they gate themselves (a draft, a change
+        // and an approval pause are core approvals bound to their arguments),
+        // so the host policy's per-call gate never sits in front of them.
+        foreach (app(Plans::class)->tools($session, $mode->name) as $name => $tool) {
+            $resolved[$name] = $tool;
         }
 
         return $this->approvalScopedOffer($session, $this->authorizer->allowed($session, $resolved));

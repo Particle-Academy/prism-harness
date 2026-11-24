@@ -7,6 +7,8 @@ namespace Prism\Harness\Steps;
 use Closure;
 use Illuminate\Support\Carbon;
 use Prism\Harness\Events\RunStepped;
+use Prism\Harness\Plans\PlanMachine;
+use Prism\Harness\Plans\PlanView;
 use Prism\Harness\Support\ToolCallArguments;
 use Prism\Harness\Tools\ToolRefusals;
 use Prism\Prism\Contracts\Message;
@@ -54,6 +56,14 @@ final class RunStepTagger
 
     /** @var list<RunStep> */
     private array $buffer = [];
+
+    /** @var (Closure(): ?array<string, mixed>)|null reads the session's plan, when plan steps are on (G-360) */
+    private ?Closure $planSource = null;
+
+    private bool $planStarted = false;
+
+    /** @var list<array<string, mixed>>|null the plan steps last sent on this stream */
+    private ?array $planSent = null;
 
     /** @var list<string>|null */
     private ?array $offered = null;
@@ -278,9 +288,46 @@ final class RunStepTagger
         return isset($this->unapproved[$toolCallId]);
     }
 
-    /** @param array<string, mixed> $data */
-    private function emit(string $type, array $data): void
+    /**
+     * Turn on `plan_updated` steps for this stream (G-360). The first step of
+     * the stream is preceded by a full snapshot when the session has a live
+     * plan, so a reader catches up on anything that changed between runs.
+     *
+     * @param  Closure(): ?array<string, mixed>  $source
+     */
+    public function plans(Closure $source): void
     {
+        $this->planSource = $source;
+    }
+
+    /**
+     * The plan was written while this stream ran: a snapshot the first time,
+     * then only the steps that changed.
+     *
+     * @param  array<string, mixed>  $plan
+     */
+    public function planUpdated(array $plan): void
+    {
+        if ($this->planSource === null) {
+            return;
+        }
+        $this->planStarted = true;
+        $data = PlanView::update($plan, $this->planSent);
+        $this->planSent = PlanView::steps($plan);
+        $this->emit(RunStep::PLAN_UPDATED, $data, PlanView::CONTRACT_VERSION);
+    }
+
+    /** @param array<string, mixed> $data */
+    private function emit(string $type, array $data, string $contractVersion = RunStep::CONTRACT_VERSION): void
+    {
+        if ($this->planSource !== null && ! $this->planStarted) {
+            $this->planStarted = true;
+            $plan = ($this->planSource)();
+            if (PlanMachine::isLive($plan)) {
+                /** @var array<string, mixed> $plan */
+                $this->planUpdated($plan);
+            }
+        }
         $runId = $this->claimRunId();
         $step = new RunStep(
             runId: $runId,
@@ -291,6 +338,7 @@ final class RunStepTagger
             at: $this->timestamp(),
             type: $type,
             data: $data,
+            contractVersion: $contractVersion,
         );
 
         if ($this->buffered) {

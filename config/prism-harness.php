@@ -308,8 +308,55 @@ return [
                 // ['thinking' => ['type' => 'adaptive'], 'effort' => 'medium']
                 // for Anthropic adaptive thinking. Must be a map of option names.
                 'provider_options' => [],
+
+                // Agent plans (G-360) are off unless this is true AND
+                // plans.enabled below is true.
+                // 'plans' => true,
             ],
         ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Agent plans (G-360)
+    |--------------------------------------------------------------------------
+    |
+    | Optional. A plan is an ordered list of steps an agent proposes, a person
+    | approves, and a driver ($session->plan()->advance()) works through one
+    | step per turn. It grants nothing: every tool call still goes through the
+    | mode's tools, approvals, the tool policy and the run budget.
+    |
+    | Off unless `enabled` is true here AND the session's mode sets `plans`.
+    |
+    | `require_approval`: a person approves every plan before any step runs.
+    | On by default. Only this config can turn it off; never a per-call option,
+    | never anything the model sends. A plan change and an approval pause are
+    | always approved by a person, whatever this says.
+    |
+    | Bounds (Fancy contract g282.3): at most 40 steps, 160-character step
+    | titles, 200-character notes, and a first update under 8 KB. A plan over
+    | a bound is refused when drafted, never truncated.
+    |
+    | `events.run_steps`: mix `plan_updated` steps (contract g282.3) into
+    | streamSteps(). Off by default; turn it on only once your consumer knows
+    | g282.3. Every other step stays g282.1.
+    |
+    | With a queue, schedule `harness:plans:reap`; `harness:doctor` fails
+    | when it has not run recently.
+    |
+    */
+
+    'plans' => [
+        'enabled' => (bool) env('HARNESS_PLANS', false),
+        'require_approval' => true,
+        'max_steps' => 20,
+        'max_attempts' => 3,
+        'max_pauses_per_step' => 1,
+        'max_changes' => 5,
+        'max_advances' => 60,
+        'context' => ['max_chars' => 2000, 'window' => 8],
+        'events' => ['run_steps' => false, 'max_bytes' => 8192],
+        'reaper' => ['stale_after' => 300],
     ],
 
 ];

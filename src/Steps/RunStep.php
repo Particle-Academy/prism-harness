@@ -38,6 +38,9 @@ final readonly class RunStep
 
     public const DECISION_RECORDED = 'decision_recorded';
 
+    /** G-360: the session's plan changed. Contract `g282.3`; off unless `plans.events.run_steps`. */
+    public const PLAN_UPDATED = 'plan_updated';
+
     /**
      * @param  array<string, mixed>  $data  the per-type fields, in contract order
      */
@@ -50,6 +53,13 @@ final readonly class RunStep
         public string $at,
         public string $type,
         public array $data = [],
+        /**
+         * Every step type keeps `g282.1`. Only `plan_updated` (G-360) carries
+         * `g282.3`, and it is emitted only when the host turned on
+         * `plans.events.run_steps`, so a consumer that knows g282.1 alone
+         * never sees it.
+         */
+        public string $contractVersion = self::CONTRACT_VERSION,
     ) {}
 
     /**
@@ -60,7 +70,7 @@ final readonly class RunStep
     public function toArray(): array
     {
         return [
-            'contractVersion' => self::CONTRACT_VERSION,
+            'contractVersion' => $this->contractVersion,
             'runId' => $this->runId,
             'parentRunId' => $this->parentRunId,
             'rootRunId' => $this->rootRunId,
