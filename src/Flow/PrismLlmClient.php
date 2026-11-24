@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Flow;
 
 use FancyFlow\Nodes\Support\LlmClient;
+use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Exceptions\UnboundFlowTools;
 use Prism\Harness\Sessions\Session;
@@ -75,6 +76,26 @@ final class PrismLlmClient implements LlmClient
      * @return array<string, mixed>
      */
     public function complete(string $prompt, array $options = []): array
+    {
+        if (! $this->session instanceof Session) {
+            return $this->completeLocked($prompt, $options);
+        }
+
+        // The call reads the session's thread and the provider's answer is
+        // added to it, so it runs inside the lock an ordinary turn holds.
+        // While another holder has it nothing is read, sent or written.
+        return $this->session->flowRuntime()->flowLocked(
+            $this->session,
+            fn (): array => $this->completeLocked($prompt, $options),
+            static fn (SessionLocked $locked): ToolNotAvailable => ToolNotAvailable::modelSessionInUse($locked),
+        );
+    }
+
+    /**
+     * @param  array<string, mixed>  $options
+     * @return array<string, mixed>
+     */
+    private function completeLocked(string $prompt, array $options): array
     {
         if ($this->session?->thread()->approvalToolNames() !== null) {
             // The thread ends on a turn a person is deciding. Sending it would

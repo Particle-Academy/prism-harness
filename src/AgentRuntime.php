@@ -22,6 +22,7 @@ use Prism\Harness\Events\ToolAutoAllowed;
 use Prism\Harness\Events\ToolDecision;
 use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Exceptions\ToolNotAvailable;
@@ -1303,6 +1304,55 @@ final readonly class AgentRuntime
      * @throws ToolNotAvailable when the call may not run
      */
     public function runFlowTool(Session $session, ?array $toolNames, string $name, array $arguments, ?callable $starting = null): mixed
+    {
+        // The decision and the handler both run inside the session lock.
+        return $this->flowLocked(
+            $session,
+            fn (Session $session): mixed => $this->runFlowToolLocked($session, $toolNames, $name, $arguments, $starting),
+            static fn (SessionLocked $locked): ToolNotAvailable => ToolNotAvailable::sessionInUse($name, $locked),
+        );
+    }
+
+    /**
+     * Run a workflow's use of the session inside the lock an ordinary turn
+     * holds, with the same timeout. While another holder has it the callback
+     * does not run and the refusal is thrown instead; nothing waits beyond the
+     * configured lock_wait. The lock is released on every exit.
+     *
+     * @internal Called by {@see runFlowTool()} and {@see PrismLlmClient}.
+     *
+     * @template TReturn
+     *
+     * @param  Closure(Session): TReturn  $callback
+     * @param  Closure(SessionLocked): ToolNotAvailable  $refusal
+     * @return TReturn
+     */
+    public function flowLocked(Session $session, Closure $callback, Closure $refusal): mixed
+    {
+        $entered = false;
+
+        try {
+            return $session->fencedLock(function (Session $session) use ($callback, &$entered): mixed {
+                $entered = true;
+
+                return $callback($session);
+            }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
+        } catch (SessionLocked $locked) {
+            if ($entered) {
+                // Thrown from inside the callback, not by taking this lock.
+                throw $locked;
+            }
+
+            throw $refusal($locked);
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $arguments
+     * @param  (callable(): void)|null  $starting
+     */
+    private function runFlowToolLocked(Session $session, ?array $toolNames, string $name, array $arguments, ?callable $starting): mixed
     {
         $entries = $this->flowEntries($session, $toolNames);
 

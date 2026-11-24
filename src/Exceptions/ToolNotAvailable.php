@@ -64,6 +64,22 @@ final class ToolNotAvailable extends RuntimeException
         return new self('This session is waiting on an approval. Finish that turn before a workflow uses the session.');
     }
 
+    public static function sessionInUse(string $tool, SessionLocked $previous): self
+    {
+        return new self(
+            "The tool [{$tool}] did not run: another turn is using this session. Run the workflow again once that turn has finished.",
+            previous: $previous,
+        );
+    }
+
+    public static function modelSessionInUse(SessionLocked $previous): self
+    {
+        return new self(
+            'The workflow did not call the model: another turn is using this session. Run the workflow again once that turn has finished.',
+            previous: $previous,
+        );
+    }
+
     public static function stepLimit(int $limit): self
     {
         return new self("This workflow loop reached the session's step limit of {$limit}.");
