@@ -10,6 +10,7 @@ use FancyFlow\Runtime\RunResult;
 use FancyFlow\Schema\FlowEdge;
 use FancyFlow\Schema\FlowGraph;
 use FancyFlow\Schema\FlowNode;
+use Illuminate\Http\Client\Events\RequestSending;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Gate;
@@ -1121,7 +1122,7 @@ it('does not run a workflow tool while another turn holds the session lock', fun
         ->and($this->ran['plain'])->toBe(0)
         ->and((string) $result->error)->toContain('[plain]')
         ->and((string) $result->error)->toContain('another turn is using this session');
-})->with(['tool_use alone', 'llm_call then tool_use', 'agent'])
+})->with(['tool_use alone'])
     ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
 
 it('runs a workflow tool when the session lock is free, and releases it afterwards', function (string $shape): void {
@@ -1210,4 +1211,100 @@ it('leaves ordinary turns as they were: a turn runs its tool, and is refused whi
     }
 
     expect($this->ran['plain'])->toBe(1);
+});
+
+/*
+ * Workflow model calls read and append to the session's conversation, so they
+ * hold the same lock. While another holder has it nothing is read, sent or
+ * written, and the node fails.
+ */
+
+function flowStoredCount(string $key = 'flow'): int
+{
+    return flowSession($key)->thread()->storedMessages()->count();
+}
+
+it('does not call the model while another turn holds the session lock', function (string $shape): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $this->replies = [flowCall('plain'), flowText()];
+    $before = flowStoredCount();
+    $release = flowHoldLock();
+
+    try {
+        $result = runFlowShape($shape, 'plain', flowSession());
+    } finally {
+        $release();
+    }
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('another turn is using this session')
+        ->and($this->hosts)->toBe([])
+        ->and($this->replies)->toHaveCount(2)
+        ->and($this->ran['plain'])->toBe(0)
+        ->and(flowStoredCount())->toBe($before);
+})->with(['llm_call alone', 'llm_call then tool_use', 'agent'])
+    ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('holds the session lock while the model call is in flight', function (): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $seen = [];
+    Event::listen(RequestSending::class, function () use (&$seen): void {
+        try {
+            flowHoldLock()();
+            $seen[] = 'free';
+        } catch (SessionLocked) {
+            $seen[] = 'held';
+        }
+    });
+    $this->replies = [flowText()];
+
+    $result = runFlowShape('llm_call alone', 'plain', flowSession());
+
+    expect($result->ok)->toBeTrue()
+        ->and($seen)->toBe(['held']);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('releases the session lock after a model call on every exit', function (string $exit): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $key = 'flow';
+    if ($exit === 'waiting on an approval') {
+        $key = 'paused';
+        $session = flowPausedApproved('mode_gated', $key);
+        $this->replies = [flowText()];
+    } else {
+        $session = flowSession();
+        $this->replies = $exit === 'answered' ? [flowText()] : [];
+    }
+
+    $client = $session->flowTools()->llmClient('openai', 'gpt-4o');
+    $failure = null;
+    try {
+        $client->complete('go', ['provider' => 'openai', 'model' => 'gpt-4o', 'tools' => ['plain']]);
+    } catch (Throwable $caught) {
+        $failure = $caught;
+    }
+
+    if ($exit === 'answered') {
+        expect($failure)->toBeNull();
+    } elseif ($exit === 'waiting on an approval') {
+        expect($failure)->toBeInstanceOf(ToolNotAvailable::class)
+            ->and($failure->getMessage())->toContain('waiting on an approval');
+    } else {
+        expect($failure)->not->toBeNull()
+            ->and($failure)->not->toBeInstanceOf(SessionLocked::class);
+    }
+
+    $release = flowHoldLock($key);
+    $release();
+    expect($release)->toBeInstanceOf(Closure::class);
+})->with(['answered', 'provider failed', 'waiting on an approval']);
+
+it('leaves ordinary turns as they were after a workflow model call', function (): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $this->replies = [flowText(), flowCall('plain'), flowText()];
+
+    flowSession()->flowTools()->llmClient('openai', 'gpt-4o')->complete('go', ['provider' => 'openai', 'model' => 'gpt-4o']);
+
+    expect(flowSession()->send('again')->text())->toBe('done')
+        ->and($this->ran['plain'])->toBe(1);
 });
