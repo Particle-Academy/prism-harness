@@ -45,6 +45,8 @@ final class WorkflowBudget implements LedgerGuard
         ?int $maxOutputTokensPerCall,
         /** @var list<string> */
         public readonly array $warnings = [],
+        /** The budget-store record this run's account is kept in; the run key when not given. */
+        private readonly ?string $record = null,
     ) {
         $ledger = (new RunLedger('wf:'.$runKey))->guardedBy($this);
         $this->root = new RunContext($ledger, new RunBudget(
@@ -91,7 +93,7 @@ final class WorkflowBudget implements LedgerGuard
 
     public function atomically(RunLedger $ledger, Closure $operation): mixed
     {
-        $result = $this->store->transact($this->runKey, $this->initial, function (array $state) use ($ledger, $operation): array {
+        $result = $this->store->transact($this->record ?? $this->runKey, $this->initial, function (array $state) use ($ledger, $operation): array {
             $ledger->restore($state);
 
             try {
@@ -124,7 +126,7 @@ final class WorkflowBudget implements LedgerGuard
 
     public function refusal(RunLedger $ledger, string $reason): RunNotPermitted
     {
-        $this->store->transact($this->runKey, $this->initial, function (array $state) use ($ledger, $reason): array {
+        $this->store->transact($this->record ?? $this->runKey, $this->initial, function (array $state) use ($ledger, $reason): array {
             $ledger->restore($state);
             $probe = new RunLedger('probe');
             $probe->restore($state);

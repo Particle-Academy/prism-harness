@@ -11,8 +11,10 @@ use Prism\Prism\Tool;
 
 /**
  * Which approval-gated tools run without asking a person (G-326). Owned by the
- * HOST, which passes it per launch and may replace it live with
- * {@see AgentRuntime::setToolPolicy()}.
+ * HOST. The deployment's comes from `prism-harness.agent.tool_policy`; a host
+ * sets one for the current request or queued job, and may replace it live,
+ * with {@see AgentRuntime::setToolPolicy()}. That one ends with the request or
+ * job: it never applies to a session a later request or job serves.
  *
  * One JSON shape in every language, so a host builds it once:
  * `{ "revision": "r7", "allow": [{ "server": "files", "tool": "read" }, { "tool": "search" }], "honor": true }`.

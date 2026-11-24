@@ -31,6 +31,13 @@ final class WorkflowBudgets
     public const SESSION_RECORD = 'harness-session-run:';
 
     /**
+     * Prefix of the budget-store record of a run's budget. A run key is the
+     * engine's or the host's string, so it is kept in a key space of its own:
+     * no run key, whatever it spells, can open a session's key record.
+     */
+    public const RUN_RECORD = 'run:';
+
+    /**
      * @param  array<string, mixed>  $config  `prism-harness.workflow`
      * @param  array<string, mixed>  $agentConfig  `prism-harness.agent`, for the cost and output fallbacks
      */
@@ -129,7 +136,8 @@ final class WorkflowBudgets
 
         $initial = ['limits' => $requested->toArray(), 'started_at' => microtime(true), 'exhausted_at' => null];
 
-        $effective = $store->transact($runKey, $initial, function (array $state) use ($requested): array {
+        $record = self::RUN_RECORD.$runKey;
+        $effective = $store->transact($record, $initial, function (array $state) use ($requested): array {
             // The first open fixed the limits; this open may only lower them.
             $stored = is_array($state['limits'] ?? null) ? $state['limits'] : [];
             $snapshot = WorkflowLimits::fromArray(array_intersect_key($stored, array_flip(WorkflowLimits::KEYS)), 'the stored workflow budget');
@@ -147,7 +155,7 @@ final class WorkflowBudgets
         $output = $this->agentConfig['max_output_tokens_per_call'] ?? null;
 
         return new WorkflowBudget($runKey, $effective, $store, $initial,
-            is_int($output) && $output > 0 ? $output : null, $warnings);
+            is_int($output) && $output > 0 ? $output : null, $warnings, $record);
     }
 
     private function lowest(WorkflowLimits $a, WorkflowLimits $b): WorkflowLimits

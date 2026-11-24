@@ -790,6 +790,19 @@ one decision is like that. The refusal comes before any provider request, any wr
 thread and any change to a pending approval, so a made-up id cannot cancel a real one, and a
 decision with nothing pending starts no model turn.
 
+**A decision is checked and written under the session lock.** `approve()`, `deny()` and
+`decide()` take the session's lock first, then check that each id is pending, write the
+decisions and continue the run, all under that one hold (`streamDecision()` does the same when
+its stream starts). While another request holds the session they throw
+`Prism\Harness\Exceptions\SessionLocked` having written nothing, so the same decision, or a
+different one, can be sent again. Two decisions racing for one approval cannot both be
+recorded.
+
+**The first answer is the answer.** If a thread ever holds two answers for one approval id
+(for example, written by an older release before the check moved under the lock), every reader
+uses the first one recorded: the history sent to the provider, the check a gated tool makes
+before it runs, the run steps and the plan. A later approval never overrides an earlier denial.
+
 **The decision is a row, not a promise.** It is recorded in the thread, so the approval a
 person grants this morning is readable by whichever worker resumes tonight — a different
 process, possibly after a deploy. That is the whole reason the durable slot is guarded.
@@ -798,6 +811,51 @@ Prism **denies by default** when it finds no response for a pending request, so 
 unanswered approval fails closed rather than executing. And `awaitingApproval()` is **not a
 failure**: a caller that treats it as one will retry, and retrying discards the half-executed
 action somebody was asked to authorise.
+
+### Tools that run without asking: the tool policy
+
+A host can let some approval-gated tools run without asking a person. Nothing is on the list
+unless you put it there, and the agent has no way to change it.
+
+The deployment's policy is the `prism-harness.agent.tool_policy` config key (unset by default:
+everything gated asks):
+
+```php
+'agent' => [
+    'tool_policy' => [
+        'revision' => 'r7',                         // any string; carried on every decision event
+        'allow' => [
+            ['tool' => 'search'],                   // a native tool
+            ['server' => 'files', 'tool' => 'read'], // a tool an MCP server provides
+        ],
+        'honor' => true,                            // false turns the list off
+    ],
+],
+```
+
+- **Matching is exact.** A name must already be in normal form: a padded, zero-width or
+  look-alike name never matches. An entry without `server` matches only a native tool, never
+  one an MCP server provides. There are no wildcards, patterns or prefixes.
+- **Refused when built, never dropped.** A malformed entry, a confirmation or approval tool
+  (`confirm`, `reject`, `accept`, `approve`, `deny`), the plan tools, and a tool that declares
+  `tier: destructive` throw `ToolPolicyRefused`.
+- **It lifts the mode's gate only.** A tool whose own approval setting asks for these
+  arguments still asks.
+- Every decision emits `ToolAutoAllowed`, `ToolApprovalAsked`, `ToolApproved` or `ToolDenied`,
+  with a digest of the arguments, never the arguments.
+
+**A policy set in code lasts for the current request or queued job.**
+`app(AgentRuntime::class)->setToolPolicy($policy)` replaces the policy live, from the next tool
+call; a revoke refuses a call the old policy allowed that has not started yet. The runtime is a
+singleton, so the policy is not kept on it: it is kept in a scoped container slot, which
+Laravel empties when Octane starts the next request and when a queue worker starts the next
+job. A policy you set from one tenant's or user's settings therefore never applies to a session
+a later request or job serves; that one gets the config policy above until your code sets
+another. Inside one request or job it applies to every session that request runs, so code that
+serves several tenants in one job sets the policy before each tenant's runs. A long-running
+process of your own that does not go through Octane or the queue worker (a custom loop in an
+Artisan command) has no such boundary: call `app()->forgetScopedInstances()` between units of
+work, as the queue worker does.
 
 ## Events
 
@@ -813,6 +871,13 @@ and an event may end up on a screen.
 
 Every event carries `run_id`, `parent_run_id` and `root_run_id` — the same identifiers on the
 stored rows — so an existing live stream can be joined to this record without adopting it.
+
+A tool call refused inside a workflow node emits `ToolDenied` with `decidedBy` `policy` and a
+`reason`: `arguments`, `approval`, `authorization` or `check_failed`. The `reason` is null on
+every other denial, and is not part of `toArray()`, which keeps the shape shared with the
+TypeScript and Python harnesses. `FlowToolRefused`, which 0.26 emitted for the same refusal,
+is still emitted beside it, with the same reason, and is deprecated: move listeners to
+`ToolDenied`.
 
 A run in a named agent adds `harness_agent` to `correlation()`, and a delegated child carries its
 own agent. Legacy runs keep exactly the fields above. The name is deliberately not `agentId`,
