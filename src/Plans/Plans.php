@@ -18,6 +18,7 @@ use Prism\Prism\Schema\EnumSchema;
 use Prism\Prism\Schema\ObjectSchema;
 use Prism\Prism\Schema\StringSchema;
 use Prism\Prism\Tool;
+use RuntimeException;
 use Throwable;
 
 /**
@@ -269,7 +270,7 @@ final class Plans
             $this->reconciled($session);
         } catch (Throwable $failure) {
             // The run is over either way; the next advance reconciles again.
-            report($failure);
+            self::reportQuietly($failure);
         }
     }
 
@@ -279,7 +280,13 @@ final class Plans
         if (! $this->enabled()) {
             return;
         }
-        $this->reconciled($session);
+        try {
+            $this->reconciled($session);
+        } catch (Throwable $failure) {
+            // The decision is recorded; the plan reads it again at the end of
+            // the run and on the next advance.
+            self::reportQuietly($failure);
+        }
     }
 
     /**
@@ -292,9 +299,25 @@ final class Plans
         if (! $this->enabledFor($session)) {
             return '';
         }
-        $plan = $this->reconciled($session, superseding: $prompt !== '');
+        try {
+            $plan = $this->reconciled($session, superseding: $prompt !== '');
+        } catch (Throwable $failure) {
+            self::reportQuietly($failure);
+
+            return '';
+        }
 
         return $plan === null ? '' : PlanView::context($plan, $this->limits());
+    }
+
+    /**
+     * Report a failure by its class only. A store error's message can carry
+     * the SQL and its bindings, which here would be plan text the model wrote,
+     * and plan text never goes into a log.
+     */
+    private static function reportQuietly(Throwable $failure): void
+    {
+        report(new RuntimeException('A plan update failed: '.$failure::class.'.'));
     }
 
     /**
