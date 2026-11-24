@@ -513,6 +513,23 @@ it('keeps plan text out of logs, events, plan steps and the stored thread', func
     expect(G360::threadText())->not->toContain('[Plan —')->not->toContain('CANARY-ANSWER');
 });
 
+it('streams the plan a decision ended: a rejected draft reaches the reader', function (): void {
+    // The decision is written before the stream watches the plan. A decision
+    // that ends a plan left it no longer live, and the opening snapshot is only
+    // for live plans, so the reader never learned the draft was rejected.
+    config()->set('prism-harness.plans.events.run_steps', true);
+    G360::calls([['plan_draft', g360Draft()]]);
+    $pending = G360::session()->send('Plan the trip')->pendingApprovals()[0];
+
+    G360::text('Understood.');
+    $steps = iterator_to_array(G360::session()->streamDecision([new ToolApprovalResponse($pending->approvalId, false)], g360Actor()), false);
+    $types = array_map(fn ($step) => $step->type, $steps);
+    $plans = array_values(array_filter($steps, fn ($step) => $step->type === 'plan_updated'));
+
+    expect(array_map(fn ($step) => $step->toArray()['planStatus'], $plans))->toContain('rejected')
+        ->and(array_search('plan_updated', $types, true))->toBeLessThan(array_search('decision_recorded', $types, true));
+});
+
 it('streams a g282.3 snapshot first and keeps every other step g282.1, under 8 KB at the bound', function (): void {
     config()->set('prism-harness.plans.events.run_steps', true);
     config()->set('prism-harness.plans.max_steps', 40);

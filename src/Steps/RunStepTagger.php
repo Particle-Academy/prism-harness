@@ -62,6 +62,9 @@ final class RunStepTagger
 
     private bool $planStarted = false;
 
+    /** Open with the plan even when it is no longer live: this stream's own decision just wrote it. */
+    private bool $planAlways = false;
+
     /** @var list<array<string, mixed>>|null the plan steps last sent on this stream */
     private ?array $planSent = null;
 
@@ -295,9 +298,10 @@ final class RunStepTagger
      *
      * @param  Closure(): ?array<string, mixed>  $source
      */
-    public function plans(Closure $source): void
+    public function plans(Closure $source, bool $always = false): void
     {
         $this->planSource = $source;
+        $this->planAlways = $always;
     }
 
     /**
@@ -323,7 +327,7 @@ final class RunStepTagger
         if ($this->planSource !== null && ! $this->planStarted) {
             $this->planStarted = true;
             $plan = ($this->planSource)();
-            if (PlanMachine::isLive($plan)) {
+            if ($plan !== null && ($this->planAlways || PlanMachine::isLive($plan))) {
                 /** @var array<string, mixed> $plan */
                 $this->planUpdated($plan);
             }

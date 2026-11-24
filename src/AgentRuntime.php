@@ -646,13 +646,13 @@ final readonly class AgentRuntime
      *
      * @return Closure(): void the unwatch
      */
-    private function watchPlan(Session $session, RunStepTagger $tagger): Closure
+    private function watchPlan(Session $session, RunStepTagger $tagger, bool $written = false): Closure
     {
         $plans = app(Plans::class);
         if (! $plans->enabledFor($session) || ! $plans->limits()->runSteps) {
             return static function (): void {};
         }
-        $tagger->plans(fn (): ?array => $plans->load($session));
+        $tagger->plans(fn (): ?array => $plans->load($session), $written);
 
         return $plans->watch($session->key(), fn (array $plan) => $tagger->planUpdated($plan));
     }
@@ -701,9 +701,20 @@ final readonly class AgentRuntime
      */
     private function resumeLocked(Session $session, array $decisions, Closure $record, ?RunContext $context): Generator
     {
-        [$parkedRunId, $lastSeq] = $record();
+        // A plan the decisions wrote is noted (G-360): this stream opens with
+        // it even when the decision ended it, or the reader would never learn
+        // that a draft was rejected.
+        $decidedPlan = false;
+        $capture = app(Plans::class)->watch($session->key(), function () use (&$decidedPlan): void {
+            $decidedPlan = true;
+        });
+        try {
+            [$parkedRunId, $lastSeq] = $record();
+        } finally {
+            $capture();
+        }
         $tagger = new RunStepTagger($context?->turnId, buffered: true, seq: $lastSeq, resumeRunId: $parkedRunId);
-        $unwatch = $this->watchPlan($session, $tagger);
+        $unwatch = $this->watchPlan($session, $tagger, $decidedPlan);
         try {
             yield from $this->resumeTagged($session, $decisions, $context, $tagger);
         } finally {
