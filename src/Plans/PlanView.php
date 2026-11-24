@@ -94,8 +94,9 @@ final class PlanView
 
     /**
      * The fields of a `plan_updated` run step. The full list goes out on a
-     * snapshot; otherwise only the steps that differ from `$previous`. A step
-     * that disappeared forces a snapshot, because a patch cannot remove one.
+     * snapshot; otherwise only the steps that differ from `$previous`. Any
+     * change to the list of step ids forces a snapshot, because a patch can
+     * neither remove a step nor say where a new one goes.
      *
      * @param  array<string, mixed>  $plan
      * @param  list<array<string, mixed>>|null  $previous  the steps last sent on this stream, or null
@@ -104,15 +105,11 @@ final class PlanView
     public static function update(array $plan, ?array $previous): array
     {
         $steps = self::steps($plan);
-        $snapshot = $previous === null;
-        if (! $snapshot) {
-            $ids = array_column($steps, 'id');
-            foreach ($previous as $old) {
-                if (! in_array($old['id'], $ids, true)) {
-                    $snapshot = true;
-                }
-            }
-        }
+        // A patch can say WHAT changed, by id, but not WHERE a step goes. So it
+        // is sent only while the list of ids is the same, in the same order; an
+        // insert (a pause puts the person's step before the current one), a
+        // removal or a reorder is a snapshot.
+        $snapshot = $previous === null || array_column($previous, 'id') !== array_column($steps, 'id');
         $sent = $steps;
         if (! $snapshot) {
             $before = [];

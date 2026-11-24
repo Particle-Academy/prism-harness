@@ -41,11 +41,12 @@ function runPlansCase(array $case): array
         return $prefix.'_'.str_pad((string) ++$counter, 26, '0', STR_PAD_LEFT);
     });
     $plan = null;
+    $marked = null;
     $results = [];
     foreach ($case['ops'] as $op) {
         $now = $op['now'] ?? ($case['now'] ?? 1767225600);
         try {
-            $results[] = plansOp($op, $plan, $ids, $limits, $now);
+            $results[] = plansOp($op, $plan, $ids, $limits, $now, $marked);
         } catch (PlanRefused $refused) {
             $results[] = ['refused' => $refused->code()];
         }
@@ -57,9 +58,10 @@ function runPlansCase(array $case): array
 /**
  * @param  array<string, mixed>  $op
  * @param  array<string, mixed>|null  $plan
+ * @param  list<array<string, mixed>>|null  $marked
  * @return array<string, mixed>
  */
-function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int $now): array
+function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int $now, ?array &$marked = null): array
 {
     $run = 'run_case';
     $needs = static function () use (&$plan): array {
@@ -139,6 +141,12 @@ function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int
             $plan = PlanMachine::cancel($needs(), $now);
 
             return ['ok' => true];
+        case 'mark':
+            $marked = PlanView::steps($needs());
+
+            return ['ok' => true];
+        case 'update_since_mark':
+            return ['update' => PlanView::update($needs(), $marked)];
         case 'stalled':
             return ['stalled' => PlanMachine::stalled($needs(), $now, $op['stale_after'])];
         case 'policy':
