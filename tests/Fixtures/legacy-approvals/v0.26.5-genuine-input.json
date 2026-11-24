@@ -1,0 +1,54 @@
+{
+    "written_by": "particle-academy/prism-harness v0.26.5 with particle-academy/prism v0.152.0",
+    "tool_parameter": "input",
+    "model_arguments": "{\"input\":\"Hello\"}",
+    "approval_id": "apr_01M85RRRT8C3VQENF8ZWNQ4DYS",
+    "rows": [
+        {
+            "type": "user",
+            "payload": {
+                "content": "Translate it.",
+                "additional_content": [],
+                "additional_attributes": []
+            }
+        },
+        {
+            "type": "assistant",
+            "payload": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "fc_1",
+                        "name": "translate",
+                        "arguments": "{\"input\":\"Hello\"}",
+                        "result_id": "call_1",
+                        "reasoning_id": null,
+                        "reasoning_summary": null
+                    }
+                ],
+                "additional_content": {
+                    "reasoningSummaries": [],
+                    "output_items": [
+                        {
+                            "id": "fc_1",
+                            "type": "function_call",
+                            "status": "completed",
+                            "arguments": "{\"input\":\"Hello\"}",
+                            "call_id": "call_1",
+                            "name": "translate"
+                        }
+                    ]
+                },
+                "tool_approval_requests": [
+                    {
+                        "approval_id": "apr_01M85RRRT8C3VQENF8ZWNQ4DYS",
+                        "tool_call_id": "fc_1"
+                    }
+                ],
+                "harness_tool_names": [
+                    "translate"
+                ]
+            }
+        }
+    ]
+}

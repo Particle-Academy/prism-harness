@@ -1,0 +1,55 @@
+{
+    "written_by": "particle-academy/prism-harness v0.26.4 with particle-academy/prism v0.151.1",
+    "tool_parameter": "input",
+    "model_arguments": "{\"city\": \"Par",
+    "transport": "anthropic stream",
+    "approval_id": "apr_01M85RRQV54YVD1X8AXDKMM1EZ",
+    "rows": [
+        {
+            "type": "user",
+            "payload": {
+                "content": "Translate it.",
+                "additional_content": [],
+                "additional_attributes": []
+            }
+        },
+        {
+            "type": "assistant",
+            "payload": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "toolu_1",
+                        "name": "translate",
+                        "arguments": {
+                            "input": "{\"city\": \"Par"
+                        },
+                        "result_id": null,
+                        "reasoning_id": null,
+                        "reasoning_summary": null
+                    }
+                ],
+                "additional_content": {
+                    "content_blocks": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "translate",
+                            "input": "{\"city\": \"Par"
+                        }
+                    ],
+                    "stop_reason": "tool_use"
+                },
+                "tool_approval_requests": [
+                    {
+                        "approval_id": "apr_01M85RRQV54YVD1X8AXDKMM1EZ",
+                        "tool_call_id": "toolu_1"
+                    }
+                ],
+                "harness_tool_names": [
+                    "translate"
+                ]
+            }
+        }
+    ]
+}
