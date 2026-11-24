@@ -56,43 +56,55 @@ final class PlanText
     /** Whether a model-written field is acceptable as it stands. */
     public static function acceptable(mixed $value, int $max): bool
     {
-        if (! is_string($value) || $value === '' || ! mb_check_encoding($value, 'UTF-8')) {
+        if (! is_string($value) || $value === '' || ! self::validUtf8($value)) {
             return false;
         }
-        if (mb_strlen($value, 'UTF-8') > $max) {
+        if (self::length($value) > $max) {
             return false;
         }
         if (preg_match('/['.self::FORBIDDEN.']/u', $value) === 1) {
             return false;
         }
-        $lower = mb_strtolower($value, 'UTF-8');
-        foreach (self::MARKERS as $marker) {
-            if (str_contains($lower, $marker)) {
-                return false;
-            }
-        }
 
-        return true;
+        // The frame's markers, in any case.
+        return preg_match('/[[](?:end of plan|plan)/iu', $value) !== 1;
     }
 
     /** Text cleaned for the plan context: forbidden characters removed, markers defused, cut to $max code points. */
     public static function render(string $value, int $max): string
     {
-        if (! mb_check_encoding($value, 'UTF-8')) {
+        if (! self::validUtf8($value)) {
             return '';
         }
         $clean = (string) preg_replace('/['.self::FORBIDDEN.']/u', '', $value);
-        $clean = (string) preg_replace('/\[(end of plan|plan)/iu', '($1', $clean);
-        if (mb_strlen($clean, 'UTF-8') > $max) {
-            $clean = mb_substr($clean, 0, $max - 1, 'UTF-8').'…';
+        $clean = (string) preg_replace('/[[](end of plan|plan)/iu', '($1', $clean);
+        if (self::length($clean) > $max) {
+            $clean = implode('', array_slice(self::codePoints($clean), 0, $max - 1)).'…';
         }
 
         return $clean;
     }
 
-    /** Code points, the unit every cap here is counted in. */
+    /**
+     * Code points, the unit every cap here is counted in. PCRE rather than
+     * mbstring, which this package does not require.
+     */
     public static function length(string $value): int
     {
-        return mb_strlen($value, 'UTF-8');
+        return count(self::codePoints($value));
+    }
+
+    /** Valid UTF-8 with no surrogate code points: PCRE checks both. */
+    public static function validUtf8(string $value): bool
+    {
+        return preg_match('//u', $value) === 1;
+    }
+
+    /** @return list<string> */
+    private static function codePoints(string $value): array
+    {
+        $points = preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY);
+
+        return $points === false ? [] : $points;
     }
 }

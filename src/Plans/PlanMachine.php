@@ -600,7 +600,7 @@ final class PlanMachine
             throw PlanRefused::because('plan.not_answerable');
         }
         $text ??= '';
-        if (! is_string($text) || ! mb_check_encoding($text, 'UTF-8') || PlanText::length($text) > PlanText::ANSWER
+        if (! is_string($text) || ! PlanText::validUtf8($text) || PlanText::length($text) > PlanText::ANSWER
             || ($choice !== null && ! in_array($choice, $step['options'], true))
             || ($text === '' && $choice === null)) {
             throw PlanRefused::because('plan.answer_invalid');
