@@ -482,8 +482,19 @@ it('does not treat a person\'s recorded approval as permission for a workflow no
 
     $session->approve($pending[0]);
 
+    // approve() holds the session lock while the handler runs, so the
+    // workflow call is refused before its approval is even read.
     expect($runs)->toBe(1)
-        ->and($outcome)->toContain('needs approval');
+        ->and($outcome)->toContain('another turn is using this session');
+});
+
+it('does not treat a recorded approval as permission once the session lock is free', function (): void {
+    config()->set('prism-harness.agent.modes.flow.tools', ['mode_gated']);
+    $session = flowPausedApproved('mode_gated');
+    $invoker = $session->flowTools()->toolInvoker();
+
+    expect(fn () => $invoker->invoke('mode_gated', ['target' => 'prod']))->toThrow(ToolNotAvailable::class, 'needs approval')
+        ->and($this->ran['mode_gated'])->toBe(0);
 });
 
 it('offers the model no subagent through the workflow boundary', function (): void {

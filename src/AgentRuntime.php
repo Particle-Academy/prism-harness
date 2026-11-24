@@ -22,6 +22,7 @@ use Prism\Harness\Events\ToolAutoAllowed;
 use Prism\Harness\Events\ToolDecision;
 use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Exceptions\ToolNotAvailable;
@@ -1303,6 +1304,34 @@ final readonly class AgentRuntime
      * @throws ToolNotAvailable when the call may not run
      */
     public function runFlowTool(Session $session, ?array $toolNames, string $name, array $arguments, ?callable $starting = null): mixed
+    {
+        // The same lock an ordinary turn holds, with the same timeout, for the
+        // whole decision and the handler. While another holder has it the call
+        // does not run; the node fails rather than waiting.
+        $entered = false;
+
+        try {
+            return $session->fencedLock(function (Session $session) use ($toolNames, $name, $arguments, $starting, &$entered): mixed {
+                $entered = true;
+
+                return $this->runFlowToolLocked($session, $toolNames, $name, $arguments, $starting);
+            }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
+        } catch (SessionLocked $locked) {
+            if ($entered) {
+                // Thrown by the tool itself, not by taking this lock.
+                throw $locked;
+            }
+
+            throw ToolNotAvailable::sessionInUse($name, $locked);
+        }
+    }
+
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $arguments
+     * @param  (callable(): void)|null  $starting
+     */
+    private function runFlowToolLocked(Session $session, ?array $toolNames, string $name, array $arguments, ?callable $starting): mixed
     {
         $entries = $this->flowEntries($session, $toolNames);
 
