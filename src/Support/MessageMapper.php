@@ -219,10 +219,14 @@ final class MessageMapper
      */
     private static function approvalRequest(array $data): ToolApprovalRequest
     {
-        return new ToolApprovalRequest(
-            approvalId: (string) ($data['approval_id'] ?? ''),
-            toolCallId: (string) ($data['tool_call_id'] ?? ''),
-        );
+        // fromArray() keeps core's marker. Without it, core expires an
+        // approval whose call could have been stored unparsed by an earlier
+        // version, so the tool could never run after a resume.
+        return ToolApprovalRequest::fromArray([
+            ...$data,
+            'approval_id' => (string) ($data['approval_id'] ?? ''),
+            'tool_call_id' => (string) ($data['tool_call_id'] ?? ''),
+        ]);
     }
 
     /**
