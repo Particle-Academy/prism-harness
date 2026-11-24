@@ -37,7 +37,9 @@ final class DatabaseWorkflowLedgerStore implements WorkflowLedgerStore
             $now = now();
             $this->query()->insertOrIgnore([
                 'id' => $id,
-                'run_key' => mb_substr($runKey, 0, 255),
+                // A readable copy only when it fits whole; cutting a key could
+                // leave invalid UTF-8 a strict database refuses.
+                'run_key' => strlen($runKey) <= 255 && preg_match('//u', $runKey) === 1 ? $runKey : 'sha256:'.$id,
                 'state' => json_encode($initial, JSON_THROW_ON_ERROR),
                 'steps' => 0,
                 'tool_calls' => 0,
