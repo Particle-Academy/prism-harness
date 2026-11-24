@@ -168,7 +168,7 @@ final readonly class StepCalls
                     $final = ! $failed;
                 }
                 if ($event instanceof ToolApprovalRequestEvent) {
-                    $approvals[] = new ToolApprovalRequest($event->approvalId, $event->toolCall->id);
+                    $approvals[] = $event->approvalRequest();
                 }
                 yield $event;
             }

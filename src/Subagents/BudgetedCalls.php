@@ -30,7 +30,6 @@ use Prism\Prism\Text\ResponseBuilder as TextBuilder;
 use Prism\Prism\Text\Step;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
-use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 use Prism\Prism\ValueObjects\Usage;
@@ -228,7 +227,7 @@ final readonly class BudgetedCalls
                         $final = ! $failed;
                     }
                     if ($event instanceof ToolApprovalRequestEvent) {
-                        $approvals[] = new ToolApprovalRequest($event->approvalId, $event->toolCall->id);
+                        $approvals[] = $event->approvalRequest();
                     }
                     yield $event;
                 }
