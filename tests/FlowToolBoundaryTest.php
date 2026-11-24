@@ -398,6 +398,15 @@ it('applies a named agent\'s own mode, approval marks and authorization', functi
     expect($runs)->toBe(['open' => 1, 'held' => 0, 'hidden' => 0, 'refused' => 0]);
 });
 
+it('does not treat a recorded approval as permission once the session lock is free', function (): void {
+    config()->set('prism-harness.agent.modes.flow.tools', ['mode_gated']);
+    $session = flowPausedApproved('mode_gated');
+    $invoker = $session->flowTools()->toolInvoker();
+
+    expect(fn () => $invoker->invoke('mode_gated', ['target' => 'prod']))->toThrow(ToolNotAvailable::class, 'needs approval')
+        ->and($this->ran['mode_gated'])->toBe(0);
+});
+
 it('offers the model no subagent through the workflow boundary', function (): void {
     config()->set('prism-harness.agent.modes.flow.subagents', [
         'helper' => ['description' => 'Helps.', 'mode' => 'narrow'],

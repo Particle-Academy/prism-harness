@@ -325,6 +325,9 @@ class Session
      * A tool that needs approval fails its node, because a workflow node cannot
      * ask a person. Use a session turn for those.
      *
+     * Each tool call holds the session lock while it runs, as a turn does. When
+     * another turn holds it, the call does not run and its node fails.
+     *
      * @param  list<string>|null  $toolNames  narrows the mode, and cannot widen it
      */
     public function flowTools(?array $toolNames = null): FlowToolset
