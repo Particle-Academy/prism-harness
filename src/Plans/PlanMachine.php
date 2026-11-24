@@ -49,8 +49,13 @@ final class PlanMachine
      *
      * @return array{goal: string, steps: list<array<string, mixed>>}
      */
-    public static function checkDraft(mixed $args, PlanLimits $limits): array
+    public static function checkDraft(mixed $args, PlanLimits $limits, bool $authorized = true): array
     {
+        if (! $authorized) {
+            // The host's call policy refused this call: nothing is checked,
+            // recorded or proposed, and the live-plan slot stays free.
+            throw PlanRefused::because('plan.not_authorized');
+        }
         if (! is_array($args) || ! array_key_exists('goal', $args) || ! array_key_exists('steps', $args)
             || array_diff(array_keys($args), ['goal', 'steps']) !== []) {
             throw PlanRefused::because('plan.shape');
@@ -518,8 +523,13 @@ final class PlanMachine
      * @param  array<string, mixed>  $plan
      * @return array{0: array<string, mixed>, 1: ?string} the plan, and a refusal code or null
      */
-    public static function pause(array $plan, mixed $args, ?string $digest, PlanIds $ids, PlanLimits $limits, int $now, ?string $runId): array
+    public static function pause(array $plan, mixed $args, ?string $digest, PlanIds $ids, PlanLimits $limits, int $now, ?string $runId, bool $authorized = true): array
     {
+        if (! $authorized) {
+            // The host's call policy refused this call: nothing is checked,
+            // recorded or proposed, and the live-plan slot stays free.
+            throw PlanRefused::because('plan.not_authorized');
+        }
         if (! is_array($args) || array_diff(array_keys($args), ['kind', 'question', 'options']) !== []
             || ! in_array($args['kind'] ?? null, ['approve', 'input'], true)) {
             throw PlanRefused::because('plan.shape');
@@ -621,8 +631,13 @@ final class PlanMachine
      * @param  array<string, mixed>  $plan
      * @return array<string, mixed>
      */
-    public static function proposeChange(array $plan, mixed $args, string $digest, PlanIds $ids, PlanLimits $limits, int $now, ?string $runId): array
+    public static function proposeChange(array $plan, mixed $args, string $digest, PlanIds $ids, PlanLimits $limits, int $now, ?string $runId, bool $authorized = true): array
     {
+        if (! $authorized) {
+            // The host's call policy refused this call: nothing is checked,
+            // recorded or proposed, and the live-plan slot stays free.
+            throw PlanRefused::because('plan.not_authorized');
+        }
         if (! is_array($args) || array_diff(array_keys($args), ['reason', 'base_revision', 'steps']) !== []
             || ! is_array($args['steps'] ?? null) || ($args['steps'] !== [] && ! array_is_list($args['steps']))) {
             throw PlanRefused::because('plan.shape');

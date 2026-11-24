@@ -71,7 +71,7 @@ function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int
     };
     switch ($op['op']) {
         case 'draft':
-            $draft = PlanMachine::checkDraft($op['args'], $limits);
+            $draft = PlanMachine::checkDraft($op['args'], $limits, $op['authorized'] ?? true);
             if (PlanMachine::isLive($plan)) {
                 throw PlanRefused::because('plan.exists');
             }
@@ -107,7 +107,7 @@ function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int
 
             return ['ok' => true];
         case 'pause':
-            [$plan, $code] = PlanMachine::pause($needs(), $op['args'], $op['digest'], $ids, $limits, $now, $run);
+            [$plan, $code] = PlanMachine::pause($needs(), $op['args'], $op['digest'], $ids, $limits, $now, $run, $op['authorized'] ?? true);
 
             return $code === null ? ['ok' => true] : ['refused' => $code];
         case 'answer':
@@ -124,7 +124,7 @@ function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int
             }
             $args['steps'] = array_map(static fn (array $entry): array => array_key_exists('ref', $entry)
                 ? ['id' => $current['steps'][$entry['ref']]['id']] : $entry, $args['steps']);
-            $plan = PlanMachine::proposeChange($current, $args, $op['digest'], $ids, $limits, $now, $run);
+            $plan = PlanMachine::proposeChange($current, $args, $op['digest'], $ids, $limits, $now, $run, $op['authorized'] ?? true);
 
             return ['ok' => true];
         case 'apply_change':

@@ -6,6 +6,7 @@ namespace Prism\Harness\Plans;
 
 use Prism\Harness\Exceptions\PlanRefused;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Prism\Schema\ArraySchema;
 use Prism\Prism\Schema\EnumSchema;
 use Prism\Prism\Schema\StringSchema;
@@ -48,19 +49,21 @@ final class PlanTools
 
     private function draft(): Tool
     {
-        return (new Tool)
+        $tool = null;
+
+        return $tool = (new Tool)
             ->as(PlanMachine::DRAFT)
             ->for('Propose a plan: a goal and an ordered list of steps. A person approves it before any step starts. Steps are your own work (owner agent, with an instruction) or a question for the person (owner human, interaction input, with a question).')
             ->withStringParameter('goal', 'What the plan is for, at most 200 characters, one line.')
             ->withParameter(new ArraySchema('steps', 'The steps, in order.', Plans::stepSchema(false)))
-            ->requiresApproval(function (array $arguments): bool {
+            ->requiresApproval(function (array $arguments) use (&$tool): bool {
                 $limits = $this->plans->limits();
                 if (! $limits->requireApproval) {
                     return false;
                 }
                 $digest = Plans::digest($arguments);
                 try {
-                    $plan = $this->proposal($arguments, $digest);
+                    $plan = $this->proposal($arguments, $digest, $this->allowed($tool, $arguments));
                     $this->plans->write($this->session, $plan, $this->plans->load($this->session)['revision'] ?? null);
                 } catch (PlanRefused $refused) {
                     $this->refusals[PlanMachine::DRAFT.$digest] = $refused->code();
@@ -103,10 +106,10 @@ final class PlanTools
      * @param  array<array-key, mixed>  $arguments
      * @return array<string, mixed>
      */
-    private function proposal(array $arguments, string $digest): array
+    private function proposal(array $arguments, string $digest, bool $authorized = true): array
     {
         $limits = $this->plans->limits();
-        $draft = PlanMachine::checkDraft($arguments, $limits);
+        $draft = PlanMachine::checkDraft($arguments, $limits, $authorized);
         if (PlanMachine::isLive($this->plans->load($this->session))) {
             throw PlanRefused::because('plan.exists');
         }
@@ -139,18 +142,20 @@ final class PlanTools
 
     private function pause(): Tool
     {
-        return (new Tool)
+        $tool = null;
+
+        return $tool = (new Tool)
             ->as(PlanMachine::PAUSE)
             ->for('Stop for the person before continuing the CURRENT step. kind approve asks the person to approve going on; kind input asks a question. End your turn after calling it.')
             ->withParameter(new EnumSchema('kind', 'approve or input', ['approve', 'input']))
             ->withStringParameter('question', 'What to ask the person, at most 160 characters, one line.')
             ->withParameter(new ArraySchema('options', 'Suggested answers for kind input; free text is always allowed.', new StringSchema('option', 'An option'), nullable: true), false)
-            ->requiresApproval(function (array $arguments): bool {
+            ->requiresApproval(function (array $arguments) use (&$tool): bool {
                 if (($arguments['kind'] ?? null) !== 'approve') {
                     return false;
                 }
                 $digest = Plans::digest($arguments);
-                $code = $this->applyPause($arguments, $digest);
+                $code = $this->applyPause($arguments, $digest, $this->allowed($tool, $arguments));
                 if ($code !== null) {
                     $this->refusals[PlanMachine::PAUSE.$digest] = $code;
 
@@ -177,13 +182,13 @@ final class PlanTools
     }
 
     /** @param array<array-key, mixed> $arguments */
-    private function applyPause(array $arguments, ?string $digest): ?string
+    private function applyPause(array $arguments, ?string $digest, bool $authorized = true): ?string
     {
         $code = null;
         try {
-            $plan = $this->plans->mutate($this->session, function (array $plan) use ($arguments, $digest, &$code): array {
+            $plan = $this->plans->mutate($this->session, function (array $plan) use ($arguments, $digest, $authorized, &$code): array {
                 [$plan, $code] = PlanMachine::pause($plan, $arguments, $digest, $this->plans->ids(), $this->plans->limits(),
-                    $this->plans->now(), $this->plans->runId($this->session));
+                    $this->plans->now(), $this->plans->runId($this->session), $authorized);
 
                 return $plan;
             });
@@ -196,17 +201,20 @@ final class PlanTools
 
     private function change(): Tool
     {
-        return (new Tool)
+        $tool = null;
+
+        return $tool = (new Tool)
             ->as(PlanMachine::CHANGE)
             ->for('Propose a new list for the plan\'s remaining steps. Keep every finished, running, held or person step unchanged by giving only its id. A person approves the change before it applies.')
             ->withStringParameter('reason', 'Why the plan should change, at most 200 characters, one line.')
             ->withNumberParameter('base_revision', 'The plan revision you are changing, from the plan context.')
             ->withParameter(new ArraySchema('steps', 'The new list of steps, in order.', Plans::stepSchema(true)))
-            ->requiresApproval(function (array $arguments): bool {
+            ->requiresApproval(function (array $arguments) use (&$tool): bool {
                 $digest = Plans::digest($arguments);
                 try {
+                    $authorized = $this->allowed($tool, $arguments);
                     $plan = $this->plans->mutate($this->session, fn (array $plan): array => PlanMachine::proposeChange($plan, $arguments, $digest,
-                        $this->plans->ids(), $this->plans->limits(), $this->plans->now(), $this->plans->runId($this->session)));
+                        $this->plans->ids(), $this->plans->limits(), $this->plans->now(), $this->plans->runId($this->session), $authorized));
                     if ($plan === null) {
                         throw PlanRefused::because('plan.no_plan');
                     }
@@ -231,6 +239,26 @@ final class PlanTools
 
                 return 'The person approved the change. The plan now follows the new steps.';
             });
+    }
+
+    /**
+     * Whether the host's call policy lets this call proceed, asked BEFORE a
+     * proposal is recorded. Core asks whether a call needs approval before the
+     * authorization guard around the handler runs, so a draft the host forbids
+     * would otherwise be stored as proposed and hold the session's one plan
+     * slot. Fails closed when the tool is not built yet, which cannot happen
+     * at call time.
+     *
+     * @param  array<array-key, mixed>  $arguments
+     */
+    private function allowed(?Tool $tool, array $arguments): bool
+    {
+        if (! $tool instanceof Tool) {
+            return false;
+        }
+
+        /** @var array<string, mixed> $arguments */
+        return app(ToolAuthorizer::class)->allowsCall($this->session, $tool, $arguments);
     }
 
     /** A person approved exactly this call, and it has not run yet. Read from the thread. */
