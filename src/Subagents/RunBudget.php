@@ -25,6 +25,12 @@ final readonly class RunBudget
         public ?float $maxCostUsd = null,
         public ?int $maxSeconds = null,
         public ?int $maxOutputTokensPerCall = null,
+        /**
+         * Tool handlers a workflow run may execute, counted apart from model
+         * steps (G-348). Null for every session run: a turn's tools are
+         * already bounded by its steps.
+         */
+        public ?int $maxToolCalls = null,
     ) {}
 
     /**
@@ -92,7 +98,17 @@ final readonly class RunBudget
             maxOutputTokensPerCall: $parent->maxOutputTokensPerCall === null ? $this->maxOutputTokensPerCall
                 : ($this->maxOutputTokensPerCall === null ? $parent->maxOutputTokensPerCall
                     : min($parent->maxOutputTokensPerCall, $this->maxOutputTokensPerCall)),
+            // A tree total like steps: a child never widens it.
+            maxToolCalls: self::lesserCount(
+                $parent->maxToolCalls,
+                $this->maxToolCalls === null ? null : $ledger->toolCalls() + $this->maxToolCalls,
+            ),
         );
+    }
+
+    private static function lesserCount(?int $a, ?int $b): ?int
+    {
+        return $a === null ? $b : ($b === null ? $a : min($a, $b));
     }
 
     private static function lesser(?float $a, ?float $b): ?float

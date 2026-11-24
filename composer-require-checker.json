@@ -5,6 +5,11 @@
         "FancyFlow\\Contracts\\NodeExecutor",
         "FancyFlow\\Runtime\\ExecutionContext",
         "FancyFlow\\Runtime\\RunEvent",
+        "FancyFlow\\Runtime\\RunIdentity",
+        "FancyFlow\\ExecutorRegistry",
+        "FancyFlow\\Nodes\\Ai\\LlmCallExecutor",
+        "FancyFlow\\Nodes\\Ai\\ToolUseExecutor",
+        "FancyFlow\\Nodes\\Ai\\AgentExecutor",
         "Prism\\Prism\\Contracts\\DescribesProjectedPayload"
     ]
 }

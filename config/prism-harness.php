@@ -252,6 +252,29 @@ return [
     // Requires a hard cost cap. The host owns durable reservation expiry after worker death.
     'cost_observer' => null,
 
+    /*
+     * One budget for a whole fancy-flow workflow run (G-348). ON BY DEFAULT.
+     *
+     * Counted across every node, `for_each` item, subflow level, retry,
+     * resume and parallel worker of one run: model calls (`max_steps`), tool
+     * handlers the workflow runs (`max_tool_calls`), cost and wall-clock
+     * time. These are the ceiling; a host's per-run limits and a graph's
+     * `harness_budget` can only lower them. Null removes a limit and should be
+     * a deliberate choice. `max_cost_usd` null falls back to
+     * `agent.max_cost_usd`; `pricing` and `agent.max_output_tokens_per_call`
+     * apply as they do to turns.
+     *
+     * `store`: `database` (shared by every worker; needs the migrations) or
+     * `memory` (one process only, so a retry elsewhere starts at zero).
+     */
+    'workflow' => [
+        'max_steps' => (int) env('HARNESS_WORKFLOW_MAX_STEPS', 100),
+        'max_tool_calls' => (int) env('HARNESS_WORKFLOW_MAX_TOOL_CALLS', 100),
+        'max_cost_usd' => null,
+        'max_seconds' => null,
+        'store' => env('HARNESS_WORKFLOW_BUDGET_STORE', 'database'),
+    ],
+
     'agent' => [
         'max_output_tokens_per_call' => null,
         'provider' => env('HARNESS_PROVIDER', 'anthropic'),

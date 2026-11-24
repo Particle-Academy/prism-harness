@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Flow;
 
 use FancyFlow\Nodes\Support\ToolInvoker;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Exceptions\UnboundFlowTools;
 use Prism\Harness\Sessions\Session;
@@ -34,7 +35,7 @@ final class HarnessToolInvoker implements ToolInvoker
      *
      * @throws UnboundFlowTools when given tools that did not come from a session
      */
-    public function __construct(array|FlowToolset $tools = [])
+    public function __construct(array|FlowToolset $tools = [], private readonly ?WorkflowBudget $budget = null)
     {
         $this->toolset = FlowToolset::from($tools);
     }
@@ -55,7 +56,7 @@ final class HarnessToolInvoker implements ToolInvoker
         }
 
         try {
-            $result = $this->toolset->run($tool, $args);
+            $result = $this->toolset->run($tool, $args, $this->budget);
 
             if ($result instanceof ToolError) {
                 // Prism has a first-class failure VALUE as well as exceptions:
@@ -68,7 +69,9 @@ final class HarnessToolInvoker implements ToolInvoker
             }
 
             return $result;
-        } catch (ToolNotAvailable $e) {
+        } catch (ToolNotAvailable|RunNotPermitted $e) {
+            // A spent workflow budget keeps its own code: rewrapped, the run
+            // would read as one failed tool rather than a stopped workflow.
             throw $e;
         } catch (Throwable $e) {
             // A tool that throws is a fact about the run, and the workflow's

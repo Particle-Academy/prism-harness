@@ -10,11 +10,25 @@ use FancyFlow\Runtime\ExecutionContext;
 use FancyFlow\Runtime\RunEvent;
 use Prism\Harness\Sessions\Session;
 
-/** Run a current fancy-flow agent node through a durable Harness session. */
+/**
+ * Run a current fancy-flow agent node through a durable Harness session.
+ *
+ * The turn runs on the workflow's run tree (G-348): every step, and every
+ * subagent's step, charges the run's one budget, and the node gets the
+ * smaller of the session's own step ceiling and what the workflow has left.
+ */
 final readonly class HarnessAgentExecutor implements NodeExecutor
 {
-    /** @param Closure(string): Session $sessions */
-    public function __construct(private Closure $sessions) {}
+    /**
+     * @param  Closure(string): Session  $sessions
+     * @param  array<string, mixed>  $limits  this run's limits from the host; lower only
+     * @param  array<string, mixed>  $workflow  the graph's `harness_budget`; lower only
+     */
+    public function __construct(
+        private Closure $sessions,
+        private array $limits = [],
+        private array $workflow = [],
+    ) {}
 
     /** @return array<string, mixed> */
     public function execute(ExecutionContext $ctx): array
@@ -51,8 +65,13 @@ final readonly class HarnessAgentExecutor implements NodeExecutor
             ? array_values(array_filter($requested, fn (mixed $name): bool => is_string($name) && $name !== ''))
             : null;
 
+        $budget = HarnessFlowExecutors::budgetFor($ctx, $session, $this->limits, $this->workflow);
         $ctx->emit(RunEvent::log('info', 'Harness agent started', $ctx->node->id));
-        $result = $session->send($prompt, $toolNames);
+        $result = HarnessFlowExecutors::reporting($ctx, $budget, function () use ($budget, $session, $prompt, $toolNames) {
+            $budget->assertAvailable();
+
+            return $session->send($prompt, $toolNames, context: $budget->nodeContext());
+        });
         $response = $result->response;
 
         return [

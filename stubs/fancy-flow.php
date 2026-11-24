@@ -41,6 +41,43 @@ interface NodeExecutor
     public function execute(ExecutionContext $ctx): mixed;
 }
 
+namespace FancyFlow;
+
+use FancyFlow\Contracts\NodeExecutor;
+
+class ExecutorRegistry
+{
+    public function bind(string $kind, callable|NodeExecutor|string $executor): static {}
+}
+
+namespace FancyFlow\Nodes\Ai;
+
+use FancyFlow\Contracts\NodeExecutor;
+use FancyFlow\Nodes\Support\LlmClient;
+use FancyFlow\Nodes\Support\ToolInvoker;
+use FancyFlow\Runtime\ExecutionContext;
+
+final class LlmCallExecutor implements NodeExecutor
+{
+    public function __construct(LlmClient $llm) {}
+
+    public function execute(ExecutionContext $ctx): mixed {}
+}
+
+final class ToolUseExecutor implements NodeExecutor
+{
+    public function __construct(ToolInvoker $tools) {}
+
+    public function execute(ExecutionContext $ctx): mixed {}
+}
+
+final class AgentExecutor implements NodeExecutor
+{
+    public function __construct(LlmClient $llm, ToolInvoker $tools) {}
+
+    public function execute(ExecutionContext $ctx): mixed {}
+}
+
 namespace FancyFlow\Schema;
 
 final class FlowNode
@@ -60,9 +97,16 @@ final class RunEvent
     public static function log(string $level, string $message, ?string $nodeId = null, mixed $detail = null): self {}
 }
 
+final class RunIdentity
+{
+    public string $runKey;
+}
+
 final class ExecutionContext
 {
     public FlowNode $node;
+
+    public ?RunIdentity $run;
 
     public function option(string $key, mixed $default = null): mixed {}
 

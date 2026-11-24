@@ -18,12 +18,16 @@ use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\ContextRecall;
 use Prism\Harness\Contracts\EvictionSink;
 use Prism\Harness\Contracts\SummaryBudget;
+use Prism\Harness\Contracts\WorkflowLedgerStore;
+use Prism\Harness\Flow\WorkflowBudgets;
 use Prism\Harness\Math\DoMathManager;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Participants\ParticipantAdapters;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Skills\SkillRegistry;
+use Prism\Harness\Stores\DatabaseWorkflowLedgerStore;
+use Prism\Harness\Stores\MemoryWorkflowLedgerStore;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ContextRecallTool;
 use Prism\Harness\Tools\DoMathTool;
@@ -157,6 +161,24 @@ class PrismHarnessServiceProvider extends ServiceProvider
                 return $observer;
             },
             agents: $app['config']->get('prism-harness.agents', []),
+        ));
+
+        // G-348: one budget per workflow run. The memory store lives as long
+        // as the process; the database store is shared by every worker.
+        $this->app->singleton(MemoryWorkflowLedgerStore::class);
+        $this->app->bind(WorkflowLedgerStore::class, function ($app): WorkflowLedgerStore {
+            $store = $app['config']->get('prism-harness.workflow.store', 'database');
+
+            return match ($store) {
+                'database' => new DatabaseWorkflowLedgerStore($app['db']->connection()),
+                'memory' => $app->make(MemoryWorkflowLedgerStore::class),
+                default => throw new RuntimeException('prism-harness.workflow.store must be "database" or "memory".'),
+            };
+        });
+        $this->app->bind(WorkflowBudgets::class, fn ($app): WorkflowBudgets => new WorkflowBudgets(
+            $app->make(WorkflowLedgerStore::class),
+            (array) $app['config']->get('prism-harness.workflow', []),
+            (array) $app['config']->get('prism-harness.agent', []),
         ));
 
         $this->app->singleton(SubagentRunner::class, fn ($app): SubagentRunner => new SubagentRunner(

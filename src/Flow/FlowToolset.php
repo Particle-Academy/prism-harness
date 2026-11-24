@@ -32,6 +32,9 @@ final class FlowToolset
     /** @var array<int, array{name: string, arguments: array<array-key, mixed>, callIds: list<string>}> */
     private array $handedOver = [];
 
+    /** The workflow run's account; see {@see self::budget()}. */
+    private ?WorkflowBudget $budget = null;
+
     /** @param list<string>|null $names */
     private function __construct(
         private readonly Session $session,
@@ -121,15 +124,46 @@ final class FlowToolset
      *
      * @param  array<array-key, mixed>  $arguments
      */
-    public function run(string $tool, array $arguments): mixed
+    public function run(string $tool, array $arguments, ?WorkflowBudget $budget = null): mixed
     {
+        $budget ??= $this->budget();
+        // A spent run is refused before the lock and before any decision.
+        $budget->assertAvailable();
+
         return $this->session->flowRuntime()->runFlowTool(
             $this->session,
             $this->names,
             $tool,
             $arguments,
-            fn () => $this->recordRun($tool, $arguments),
+            function () use ($budget, $tool, $arguments): void {
+                // Inside the lock, after the decision, immediately before the
+                // handler: charged now and never refunded, even if it throws.
+                $budget->takeToolCall();
+                $this->recordRun($tool, $arguments);
+            },
         );
+    }
+
+    /**
+     * The workflow run this toolset's adapters charge (G-348).
+     *
+     * A toolset is built per run, but the engine gives its adapters no run
+     * key. So unless a host binds one with {@see self::usingBudget()} (as
+     * {@see HarnessFlowExecutors} does), the run is keyed by a key the
+     * Harness saves with the session, and a retry or resume through a new
+     * toolset on that session continues the same budget.
+     */
+    public function budget(): WorkflowBudget
+    {
+        return $this->budget ??= app(WorkflowBudgets::class)->forSession($this->session);
+    }
+
+    /** Charge this toolset's adapters to a given workflow run. */
+    public function usingBudget(WorkflowBudget $budget): self
+    {
+        $this->budget = $budget;
+
+        return $this;
     }
 
     /** @internal Called by {@see PrismLlmClient}. */

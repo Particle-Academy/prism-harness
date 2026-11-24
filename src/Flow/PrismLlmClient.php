@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace Prism\Harness\Flow;
 
 use FancyFlow\Nodes\Support\LlmClient;
+use Prism\Harness\AgentRuntime;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Exceptions\UnboundFlowTools;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Tool;
 use Throwable;
@@ -51,6 +54,9 @@ final class PrismLlmClient implements LlmClient
     /** Whether the last step handed tool calls back, so the next one continues its loop. */
     private bool $loopOpen = false;
 
+    /** The workflow run's account; see {@see self::budget()}. */
+    private ?WorkflowBudget $budget;
+
     /**
      * @param  FlowToolset|array{}  $tools  from {@see Session::flowTools()}; empty for a call with no tools
      *
@@ -61,8 +67,10 @@ final class PrismLlmClient implements LlmClient
         private readonly ?string $defaultModel = null,
         ?Session $session = null,
         array|FlowToolset $tools = [],
+        ?WorkflowBudget $budget = null,
     ) {
         $this->toolset = FlowToolset::from($tools);
+        $this->budget = $budget;
 
         if ($this->toolset instanceof FlowToolset && $session instanceof Session && $session !== $this->toolset->session()) {
             throw UnboundFlowTools::otherSession();
@@ -77,6 +85,9 @@ final class PrismLlmClient implements LlmClient
      */
     public function complete(string $prompt, array $options = []): array
     {
+        // A spent run is refused before the lock, the thread or the provider.
+        $this->budget()->assertAvailable();
+
         if (! $this->session instanceof Session) {
             return $this->completeLocked($prompt, $options);
         }
@@ -131,8 +142,20 @@ final class PrismLlmClient implements LlmClient
             $pending->usingTemperature((float) $options['temperature']);
         }
 
-        if (isset($options['max_tokens']) && is_numeric($options['max_tokens'])) {
-            $pending->withMaxTokens((int) $options['max_tokens']);
+        // The workflow's run tree: its ledger, labelled with the session's
+        // named agent and held to that agent's spend ceiling, with the host's
+        // cost observer. Priced when a cost cap or a ceiling applies.
+        $run = $this->runtime()->flowRun($this->session, $this->budget()->context());
+        $price = $run->capped() ? $this->runtime()->flowCallBudget($run, $provider, $model) : null;
+        $outputLimit = $price !== null ? $price->maxOutputTokens : $run->budget->maxOutputTokensPerCall;
+
+        $maxTokens = isset($options['max_tokens']) && is_numeric($options['max_tokens']) ? (int) $options['max_tokens'] : null;
+        if ($outputLimit !== null) {
+            // The operator's output limit wins over a larger graph value.
+            $maxTokens = $maxTokens === null ? $outputLimit : min($maxTokens, $outputLimit);
+        }
+        if ($maxTokens !== null) {
+            $pending->withMaxTokens($maxTokens);
         }
 
         $tools = $this->requestedTools($options);
@@ -155,7 +178,35 @@ final class PrismLlmClient implements LlmClient
             $pending->withThread($this->session->thread());
         }
 
-        $response = $pending->withPrompt($prompt)->asText();
+        $pending->withPrompt($prompt);
+
+        if ($price === null) {
+            // Admitted and charged in one decision, before the request.
+            $run->ledger->takeStep($run->budget);
+            $response = $pending->asText();
+            $run->ledger->recordCost($response->usage->cost);
+        } else {
+            $calls = new BudgetedCalls($price);
+            [$reservation, $call] = $calls->reserve($run, $pending->toRequest(), 'text', $pending->provider());
+            try {
+                $run->ledger->takeStep($run->budget);
+            } catch (RunNotPermitted $refused) {
+                $run->ledger->releaseCost($reservation);
+
+                throw $refused;
+            }
+            $usage = null;
+            $billing = [];
+            $outcome = 'failed';
+            try {
+                $response = $pending->asText();
+                $usage = $response->usage;
+                $billing = $response->additionalContent;
+                $outcome = 'completed';
+            } finally {
+                $calls->settle($run, $reservation, $call, $usage, $outcome, additionalContent: $billing);
+            }
+        }
 
         $result = [
             'text' => $response->text,
@@ -180,6 +231,23 @@ final class PrismLlmClient implements LlmClient
         }
 
         return $result;
+    }
+
+    /**
+     * The workflow run this client charges (G-348): the one it was given, else
+     * its toolset's (saved with the session), else one held for this process.
+     */
+    private function budget(): WorkflowBudget
+    {
+        return $this->budget ??= $this->toolset?->budget()
+            ?? ($this->session instanceof Session
+                ? app(WorkflowBudgets::class)->forSession($this->session)
+                : app(WorkflowBudgets::class)->forProcess());
+    }
+
+    private function runtime(): AgentRuntime
+    {
+        return $this->session?->flowRuntime() ?? app(AgentRuntime::class);
     }
 
     /**

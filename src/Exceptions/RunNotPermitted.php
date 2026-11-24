@@ -40,9 +40,35 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
         return $this->errorCode;
     }
 
+    /** Which limit stopped the run, for a refusal made by {@see self::exhausted()} or {@see self::workflowBudget()}. */
+    private ?string $reason = null;
+
+    public function reason(): ?string
+    {
+        return $this->reason;
+    }
+
     public static function exhausted(string $reason): self
     {
-        return new self("This run may not proceed: {$reason}.");
+        $failure = new self("This run may not proceed: {$reason}.");
+        $failure->reason = $reason;
+
+        return $failure;
+    }
+
+    /**
+     * A workflow run's shared budget is spent (G-348). The reason names the
+     * limit: steps, tool calls, cost, time, or a cost cap that cannot be
+     * enforced. The code is in the message as well, because a workflow
+     * engine reports a node's failure as text.
+     */
+    public static function workflowBudget(string $reason): self
+    {
+        $failure = new self("This workflow run may not proceed (workflow_budget_exhausted): {$reason}.");
+        $failure->errorCode = 'workflow_budget_exhausted';
+        $failure->reason = $reason;
+
+        return $failure;
     }
 
     public static function callBudget(string $code): self
