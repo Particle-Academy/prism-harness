@@ -1082,3 +1082,121 @@ it('applies a tool policy revoked while the call policy is deciding', function (
     expect(fn () => $invoker->invoke('mode_gated', ['target' => 'x']))->toThrow(ToolNotAvailable::class, 'needs approval')
         ->and($this->ran['mode_gated'])->toBe(0);
 });
+
+/*
+ * The session lock. A workflow tool call holds the same lock an ordinary turn
+ * holds, for as long as the tool runs. While another holder has it the call
+ * does not run and the node fails; nothing waits past the lock's own timeout.
+ */
+
+/** Hold the session's lock from another session object, as a turn in progress does. */
+function flowHoldLock(string $key = 'flow'): Closure
+{
+    return flowSession($key)->holdFencedLock(300, 0);
+}
+
+it('does not run a workflow tool while another turn holds the session lock', function (string $shape): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $this->replies = [flowCall('plain'), flowText()];
+    $release = flowHoldLock();
+
+    try {
+        $result = runFlowShape($shape, 'plain', flowSession());
+    } finally {
+        $release();
+    }
+
+    expect($result->ok)->toBeFalse()
+        ->and($this->ran['plain'])->toBe(0)
+        ->and((string) $result->error)->toContain('[plain]')
+        ->and((string) $result->error)->toContain('another turn is using this session');
+})->with(['tool_use alone', 'llm_call then tool_use', 'agent'])
+    ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('runs a workflow tool when the session lock is free, and releases it afterwards', function (string $shape): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $this->replies = [flowCall('plain'), flowText()];
+    flowHoldLock()();
+
+    $result = runFlowShape($shape, 'plain', flowSession());
+
+    expect($result->ok)->toBeTrue()
+        ->and($this->ran['plain'])->toBe(1);
+
+    $release = flowHoldLock();
+    $release();
+})->with(['tool_use alone', 'llm_call then tool_use', 'agent'])
+    ->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('holds the session lock while the workflow tool runs', function (): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $seen = [];
+    app(ToolRegistry::class)->register((new Tool)->as('lock_probe')->for('Probe.')->withStringParameter('target', 'Target')
+        ->using(function (string $target) use (&$seen): string {
+            try {
+                flowHoldLock()();
+                $seen[] = 'free';
+            } catch (SessionLocked) {
+                $seen[] = 'held';
+            }
+
+            return 'ran';
+        }));
+    config()->set('prism-harness.agent.modes.flow.tools', ['lock_probe']);
+
+    $result = runFlowShape('tool_use alone', 'lock_probe', flowSession());
+
+    expect($result->ok)->toBeTrue()
+        ->and($seen)->toBe(['held']);
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('releases the session lock when a workflow tool throws', function (): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    app(ToolRegistry::class)->register((new Tool)->as('throws')->for('Probe.')->withStringParameter('target', 'Target')
+        ->using(fn (string $target): string => throw new RuntimeException('tool broke')));
+    config()->set('prism-harness.agent.modes.flow.tools', ['throws']);
+
+    $result = runFlowShape('tool_use alone', 'throws', flowSession());
+
+    expect($result->ok)->toBeFalse()
+        ->and((string) $result->error)->toContain('tool broke');
+
+    $release = flowHoldLock();
+    $release();
+})->skip(fn (): bool => flowEngineMissing(), FLOW_ENGINE_SKIP);
+
+it('refuses a direct invoker call while another turn holds the session lock', function (): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $invoker = flowSession()->flowTools()->toolInvoker();
+    $release = flowHoldLock();
+
+    try {
+        expect(fn () => $invoker->invoke('plain', ['target' => 'x']))
+            ->toThrow(ToolNotAvailable::class, 'another turn is using this session');
+    } finally {
+        $release();
+    }
+
+    expect($this->ran['plain'])->toBe(0)
+        ->and($invoker->invoke('plain', ['target' => 'x']))->toBe('ran')
+        ->and($this->ran['plain'])->toBe(1);
+});
+
+it('leaves ordinary turns as they were: a turn runs its tool, and is refused while the lock is held', function (): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $this->replies = [flowCall('plain'), flowText()];
+
+    $response = flowSession()->send('go');
+
+    expect($response->text())->toBe('done')
+        ->and($this->ran['plain'])->toBe(1);
+
+    $release = flowHoldLock();
+    try {
+        expect(fn () => flowSession()->send('again'))->toThrow(SessionLocked::class);
+    } finally {
+        $release();
+    }
+
+    expect($this->ran['plain'])->toBe(1);
+});
