@@ -29,58 +29,90 @@ final class ApprovedTools
     use CallsTools;
 
     /**
+     * Resolve the approvals the request carries, record the result message
+     * core appends, and return the resolution's events.
+     *
+     * Whether anything was resolved is read from what the resolver yielded,
+     * never from the message list: core rebuilds some messages on every read
+     * (an answered call with unparseable arguments), so a list comparison
+     * would see a change that never happened.
+     *
+     * Core reports each call it runs with a ToolInvoked telemetry event, and
+     * only under a telemetry context, which core opens inside its own
+     * generation; this runs before that, under a context of its own that opens
+     * no generation. The resolver is stepped one result at a time and each
+     * step's events are dispatched after the step: a listener that throws is
+     * reported, never thrown, so it can neither stop the resolution before its
+     * result is recorded (an approved call whose result was lost would run
+     * again on the next resume) nor keep the other calls' events from being
+     * sent.
+     *
      * @param  Closure(list<Message>):void  $record
      * @return list<StreamEvent>
      */
     public function resolve(TextPending|StructuredPending $generation, Closure $record): array
     {
         $request = $generation->toRequest();
-        $before = $request->messages();
-        $events = null;
-        // Core reports each call it runs here with a ToolInvoked telemetry
-        // event, but only under a telemetry context, which core opens inside
-        // its own generation. This resolution runs before that, so it runs
-        // under a context of its own that opens no generation.
-        //
-        // Those events are held until the merge below is recorded: a
-        // listener that throws must not stop a call that has already run
-        // from being recorded, or the next resume would run it again. A
-        // listener failure after that is reported, never thrown.
+        $context = null;
+        if (Telemetry::enabled() && Telemetry::current() === null) {
+            $context = new TelemetryContext(
+                traceId: (string) Str::uuid(),
+                operation: $generation instanceof StructuredPending ? TelemetryOperation::Structured : TelemetryOperation::Text,
+                provider: (string) $request->provider(),
+                model: $request->model(),
+                startedAt: microtime(true),
+            );
+            Telemetry::stack()->push($context);
+        }
+        $events = [];
         try {
-            Event::defer(function () use ($generation, $record, $request, $before, &$events): void {
-                $context = null;
-                if (Telemetry::enabled() && Telemetry::current() === null) {
-                    $context = new TelemetryContext(
-                        traceId: (string) Str::uuid(),
-                        operation: $generation instanceof StructuredPending ? TelemetryOperation::Structured : TelemetryOperation::Text,
-                        provider: (string) $request->provider(),
-                        model: $request->model(),
-                        startedAt: microtime(true),
-                    );
-                    Telemetry::stack()->push($context);
-                }
-                try {
-                    // Consume ONLY the resolution events. Core merges after
-                    // yielding its results; exposing them before that
-                    // merge/writeback could replay a side effect if the
-                    // consumer abandons the generator at that yield.
-                    $resolved = iterator_to_array($this->resolveToolApprovalsAndYieldEvents($request, EventID::generate()), false);
-                } finally {
-                    Telemetry::end($context);
-                }
-                if ($request->messages() !== $before) {
-                    $record($request->messages());
-                    $generation->withMessages($request->messages());
-                }
-                $events = $resolved;
+            // Consume ONLY the resolution events. Core merges after yielding
+            // its results; exposing them before that merge/writeback could
+            // replay a side effect if the consumer abandons the generator at
+            // that yield.
+            $resolver = $this->resolveToolApprovalsAndYieldEvents($request, EventID::generate());
+            while (self::held(static fn (): bool => $resolver->valid())) {
+                $events[] = $resolver->current();
+                self::held(static function () use ($resolver): bool {
+                    $resolver->next();
+
+                    return true;
+                });
+            }
+        } finally {
+            Telemetry::end($context);
+        }
+        if ($events !== []) {
+            $messages = $request->messages();
+            $record($messages);
+            $generation->withMessages($messages);
+        }
+
+        return $events;
+    }
+
+    /**
+     * One step of the resolver, with core's ToolInvoked events held until it
+     * returns and a listener failure reported, never thrown.
+     *
+     * @param  Closure(): bool  $step
+     */
+    private static function held(Closure $step): bool
+    {
+        $done = false;
+        $result = false;
+        try {
+            Event::defer(function () use ($step, &$done, &$result): void {
+                $result = $step();
+                $done = true;
             }, [ToolInvoked::class]);
         } catch (Throwable $failure) {
-            if ($events === null) {
+            if (! $done) {
                 throw $failure;
             }
             report($failure);
         }
 
-        return $events;
+        return $result;
     }
 }
