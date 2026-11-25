@@ -65,3 +65,27 @@ it('reports the approved call it runs on resume with a ToolInvoked event', funct
         ->and($generations)->toBe(1)
         ->and(Telemetry::current())->toBeNull();
 })->with(['approve', 'streamDecision']);
+
+// A ToolInvoked listener that throws must not stop the approved call's result
+// from being recorded, or the next resume would run the call again.
+it('records an approved call before reporting it, so a throwing listener never runs it twice', function (): void {
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    G360::calls([['weather', ['city' => 'Detroit']]]);
+    $pending = $session->send('go')->pendingApprovals()[0];
+    Event::listen(ToolInvoked::class, function (): void {
+        throw new RuntimeException('listener exploded');
+    });
+    G360::text('Done.');
+    G360::text('Again.');
+
+    try {
+        $session->approve($pending->approvalId);
+    } catch (RuntimeException) {
+    }
+    try {
+        $session->send('');
+    } catch (Throwable) {
+    }
+
+    expect($this->ran)->toBe(1);
+});
