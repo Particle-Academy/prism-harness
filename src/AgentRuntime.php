@@ -23,6 +23,7 @@ use Prism\Harness\Events\ToolApproved;
 use Prism\Harness\Events\ToolAutoAllowed;
 use Prism\Harness\Events\ToolDecision;
 use Prism\Harness\Events\ToolDenied;
+use Prism\Harness\Exceptions\PlanRefused;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
@@ -245,6 +246,7 @@ final readonly class AgentRuntime
             ));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
+            $run = $this->planRun($session, $runId, $run, $context, begun: true);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -298,7 +300,7 @@ final readonly class AgentRuntime
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $stepOnly = $context !== null || $mode->subagents !== [];
+                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId);
                 $response = ! $run->capped()
                     ? ($stepOnly ? (new StepCalls)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
@@ -461,6 +463,7 @@ final readonly class AgentRuntime
             ));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
+            $run = $this->planRun($session, $runId, $run, $context, begun: true);
             $budget = $run->budget;
 
             event(new RunStarted(
@@ -509,7 +512,7 @@ final readonly class AgentRuntime
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $stepOnly = $context !== null || $mode->subagents !== [];
+                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId);
                 $response = ! $run->capped()
                     ? ($stepOnly ? (new StepCalls)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
@@ -849,7 +852,7 @@ final readonly class AgentRuntime
         }
 
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        if ($context !== null || $mode->subagents !== []) {
+        if ($context !== null || $mode->subagents !== [] || app(Plans::class)->servingSharedPlan($session) !== null) {
             yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
             return;
@@ -1037,6 +1040,7 @@ final readonly class AgentRuntime
         ));
         $run = $this->boundedAgentRun($session, $run);
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
+        $run = $this->planRun($session, $runId, $run, $context, begun: false);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
@@ -1139,6 +1143,7 @@ final readonly class AgentRuntime
         ));
         $run = $this->boundedAgentRun($session, $run);
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
+        $run = $this->planRun($session, $runId, $run, $context, begun: false);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $session->beginRun($runId, $mode->name, $provider, $model);
@@ -1944,6 +1949,24 @@ final readonly class AgentRuntime
         return $steps ?? 0;
     }
 
+    /**
+     * The run, narrowed to what a shared plan budget holds for it when the
+     * turn serves a plan step (G-366); unchanged otherwise. A refusal after
+     * the run began closes the run first, as every other budget refusal does.
+     */
+    private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, bool $begun): RunContext
+    {
+        try {
+            return app(Plans::class)->planTurn($session, $runId, $run, $context);
+        } catch (RunNotPermitted|PlanRefused $refused) {
+            if ($begun) {
+                $session->failRun($runId, 'budget');
+            }
+
+            throw $refused;
+        }
+    }
+
     private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run, string $runId): void
     {
         $run->ledger->recordSteps($this->pausedSteps($session, $prompt, $context, $runId));
@@ -2202,7 +2225,9 @@ final readonly class AgentRuntime
     private function takesPricedPath(Session $session, ?RunContext $context): bool
     {
         return ($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null
-            || $this->agentCeiling($session) !== null;
+            || $this->agentCeiling($session) !== null
+            // A shared plan budget with a cost cap prices every call (G-366).
+            || ($context === null && (app(Plans::class)->servingSharedPlan($session)['max_cost_micros'] ?? null) !== null);
     }
 
     /**

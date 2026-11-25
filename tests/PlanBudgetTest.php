@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\Events\PlanBudgetExhausted;
 use Prism\Harness\Exceptions\PlanRefused;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Plans\PlanMachine;
 use Prism\Harness\Plans\Plans;
@@ -232,7 +233,7 @@ it('never grants two turns the same remainder of a shared budget', function (): 
     expect($first->budget->maxSteps)->toBe(8)
         ->and($other->budget->maxSteps)->toBe(2)
         ->and(fn () => $plans->planTurn($session, 'run_c', RunContext::root('run_c', new RunBudget(8)), null))
-        ->toThrow(Prism\Harness\Exceptions\RunNotPermitted::class, 'plan_budget_exhausted');
+        ->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
 });
 
 it('ignores budget fields the model sends and refuses a run tree handed to a shared plan step', function (): void {

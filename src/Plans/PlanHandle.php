@@ -7,6 +7,7 @@ namespace Prism\Harness\Plans;
 use Closure;
 use Generator;
 use Prism\Harness\Exceptions\PlanRefused;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Steps\RunStep;
 use Prism\Harness\Subagents\RunContext;
@@ -51,7 +52,11 @@ final class PlanHandle
             if ($step === null) {
                 return $outcome;
             }
-            $response = $this->session->send($this->prompt($step), context: $context);
+            try {
+                $response = $this->session->send($this->prompt($step), context: $context);
+            } catch (RunNotPermitted $refused) {
+                return $this->stoppedOnBudget() ?? throw $refused;
+            }
 
             return new AdvanceOutcome('ran', 'active', $step['id'], $response->runId);
         });
@@ -77,15 +82,65 @@ final class PlanHandle
                 return $outcome;
             }
             $runId = null;
-            foreach ($this->session->streamSteps($this->prompt($step), context: $context) as $runStep) {
-                $runId ??= $runStep->runId;
-                yield $runStep;
+            try {
+                foreach ($this->session->streamSteps($this->prompt($step), context: $context) as $runStep) {
+                    $runId ??= $runStep->runId;
+                    yield $runStep;
+                }
+            } catch (RunNotPermitted $refused) {
+                return $this->stoppedOnBudget() ?? throw $refused;
             }
 
             return new AdvanceOutcome('ran', 'active', $step['id'], $runId);
         } finally {
             $release();
         }
+    }
+
+    /**
+     * Choose this plan's budget (G-366), in host code: `shared` with
+     * `max_steps` and optionally `max_cost_usd`, `per_step`, or `none`. Each
+     * limit is the lower of this and `prism-harness.plans.budget`. The first
+     * choice, or the plan's first shared turn, fixes the budget: after that
+     * the mode cannot change (`plan.budget_fixed`) and a limit can only be
+     * lowered. Never reachable from a tool or the model.
+     *
+     * @param  array{mode?: string, max_steps?: ?int, max_cost_usd?: int|float|null}  $budget
+     *
+     * @throws \InvalidArgumentException for an invalid mode or limit
+     */
+    public function useBudget(array $budget): void
+    {
+        $plan = $this->plans->load($this->session);
+        if (! PlanMachine::isLive($plan)) {
+            throw PlanRefused::because('plan.no_plan');
+        }
+        $this->plans->useBudget($this->session, $plan['id'], $budget);
+    }
+
+    /**
+     * The plan's budget as it stands: `mode`, `max_steps`, `max_cost_usd`,
+     * and what a shared budget has spent (`steps`, `cost_usd`). Null when
+     * there is no plan.
+     *
+     * @return array{mode: string, max_steps: ?int, max_cost_usd: ?float, steps: int, cost_usd: float}|null
+     */
+    public function budget(): ?array
+    {
+        $plan = $this->plans->load($this->session);
+        if ($plan === null) {
+            return null;
+        }
+        $settings = $this->plans->budgetFor($this->session, $plan['id']);
+        $record = $this->plans->budgetRecord($this->session, $plan['id']);
+
+        return [
+            'mode' => $settings['mode'],
+            'max_steps' => $settings['max_steps'],
+            'max_cost_usd' => $settings['max_cost_micros'] === null ? null : $settings['max_cost_micros'] / 1_000_000,
+            'steps' => (int) ($record['steps'] ?? 0),
+            'cost_usd' => (int) ($record['cost_micros'] ?? 0) / 1_000_000,
+        ];
     }
 
     /**
@@ -140,11 +195,15 @@ final class PlanHandle
         $run = $this->session->run();
         $runFailed = is_array($run) && ($run['status'] ?? null) === 'failed';
         $now = $this->plans->now();
-        [$next, $outcome] = PlanMachine::prepare($plan, $runFailed, $this->plans->limits(), $now, null);
+        $spent = $plan['status'] === 'active' ? $this->plans->budgetExhaustion($this->session, $plan['id']) : null;
+        [$next, $outcome] = PlanMachine::prepare($plan, $runFailed, $this->plans->limits(), $now, null, $spent !== null);
         if ($next !== $plan) {
             $this->plans->write($this->session, $next, $plan['revision']);
         }
         [$kind, $value] = $outcome;
+        if ($kind === 'blocked' && $value === PlanBudget::EXHAUSTED) {
+            $this->plans->announceBudgetExhausted($this->session, $plan['id'], (string) $spent);
+        }
         if ($kind !== 'run') {
             return [match ($kind) {
                 'waiting' => new AdvanceOutcome('waiting', $next['status'], $value),
@@ -162,6 +221,22 @@ final class PlanHandle
         }
 
         throw PlanRefused::because('plan.conflict');
+    }
+
+    /**
+     * A turn refused because the plan's shared budget is spent stops the
+     * plan cleanly: prepare settles the step and blocks the plan with
+     * `plan_budget_exhausted`. Null when the budget is not what stopped it.
+     */
+    private function stoppedOnBudget(): ?AdvanceOutcome
+    {
+        $plan = $this->plans->load($this->session);
+        if ($plan === null || $plan['status'] !== 'active' || $this->plans->budgetExhaustion($this->session, $plan['id']) === null) {
+            return null;
+        }
+        [$outcome] = $this->prepare();
+
+        return $outcome;
     }
 
     /** @param array<string, mixed> $step */
