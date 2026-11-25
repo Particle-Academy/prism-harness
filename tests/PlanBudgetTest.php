@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\Events\PlanBudgetExhausted;
@@ -286,3 +287,151 @@ it('refuses an invalid plan budget in config before anything runs', function (mi
     'unknown key' => [['mode' => 'shared', 'max_steps' => 5, 'per_call' => true]],
     'not a map' => ['shared'],
 ]);
+
+// Only the plan's own turns spend from a shared budget: the turns advance()
+// runs, and the resume of an approval its held step asked for. A person
+// chatting while a step waits is not the plan, and is never refused for it.
+
+/** A shared plan whose first step paused on a weather approval after one model step. */
+function g366Held(int $maxSteps): string
+{
+    config()->set('prism-harness.plans.budget', ['mode' => 'shared', 'max_steps' => $maxSteps]);
+    g366Active(2);
+    G360::calls([['weather', ['city' => 'Paris']]]);
+    G360::session()->plan()->advance();
+    $step = g366Plan()['steps'][0];
+    expect($step['state'])->toBe('held')
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(1);
+
+    return $step['approvalIds'][0];
+}
+
+it('does not charge a shared plan for a chat turn while its step is held', function (): void {
+    g366Held(10);
+
+    G360::calls([['lookup', ['q' => 'a']]]);
+    G360::calls([['lookup', ['q' => 'b']]]);
+    G360::text('Unrelated answer.');
+    G360::session()->send('Unrelated question');
+
+    expect($this->lookups)->toBe(2)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(1);
+});
+
+it('lets the person chat when a shared budget is spent while a step is held', function (): void {
+    g366Held(1);
+
+    G360::text('Unrelated answer.');
+    expect(G360::session()->send('Unrelated question')->text())->toBe('Unrelated answer.')
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(1);
+});
+
+it('does not charge a shared plan for a turn while its step is claimed by no running advance', function (): void {
+    config()->set('prism-harness.plans.budget', ['mode' => 'shared', 'max_steps' => 10]);
+    g366Active(1);
+    $plans = app(Plans::class);
+    $session = G360::session();
+    // A worker claimed the step and died before its turn ran.
+    $plan = $plans->load($session);
+    $plans->write($session, PlanMachine::claim($plan, $plan['steps'][0]['id'], 'worker', $plans->now() + 300, $plans->now()), $plan['revision']);
+
+    G360::calls([['lookup', ['q' => 'a']]]);
+    G360::text('Unrelated answer.');
+    G360::session()->send('Unrelated question');
+
+    expect($this->lookups)->toBe(1)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(0);
+});
+
+it('refuses an approval a spent shared budget cannot run, records nothing, and blocks the plan once', function (): void {
+    Event::fake([PlanBudgetExhausted::class]);
+    $held = g366Held(1);
+    $before = count(Http::recorded());
+
+    expect(fn () => G360::session()->approve($held))->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
+    expect(G360::session()->thread()->pendingApprovalIds())->toBe([$held])
+        ->and($this->weatherRan)->toBe(0)
+        ->and(count(Http::recorded()))->toBe($before);
+
+    $outcome = G360::session()->plan()->advance();
+    expect($outcome->status)->toBe('blocked')
+        ->and($outcome->reason)->toBe('plan_budget_exhausted');
+    Event::assertDispatchedTimes(PlanBudgetExhausted::class, 1);
+    expect(G360::session()->plan()->advance()->status)->toBe('not_active');
+    Event::assertDispatchedTimes(PlanBudgetExhausted::class, 1);
+
+    // Still refused once the plan is blocked: the call never runs outside the budget.
+    expect(fn () => G360::session()->decide([new ToolApprovalResponse($held, true)]))
+        ->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
+    expect(G360::session()->thread()->pendingApprovalIds())->toBe([$held])
+        ->and($this->weatherRan)->toBe(0)
+        ->and(count(Http::recorded()))->toBe($before);
+});
+
+it('closes the run when a shared plan budget cannot be written', function (): void {
+    config()->set('prism-harness.plans.budget', ['mode' => 'shared', 'max_steps' => 10]);
+    g366Active(1);
+    // The durable store fails on the plan budget record, and only there.
+    DB::statement("CREATE TRIGGER g366_budget_down BEFORE INSERT ON harness_session_state
+        WHEN NEW.key LIKE '%:plan-budget' AND NEW.key NOT LIKE 'lock:%'
+        BEGIN SELECT RAISE(ABORT, 'store down'); END");
+    G360::text('unused');
+
+    expect(fn () => G360::session()->plan()->advance())->toThrow(Illuminate\Database\QueryException::class);
+    expect(G360::session()->run()['status'])->toBe('failed');
+});
+
+// A subagent child that pauses on an approval is resumed later on its own
+// session, outside the runner. When the turn that started it spent from a
+// shared plan budget, the resumed child spends from the same one.
+
+function g366ChildModes(): void
+{
+    config()->set('prism-harness.agent.modes.research', [
+        'system_prompt' => 'Research.', 'tools' => ['weather'], 'requires_approval' => ['weather'], 'max_steps' => 4,
+    ]);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'research' => ['description' => 'Research something.', 'mode' => 'research'],
+    ]);
+}
+
+/** A plan step that delegates; the child pauses on weather. Returns the child session and its approval id. */
+function g366PausedChild(int $maxSteps): array
+{
+    g366ChildModes();
+    config()->set('prism-harness.plans.budget', ['mode' => 'shared', 'max_steps' => $maxSteps]);
+    g366Active(1);
+    G360::calls([['research', ['task' => 'Find the weather.']]]);   // parent
+    G360::calls([['weather', ['city' => 'Paris']]]);                 // child: pauses
+    G360::calls([['plan_complete_step', ['summary' => 'Asked.']]]);  // parent
+    G360::text('Step done.');                                        // parent
+    G360::session()->plan()->advance();
+
+    $child = app(Prism\Harness\PrismHarness::class)
+        ->for(Tests\Fixtures\Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::research');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(4);
+
+    return [$child, $pending[0]];
+}
+
+it('charges a child resumed outside the runner to the shared plan budget it was started under', function (): void {
+    [$child, $id] = g366PausedChild(10);
+
+    G360::text('Child answer.');
+    $child->approve($id);
+
+    expect($this->weatherRan)->toBe(1)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(5);
+});
+
+it('refuses, recording nothing, an approval for a child whose shared plan budget is spent', function (): void {
+    [$child, $id] = g366PausedChild(4);
+    $before = count(Http::recorded());
+
+    expect(fn () => $child->approve($id))->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
+    expect($child->thread()->pendingApprovalIds())->toBe([$id])
+        ->and($this->weatherRan)->toBe(0)
+        ->and(count(Http::recorded()))->toBe($before);
+});
