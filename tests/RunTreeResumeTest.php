@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\Http;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tools\ToolRegistry;
@@ -174,4 +175,51 @@ it('narrows a host-supplied run context on a streamed child resume to what its r
 
     expect($this->weatherRan)->toBe(1)
         ->and(count(Http::recorded()) - $before)->toBe(1);
+});
+
+// A run context the host hands in may only narrow what the tree has left. One
+// that carries a child binding of its own is still a host context: the
+// binding, depth, run tree and plan budget the runner saved with the child
+// win, so the context can neither move the child to another provider or
+// model nor erase the tree a later resume would continue.
+
+it('keeps the saved binding and run tree when a host context on a child resume carries a binding of its own', function (): void {
+    [$child, $id] = treePausedChild(5);
+    $forged = RunContext::root('host_root', new RunBudget(100))->withBinding(new ChildBinding('openai', 'forged-model'));
+
+    // Resumed under that context: one step, which pauses on weather again (tree 4 of 5).
+    $before = count(Http::recorded());
+    G360::calls([['weather', ['city' => 'Rome']]]);
+    $second = $child->approve($id, true, null, $forged)->pendingApprovals()[0]->approvalId;
+    expect(G360::lastRequest()['model'] ?? null)->toBe('gpt-4o');
+
+    // A plain answer afterwards still continues the saved tree: one step left.
+    $after = count(Http::recorded());
+    G360::calls([['lookup', ['q' => 'a']]]);
+    G360::calls([['lookup', ['q' => 'b']]]);
+    G360::text('Child answer.');
+    $child->approve($second);
+
+    expect(count(Http::recorded()) - $after)->toBe(1)
+        ->and(count(Http::recorded()) - $before)->toBe(2)
+        ->and(G360::lastRequest()['model'] ?? null)->toBe('gpt-4o');
+});
+
+it('keeps the saved run tree when a host context with a binding sends a new message to a child session', function (): void {
+    [$child] = treePausedChild(4);
+    $forged = RunContext::root('host_root', new RunBudget(100))->withBinding(new ChildBinding('openai', 'forged-model'));
+
+    G360::calls([['lookup', ['q' => 'a']]]);
+    G360::calls([['lookup', ['q' => 'b']]]);
+    G360::text('Child answer.');
+    $before = count(Http::recorded());
+    $child->send('New question', null, [], $forged);
+
+    expect(count(Http::recorded()) - $before)->toBe(1)
+        ->and(G360::lastRequest()['model'] ?? null)->toBe('gpt-4o');
+
+    // The tree is spent, and still saved: a plain message is refused.
+    $spent = count(Http::recorded());
+    expect(fn () => $child->send('Another question'))->toThrow(RunNotPermitted::class);
+    expect(count(Http::recorded()))->toBe($spent);
 });

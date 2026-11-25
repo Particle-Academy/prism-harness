@@ -81,14 +81,15 @@ final readonly class SubagentRunner
         // The child runs in the agent the declaration names, or the parent's.
         // ModeRegistry already refused an agent the parent mode does not list.
         $childAgent = $subagent->agent ?? $parent->agent();
-        $childContext = $context->forChild($subagent, $parentRunId, $parent->thread()->getKey())
+        // Marked as the runner's own: only this context saves the child's binding.
+        $childContext = app(RunTrees::class)->startingChild($context->forChild($subagent, $parentRunId, $parent->thread()->getKey())
             ->withBinding(ChildBinding::for(
                 $subagent,
                 $parent->provider(),
                 $parent->model(),
                 $parentMode ?? $this->modeOf($parent),
                 sameAgent: $childAgent === $parent->agent(),
-            ));
+            )));
 
         // Refused BEFORE the child's address is built. Two modes that name each
         // other as subagents form a cycle that budgets would eventually stop,

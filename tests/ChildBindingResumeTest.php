@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunLedger;
@@ -191,9 +192,52 @@ it('refuses to run a linked child session that has no saved binding rather than 
         ->and($requests)->toBe([]);
 });
 
+// A run context the host builds is not the runner's, so it cannot stand in for
+// the binding a linked child lost: the child is refused before any request,
+// whether the context carries a binding of its own or not.
+it('refuses a linked child that has no saved binding under a host context too', function (bool $withBinding): void {
+    configureResumeAgents(researchMode: ['tools' => []]);
+    $requests = [];
+    fakeBindingWire(null, $requests);
+
+    $parent = bindingSession('planner', 'plan');
+    $child = bindingSession('planner', 'research', 'binding::sub::research');
+    $child->thread()->linkBeneath($parent->thread(), 'run_lost');
+    $context = RunContext::root('host_root', new RunBudget(10));
+    $context = $withBinding ? $context->withBinding(new ChildBinding('custom-cheap', 'cheap-model')) : $context;
+
+    try {
+        $child->send('hello', null, [], $context);
+        $code = null;
+    } catch (RunNotPermitted $refused) {
+        $code = $refused->code();
+    }
+
+    expect($code)->toBe('child_binding_missing')
+        ->and($requests)->toBe([]);
+})->with(['with a binding' => true, 'without one' => false]);
+
+// A host context may bind the session it runs for that turn. Only the
+// runner's own context saves a binding, so the next turn with no context runs
+// on the root rules again.
+it('uses a host context binding on a session that was never a child for that turn only', function (): void {
+    configureResumeAgents(planMode: ['model' => 'mode-model']);
+    $requests = [];
+    fakeBindingWire(null, $requests);
+
+    $session = bindingSession('planner', 'plan');
+    $session->send('go', null, [], RunContext::root('host_root', new RunBudget(10))->withBinding(new ChildBinding('custom-cheap', 'cheap-model')));
+    bindingSession('planner', 'plan')->send('again');
+
+    expect($requests)->toBe([
+        ['who' => 'parent', 'provider' => 'custom-cheap', 'model' => 'cheap-model'],
+        ['who' => 'parent', 'provider' => 'anthropic', 'model' => 'mode-model'],
+    ]);
+});
+
 // A child resumed outside the runner keeps the depth the runner gave it, so a
 // delegation from it is refused at the same maximum depth as inside the tree.
-it('refuses a delegation past the maximum depth from a child resumed outside the runner', function (): void {
+it('refuses a delegation past the maximum depth from a child resumed outside the runner', function (string $context): void {
     configureResumeAgents(planMode: ['max_steps' => 20], researchMode: [
         'max_steps' => 20, 'tools' => ['lookup'], 'requires_approval' => ['lookup'],
         'subagents' => ['deeper' => ['mode' => 'research']],
@@ -241,8 +285,46 @@ it('refuses a delegation past the maximum depth from a child resumed outside the
     // The host answers on the child's own session, after the ephemeral half is gone.
     $child->forget();
     $child->usingMode('research');
-    $child->approve($pending[0]);
+    $child->approve($pending[0], true, null, match ($context) {
+        'none' => null,
+        'host' => RunContext::root('host_root', new RunBudget(50)),
+        'host with a binding' => RunContext::root('host_root', new RunBudget(50))->withBinding(new ChildBinding('anthropic', 'forged-model')),
+    });
 
     expect($seen)->not->toContain('grandchild')
         ->and(implode("\n", $toolResults))->toContain('maximum depth');
-});
+})->with(['none', 'host', 'host with a binding']);
+
+// A run context the host builds may carry a binding of its own. Once the
+// runner has saved one with the child, the saved binding wins: the context
+// cannot move the child to another provider or model.
+it('keeps the saved child binding when a host context on the resume carries another', function (string $answer): void {
+    configureResumeAgents(
+        planMode: ['max_steps' => 20, 'subagents' => ['research' => ['mode' => 'research', 'provider' => 'custom-cheap', 'model' => 'cheap-model']]],
+        researchMode: ['max_steps' => 20, 'tools' => ['lookup'], 'requires_approval' => ['lookup']],
+    );
+    app(ToolRegistry::class)->forAgent('planner')->register((new Tool)->as('lookup')->for('Look it up.')->withStringParameter('q', 'Query')
+        ->using(fn (string $q): string => 'found'), 'binding-test');
+    $requests = [];
+    fakePausingChildWire($requests);
+
+    bindingSession('planner', 'plan')->send('go');
+    $child = bindingSession('planner', 'research', 'binding::sub::research');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1);
+
+    $forged = RunContext::root('host_root', new RunBudget(50))->withBinding(new ChildBinding('anthropic', 'forged-model'));
+    $before = count($requests);
+    if ($answer === 'approve') {
+        $child->approve($pending[0], true, null, $forged);
+    } else {
+        iterator_to_array($child->streamDecision([new ToolApprovalResponse($pending[0], true)], $forged), false);
+    }
+    // And the saved binding is still there for a later turn with no context.
+    $child->send('again');
+
+    expect(array_slice($requests, $before))->toBe([
+        ['who' => 'child', 'provider' => 'custom-cheap', 'model' => 'cheap-model'],
+        ['who' => 'child', 'provider' => 'custom-cheap', 'model' => 'cheap-model'],
+    ]);
+})->with(['approve', 'streamDecision']);

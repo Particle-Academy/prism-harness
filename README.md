@@ -665,7 +665,14 @@ budget, the resumed run spends from that plan budget too (`plan_budget_exhausted
 for every turn on the child session the runner did not start: a new message sent with `send()`
 instead of an answer continues the tree and the plan budget exactly as an answer does, and a run
 context the host passes in can only narrow them. The host context's limits are lowered to what
-the tree and the plan budget have left, and the turn is refused only when they are spent. A child
+the tree and the plan budget have left, and the turn is refused only when they are spent. A host
+context never replaces what the runner saved: if it carries a child binding of its own, the saved
+binding, depth, run tree and plan budget still win, and the turn runs no shallower than the saved
+depth. Only the runner's own context rewrites them. A host context cannot stand in for a binding
+a linked child has lost either: that child is refused (`child_binding_missing`) before any request
+under a host context too. On a session that was never a child, a binding on a host context is used
+for that turn only and is never saved, so the next turn without a context runs on the root rules.
+A child
 started under a run context the host built itself, rather than a run of this runtime, has no
 tree record, and is resumed on its own root budget.
 
