@@ -11,6 +11,7 @@ use Prism\Harness\Plans\PlanBudget;
 use Prism\Harness\Sessions\Session;
 use RuntimeException;
 use Throwable;
+use WeakMap;
 
 /**
  * The durable half of a run tree's budget, for subagent children resumed
@@ -197,6 +198,40 @@ final class RunTrees
             // The hold stays and is charged in full once it expires.
             report(new RuntimeException('A run tree budget update failed: '.$failure::class.'.'));
         }
+    }
+
+    /**
+     * The child contexts the subagent runner built, held weakly. Only these
+     * (and a context of a live tree here) may save a child's binding.
+     *
+     * @var WeakMap<RunContext, true>|null
+     */
+    private ?WeakMap $childContexts = null;
+
+    /**
+     * @internal Called by the subagent runner for the context it starts a child under.
+     */
+    public function startingChild(RunContext $context): RunContext
+    {
+        $this->childContexts ??= new WeakMap;
+        $this->childContexts[$context] = true;
+
+        return $context;
+    }
+
+    /**
+     * The kind of context a turn was handed, for {@see ChildBinding::route()}:
+     * `runner` for the context the subagent runner built to start a child,
+     * even under a run tree the host built, otherwise {@see self::contextKind()}.
+     * A context the host builds and binds itself is never the runner's.
+     *
+     * @internal
+     *
+     * @return 'none'|'metadata'|'runner'|'host'
+     */
+    public function bindingContextKind(?RunContext $context): string
+    {
+        return $context !== null && isset($this->childContexts[$context]) ? 'runner' : $this->contextKind($context);
     }
 
     /**
