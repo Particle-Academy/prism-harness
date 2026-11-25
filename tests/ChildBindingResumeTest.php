@@ -4,6 +4,12 @@ declare(strict_types=1);
 
 use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Facades\Http;
+use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunLedger;
+use Prism\Harness\Subagents\Subagent;
+use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
@@ -135,4 +141,108 @@ it('leaves a root session that was never a child on the root rules', function ()
         ['who' => 'parent', 'provider' => 'anthropic', 'model' => 'mode-model'],
         ['who' => 'parent', 'provider' => 'anthropic', 'model' => 'mode-model'],
     ]);
+});
+
+// The binding must outlive the session's ephemeral half. A person may answer
+// an approval hours later, after the ephemeral TTL has lapsed, Redis has
+// evicted the key, or the host called forget(); the child must still go to
+// the provider and model its declaration chose.
+it('keeps the child binding when the ephemeral state is gone before the answer', function (string $answer): void {
+    configureResumeAgents(
+        planMode: ['model' => 'opus-like', 'subagents' => [
+            'research' => ['mode' => 'research', 'provider' => 'custom-cheap', 'model' => 'cheap-model'],
+        ]],
+        researchMode: ['tools' => ['lookup'], 'requires_approval' => ['lookup']],
+    );
+    app(ToolRegistry::class)->forAgent('planner')->register((new Tool)->as('lookup')->for('Look it up.')->withStringParameter('q', 'Query')
+        ->using(fn (string $q): string => 'found'), 'binding-test');
+    $requests = [];
+    fakePausingChildWire($requests);
+
+    bindingSession('planner', 'plan')->send('go');
+    $child = bindingSession('planner', 'research', 'binding::sub::research');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1);
+
+    // The ephemeral half expires; the mode is set again, as a host would.
+    $child->forget();
+    $child->usingMode('research');
+
+    $before = count($requests);
+    if ($answer === 'approve') {
+        $child->approve($pending[0]);
+    } else {
+        iterator_to_array($child->streamDecision([new ToolApprovalResponse($pending[0], true)]), false);
+    }
+
+    expect(array_slice($requests, $before))->toBe([['who' => 'child', 'provider' => 'custom-cheap', 'model' => 'cheap-model']]);
+})->with(['approve', 'streamDecision']);
+
+it('refuses to run a linked child session that has no saved binding rather than run it as a root', function (): void {
+    configureResumeAgents(researchMode: ['tools' => []]);
+    $requests = [];
+    fakeBindingWire(null, $requests);
+
+    $parent = bindingSession('planner', 'plan');
+    $child = bindingSession('planner', 'research', 'binding::sub::research');
+    $child->thread()->linkBeneath($parent->thread(), 'run_lost');
+
+    expect(fn (): mixed => $child->send('hello'))->toThrow(RunNotPermitted::class)
+        ->and($requests)->toBe([]);
+});
+
+// A child resumed outside the runner keeps the depth the runner gave it, so a
+// delegation from it is refused at the same maximum depth as inside the tree.
+it('refuses a delegation past the maximum depth from a child resumed outside the runner', function (): void {
+    configureResumeAgents(planMode: ['max_steps' => 20], researchMode: [
+        'max_steps' => 20, 'tools' => ['lookup'], 'requires_approval' => ['lookup'],
+        'subagents' => ['deeper' => ['mode' => 'research']],
+    ]);
+    app(ToolRegistry::class)->forAgent('planner')->register((new Tool)->as('lookup')->for('Look it up.')->withStringParameter('q', 'Query')
+        ->using(fn (string $q): string => 'found'), 'binding-test');
+    $seen = [];
+    $toolResults = [];
+    Http::fake(function (HttpRequest $wire) use (&$seen, &$toolResults) {
+        $body = $wire->data();
+        $first = $body['messages'][0]['content'] ?? null;
+        $firstText = is_string($first) ? $first : (is_array($first) ? ($first[0]['text'] ?? null) : null);
+        $seen[] = $firstText;
+        $results = 0;
+        foreach ($body['messages'] ?? [] as $message) {
+            foreach (is_array($message['content'] ?? null) ? $message['content'] : [] as $block) {
+                if (($block['type'] ?? null) === 'tool_result') {
+                    $results++;
+                    $toolResults[] = json_encode($block['content'] ?? null, JSON_THROW_ON_ERROR);
+                }
+            }
+        }
+        $call = $firstText !== 'deep-task' ? null : match ($results) {
+            0 => ['type' => 'tool_use', 'id' => 'lookup-call', 'name' => 'lookup', 'input' => ['q' => 'x']],
+            1 => ['type' => 'tool_use', 'id' => 'deeper-call', 'name' => 'deeper', 'input' => ['task' => 'grandchild']],
+            default => null,
+        };
+
+        return Http::response([
+            'id' => 'depth-'.count($seen), 'type' => 'message', 'role' => 'assistant', 'model' => $body['model'] ?? '',
+            'content' => $call !== null ? [$call] : [['type' => 'text', 'text' => 'answer']],
+            'stop_reason' => $call !== null ? 'tool_use' : 'end_turn', 'stop_sequence' => null,
+            'usage' => ['input_tokens' => 3, 'output_tokens' => 2],
+        ]);
+    });
+
+    // The runner starts a child one level below the maximum; it stops on an approval.
+    $parent = bindingSession('planner', 'research', 'deep');
+    $deep = new RunContext(ledger: RunLedger::start('run_root'), budget: new RunBudget(50), parentRunId: 'run_root', depth: RunContext::MAX_DEPTH - 2);
+    app(SubagentRunner::class)->run(new Subagent('deeper', 'Go deeper.', 'research', new RunBudget(20)), $parent, $deep, 'run_root', 'deep-task');
+    $child = bindingSession('planner', 'research', 'deep::sub::deeper');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1);
+
+    // The host answers on the child's own session, after the ephemeral half is gone.
+    $child->forget();
+    $child->usingMode('research');
+    $child->approve($pending[0]);
+
+    expect($seen)->not->toContain('grandchild')
+        ->and(implode("\n", $toolResults))->toContain('maximum depth');
 });

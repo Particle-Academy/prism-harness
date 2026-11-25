@@ -127,6 +127,15 @@ final readonly class RunContext
         return $this->rebuild(binding: $binding);
     }
 
+    /**
+     * The same run, at the nesting depth a resumed child was given by the
+     * subagent runner, so it cannot delegate past {@see self::MAX_DEPTH}.
+     */
+    public function atDepth(int $depth): self
+    {
+        return $this->rebuild(depth: $depth);
+    }
+
     /** The same run, labelled as a named agent's and held to its ceiling. */
     public function forAgent(?string $agent, ?float $ceilingUsd): self
     {
@@ -156,13 +165,14 @@ final readonly class RunContext
         ?float $agentCeilingUsd = null,
         bool $labelled = false,
         ?bool $workflowNode = null,
+        ?int $depth = null,
     ): self {
         return new self(
             ledger: $this->ledger,
             budget: $budget ?? $this->budget,
             parentRunId: $this->parentRunId,
             parentThreadId: $this->parentThreadId,
-            depth: $this->depth,
+            depth: $depth ?? $this->depth,
             pricing: $this->pricing,
             observer: $observer ?? $this->observer,
             turnId: $this->turnId,
