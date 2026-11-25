@@ -13,10 +13,13 @@ use Prism\Prism\Enums\TelemetryOperation;
 use Prism\Prism\Events\Telemetry\ToolInvoked;
 use Prism\Prism\Streaming\EventID;
 use Prism\Prism\Streaming\Events\StreamEvent;
+use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Structured\PendingRequest as StructuredPending;
 use Prism\Prism\Telemetry\Telemetry;
 use Prism\Prism\Telemetry\TelemetryContext;
 use Prism\Prism\Text\PendingRequest as TextPending;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Throwable;
 
 /**
@@ -89,6 +92,23 @@ final class ApprovedTools
                     return true;
                 });
             }
+        } catch (Throwable $failure) {
+            // A tool that throws its own exception (one built
+            // withoutErrorHandling()) stops the resolution before core merges
+            // anything. A call resolved before it has already run, so its
+            // result is recorded first, merged as core would have merged it;
+            // otherwise the next resume would run that call again.
+            $partial = self::merged($request->messages(), $events);
+            if ($partial !== null) {
+                try {
+                    $record($partial);
+                    $generation->withMessages($partial);
+                } catch (Throwable $unrecorded) {
+                    report($unrecorded);
+                }
+            }
+
+            throw $failure;
         } finally {
             Telemetry::end($context);
         }
@@ -99,6 +119,51 @@ final class ApprovedTools
         }
 
         return $events;
+    }
+
+    /**
+     * The messages with the results the resolver yielded so far merged into
+     * the tool results after the last assistant tool call, as core merges
+     * them once every call is resolved; null when nothing was resolved.
+     *
+     * @param  list<Message>  $messages
+     * @param  list<StreamEvent>  $events
+     * @return list<Message>|null
+     */
+    private static function merged(array $messages, array $events): ?array
+    {
+        $resolved = [];
+        foreach ($events as $event) {
+            if ($event instanceof ToolResultEvent) {
+                $resolved[] = $event->toolResult;
+            }
+        }
+        $assistant = null;
+        for ($i = count($messages) - 1; $i >= 0; $i--) {
+            if ($messages[$i] instanceof AssistantMessage && $messages[$i]->toolCalls !== []) {
+                $assistant = $i;
+
+                break;
+            }
+        }
+        if ($resolved === [] || $assistant === null) {
+            return null;
+        }
+        $kept = [];
+        $results = [];
+        $responses = [];
+        foreach ($messages as $index => $message) {
+            if ($index > $assistant && $message instanceof ToolResultMessage) {
+                $results = [...$results, ...$message->toolResults];
+                $responses = [...$responses, ...$message->toolApprovalResponses];
+
+                continue;
+            }
+            $kept[] = $message;
+        }
+        $kept[] = new ToolResultMessage([...$results, ...$resolved], $responses);
+
+        return $kept;
     }
 
     /**
