@@ -5,6 +5,9 @@ on:
     branches:
       - main
       - "*.x"
+      # A release line: the publish guard needs a Tests run for the exact
+      # commit a tag names, and "*.x" does not match across the slash.
+      - "release/*.x"
   pull_request:
 
 permissions:
