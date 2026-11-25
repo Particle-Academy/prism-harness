@@ -175,19 +175,23 @@ final class PlanMachine
     }
 
     /**
-     * The person approved the draft: the approved call ran with its stored
-     * arguments, and they must be the arguments that were proposed.
+     * The draft starts: the person approved it, and the approved call ran with
+     * its stored arguments, which must be the arguments that were proposed.
+     * Or, with `plans.require_approval` off, nobody was asked
+     * (`$approvedByPerson` false), and the plan says so for as long as it
+     * lives: the context never tells the model a person approved it.
      *
      * @param  array<string, mixed>  $plan
      * @return array<string, mixed>
      */
-    public static function activate(array $plan, string $digest, int $now, ?string $runId): array
+    public static function activate(array $plan, string $digest, int $now, ?string $runId, bool $approvedByPerson = true): array
     {
         if ($plan['status'] !== 'proposed' || $plan['draftDigest'] !== $digest) {
             throw PlanRefused::because('plan.not_waiting');
         }
         $plan['status'] = 'active';
         $plan['holdingApprovalId'] = null;
+        $plan['approvedBy'] = $approvedByPerson ? 'person' : null;
 
         return self::written($plan, $now, $runId);
     }

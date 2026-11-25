@@ -276,7 +276,8 @@ final class RunStepTagger
                         }
                     } elseif ($message instanceof ToolResultMessage) {
                         foreach ($message->toolApprovalResponses as $response) {
-                            $approved[$response->approvalId] = $response->approved;
+                            // The first answer for an approval is the answer.
+                            $approved[$response->approvalId] ??= $response->approved;
                         }
                     }
                 }

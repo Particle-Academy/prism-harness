@@ -35,6 +35,7 @@ use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ContextRecallTool;
 use Prism\Harness\Tools\DoMathTool;
 use Prism\Harness\Tools\ToolAuthorizer;
+use Prism\Harness\Tools\ToolPolicySlot;
 use Prism\Harness\Tools\ToolRegistry;
 use RuntimeException;
 
@@ -145,6 +146,10 @@ class PrismHarnessServiceProvider extends ServiceProvider
             (bool) $app['config']->get('prism-harness.agent.authorize_tools', false),
             $app['config']->get('prism-harness.agents', []),
         ));
+        // SCOPED, not a singleton: Laravel empties it when Octane starts a new
+        // request and when a queue worker starts a new job, so a tool policy a
+        // host sets for one request never applies to the next (G-326).
+        $this->app->scoped(ToolPolicySlot::class, fn (): ToolPolicySlot => new ToolPolicySlot);
         $this->app->singleton(AgentRuntime::class, fn ($app): AgentRuntime => new AgentRuntime(
             $app->make(ModeRegistry::class),
             $app->make(ToolRegistry::class),

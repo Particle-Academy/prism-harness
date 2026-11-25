@@ -290,13 +290,18 @@ final class ApprovalToolScopeTest extends TestCase
         };
         self::assertNotSame($firstSession, $fresh);
         self::assertSame($firstSession->key(), $fresh->key());
-        $fresh->approve($first->pendingApprovals()[0]);
-        self::assertSame(0, $ceilingCalls);
-        Http::assertSentCount(3);
-        foreach (Http::recorded()->slice(1) as [$request]) {
-            $body = json_decode((string) $request->body(), true, flags: JSON_THROW_ON_ERROR);
-            self::assertSame(['scope_safe'], array_column($body['tools'] ?? [], 'name'));
+        $rows = $fresh->thread()->storedMessages()->count();
+        // The decision is checked under the real lock, after the concurrent
+        // turn: that turn ended the approval, so the decision is refused,
+        // nothing is written for it, and nothing is resumed or run.
+        try {
+            $fresh->approve($first->pendingApprovals()[0]);
+            self::fail('A decision for an approval a later turn ended was accepted.');
+        } catch (ApprovalNotPending) {
         }
+        self::assertSame(0, $ceilingCalls);
+        Http::assertSentCount(1);
+        self::assertSame($rows + 3, $fresh->thread()->storedMessages()->count());
     }
 
     /** @return iterable<string, array{string, bool, bool}> */

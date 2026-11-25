@@ -64,6 +64,16 @@ and the note in `tests/Pest.php` are owed a re-verification against v0.42.0.
 This is exactly the drift the arrangement is known to have; it is written down
 here rather than left for the next person to discover.
 
+## The host tool policy is scoped, not global
+
+`AgentRuntime` is a singleton, so anything kept on it lives for the whole
+process: in Octane or a queue worker, every later request and job. The host
+tool policy (G-326) is therefore NOT kept on it. `setToolPolicy()` writes a
+`ToolPolicySlot` the service provider binds with `scoped()`, which Laravel
+empties before each Octane request and each queued job; the deployment's
+policy comes from `prism-harness.agent.tool_policy`. Do not move the policy,
+or anything else a host sets per tenant or per user, back onto the runtime.
+
 ## Two things about the seam that read as bugs and are not
 
 **`withMaxSteps(1)` and `clientExecuted()` when tools are present.** fancy-flow's

@@ -16,6 +16,7 @@ use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Exceptions\PlansDisabled;
+use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Flow\FlowToolset;
@@ -574,9 +575,13 @@ class Session
      * the run never issued, or one already answered, throws
      * ApprovalNotPending before any provider call or write (G-354).
      *
+     * Throws SessionLocked, having recorded nothing, while another request
+     * holds the session; the same decision can then be sent again.
+     *
      * @param  list<ToolApprovalResponse>  $decisions
      *
      * @throws ApprovalNotPending
+     * @throws SessionLocked
      */
     public function decide(array $decisions, ?RunContext $context = null): AgentResponse
     {
@@ -588,13 +593,18 @@ class Session
             throw new \InvalidArgumentException('decide() needs at least one decision.');
         }
 
-        $this->recordDecisions($decisions);
-
+        // Checked and written INSIDE the session's fenced lock, which the
+        // resumed run then keeps: a session another request holds refuses with
+        // SessionLocked having written nothing, and two racing decisions for
+        // one approval cannot both pass the pending check.
+        //
         // Resumed with an EMPTY prompt: the conversation already contains the
         // request, the decisions, and everything before them. A new prompt here
         // would be a second instruction competing with the one the tool call
         // came from.
-        return $this->runtime->send($this, '', context: $context);
+        return $this->runtime->resumeDecided($this, function () use ($decisions): void {
+            $this->recordDecisions($decisions);
+        }, $context);
     }
 
     /**
