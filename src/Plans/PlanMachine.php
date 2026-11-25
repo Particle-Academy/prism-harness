@@ -418,6 +418,12 @@ final class PlanMachine
                 $step['state'] = 'waiting_input';
                 $plan['steps'][$head] = $step;
                 $outcome = ['waiting', $step['id']];
+            } elseif ($budgetExhausted && $step['owner'] === 'agent' && $step['state'] === 'held') {
+                // G-366: a step held on an approval whose resume the spent
+                // shared budget could not run stops the plan, once, instead
+                // of waiting on a decision that would be refused.
+                $plan = self::block($plan, PlanBudget::EXHAUSTED);
+                $outcome = ['blocked', PlanBudget::EXHAUSTED];
             } elseif ($step['state'] !== 'todo') {
                 $outcome = ['waiting', $step['id']];
             } elseif ($plan['counters']['advances'] >= $limits->maxAdvances) {

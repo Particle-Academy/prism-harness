@@ -52,10 +52,14 @@ final class PlanHandle
             if ($step === null) {
                 return $outcome;
             }
+            // This turn, and only this one, is the step's own (G-366).
+            $serving = $this->plans->servingStep($this->session);
             try {
                 $response = $this->session->send($this->prompt($step), context: $context);
             } catch (RunNotPermitted $refused) {
                 return $this->stoppedOnBudget() ?? throw $refused;
+            } finally {
+                $serving();
             }
 
             return new AdvanceOutcome('ran', 'active', $step['id'], $response->runId);
@@ -82,6 +86,7 @@ final class PlanHandle
                 return $outcome;
             }
             $runId = null;
+            $serving = $this->plans->servingStep($this->session);
             try {
                 foreach ($this->session->streamSteps($this->prompt($step), context: $context) as $runStep) {
                     $runId ??= $runStep->runId;
@@ -89,6 +94,8 @@ final class PlanHandle
                 }
             } catch (RunNotPermitted $refused) {
                 return $this->stoppedOnBudget() ?? throw $refused;
+            } finally {
+                $serving();
             }
 
             return new AdvanceOutcome('ran', 'active', $step['id'], $runId);

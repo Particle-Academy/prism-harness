@@ -54,9 +54,17 @@ final class Plans
     /**
      * Turns spending from a shared plan budget, by run id, until they settle.
      *
-     * @var array<string, array{session: string, plan: string, context: RunContext, steps: int, cost: float, unmetered: int}>
+     * @var array<string, array{session: string, ledger: string, plan: string, context: RunContext, steps: int, cost: float, unmetered: int}>
      */
     private array $budgetTurns = [];
+
+    /**
+     * Sessions whose advance() is running the turn of the step it claimed,
+     * counted per session so a nested hold releases only its own.
+     *
+     * @var array<string, int>
+     */
+    private array $advancing = [];
 
     /** @var (Closure(string, string): void)|null */
     private ?Closure $reapDispatcher = null;
@@ -380,9 +388,22 @@ final class Plans
      */
     public function budgetRecord(Session $session, string $planId): ?array
     {
-        $record = $session->planStore()->get(self::budgetKey($session->key()));
+        return $this->budgetRecordAt($session->planStore(), $session->key(), $planId);
+    }
+
+    /** @return array<string, mixed>|null */
+    private function budgetRecordAt(SessionStore $store, string $sessionKey, string $planId): ?array
+    {
+        $record = $store->get(self::budgetKey($sessionKey));
 
         return is_array($record) && ($record['planId'] ?? null) === $planId ? $record : null;
+    }
+
+    private function exhaustionAt(SessionStore $store, string $sessionKey, string $planId): ?string
+    {
+        $record = $this->budgetRecordAt($store, $sessionKey, $planId);
+
+        return $record === null ? null : PlanBudget::exhaustion(PlanBudget::expire($record, $this->now(), $this->holdTtl()));
     }
 
     /**
@@ -414,12 +435,7 @@ final class Plans
     /** Which shared limit this plan has spent, or null. */
     public function budgetExhaustion(Session $session, string $planId): ?string
     {
-        $record = $this->budgetRecord($session, $planId);
-        if ($record === null) {
-            return null;
-        }
-
-        return PlanBudget::exhaustion(PlanBudget::expire($record, $this->now(), $this->holdTtl()));
+        return $this->exhaustionAt($session->planStore(), $session->key(), $planId);
     }
 
     /** Announce that a plan stopped on its shared budget. */
@@ -435,9 +451,16 @@ final class Plans
     }
 
     /**
-     * The run a turn executes under, when the turn serves a plan step whose
-     * budget is shared: the per-turn budget, narrowed to what the plan's
-     * ledger holds for it. Any other run is returned unchanged.
+     * The run a turn executes under, when the turn is one of the plan's own
+     * and its budget is shared: the per-turn budget, narrowed to what the
+     * plan's ledger holds for it. Any other run is returned unchanged.
+     *
+     * The plan's own turns are the one advance() runs for the step it
+     * claimed, the resume of an approval that step asked for, and a subagent
+     * child those turns started, resumed outside the runner. Any other turn
+     * on the session (a person chatting while a step waits on them, or while
+     * a claim whose worker died is still live) is not the plan's: it spends
+     * nothing from the plan's budget and is never refused for it.
      *
      * A run handed a run tree of its own (a subagent, a workflow node) cannot
      * also spend from the plan's ledger, so it is refused rather than let
@@ -448,13 +471,10 @@ final class Plans
      * @throws PlanRefused plan.budget_context
      * @throws RunNotPermitted plan_budget_exhausted
      */
-    public function planTurn(Session $session, string $runId, RunContext $run, ?RunContext $context): RunContext
+    public function planTurn(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt = ''): RunContext
     {
-        if (! $this->enabledFor($session)) {
-            return $run;
-        }
-        $plan = $this->load($session);
-        if (! self::serving($plan) || $this->budgetFor($session, $plan['id'])['mode'] !== 'shared') {
+        $target = $this->ledgerFor($session, $prompt, $context);
+        if ($target === null) {
             return $run;
         }
         if ($context !== null && ! $context->metadataOnly) {
@@ -468,7 +488,7 @@ final class Plans
         $turnCost = $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $baseCost));
         $now = $this->now();
         $ttl = $this->holdTtl();
-        [, $grant] = $this->budgetWrite($session, $plan['id'], $this->budgetSettings(),
+        [, $grant] = $this->budgetWriteAt($session->planStore(), $target['session'], $target['plan'], $this->budgetSettings(),
             static fn (array $state): array => PlanBudget::reserve($state, $runId, max(0, $budget->maxSteps - $baseSteps), $turnCost, $now, $ttl));
         if (isset($grant['refused'])) {
             throw RunNotPermitted::planBudget((string) $grant['limit']);
@@ -482,7 +502,7 @@ final class Plans
             maxToolCalls: $budget->maxToolCalls,
         ));
         $this->budgetTurns[$runId] = [
-            'session' => $session->key(), 'plan' => $plan['id'], 'context' => $narrowed,
+            'session' => $session->key(), 'ledger' => $target['session'], 'plan' => $target['plan'], 'context' => $narrowed,
             'steps' => $baseSteps, 'cost' => $baseCost, 'unmetered' => $ledger->unmeteredRuns(),
         ];
 
@@ -490,30 +510,199 @@ final class Plans
     }
 
     /**
-     * The shared budget a turn on this session would spend from now, or null.
+     * The shared budget this turn would spend from, or null.
      *
      * @internal The runtime routes such a turn to the step path.
      *
      * @return array{mode: string, max_steps: ?int, max_cost_micros: ?int}|null
      */
-    public function servingSharedPlan(Session $session): ?array
+    public function servingSharedPlan(Session $session, string $prompt = '', ?RunContext $context = null): ?array
     {
-        if (! $this->enabledFor($session)) {
-            return null;
-        }
-        $plan = $this->load($session);
-        if (! self::serving($plan)) {
-            return null;
-        }
-        $settings = $this->budgetFor($session, $plan['id']);
-
-        return $settings['mode'] === 'shared' ? $settings : null;
+        return $this->ledgerFor($session, $prompt, $context)['settings'] ?? null;
     }
 
     /** @internal Whether this run spends from a shared plan budget. */
     public function isPlanTurn(string $runId): bool
     {
         return isset($this->budgetTurns[$runId]);
+    }
+
+    /**
+     * The shared plan budget a run spends from, as the session key the plan
+     * belongs to and the plan id; null when it spends from none.
+     *
+     * @internal Saved with a subagent child the run starts.
+     *
+     * @return array{session: string, plan: string}|null
+     */
+    public function ledgerOf(string $runId): ?array
+    {
+        $turn = $this->budgetTurns[$runId] ?? null;
+
+        return $turn === null ? null : ['session' => $turn['ledger'], 'plan' => $turn['plan']];
+    }
+
+    /**
+     * Mark the turn advance() runs for the step it claimed as the plan's own
+     * until the returned release is called.
+     *
+     * @internal
+     *
+     * @return Closure(): void
+     */
+    public function servingStep(Session $session): Closure
+    {
+        $key = $session->key();
+        $this->advancing[$key] = ($this->advancing[$key] ?? 0) + 1;
+        $released = false;
+
+        return function () use ($key, &$released): void {
+            if ($released) {
+                return;
+            }
+            $released = true;
+            $this->advancing[$key] = ($this->advancing[$key] ?? 1) - 1;
+            if ($this->advancing[$key] <= 0) {
+                unset($this->advancing[$key]);
+            }
+        };
+    }
+
+    /**
+     * Refuse, before anything is recorded, a decision on an approval whose
+     * resume would spend from a shared plan budget that is already spent, or
+     * that is handed a run tree of its own. Recorded, it would be consumed by
+     * a resume the budget then refuses, and the approved call would never run.
+     *
+     * @internal Called by the session before it records decisions.
+     *
+     * @param  list<string>  $approvalIds
+     *
+     * @throws PlanRefused plan.budget_context
+     * @throws RunNotPermitted plan_budget_exhausted
+     */
+    public function assertDecisionsFunded(Session $session, array $approvalIds, ?RunContext $context): void
+    {
+        $context = $context?->metadataOnly === true ? null : $context;
+        $ledger = $this->decisionLedger($session, $approvalIds, $context);
+        if ($ledger === null) {
+            return;
+        }
+        if ($context !== null) {
+            throw PlanRefused::because('plan.budget_context');
+        }
+        $spent = $this->exhaustionAt($session->planStore(), $ledger['session'], $ledger['plan']);
+        if ($spent !== null) {
+            throw RunNotPermitted::planBudget($spent);
+        }
+    }
+
+    /**
+     * The shared ledger a turn spends from: its own plan's, when the turn is
+     * the plan's own; else, for a subagent child resumed outside the runner,
+     * the ledger of the plan turn that started it.
+     *
+     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}}|null
+     */
+    private function ledgerFor(Session $session, string $prompt, ?RunContext $context): ?array
+    {
+        if (! $this->enabled()) {
+            return null;
+        }
+        if ($this->enabledFor($session)) {
+            $plan = $this->load($session);
+            if ($plan !== null && $this->ownTurn($session, $plan, $prompt)) {
+                $settings = $this->budgetFor($session, $plan['id']);
+
+                return $settings['mode'] === 'shared' ? ['session' => $session->key(), 'plan' => $plan['id'], 'settings' => $settings] : null;
+            }
+        }
+
+        return $context === null || $context->metadataOnly ? $this->childLedger($session) : null;
+    }
+
+    /**
+     * The shared ledger a decision on these approvals would resume into.
+     *
+     * @param  list<string>  $approvalIds
+     * @return array{session: string, plan: string}|null
+     */
+    private function decisionLedger(Session $session, array $approvalIds, ?RunContext $context): ?array
+    {
+        if (! $this->enabled() || $approvalIds === []) {
+            return null;
+        }
+        if ($this->enabledFor($session)) {
+            $plan = $this->load($session);
+            $step = self::activeAgentStep($plan);
+            if ($plan !== null && $step !== null && array_intersect($step['approvalIds'], $approvalIds) !== []) {
+                return $this->budgetFor($session, $plan['id'])['mode'] === 'shared' ? ['session' => $session->key(), 'plan' => $plan['id']] : null;
+            }
+        }
+
+        return $context === null ? $this->childLedger($session) : null;
+    }
+
+    /**
+     * The plan ledger saved with a subagent child, while it is still that
+     * plan's shared ledger.
+     *
+     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}}|null
+     */
+    private function childLedger(Session $session): ?array
+    {
+        $saved = $session->childPlanLedger();
+        if ($saved === null) {
+            return null;
+        }
+        $record = $this->budgetRecordAt($session->planStore(), $saved['session'], $saved['plan']);
+        if ($record === null || ($record['mode'] ?? null) !== 'shared') {
+            return null;
+        }
+
+        return [...$saved, 'settings' => ['mode' => 'shared', 'max_steps' => $record['max_steps'], 'max_cost_micros' => $record['max_cost_micros']]];
+    }
+
+    /**
+     * Whether a turn is one of the plan's own: the turn advance() runs for
+     * the step it claimed, or a turn with no new message that continues an
+     * approval the step asked for.
+     *
+     * @param  array<string, mixed>  $plan
+     */
+    private function ownTurn(Session $session, array $plan, string $prompt): bool
+    {
+        $step = self::activeAgentStep($plan);
+        if ($step === null) {
+            return false;
+        }
+        if (isset($this->advancing[$session->key()])) {
+            return true;
+        }
+
+        return $prompt === '' && $step['approvalIds'] !== []
+            && array_intersect($step['approvalIds'], $session->thread()->pausedApprovalIds()) !== [];
+    }
+
+    /**
+     * The plan's head step when it is the agent's and claimed for a turn or
+     * held on an approval that turn asked for; null otherwise.
+     *
+     * @param  array<string, mixed>|null  $plan
+     * @return array<string, mixed>|null
+     */
+    private static function activeAgentStep(?array $plan): ?array
+    {
+        if (! is_array($plan) || ! in_array($plan['status'], ['active', 'waiting', 'blocked'], true)) {
+            return null;
+        }
+        $head = PlanMachine::headIndex($plan);
+        if ($head === null) {
+            return null;
+        }
+        $step = $plan['steps'][$head];
+
+        return $step['owner'] === 'agent' && in_array($step['state'], ['running', 'held'], true) ? $step : null;
     }
 
     /** Replace a finished turn's hold with what it spent. */
@@ -530,7 +719,7 @@ final class Plans
         $steps = $ledger->steps() - $turn['steps'];
         $cost = $ledger->unmeteredRuns() > $turn['unmetered'] ? null : PlanBudget::micros(max(0.0, $ledger->costUsd() - $turn['cost']));
         try {
-            $this->budgetWrite($session, $turn['plan'], $this->budgetSettings(),
+            $this->budgetWriteAt($session->planStore(), $turn['ledger'], $turn['plan'], $this->budgetSettings(),
                 static fn (array $state): array => [PlanBudget::settle($state, $runId, $steps, $cost), null]);
         } catch (Throwable $failure) {
             // The hold stays and is charged in full once it expires.
@@ -548,8 +737,20 @@ final class Plans
      */
     private function budgetWrite(Session $session, string $planId, array $settings, Closure $change): array
     {
-        $store = $session->planStore();
-        $key = self::budgetKey($session->key());
+        return $this->budgetWriteAt($session->planStore(), $session->key(), $planId, $settings, $change);
+    }
+
+    /**
+     * The same change to the budget record of the plan kept under another
+     * session key, in the same durable store (a subagent child's parent).
+     *
+     * @param  array{mode: string, max_steps: ?int, max_cost_micros: ?int}  $settings
+     * @param  Closure(array<string, mixed>): array{0: array<string, mixed>, 1: mixed}  $change
+     * @return array{0: array<string, mixed>, 1: mixed}
+     */
+    private function budgetWriteAt(SessionStore $store, string $sessionKey, string $planId, array $settings, Closure $change): array
+    {
+        $key = self::budgetKey($sessionKey);
 
         return $store->withLock($key, function () use ($store, $key, $planId, $settings, $change): array {
             $state = $store->get($key);
@@ -561,22 +762,6 @@ final class Plans
 
             return [$next, $result];
         }, 10, 5);
-    }
-
-    /**
-     * A turn serves the plan while the plan's head step is claimed for a turn
-     * or held on an approval that turn asked for.
-     *
-     * @param  array<string, mixed>|null  $plan
-     */
-    private static function serving(?array $plan): bool
-    {
-        if (! is_array($plan) || ! in_array($plan['status'], ['active', 'waiting'], true)) {
-            return false;
-        }
-        $head = PlanMachine::headIndex($plan);
-
-        return $head !== null && in_array($plan['steps'][$head]['state'], ['running', 'held'], true);
     }
 
     /** A hold outlives its turn by no more than the run lock does. */

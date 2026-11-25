@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
@@ -11,11 +12,13 @@ use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Plans\PlanMachine;
 use Prism\Harness\Plans\Plans;
+use Prism\Harness\PrismHarness;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
+use Tests\Fixtures\Participant;
 use Tests\Support\G360;
 
 // G-366: a plan's budget is the app's choice (Wish, q_fb920047): one shared
@@ -229,12 +232,15 @@ it('never grants two turns the same remainder of a shared budget', function (): 
     $claimed = PlanMachine::claim($plan, $plan['steps'][0]['id'], 'worker', $plans->now() + 300, $plans->now());
     $plans->write($session, $claimed, $plan['revision']);
 
+    // Each as the step's own turn, as advance() runs it.
+    $serving = $plans->servingStep($session);
     $first = $plans->planTurn($session, 'run_a', RunContext::root('run_a', new RunBudget(8)), null);
     $other = $plans->planTurn($session, 'run_b', RunContext::root('run_b', new RunBudget(8)), null);
     expect($first->budget->maxSteps)->toBe(8)
         ->and($other->budget->maxSteps)->toBe(2)
         ->and(fn () => $plans->planTurn($session, 'run_c', RunContext::root('run_c', new RunBudget(8)), null))
         ->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
+    $serving();
 });
 
 it('ignores budget fields the model sends and refuses a run tree handed to a shared plan step', function (): void {
@@ -377,7 +383,7 @@ it('closes the run when a shared plan budget cannot be written', function (): vo
         BEGIN SELECT RAISE(ABORT, 'store down'); END");
     G360::text('unused');
 
-    expect(fn () => G360::session()->plan()->advance())->toThrow(Illuminate\Database\QueryException::class);
+    expect(fn () => G360::session()->plan()->advance())->toThrow(QueryException::class);
     expect(G360::session()->run()['status'])->toBe('failed');
 });
 
@@ -407,8 +413,8 @@ function g366PausedChild(int $maxSteps): array
     G360::text('Step done.');                                        // parent
     G360::session()->plan()->advance();
 
-    $child = app(Prism\Harness\PrismHarness::class)
-        ->for(Tests\Fixtures\Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::research');
+    $child = app(PrismHarness::class)
+        ->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::research');
     $pending = $child->thread()->pendingApprovalIds();
     expect($pending)->toHaveCount(1)
         ->and(G360::session()->plan()->budget()['steps'])->toBe(4);

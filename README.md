@@ -654,7 +654,10 @@ nesting depth from where the child sat in its tree. A session whose thread is li
 parent but has no saved binding (a child started by a release before this one, say) is refused
 with `RunNotPermitted` (`child_binding_missing`) rather than run on the root rules. The resumed
 run is a new root run: its step and cost budget, and the agent's `spend_ceiling`, are counted
-from that run, not from the tree the child was started in.
+from that run, not from the tree the child was started in. When the child was started by a turn
+that spent from a shared plan budget, the resumed run spends from that plan budget too, and a
+decision on the child's approval is refused (`plan_budget_exhausted`, nothing recorded) once that
+budget is spent.
 
 **Delegating to another agent is declared, never inherited.** A subagent with `'agent' => 'auditor'`
 is accepted only when the parent mode lists `auditor` in `agents`. Otherwise the mode is refused
@@ -1420,7 +1423,7 @@ choose it or widen it.
 | mode | what it means |
 |---|---|
 | `per_step` (default) | Each step's turn gets the per-turn budget, as before. |
-| `shared` | Every turn that serves the plan also spends from one ledger: `max_steps` model steps in total (required) and optionally `max_cost_usd`. Per-turn limits still apply to each turn. When the ledger is spent, the plan is blocked with `plan_budget_exhausted` and `PlanBudgetExhausted` is dispatched once. |
+| `shared` | The plan's own turns also spend from one ledger: `max_steps` model steps in total (required) and optionally `max_cost_usd`. Per-turn limits still apply to each turn. When the ledger is spent, the plan is blocked with `plan_budget_exhausted` and `PlanBudgetExhausted` is dispatched once. |
 | `none` | No plan-level budget. Per-turn limits, the plan's own limits, workflow budgets and agent spend ceilings still apply. |
 
 ```php
@@ -1443,6 +1446,15 @@ first chosen or first used: after that its mode cannot change
 handed a run tree of its own (a subagent or workflow context) is refused
 (`plan.budget_context`) rather than run outside the ledger. An invalid mode or
 limit throws when plans are used, before anything runs.
+
+The plan's own turns are the turn `advance()` runs for the step it claimed, the
+resume of an approval that step asked for, and a subagent child those turns
+started when it is resumed outside the runner. Any other turn on the session,
+such as the person chatting while a step waits on their approval, spends
+nothing from the plan's budget and is never refused for it. A decision on an
+approval the step asked for is refused with `plan_budget_exhausted`, recording
+nothing, when the shared budget is already spent, and the next `advance()`
+blocks the plan, so an approval is never consumed by a resume that cannot run.
 
 ## What it is for
 

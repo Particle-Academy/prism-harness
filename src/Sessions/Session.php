@@ -206,8 +206,29 @@ class Session
         return is_int($depth) && $depth > 0 ? $depth : 0;
     }
 
-    /** @internal Written by the runtime when the subagent runner starts a child run. */
-    public function rememberChildBinding(ChildBinding $binding, int $depth): self
+    /**
+     * The shared plan budget the turn that started this child spent from, as
+     * the session key the plan belongs to and the plan id; null when it spent
+     * from none (G-366). A child resumed outside the runner spends from it.
+     *
+     * @internal Read by the plan budget for a run the runner did not start.
+     *
+     * @return array{session: string, plan: string}|null
+     */
+    public function childPlanLedger(): ?array
+    {
+        $ledger = $this->savedChild()['plan_ledger'] ?? null;
+
+        return is_array($ledger) && is_string($ledger['session'] ?? null) && is_string($ledger['plan'] ?? null)
+            ? ['session' => $ledger['session'], 'plan' => $ledger['plan']] : null;
+    }
+
+    /**
+     * @internal Written by the runtime when the subagent runner starts a child run.
+     *
+     * @param  array{session: string, plan: string}|null  $planLedger
+     */
+    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null): self
     {
         $this->assertWritableResolution();
         $durable = $this->durable->get($this->durableKey()) ?? [];
@@ -218,6 +239,9 @@ class Session
             'parent_mode_model' => $binding->parentModeModel,
             'depth' => $depth,
         ];
+        if ($planLedger !== null) {
+            $durable['child_binding']['plan_ledger'] = $planLedger;
+        }
         $this->durable->put($this->durableKey(), $durable);
 
         return $this;
@@ -636,8 +660,8 @@ class Session
         // request, the decisions, and everything before them. A new prompt here
         // would be a second instruction competing with the one the tool call
         // came from.
-        return $this->runtime->resumeDecided($this, function () use ($decisions): void {
-            $this->recordDecisions($decisions);
+        return $this->runtime->resumeDecided($this, function () use ($decisions, $context): void {
+            $this->recordDecisions($decisions, $context);
         }, $context);
     }
 
@@ -682,7 +706,7 @@ class Session
             throw new \InvalidArgumentException('streamDecision() needs at least one decision.');
         }
 
-        return $this->runtime->streamDecisionSteps($this, $decisions, function () use ($decisions): array {
+        return $this->runtime->streamDecisionSteps($this, $decisions, function () use ($decisions, $context): array {
             // Inside the held lock: the run state read here is the one the
             // lock protects, and the decisions are durable before anything runs.
             $parked = $this->run();
@@ -690,7 +714,7 @@ class Session
                 ? $parked['id'] : null;
             $lastSeq = $parkedId !== null && is_int($parked['last_seq'] ?? null) ? $parked['last_seq'] : 0;
 
-            $this->recordDecisions($decisions);
+            $this->recordDecisions($decisions, $context);
 
             return [$parkedId, $lastSeq];
         }, $context);
@@ -701,11 +725,16 @@ class Session
      *
      * @param  list<ToolApprovalResponse>  $decisions
      */
-    protected function recordDecisions(array $decisions): void
+    protected function recordDecisions(array $decisions, ?RunContext $context = null): void
     {
         // BEFORE anything is written or emitted, and so before any provider
         // call: a decision answers a question the run asked (G-354).
         $this->assertDecisionsPending($decisions);
+        // A decision a spent shared plan budget could not run is refused
+        // here, with nothing recorded, rather than consumed by a resume that
+        // is then refused (G-366).
+        app(Plans::class)->assertDecisionsFunded($this, array_map(
+            static fn (ToolApprovalResponse $decision): string => $decision->approvalId, $decisions), $context);
 
         $this->runtime?->recordToolDecisions($this, $decisions);
         $this->thread()->record([
