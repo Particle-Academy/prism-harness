@@ -11,6 +11,9 @@ use Prism\Harness\Plans\PlanMachine;
 use Prism\Harness\Plans\PlanText;
 use Prism\Harness\Plans\PlanView;
 use Prism\Harness\Subagents\ChildBinding;
+use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Tools\ToolPolicy;
 
 // The cross-language plans corpus (G-360, prism-parity suites/harness-plans).
@@ -52,6 +55,7 @@ function runPlansCase(array $case): array
         try {
             $results[] = match (true) {
                 $op['op'] === 'binding_route' => plansBindingOp($op, $savedBinding),
+                $op['op'] === 'binding_context' => plansBindingContextOp($op, $savedBinding),
                 str_starts_with($op['op'], 'budget_') => plansBudgetOp($op, $ledger, $now),
                 default => plansOp($op, $plan, $ids, $limits, $now, $marked, $ledger),
             };
@@ -87,6 +91,39 @@ function plansBindingOp(array $op, bool &$savedBinding): array
     $savedBinding = $saved || $route['save'];
 
     return ['route' => $route];
+}
+
+/**
+ * Which kind of context a turn was handed for its binding
+ * (RunTrees::bindingContextKind on a real RunContext), then the route of that
+ * kind. The host builds the root context; the runner marks the child context
+ * it builds with RunTrees::startingChild; `rebound` binds it again after the
+ * mark, as a host deriving a context from the runner's would.
+ *
+ * @param  array<string, mixed>  $op
+ * @return array<string, mixed>
+ */
+function plansBindingContextOp(array $op, bool &$savedBinding): array
+{
+    if (! in_array($op['context'], ['none', 'host'], true) || ($op['context'] === 'none' && ($op['runner_started'] || $op['supplied_binding'] || $op['rebound']))) {
+        return ['invalid' => true];
+    }
+    $trees = new RunTrees;
+    $context = $op['context'] === 'host' ? RunContext::root('host_root', new RunBudget(10)) : null;
+    if ($context !== null && $op['supplied_binding']) {
+        $context = $context->withBinding(new ChildBinding('custom-cheap', 'cheap-model'));
+    }
+    if ($context !== null && $op['runner_started']) {
+        $context = $trees->startingChild($context);
+    }
+    if ($context !== null && $op['rebound']) {
+        $context = $context->withBinding(new ChildBinding('custom-cheap', 'cheap-model'));
+    }
+    $kind = $trees->bindingContextKind($context);
+    $route = ChildBinding::route($kind, $context?->binding !== null, $savedBinding, $op['linked']);
+    $savedBinding = $savedBinding || $route['save'];
+
+    return ['kind' => $kind, 'route' => $route];
 }
 
 /**
