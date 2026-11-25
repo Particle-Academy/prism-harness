@@ -100,13 +100,21 @@ Only one `advance()` runs at a time per session. A second one gets
 
 `plans.budget.mode` is `per_step` (the default: each step's turn gets the
 per-turn budget), `shared` (one ledger of `max_steps` model steps, and
-optionally `max_cost_usd`, across every turn that serves the plan, on top of
-each turn's own limits) or `none` (no plan-level budget). Host code can choose
+optionally `max_cost_usd`, across the plan's own turns, on top of each turn's
+own limits) or `none` (no plan-level budget). Host code can choose
 it for one plan with `useBudget()`; the configured limits are its ceiling.
 The first choice or first shared turn fixes it, and after that it can only be
 lowered. When a shared budget is spent, `advance()` returns `blocked` with
 reason `plan_budget_exhausted`, the plan is blocked with that reason,
 `PlanBudgetExhausted` is dispatched once, and `resume()` refuses it.
+
+The plan's own turns are the turn `advance()` runs for the step it claimed, the
+resume of an approval that step asked for, and a subagent child those turns
+started, resumed outside the runner. Other turns on the session spend nothing
+from the plan's budget and are never refused for it. A decision on the step's
+approval is refused with `plan_budget_exhausted`, recording nothing, once the
+shared budget is spent; a step held on an approval when the budget is spent
+blocks the plan on the next `advance()`.
 
 ## Hosts with queues
 

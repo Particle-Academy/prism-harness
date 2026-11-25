@@ -671,6 +671,38 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
+     * Every approval id the run paused at the transcript tail asked for,
+     * answered or not; empty when the tail is a user turn or an assistant
+     * step that asked nothing. A turn with no new message continues exactly
+     * these calls (G-366).
+     *
+     * @internal
+     *
+     * @return list<string>
+     */
+    public function pausedApprovalIds(): array
+    {
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            if ($stored->type === MessageMapper::TYPE_USER) {
+                return [];
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                continue;
+            }
+            $ids = [];
+            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && is_string($request['approval_id'] ?? null) && $request['approval_id'] !== '') {
+                    $ids[] = $request['approval_id'];
+                }
+            }
+
+            return array_values(array_unique($ids));
+        }
+
+        return [];
+    }
+
+    /**
      * The call an approval id was requested for, or null.
      *
      * @return array{name: string, arguments: mixed}|null
