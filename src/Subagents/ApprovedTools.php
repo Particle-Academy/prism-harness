@@ -16,6 +16,7 @@ use Prism\Prism\Enums\TelemetryOperation;
 use Prism\Prism\Events\Telemetry\GenerationStarted;
 use Prism\Prism\Events\Telemetry\ToolInvoked;
 use Prism\Prism\Streaming\EventID;
+use Prism\Prism\Streaming\Events\ArtifactEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Structured\PendingRequest as StructuredPending;
@@ -24,8 +25,11 @@ use Prism\Prism\Telemetry\Telemetry;
 use Prism\Prism\Telemetry\TelemetryContext;
 use Prism\Prism\Text\PendingRequest as TextPending;
 use Prism\Prism\Text\Request as TextRequest;
+use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Throwable;
 use WeakMap;
 
@@ -36,7 +40,26 @@ use WeakMap;
  */
 final class ApprovedTools
 {
-    use CallsTools;
+    use CallsTools {
+        invokeToolCall as private coreInvokeToolCall;
+    }
+
+    /**
+     * Run one approved tool with the hold lifted.
+     *
+     * The resolver's own ToolInvoked for a call is dispatched after the tool
+     * returns, and only that one is held. A tool that runs a generation of its
+     * own (an agent built as a tool, a subagent) reports that generation's
+     * calls while it runs, in that generation's trace; they pass through live,
+     * as on 0.26.7. Core's only per-call execution path goes through here.
+     *
+     * @param  Tool[]  $tools
+     * @return array{toolResult: ToolResult, events: array<int, ToolResultEvent|ArtifactEvent>, durationMs: float, failed: bool, failure: ?string}
+     */
+    private static function invokeToolCall(array $tools, ToolCall $toolCall, string $messageId): array
+    {
+        return Event::defer(static fn (): array => self::coreInvokeToolCall($tools, $toolCall, $messageId), []);
+    }
 
     /**
      * The resolution's ToolInvoked events (dispatch arguments), held until
