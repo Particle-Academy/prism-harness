@@ -6,8 +6,11 @@ use Illuminate\Support\Facades\Http;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
 
@@ -110,4 +113,65 @@ it('charges a resumed child to its run tree once, so a second resume gets only w
     $child->approve($second);
 
     expect(count(Http::recorded()) - $before)->toBe(1);
+});
+
+// A turn on a child session the runner did not start never gets a fresh root
+// budget by any route: not a new message instead of an answer, and not a run
+// context the host hands in (which may only narrow what the tree has left).
+
+it('runs a new message to a child session on what its run tree has left', function (): void {
+    [$child] = treePausedChild(4);
+    $before = count(Http::recorded());
+
+    G360::calls([['lookup', ['q' => 'a']]]);
+    G360::calls([['lookup', ['q' => 'b']]]);
+    G360::text('Child answer.');
+    $child->send('New question');
+
+    expect(count(Http::recorded()) - $before)->toBe(1);
+});
+
+it('refuses a new message to a child session whose run tree is spent', function (): void {
+    [$child] = treePausedChild(3);
+    $before = count(Http::recorded());
+
+    expect(fn () => $child->send('New question'))->toThrow(RunNotPermitted::class);
+    expect(count(Http::recorded()))->toBe($before);
+});
+
+it('narrows a host-supplied run context on a resumed child to what its run tree has left', function (): void {
+    [$child, $id] = treePausedChild(4);
+    $before = count(Http::recorded());
+
+    G360::calls([['lookup', ['q' => 'a']]]);
+    G360::calls([['lookup', ['q' => 'b']]]);
+    G360::text('Child answer.');
+    $child->approve($id, true, null, RunContext::root('host_root', new RunBudget(100)));
+
+    expect($this->weatherRan)->toBe(1)
+        ->and(count(Http::recorded()) - $before)->toBe(1);
+});
+
+it('refuses, recording nothing, a host-supplied run context on a child whose run tree is spent', function (): void {
+    [$child, $id] = treePausedChild(3);
+    $before = count(Http::recorded());
+
+    expect(fn () => $child->approve($id, true, null, RunContext::root('host_root', new RunBudget(100))))
+        ->toThrow(RunNotPermitted::class);
+    expect($child->thread()->pendingApprovalIds())->toBe([$id])
+        ->and($this->weatherRan)->toBe(0)
+        ->and(count(Http::recorded()))->toBe($before);
+});
+
+it('narrows a host-supplied run context on a streamed child resume to what its run tree has left', function (): void {
+    [$child, $id] = treePausedChild(4);
+    $before = count(Http::recorded());
+
+    G360::calls([['lookup', ['q' => 'a']]]);
+    G360::calls([['lookup', ['q' => 'b']]]);
+    G360::text('Child answer.');
+    iterator_to_array($child->streamDecision([new ToolApprovalResponse($id, true)], RunContext::root('host_root', new RunBudget(100))), false);
+
+    expect($this->weatherRan)->toBe(1)
+        ->and(count(Http::recorded()) - $before)->toBe(1);
 });
