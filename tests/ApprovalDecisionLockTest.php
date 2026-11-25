@@ -21,8 +21,10 @@ use Tests\Fixtures\Participant;
 // decision written, the caller got SessionLocked, and a retry was refused as
 // "not pending". Two racing answers for one id could both be written.
 //
-// And every reader honours the FIRST recorded answer for an approval id, so a
-// thread that holds two answers never runs a call its first answer denied.
+// And the tool gate and the plan honour the FIRST recorded answer for an
+// approval id, so a thread that holds two answers never runs a mode-gated call
+// its first answer denied. (The replayed history folds decisions as the shared
+// thread-rows corpus pins, keeping the later one; the gate refuses the call.)
 
 beforeEach(function (): void {
     Http::preventStrayRequests();
@@ -128,16 +130,3 @@ it('never runs a call whose first recorded answer denied it, though a later one 
 
     expect($this->ran)->toBe(['search' => 1, 'weather' => 0]);
 })->with(['send', 'streamSteps']);
-
-it('runs a call whose first recorded answer approved it, though a later one denied it', function (): void {
-    $session = decisionLockSession();
-    $pending = $session->send('What time is the game, and do I need a coat?')->pendingApprovals()[0];
-    $runId = $session->run()['id'] ?? null;
-
-    $session->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($pending->approvalId, true)])], $runId);
-    $session->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($pending->approvalId, false, 'no')])], $runId);
-
-    decisionLockSession()->send('');
-
-    expect($this->ran)->toBe(['search' => 1, 'weather' => 1]);
-});

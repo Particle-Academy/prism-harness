@@ -22,9 +22,7 @@ use Prism\Prism\ValueObjects\ToolResult;
  *
  * A result is keyed by its tool call id, and a later row's result for the same
  * call replaces an earlier one, in the earlier one's position. A decision is
- * keyed by its approval id, and the FIRST one recorded is kept: a later answer
- * for the same approval never overrides it, so the history a provider is sent
- * agrees with the tool gate and the plan.
+ * keyed by its approval id, the same way.
  */
 class ToolResultRuns
 {
@@ -77,7 +75,7 @@ class ToolResultRuns
             }
 
             foreach ($message->toolApprovalResponses as $decision) {
-                $decisions[$decision->approvalId] ??= $decision;
+                $decisions[$decision->approvalId] = $decision;
             }
         }
 

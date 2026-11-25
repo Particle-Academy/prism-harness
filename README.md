@@ -798,10 +798,10 @@ its stream starts). While another request holds the session they throw
 different one, can be sent again. Two decisions racing for one approval cannot both be
 recorded.
 
-**The first answer is the answer.** If a thread ever holds two answers for one approval id
-(for example, written by an older release before the check moved under the lock), every reader
-uses the first one recorded: the history sent to the provider, the check a gated tool makes
-before it runs, the run steps and the plan. A later approval never overrides an earlier denial.
+**The first answer is the answer.** If a thread holds two answers for one approval id (for
+example, written by an older release before the check moved under the lock), the check a
+mode-gated tool makes before it runs, the run steps and the plan all use the first one recorded.
+A later approval never runs a call the mode gates whose first answer was a denial.
 
 **The decision is a row, not a promise.** It is recorded in the thread, so the approval a
 person grants this morning is readable by whichever worker resumes tonight — a different
