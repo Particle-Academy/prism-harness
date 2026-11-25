@@ -122,9 +122,13 @@ final readonly class AgentRuntime
      * Core would otherwise run an approved call inside its generation and
      * report it with ToolInvoked before the harness records the result. A
      * telemetry listener that threw there would lose that record, and the
-     * approved call would run again when the run resumed. Here the result is
-     * recorded first and the event is dispatched after it; a listener failure
-     * is reported, never thrown.
+     * approved call would run again when the run resumed. Here each call's
+     * event is dispatched when its resolution step returns, and a listener
+     * failure is reported, never thrown, so the resolution always finishes and
+     * is recorded. Known limit: the event still reaches its listeners before
+     * the record is written, so a listener that ends the process in a way PHP
+     * cannot catch (a time limit, running out of memory, a killed worker)
+     * loses the record, as it would have on 0.26.7.
      *
      * @template T of TextPending|StructuredPending
      *
