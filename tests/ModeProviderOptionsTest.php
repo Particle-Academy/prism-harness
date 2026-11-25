@@ -63,7 +63,7 @@ it('replays extended thinking with its signature on the next turn from a stored 
     // must hold under the shape people actually use, not only the older one.
     config()->set('prism.providers.anthropic.api_key', 'sk-ant-test');
     config()->set('prism-harness.agent.provider', 'anthropic');
-    config()->set('prism-harness.agent.model', 'claude-sonnet-4-6');
+    config()->set('prism-harness.agent.model', 'claude-sonnet-5-5');
     config()->set('prism-harness.agent.modes.chat.provider_options', $options);
     config()->set('prism-harness.agent.modes.chat.tools', ['weather', 'search']);
     app(ToolRegistry::class)->registerMany([

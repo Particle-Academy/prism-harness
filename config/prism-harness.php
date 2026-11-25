@@ -255,7 +255,7 @@ return [
     'agent' => [
         'max_output_tokens_per_call' => null,
         'provider' => env('HARNESS_PROVIDER', 'anthropic'),
-        'model' => env('HARNESS_MODEL', 'claude-sonnet-4-5'),
+        'model' => env('HARNESS_MODEL', 'claude-sonnet-5-5'),
         'lock_ttl' => (int) env('HARNESS_RUN_LOCK_TTL', 300),
         'lock_wait' => (int) env('HARNESS_RUN_LOCK_WAIT', 0),
         'authorize_tools' => env('HARNESS_AUTHORIZE_TOOLS', false),
