@@ -28,6 +28,8 @@ final class ApprovedTools
 {
     use CallsTools;
 
+    public function __construct(private readonly bool $inGeneration = false) {}
+
     /**
      * Resolve the approvals the request carries, record the result message
      * core appends, and return the resolution's events.
@@ -38,14 +40,22 @@ final class ApprovedTools
      * would see a change that never happened.
      *
      * Core reports each call it runs with a ToolInvoked telemetry event, and
-     * only under a telemetry context, which core opens inside its own
-     * generation; this runs before that, under a context of its own that opens
-     * no generation. The resolver is stepped one result at a time and each
-     * step's events are dispatched after the step: a listener that throws is
-     * reported, never thrown, so it can neither stop the resolution before its
-     * result is recorded (an approved call whose result was lost would run
-     * again on the next resume) nor keep the other calls' events from being
-     * sent.
+     * only under a telemetry context. The resolver is stepped one result at a
+     * time and each step's events are dispatched after the step: a listener
+     * that throws is reported, never thrown, so it can neither stop the
+     * resolution before its result is recorded (an approved call whose result
+     * was lost would run again on the next resume) nor keep the other calls'
+     * events from being sent.
+     *
+     * Those events still reach their listeners before the record is written,
+     * so a listener that ends the process in a way PHP cannot catch (a time
+     * limit, running out of memory, a killed worker) loses the record. A
+     * context of this resolution's own is therefore opened only when it stands
+     * in for core's generation ($inGeneration, the plain send paths), which on
+     * 0.26.7 ran the approved call under its own context and reported it the
+     * same way. The step-by-step paths (subagents, a cost cap, every stream)
+     * open none, as on 0.26.7: without a host context of its own, no listener
+     * runs between an approved call and its record there.
      *
      * @param  Closure(list<Message>):void  $record
      * @return list<StreamEvent>
@@ -54,7 +64,7 @@ final class ApprovedTools
     {
         $request = $generation->toRequest();
         $context = null;
-        if (Telemetry::enabled() && Telemetry::current() === null) {
+        if ($this->inGeneration && Telemetry::enabled() && Telemetry::current() === null) {
             $context = new TelemetryContext(
                 traceId: (string) Str::uuid(),
                 operation: $generation instanceof StructuredPending ? TelemetryOperation::Structured : TelemetryOperation::Text,

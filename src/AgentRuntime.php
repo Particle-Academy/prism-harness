@@ -138,7 +138,7 @@ final readonly class AgentRuntime
      */
     private function resolvedFirst(TextPending|StructuredPending $generation, Closure $record): TextPending|StructuredPending
     {
-        (new ApprovedTools)->resolve($generation, $record);
+        (new ApprovedTools(inGeneration: true))->resolve($generation, $record);
 
         return $generation;
     }
