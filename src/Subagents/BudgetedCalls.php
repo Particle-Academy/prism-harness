@@ -46,10 +46,11 @@ final readonly class BudgetedCalls
     public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): TextResponse
     {
         $builder = new TextBuilder;
+        $approved = new ApprovedTools;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'text', $generation->provider());
@@ -82,6 +83,8 @@ final readonly class BudgetedCalls
 
             return $combined;
         } finally {
+            // The resolution's reports, if its generation never took them.
+            $approved->announce();
             // Includes completed calls when admission refuses the NEXT call.
             if ($builder->steps->isNotEmpty()) {
                 $record($builder->toResponse());
@@ -95,10 +98,11 @@ final readonly class BudgetedCalls
     public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved): StructuredResponse
     {
         $builder = new StructuredBuilder;
+        $approved = new ApprovedTools;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'structured', $generation->provider());
@@ -150,6 +154,8 @@ final readonly class BudgetedCalls
 
             return $builder->steps->isEmpty() ? $response : $builder->toResponse();
         } finally {
+            // The resolution's reports, if its generation never took them.
+            $approved->announce();
             if ($builder->steps->isNotEmpty()) {
                 $record($builder->toResponse());
             } elseif (isset($response)) {
@@ -165,111 +171,118 @@ final readonly class BudgetedCalls
      */
     public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): Generator
     {
-        do {
-            $run->ledger->assertCallAvailable($run->budget);
-            foreach ((new ApprovedTools)->resolve($generation, $resolved) as $event) {
-                yield $event;
-            }
-            $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
-            $request = $generation->toRequest();
-            [$reservation, $call] = $this->reserve($run, $request, 'stream', $generation->provider());
-            $usage = null;
-            $billing = [];
-            $billingSteps = 0;
-            $billingEnds = 0;
-            $outcome = 'abandoned';
-            $collected = null;
-            $approvals = [];
-            // Reported usage is only final once the stream has ENDED normally
-            // with no error along the way. Decided in `finally`, so a consumer
-            // that stops reading early, or an exception, cannot skip it.
-            $final = false;
-            $failed = false;
-            $failureFinish = null;
-            try {
-                $run->ledger->recordSteps(1);
-                $collector = new StreamCollector($generation->asStream(), null,
-                    function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
-                        $collected = ['messages' => $messages->all(), 'response' => $response];
-                    });
-                foreach ($collector->collect() as $event) {
-                    if ($event instanceof StepFinishEvent) {
-                        $billingSteps++;
-                        $billing = $event->additionalContent;
-                    }
-                    if ($event instanceof StreamEndEvent) {
-                        $billingEnds++;
-                    }
-                    if (($event instanceof StreamEndEvent || ($event instanceof StepFinishEvent && ! $this->price->requiresCompleteBilling)) && $event->usage !== null) {
-                        $usage = $event->usage;
-                    }
-                    // Older cores mark a provider error recoverable and still end
-                    // with Stop, so the error event itself is the evidence.
-                    // StepFinishEvent has no finish reason before core 0.132, so
-                    // the stream's end carries the verdict on every core.
-                    if ($event instanceof ErrorEvent || ($event instanceof StreamEndEvent
-                        && in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true))) {
-                        $failed = true;
-                        if ($event instanceof ErrorEvent) {
-                            $failureFinish = FinishReason::Error;
-                        } elseif ($failureFinish !== FinishReason::Error) {
-                            $failureFinish = $event->finishReason;
-                        }
-                    }
-                    // A stream end without usage is core saying the call's total is
-                    // unknown (no final usage arrived). An earlier step's partial
-                    // usage is evidence, not the cost: never price it.
-                    if ($event instanceof StreamEndEvent && $event->usage === null) {
-                        $failed = true;
-                        $failureFinish ??= FinishReason::Unknown;
-                    }
-                    if ($event instanceof StreamEndEvent) {
-                        $final = ! $failed;
-                    }
-                    if ($event instanceof ToolApprovalRequestEvent) {
-                        $approvals[] = $event->approvalRequest();
-                    }
+        $approved = new ApprovedTools;
+        try {
+            do {
+                $run->ledger->assertCallAvailable($run->budget);
+                foreach ($approved->resolve($generation, $resolved) as $event) {
                     yield $event;
                 }
-                // Read to the end, but not ended normally: a provider error, a
-                // truncated stream, an Error/Unknown finish. Hosts label these.
-                $outcome = $final && ! $failed ? 'completed' : 'failed';
-                if ($collected === null) {
-                    return;
-                }
-                $messages = $collected['messages'];
-                $response = $collected['response'];
-                if ($failed || ! $final) {
-                    $approvals = [];
-                    [$messages, $response] = $this->refuseFailedStream($messages, $response, $failureFinish ?? FinishReason::Unknown);
-                }
-                // Core's collector does not retain approval events on messages.
-                // Preserve those IDs without rebuilding its text/tool transcript.
-                if ($approvals !== []) {
-                    foreach ($messages as $index => $message) {
-                        if ($message instanceof AssistantMessage) {
-                            $ids = array_map(fn ($call): string => $call->id, $message->toolCalls);
-                            $pending = array_values(array_filter($approvals, fn ($approval): bool => in_array($approval->toolCallId, $ids, true)));
-                            $messages[$index] = new AssistantMessage($message->content, $message->toolCalls, $message->additionalContent, $pending);
+                $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
+                $request = $generation->toRequest();
+                [$reservation, $call] = $this->reserve($run, $request, 'stream', $generation->provider());
+                $usage = null;
+                $billing = [];
+                $billingSteps = 0;
+                $billingEnds = 0;
+                $outcome = 'abandoned';
+                $collected = null;
+                $approvals = [];
+                // Reported usage is only final once the stream has ENDED normally
+                // with no error along the way. Decided in `finally`, so a consumer
+                // that stops reading early, or an exception, cannot skip it.
+                $final = false;
+                $failed = false;
+                $failureFinish = null;
+                try {
+                    $run->ledger->recordSteps(1);
+                    $collector = new StreamCollector($generation->asStream(), null,
+                        function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
+                            $collected = ['messages' => $messages->all(), 'response' => $response];
+                        });
+                    foreach ($collector->collect() as $event) {
+                        if ($event instanceof StepFinishEvent) {
+                            $billingSteps++;
+                            $billing = $event->additionalContent;
+                        }
+                        if ($event instanceof StreamEndEvent) {
+                            $billingEnds++;
+                        }
+                        if (($event instanceof StreamEndEvent || ($event instanceof StepFinishEvent && ! $this->price->requiresCompleteBilling)) && $event->usage !== null) {
+                            $usage = $event->usage;
+                        }
+                        // Older cores mark a provider error recoverable and still end
+                        // with Stop, so the error event itself is the evidence.
+                        // StepFinishEvent has no finish reason before core 0.132, so
+                        // the stream's end carries the verdict on every core.
+                        if ($event instanceof ErrorEvent || ($event instanceof StreamEndEvent
+                            && in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true))) {
+                            $failed = true;
+                            if ($event instanceof ErrorEvent) {
+                                $failureFinish = FinishReason::Error;
+                            } elseif ($failureFinish !== FinishReason::Error) {
+                                $failureFinish = $event->finishReason;
+                            }
+                        }
+                        // A stream end without usage is core saying the call's total is
+                        // unknown (no final usage arrived). An earlier step's partial
+                        // usage is evidence, not the cost: never price it.
+                        if ($event instanceof StreamEndEvent && $event->usage === null) {
+                            $failed = true;
+                            $failureFinish ??= FinishReason::Unknown;
+                        }
+                        if ($event instanceof StreamEndEvent) {
+                            $final = ! $failed;
+                        }
+                        if ($event instanceof ToolApprovalRequestEvent) {
+                            $approvals[] = $event->approvalRequest();
+                        }
+                        yield $event;
+                    }
+                    // Read to the end, but not ended normally: a provider error, a
+                    // truncated stream, an Error/Unknown finish. Hosts label these.
+                    $outcome = $final && ! $failed ? 'completed' : 'failed';
+                    if ($collected === null) {
+                        return;
+                    }
+                    $messages = $collected['messages'];
+                    $response = $collected['response'];
+                    if ($failed || ! $final) {
+                        $approvals = [];
+                        [$messages, $response] = $this->refuseFailedStream($messages, $response, $failureFinish ?? FinishReason::Unknown);
+                    }
+                    // Core's collector does not retain approval events on messages.
+                    // Preserve those IDs without rebuilding its text/tool transcript.
+                    if ($approvals !== []) {
+                        foreach ($messages as $index => $message) {
+                            if ($message instanceof AssistantMessage) {
+                                $ids = array_map(fn ($call): string => $call->id, $message->toolCalls);
+                                $pending = array_values(array_filter($approvals, fn ($approval): bool => in_array($approval->toolCallId, $ids, true)));
+                                $messages[$index] = new AssistantMessage($message->content, $message->toolCalls, $message->additionalContent, $pending);
+                            }
                         }
                     }
+                    $record($messages, $response);
+                    $generation->withMessages([...$request->messages(), ...$messages]);
+                } catch (Throwable $failure) {
+                    $outcome = 'failed';
+                    throw $failure;
+                } finally {
+                    // Anything short of a normal end may have generated output its
+                    // reported usage does not cover: charge the reserved maximum.
+                    // Every capped request uses maxSteps(1). One StepFinish owns
+                    // the provenance; only StreamEnd supplies the final total.
+                    $billingComplete = ! $this->price->requiresCompleteBilling || ($billingSteps === 1 && $billingEnds === 1);
+                    $this->settle($run, $reservation, $call, $usage, $outcome, trusted: $final && ! $failed && $billingComplete,
+                        additionalContent: $billing);
                 }
-                $record($messages, $response);
-                $generation->withMessages([...$request->messages(), ...$messages]);
-            } catch (Throwable $failure) {
-                $outcome = 'failed';
-                throw $failure;
-            } finally {
-                // Anything short of a normal end may have generated output its
-                // reported usage does not cover: charge the reserved maximum.
-                // Every capped request uses maxSteps(1). One StepFinish owns
-                // the provenance; only StreamEnd supplies the final total.
-                $billingComplete = ! $this->price->requiresCompleteBilling || ($billingSteps === 1 && $billingEnds === 1);
-                $this->settle($run, $reservation, $call, $usage, $outcome, trusted: $final && ! $failed && $billingComplete,
-                    additionalContent: $billing);
-            }
-        } while ($final && ! $failed && $approvals === [] && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
-            && $run->ledger->steps() < $run->budget->maxSteps);
+            } while ($final && ! $failed && $approvals === [] && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
+                && $run->ledger->steps() < $run->budget->maxSteps);
+        } finally {
+            // The resolution's reports, if its generation never took them
+            // (a refused admission, a stream dropped before it started).
+            $approved->announce();
+        }
     }
 
     /**
