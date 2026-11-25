@@ -432,7 +432,84 @@ it('guards a plain tool, and leaves alone the tools a copy would change', functi
             return 'mine';
         }
     };
-    foreach ([$mcp, $concurrent, $overriding] as $tool) {
+    // A subclass with properties of its own: copying them would create
+    // dynamic properties, which PHP deprecates.
+    $stateful = new class extends Tool
+    {
+        public string $extra = 'x';
+
+        protected string $inner = 'y';
+    };
+    $stateful->as('stateful')->for('Stateful.')->using(fn (): string => 'ran');
+    foreach ([$mcp, $concurrent, $overriding, $stateful] as $tool) {
         expect(CancelGuardedTool::guard($tool, fn (): bool => true, null))->toBe($tool);
     }
+});
+
+// A subagent child parked on an approval when its tree is cancelled is
+// cancelled with the tree: the person stopped the whole tree, so the child's
+// approval can no longer be answered and nothing more of it runs.
+it('cancels a subagent child parked on an approval when its run tree is cancelled', function (): void {
+    config()->set('prism-harness.agent.modes.op_runner', [
+        'system_prompt' => 'You run one Op.', 'tools' => ['weather'], 'requires_approval' => ['weather'], 'skills' => [], 'max_steps' => 4,
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', ['search']);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'run_op' => ['description' => 'Run an Op.', 'mode' => 'op_runner', 'max_steps' => 3],
+    ]);
+    $outcome = null;
+    $this->during['search'] = function () use (&$outcome): void {
+        $outcome = g285Cancel(g285Web(), g285RunId());
+    };
+    G360::calls([['run_op', ['task' => 'Run the billing Op']]]);
+    G360::calls([['weather', ['city' => 'Detroit']]]);
+    G360::calls([['search', ['query' => 'billing']]]);
+    G360::text('Never asked for.');
+
+    expect(g285Turn('send')?->code())->toBe('run_cancelled')
+        ->and($outcome)->toBe(CancelOutcome::Ok);
+    $child = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::run_op');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1)
+        ->and($child->approvalStatus($pending[0]))->toBe('cancelled');
+
+    $requests = count(Http::recorded());
+    G360::text('A cancelled child must never be asked for.');
+    expect(fn () => $child->approve($pending[0]))->toThrow(ApprovalNotPending::class)
+        ->and(fn () => $child->send(''))->toThrow(RunNotPermitted::class, 'run_cancelled')
+        ->and(fn () => $child->send('Carry on'))->toThrow(RunNotPermitted::class, 'run_cancelled')
+        ->and(Http::recorded())->toHaveCount($requests)
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// A plan step held on an approval whose run a person then cancels is blocked
+// with run_cancelled, the step back at todo, instead of waiting on an
+// approval nobody can answer; resume() starts it again.
+it('blocks a plan whose step is held on an approval of a cancelled run', function (): void {
+    config()->set('prism-harness.agent.modes.chat.plans', true);
+    config()->set('prism-harness.plans.enabled', true);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['weather']);
+    G360::calls([['plan_draft', ['goal' => 'Plan the trip', 'steps' => G360::steps(2)]]]);
+    $pending = g285Worker()->send('Plan the trip')->pendingApprovals()[0];
+    G360::text('Plan approved.');
+    g285Worker()->approve($pending->approvalId);
+
+    G360::calls([['weather', ['city' => 'Detroit']]]);
+    $held = g285Worker()->plan()->advance();
+    $plan = g285Worker()->plan()->current()?->toArray() ?? [];
+    expect($plan['steps'][0]['state'])->toBe('held');
+
+    expect(g285Cancel(g285Web(), g285RunId()))->toBe(CancelOutcome::Ok);
+    $requests = count(Http::recorded());
+    $advanced = g285Worker()->plan()->advance();
+    $plan = g285Worker()->plan()->current()?->toArray() ?? [];
+
+    expect($advanced->status)->toBe('blocked')
+        ->and($advanced->reason)->toBe('run_cancelled')
+        ->and($plan['status'])->toBe('blocked')
+        ->and($plan['blockedReason'])->toBe('run_cancelled')
+        ->and($plan['steps'][0]['state'])->toBe('todo')
+        ->and($plan['steps'][0]['approvalIds'])->toBe([])
+        ->and(Http::recorded())->toHaveCount($requests)
+        ->and($this->ran['weather'])->toBe(0);
 });

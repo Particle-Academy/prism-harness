@@ -910,7 +910,8 @@ $outcome = $session->cancel($runId);   // CancelOutcome::Ok, NotRunning, NoTurn,
   `cancelled`; the answer that call produced is kept in the thread. Three kinds of tool are
   not checked one by one inside a step, and are stopped by the check before the next model
   step instead: tools marked `concurrent()` (they start together), Laravel MCP tools, and a
-  `Tool` subclass that overrides any of `Tool`'s methods other than `handle()`.
+  `Tool` subclass that overrides any of `Tool`'s methods other than `handle()` or declares
+  properties of its own.
 - **Events.** `RunCancelRequested` fires the moment the flag is written, in the process that
   wrote it. `RunCancelled` fires when the run stops, instead of `RunFinished` or `RunFailed`.
   Both carry the run's `run_id`, `parent_run_id`, `root_run_id` and `harness_agent`, and
@@ -919,10 +920,12 @@ $outcome = $session->cancel($runId);   // CancelOutcome::Ok, NotRunning, NoTurn,
   `$session->approvalStatus($id) === 'cancelled'`, never `pending`, and `approve()`, `deny()`,
   `decide()` and `streamDecision()` throw `ApprovalNotPending` for them. A cancelled run never
   resumes: an empty-prompt turn that would continue it throws `run_cancelled`.
-- **The whole tree stops.** Cancelling a run stops the run tree it belongs to: its subagents'
-  child runs, and the workflow it is a node of (every later node and worker is refused). A
-  plan whose step turn was cancelled is blocked with `run_cancelled`, and `resume()` continues
-  it with a new run.
+- **The whole tree stops.** Cancelling a run stops the run tree it belongs to: its
+  subagents' child runs, and the workflow it is a node of (every later node and worker is refused). A
+  subagent child parked on an approval, in its own session, is cancelled with the tree: its
+  approvals read `cancelled` and cannot be decided, and no later turn on the child continues
+  that tree. A plan whose step turn was cancelled, or whose step is held on an approval of a
+  cancelled run, is blocked with `run_cancelled`, and `resume()` continues it with a new run.
 - **The outcome.** `ok`: the flag is set. `not-running`: one of this session's runs that has
   already ended; nothing changed, and cancelling twice is `ok` then `not-running`. `no-turn`:
   the session has no run. `unsupported`: the ephemeral store cannot hold a lock outside a

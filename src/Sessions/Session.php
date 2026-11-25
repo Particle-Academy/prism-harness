@@ -916,6 +916,7 @@ class Session
                 // stops once. Only the first cancel announces it.
                 if (! $requested) {
                     $this->recordCancel($runId);
+                    $this->cancelTreeOf($runId);
                     $events[] = new RunCancelRequested($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
                         $this->agent(), $tag('turn_id'), 'running');
                 }
@@ -928,6 +929,7 @@ class Session
             // Parked on a person: no process is running it, so it is settled
             // here. Its approvals now read as cancelled and cannot be decided.
             $this->recordCancel($runId);
+            $this->cancelTreeOf($runId);
             $events[] = new RunCancelRequested($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
                 $this->agent(), $tag('turn_id'), 'parked');
             $events[] = new RunCancelled($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
@@ -976,7 +978,9 @@ class Session
         $record = $this->durable->get($this->cancelKey());
         $runs = is_array($record['runs'] ?? null) ? $record['runs'] : [];
 
-        return array_key_exists($runId, $runs);
+        // A subagent child of a run tree a person cancelled is cancelled
+        // with it, whichever session the cancel was made on.
+        return array_key_exists($runId, $runs) || app(RunTrees::class)->treeCancelled($this, $this->childTree());
     }
 
     /**
@@ -1035,6 +1039,17 @@ class Session
         }
 
         return false;
+    }
+
+    /**
+     * Mark the run tree a cancelled run belongs to, so its subagent children
+     * parked in other sessions, or running in other processes, stop too: the
+     * tree a child of this session continues, otherwise the tree this run
+     * opened as its root.
+     */
+    private function cancelTreeOf(string $runId): void
+    {
+        app(RunTrees::class)->cancelTree($this, $this->childTree() ?? ['session' => $this->key(), 'run' => $runId]);
     }
 
     private function recordCancel(string $runId): void
