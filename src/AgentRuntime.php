@@ -2142,7 +2142,18 @@ final readonly class AgentRuntime
      */
     private function bindingFor(Session $session, AgentMode $mode, ?RunContext $context): array
     {
+        // A child's binding is SAVED with its session, inside the lock, so a
+        // run on that session the runner did not start (the host answering an
+        // approval the child stopped on, say) keeps the provider and model the
+        // runner gave it, and still never reads the child's own override slot.
         $child = $context?->binding;
+        if ($child !== null) {
+            if ($session->childBinding() != $child) {
+                $session->rememberChildBinding($child);
+            }
+        } else {
+            $child = $session->childBinding();
+        }
 
         return [
             ($child === null ? $session->provider() : $child->provider)
