@@ -32,6 +32,7 @@ use Prism\Harness\Steps\RunStep;
 use Prism\Harness\Steps\RunStepTagger;
 use Prism\Harness\Structured\SchemaCheck;
 use Prism\Harness\Structured\StructuredTranscript;
+use Prism\Harness\Subagents\ApprovedTools;
 use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Harness\Subagents\CallBudget;
 use Prism\Harness\Subagents\RunBudget;
@@ -50,7 +51,9 @@ use Prism\Prism\Streaming\Events\ErrorEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\StreamCollector;
+use Prism\Prism\Structured\PendingRequest as StructuredPending;
 use Prism\Prism\Structured\Response as StructuredResponse;
+use Prism\Prism\Text\PendingRequest as TextPending;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
@@ -110,6 +113,30 @@ final readonly class AgentRuntime
                 }
             }
         }
+    }
+
+    /**
+     * Resolve the approvals a resumed run carries before the generation, and
+     * record them, as the step-by-step paths already do (G-380).
+     *
+     * Core would otherwise run an approved call inside its generation and
+     * report it with ToolInvoked before the harness records the result. A
+     * telemetry listener that threw there would lose that record, and the
+     * approved call would run again when the run resumed. Here the result is
+     * recorded first and the event is dispatched after it; a listener failure
+     * is reported, never thrown.
+     *
+     * @template T of TextPending|StructuredPending
+     *
+     * @param  T  $generation
+     * @param  Closure(list<Message>):void  $record
+     * @return T
+     */
+    private function resolvedFirst(TextPending|StructuredPending $generation, Closure $record): TextPending|StructuredPending
+    {
+        (new ApprovedTools)->resolve($generation, $record);
+
+        return $generation;
     }
 
     /**
@@ -245,7 +272,10 @@ final readonly class AgentRuntime
                         }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }) : $generation->asText())
+                        }) : $this->resolvedFirst($generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                            $history = $messages;
+                        })->asText())
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -454,7 +484,11 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }) : $generation->asStructured())
+                        }) : $this->resolvedFirst($generation, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                            $history = $messages;
+                            $userMessage = null;
+                        })->asStructured())
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
