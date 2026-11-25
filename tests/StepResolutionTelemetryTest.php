@@ -6,7 +6,10 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Enums\TelemetryOperation;
 use Prism\Prism\Events\Telemetry\ToolInvoked;
+use Prism\Prism\Telemetry\Telemetry;
+use Prism\Prism\Telemetry\TelemetryContext;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Tests\Fixtures\Participant;
@@ -116,3 +119,37 @@ it('still reports the resolution on the plain send path', function (): void {
 
     expect($this->ran['weather'])->toBe(1)->and($seen)->toBe(['weather']);
 });
+
+// With a host telemetry context of its own open, core reports the resolution on
+// these paths too (as on 0.26.7); the event now arrives once the call is
+// recorded, not before.
+it('dispatches a host context resolution event only after the record on the step paths', function (string $path, string $resume): void {
+    stepResolutionPath($path);
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('What time is the game, and do I need a coat?')->pendingApprovals()[0];
+    $recordedAtDispatch = [];
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use ($session, &$recordedAtDispatch): void {
+        $recordedAtDispatch[] = [$event->context->traceId, $session->thread()->storedMessages()->where('type', 'tool_result')->get()
+            ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])
+            ->where('tool_call_id', $event->toolCallId)->count()];
+        throw new RuntimeException('listener failed');
+    });
+
+    $host = new TelemetryContext(traceId: 'host-trace', operation: TelemetryOperation::Text, provider: 'host', model: 'host', startedAt: microtime(true));
+    Telemetry::stack()->push($host);
+    try {
+        match ($resume) {
+            'approve' => $session->approve($pending->approvalId),
+            'streamDecision' => iterator_to_array($session->streamDecision([new ToolApprovalResponse($pending->approvalId, true)]), false),
+        };
+    } finally {
+        Telemetry::end($host);
+    }
+    $session->send('');
+
+    expect($this->ran['weather'])->toBe(1)->and($recordedAtDispatch)->toBe([['host-trace', 1]]);
+})->with([
+    'subagents, approve' => ['subagents', 'approve'],
+    'capped, approve' => ['capped', 'approve'],
+    'plain stream' => ['plain', 'streamDecision'],
+]);

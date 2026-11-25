@@ -14,9 +14,9 @@ use Tests\Fixtures\Participant;
 // Core reports each tool it runs with a ToolInvoked telemetry event while the
 // turn is still running, before the harness records what the tool returned.
 // A listener that throws must never cost that record: an approved call whose
-// result was lost would run again when the run resumes. Each event reaches its
-// listeners as its resolution step returns, and a listener failure is
-// reported, never thrown, so the resolution finishes and is recorded.
+// result was lost would run again when the run resumes. The resolution's events
+// are held until its result is recorded, then dispatched one by one, and a
+// listener failure is reported, never thrown.
 
 beforeEach(function (): void {
     config()->set('prism.providers.openai.api_key', 'sk-test');
