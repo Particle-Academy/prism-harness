@@ -1410,6 +1410,40 @@ plan, a person approves it, and `$session->plan()->advance()` runs one step per
 turn. A plan step is a separate thing from a task in the list above, and a done
 plan step never closes a task. See [docs/plans.md](docs/plans.md).
 
+### Plan budgets
+
+How a plan's steps are budgeted is the app's choice, set in
+`prism-harness.plans.budget` or per plan with
+`$session->plan()->useBudget([...])`. The model and per-call options cannot
+choose it or widen it.
+
+| mode | what it means |
+|---|---|
+| `per_step` (default) | Each step's turn gets the per-turn budget, as before. |
+| `shared` | Every turn that serves the plan also spends from one ledger: `max_steps` model steps in total (required) and optionally `max_cost_usd`. Per-turn limits still apply to each turn. When the ledger is spent, the plan is blocked with `plan_budget_exhausted` and `PlanBudgetExhausted` is dispatched once. |
+| `none` | No plan-level budget. Per-turn limits, the plan's own limits, workflow budgets and agent spend ceilings still apply. |
+
+```php
+'plans' => [
+    'budget' => ['mode' => 'shared', 'max_steps' => 40, 'max_cost_usd' => 2.00],
+],
+
+// or for one plan, in host code:
+$session->plan()->useBudget(['mode' => 'shared', 'max_steps' => 12]);
+$session->plan()->budget(); // mode, limits, and what a shared budget has spent
+```
+
+A shared ledger lives in the plan store, so it carries across approval pauses,
+restarts and workers. Each turn holds what it may spend before it starts and
+settles what it spent when it ends, in one locked write each, so two turns are
+never granted the same remainder. A hold whose turn never settled is charged in
+full once the run lock's TTL has passed. A plan's budget is fixed when it is
+first chosen or first used: after that its mode cannot change
+(`plan.budget_fixed`) and its limits can only be lowered. A step whose turn is
+handed a run tree of its own (a subagent or workflow context) is refused
+(`plan.budget_context`) rather than run outside the ledger. An invalid mode or
+limit throws when plans are used, before anything runs.
+
 ## What it is for
 
 Applications where **the agent is the product** and the session is long-lived — an interactive

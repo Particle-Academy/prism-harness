@@ -397,7 +397,7 @@ final class PlanMachine
      * @param  array<string, mixed>  $plan
      * @return array{0: array<string, mixed>, 1: array{0: string, 1: ?string}}
      */
-    public static function prepare(array $plan, bool $runFailed, PlanLimits $limits, int $now, ?string $runId): array
+    public static function prepare(array $plan, bool $runFailed, PlanLimits $limits, int $now, ?string $runId, bool $budgetExhausted = false): array
     {
         if ($plan['status'] !== 'active') {
             return [$plan, ['not_active', $plan['status']]];
@@ -423,6 +423,11 @@ final class PlanMachine
             } elseif ($plan['counters']['advances'] >= $limits->maxAdvances) {
                 $plan = self::block($plan, 'budget');
                 $outcome = ['blocked', 'budget'];
+            } elseif ($budgetExhausted) {
+                // G-366: the plan's shared budget is spent. It is only ever
+                // lowered, so resume() refuses this as it refuses 'budget'.
+                $plan = self::block($plan, PlanBudget::EXHAUSTED);
+                $outcome = ['blocked', PlanBudget::EXHAUSTED];
             } else {
                 $outcome = ['run', $step['id']];
             }
@@ -778,7 +783,7 @@ final class PlanMachine
      */
     public static function resume(array $plan, PlanIds $ids, PlanLimits $limits, int $now): array
     {
-        if ($plan['status'] !== 'blocked' || $plan['blockedReason'] === 'budget') {
+        if ($plan['status'] !== 'blocked' || in_array($plan['blockedReason'], ['budget', PlanBudget::EXHAUSTED], true)) {
             throw PlanRefused::because('plan.not_resumable');
         }
         $reason = $plan['blockedReason'];

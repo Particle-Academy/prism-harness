@@ -373,6 +373,38 @@ return [
         'context' => ['max_chars' => 2000, 'window' => 8],
         'events' => ['run_steps' => false, 'max_bytes' => 8192],
         'reaper' => ['stale_after' => 300],
+
+        /*
+         * How a plan's steps are budgeted (G-366). The app's choice, here or
+         * per plan in host code ($session->plan()->useBudget([...])); never
+         * the model's, never a per-call option.
+         *
+         * `mode`:
+         *   'per_step' (default) - each step's turn gets the per-turn budget
+         *                          (the mode's max_steps, agent.max_cost_usd),
+         *                          as before this setting existed.
+         *   'shared'             - every turn that serves the plan also spends
+         *                          from ONE ledger: `max_steps` model steps in
+         *                          total (required) and, optionally,
+         *                          `max_cost_usd`. Per-turn limits still apply
+         *                          to each turn. Kept in the plan store, so it
+         *                          survives approval pauses, restarts and
+         *                          other workers. When it is spent the plan is
+         *                          blocked with `plan_budget_exhausted`, and
+         *                          PlanBudgetExhausted is dispatched once.
+         *   'none'               - no plan-level budget. Per-turn limits, the
+         *                          plan limits above, workflow budgets and
+         *                          agent spend ceilings still apply.
+         *
+         * Limits set here are also the ceiling for a budget chosen per plan.
+         * An invalid mode or limit throws when plans are used, before
+         * anything runs.
+         */
+        'budget' => [
+            'mode' => 'per_step',
+            'max_steps' => null,
+            'max_cost_usd' => null,
+        ],
     ],
 
 ];

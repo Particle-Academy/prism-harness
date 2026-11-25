@@ -6,12 +6,16 @@ namespace Prism\Harness\Plans;
 
 use Closure;
 use Prism\Harness\Contracts\SessionStore;
+use Prism\Harness\Events\PlanBudgetExhausted;
 use Prism\Harness\Events\PlanUpdated;
 use Prism\Harness\Exceptions\PlanRefused;
 use Prism\Harness\Exceptions\PlansDisabled;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
+use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Schema\ArraySchema;
 use Prism\Prism\Schema\EnumSchema;
@@ -47,6 +51,13 @@ final class Plans
 
     private int $watcherSeq = 0;
 
+    /**
+     * Turns spending from a shared plan budget, by run id, until they settle.
+     *
+     * @var array<string, array{session: string, plan: string, context: RunContext, steps: int, cost: float, unmetered: int}>
+     */
+    private array $budgetTurns = [];
+
     /** @var (Closure(string, string): void)|null */
     private ?Closure $reapDispatcher = null;
 
@@ -67,6 +78,17 @@ final class Plans
         return PlanLimits::fromConfig(is_array($config) ? $config : []);
     }
 
+    /**
+     * The configured plan budget (G-366), validated: an invalid mode or limit
+     * throws here, before any step runs.
+     *
+     * @return array{mode: string, max_steps: ?int, max_cost_micros: ?int}
+     */
+    public function budgetSettings(): array
+    {
+        return PlanBudget::settings(config('prism-harness.plans.budget'));
+    }
+
     /** Whether this session's current mode runs with plans. */
     public function enabledFor(Session $session, ?string $mode = null): bool
     {
@@ -85,6 +107,8 @@ final class Plans
         if (! $this->enabledFor($session)) {
             throw PlansDisabled::forSession();
         }
+        // An invalid plan budget fails here, before anything can run under it.
+        $this->budgetSettings();
 
         return new PlanHandle($session, $this);
     }
@@ -263,6 +287,7 @@ final class Plans
      */
     public function afterTurn(Session $session): void
     {
+        $this->settleTurn($session);
         if (! $this->enabled()) {
             return;
         }
@@ -330,6 +355,8 @@ final class Plans
         if (! $this->enabledFor($session, $mode)) {
             return [];
         }
+        // No plan can be drafted under an invalid plan budget (G-366).
+        $this->budgetSettings();
 
         return (new PlanTools($this, $session))->all();
     }
@@ -340,6 +367,229 @@ final class Plans
         $run = $session->run();
 
         return is_array($run) && is_string($run['id'] ?? null) && ($run['status'] ?? null) === 'running' ? $run['id'] : null;
+    }
+
+    // ------------------------------------------------------------------
+    // Plan budget (G-366)
+    // ------------------------------------------------------------------
+
+    /**
+     * The budget record of this plan, or null when none was fixed yet.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function budgetRecord(Session $session, string $planId): ?array
+    {
+        $record = $session->planStore()->get(self::budgetKey($session->key()));
+
+        return is_array($record) && ($record['planId'] ?? null) === $planId ? $record : null;
+    }
+
+    /**
+     * The mode and limits this plan runs under: the fixed record, else config.
+     *
+     * @return array{mode: string, max_steps: ?int, max_cost_micros: ?int}
+     */
+    public function budgetFor(Session $session, string $planId): array
+    {
+        $record = $this->budgetRecord($session, $planId);
+
+        return $record === null ? $this->budgetSettings()
+            : ['mode' => $record['mode'], 'max_steps' => $record['max_steps'], 'max_cost_micros' => $record['max_cost_micros']];
+    }
+
+    /**
+     * Host code chooses this plan's budget. The first choice fixes it; after
+     * that the mode cannot change and a limit can only be lowered.
+     *
+     * @return array<string, mixed>
+     */
+    public function useBudget(Session $session, string $planId, mixed $requested): array
+    {
+        $chosen = PlanBudget::forPlan($this->budgetSettings(), $requested);
+
+        return $this->budgetWrite($session, $planId, $chosen, static fn (array $state): array => [PlanBudget::narrow($state, $chosen), null])[0];
+    }
+
+    /** Which shared limit this plan has spent, or null. */
+    public function budgetExhaustion(Session $session, string $planId): ?string
+    {
+        $record = $this->budgetRecord($session, $planId);
+        if ($record === null) {
+            return null;
+        }
+
+        return PlanBudget::exhaustion(PlanBudget::expire($record, $this->now(), $this->holdTtl()));
+    }
+
+    /** Announce that a plan stopped on its shared budget. */
+    public function announceBudgetExhausted(Session $session, string $planId, string $limit): void
+    {
+        $record = $this->budgetRecord($session, $planId) ?? PlanBudget::open($planId, $this->budgetFor($session, $planId));
+        try {
+            event(new PlanBudgetExhausted($session->key(), $planId, PlanBudget::EXHAUSTED, $limit,
+                $record['steps'], $record['cost_micros'] / 1_000_000, $session->agent()));
+        } catch (Throwable $failure) {
+            report($failure);
+        }
+    }
+
+    /**
+     * The run a turn executes under, when the turn serves a plan step whose
+     * budget is shared: the per-turn budget, narrowed to what the plan's
+     * ledger holds for it. Any other run is returned unchanged.
+     *
+     * A run handed a run tree of its own (a subagent, a workflow node) cannot
+     * also spend from the plan's ledger, so it is refused rather than let
+     * around it.
+     *
+     * @internal Called by the runtime once a run's own budget is known.
+     *
+     * @throws PlanRefused plan.budget_context
+     * @throws RunNotPermitted plan_budget_exhausted
+     */
+    public function planTurn(Session $session, string $runId, RunContext $run, ?RunContext $context): RunContext
+    {
+        if (! $this->enabledFor($session)) {
+            return $run;
+        }
+        $plan = $this->load($session);
+        if (! self::serving($plan) || $this->budgetFor($session, $plan['id'])['mode'] !== 'shared') {
+            return $run;
+        }
+        if ($context !== null && ! $context->metadataOnly) {
+            throw PlanRefused::because('plan.budget_context');
+        }
+
+        $ledger = $run->ledger;
+        $budget = $run->budget;
+        $baseSteps = $ledger->steps();
+        $baseCost = $ledger->costUsd();
+        $turnCost = $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $baseCost));
+        $now = $this->now();
+        $ttl = $this->holdTtl();
+        [, $grant] = $this->budgetWrite($session, $plan['id'], $this->budgetSettings(),
+            static fn (array $state): array => PlanBudget::reserve($state, $runId, max(0, $budget->maxSteps - $baseSteps), $turnCost, $now, $ttl));
+        if (isset($grant['refused'])) {
+            throw RunNotPermitted::planBudget((string) $grant['limit']);
+        }
+
+        $narrowed = $run->withBudget(new RunBudget(
+            maxSteps: $baseSteps + (int) $grant['steps'],
+            maxCostUsd: $grant['cost_micros'] === null ? $budget->maxCostUsd : $baseCost + $grant['cost_micros'] / 1_000_000,
+            maxSeconds: $budget->maxSeconds,
+            maxOutputTokensPerCall: $budget->maxOutputTokensPerCall,
+            maxToolCalls: $budget->maxToolCalls,
+        ));
+        $this->budgetTurns[$runId] = [
+            'session' => $session->key(), 'plan' => $plan['id'], 'context' => $narrowed,
+            'steps' => $baseSteps, 'cost' => $baseCost, 'unmetered' => $ledger->unmeteredRuns(),
+        ];
+
+        return $narrowed;
+    }
+
+    /**
+     * The shared budget a turn on this session would spend from now, or null.
+     *
+     * @internal The runtime routes such a turn to the step path.
+     *
+     * @return array{mode: string, max_steps: ?int, max_cost_micros: ?int}|null
+     */
+    public function servingSharedPlan(Session $session): ?array
+    {
+        if (! $this->enabledFor($session)) {
+            return null;
+        }
+        $plan = $this->load($session);
+        if (! self::serving($plan)) {
+            return null;
+        }
+        $settings = $this->budgetFor($session, $plan['id']);
+
+        return $settings['mode'] === 'shared' ? $settings : null;
+    }
+
+    /** @internal Whether this run spends from a shared plan budget. */
+    public function isPlanTurn(string $runId): bool
+    {
+        return isset($this->budgetTurns[$runId]);
+    }
+
+    /** Replace a finished turn's hold with what it spent. */
+    private function settleTurn(Session $session): void
+    {
+        $run = $session->run();
+        $runId = is_array($run) && is_string($run['id'] ?? null) ? $run['id'] : null;
+        $turn = $runId === null ? null : ($this->budgetTurns[$runId] ?? null);
+        if ($turn === null || $turn['session'] !== $session->key()) {
+            return;
+        }
+        unset($this->budgetTurns[$runId]);
+        $ledger = $turn['context']->ledger;
+        $steps = $ledger->steps() - $turn['steps'];
+        $cost = $ledger->unmeteredRuns() > $turn['unmetered'] ? null : PlanBudget::micros(max(0.0, $ledger->costUsd() - $turn['cost']));
+        try {
+            $this->budgetWrite($session, $turn['plan'], $this->budgetSettings(),
+                static fn (array $state): array => [PlanBudget::settle($state, $runId, $steps, $cost), null]);
+        } catch (Throwable $failure) {
+            // The hold stays and is charged in full once it expires.
+            self::reportQuietly($failure);
+        }
+    }
+
+    /**
+     * One locked change to this plan's budget record, opening it from
+     * $settings when it is absent or belongs to an earlier plan.
+     *
+     * @param  array{mode: string, max_steps: ?int, max_cost_micros: ?int}  $settings
+     * @param  Closure(array<string, mixed>): array{0: array<string, mixed>, 1: mixed}  $change
+     * @return array{0: array<string, mixed>, 1: mixed}
+     */
+    private function budgetWrite(Session $session, string $planId, array $settings, Closure $change): array
+    {
+        $store = $session->planStore();
+        $key = self::budgetKey($session->key());
+
+        return $store->withLock($key, function () use ($store, $key, $planId, $settings, $change): array {
+            $state = $store->get($key);
+            if (! is_array($state) || ($state['planId'] ?? null) !== $planId) {
+                $state = PlanBudget::open($planId, $settings);
+            }
+            [$next, $result] = $change($state);
+            $store->put($key, $next);
+
+            return [$next, $result];
+        }, 10, 5);
+    }
+
+    /**
+     * A turn serves the plan while the plan's head step is claimed for a turn
+     * or held on an approval that turn asked for.
+     *
+     * @param  array<string, mixed>|null  $plan
+     */
+    private static function serving(?array $plan): bool
+    {
+        if (! is_array($plan) || ! in_array($plan['status'], ['active', 'waiting'], true)) {
+            return false;
+        }
+        $head = PlanMachine::headIndex($plan);
+
+        return $head !== null && in_array($plan['steps'][$head]['state'], ['running', 'held'], true);
+    }
+
+    /** A hold outlives its turn by no more than the run lock does. */
+    private function holdTtl(): int
+    {
+        $ttl = config('prism-harness.agent.lock_ttl', 300);
+
+        return is_int($ttl) && $ttl > 0 ? $ttl : 300;
+    }
+
+    private static function budgetKey(string $sessionKey): string
+    {
+        return $sessionKey.':plan-budget';
     }
 
     // ------------------------------------------------------------------

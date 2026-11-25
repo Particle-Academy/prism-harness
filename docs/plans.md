@@ -96,6 +96,18 @@ of advances.
 Only one `advance()` runs at a time per session. A second one gets
 `SessionLocked`.
 
+## Plan budgets
+
+`plans.budget.mode` is `per_step` (the default: each step's turn gets the
+per-turn budget), `shared` (one ledger of `max_steps` model steps, and
+optionally `max_cost_usd`, across every turn that serves the plan, on top of
+each turn's own limits) or `none` (no plan-level budget). Host code can choose
+it for one plan with `useBudget()`; the configured limits are its ceiling.
+The first choice or first shared turn fixes it, and after that it can only be
+lowered. When a shared budget is spent, `advance()` returns `blocked` with
+reason `plan_budget_exhausted`, the plan is blocked with that reason,
+`PlanBudgetExhausted` is dispatched once, and `resume()` refuses it.
+
 ## Hosts with queues
 
 If a queued job calls `advance()`, register a reaper callback and schedule the

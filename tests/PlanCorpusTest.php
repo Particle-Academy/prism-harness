@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Prism\Harness\Exceptions\PlanRefused;
 use Prism\Harness\Exceptions\ToolPolicyRefused;
+use Prism\Harness\Plans\PlanBudget;
 use Prism\Harness\Plans\PlanIds;
 use Prism\Harness\Plans\PlanLimits;
 use Prism\Harness\Plans\PlanMachine;
@@ -42,17 +43,84 @@ function runPlansCase(array $case): array
     });
     $plan = null;
     $marked = null;
+    $ledger = null;
     $results = [];
     foreach ($case['ops'] as $op) {
         $now = $op['now'] ?? ($case['now'] ?? 1767225600);
         try {
-            $results[] = plansOp($op, $plan, $ids, $limits, $now, $marked);
+            $results[] = str_starts_with($op['op'], 'budget_')
+                ? plansBudgetOp($op, $ledger, $now)
+                : plansOp($op, $plan, $ids, $limits, $now, $marked, $ledger);
         } catch (PlanRefused $refused) {
             $results[] = ['refused' => $refused->code()];
         }
     }
 
-    return ['results' => $results, 'final' => $plan === null ? null : plansFinal($plan, $limits)];
+    $out = ['results' => $results, 'final' => $plan === null ? null : plansFinal($plan, $limits)];
+    if ($ledger !== null) {
+        $out['budget'] = plansBudgetFinal($ledger);
+    }
+
+    return $out;
+}
+
+/**
+ * The plan budget ops (G-366): settings and the shared ledger, pure.
+ *
+ * @param  array<string, mixed>  $op
+ * @param  array<string, mixed>|null  $ledger
+ * @return array<string, mixed>
+ */
+function plansBudgetOp(array $op, ?array &$ledger, int $now): array
+{
+    try {
+        switch ($op['op']) {
+            case 'budget_settings':
+                return ['settings' => PlanBudget::settings($op['config'])];
+            case 'budget_for_plan':
+                return ['settings' => PlanBudget::forPlan(PlanBudget::settings($op['configured']), $op['requested'])];
+            case 'budget_open':
+                $ledger = PlanBudget::open('plan', PlanBudget::settings($op['config']));
+
+                return ['ok' => true];
+            case 'budget_narrow':
+                $ledger = PlanBudget::narrow($ledger, PlanBudget::forPlan(PlanBudget::settings(null), $op['requested']));
+
+                return ['ok' => true];
+            case 'budget_reserve':
+                [$ledger, $grant] = PlanBudget::reserve($ledger, $op['hold'], $op['steps'], $op['cost_micros'], $now, $op['ttl'] ?? 300);
+
+                return isset($grant['refused']) ? $grant : ['grant' => $grant];
+            case 'budget_settle':
+                $ledger = PlanBudget::settle($ledger, $op['hold'], $op['steps'], $op['cost_micros']);
+
+                return ['ok' => true];
+            case 'budget_exhaustion':
+                return ['exhaustion' => PlanBudget::exhaustion($ledger)];
+        }
+    } catch (InvalidArgumentException) {
+        return ['invalid' => true];
+    }
+
+    throw new LogicException('Unknown op '.$op['op']);
+}
+
+/**
+ * @param  array<string, mixed>  $ledger
+ * @return array<string, mixed>
+ */
+function plansBudgetFinal(array $ledger): array
+{
+    $holds = [];
+    foreach ($ledger['holds'] as $id => $hold) {
+        $holds[] = ['id' => (string) $id, 'steps' => $hold['steps'], 'cost_micros' => $hold['cost_micros'], 'at' => $hold['at']];
+    }
+
+    return [
+        'mode' => $ledger['mode'], 'max_steps' => $ledger['max_steps'], 'max_cost_micros' => $ledger['max_cost_micros'],
+        'steps' => $ledger['steps'], 'cost_micros' => $ledger['cost_micros'], 'unmetered' => $ledger['unmetered'],
+        'holds' => $holds, 'exhaustion' => PlanBudget::exhaustion($ledger),
+    ];
 }
 
 /**
@@ -61,7 +129,7 @@ function runPlansCase(array $case): array
  * @param  list<array<string, mixed>>|null  $marked
  * @return array<string, mixed>
  */
-function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int $now, ?array &$marked = null): array
+function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int $now, ?array &$marked = null, ?array $ledger = null): array
 {
     $run = 'run_case';
     $needs = static function () use (&$plan): array {
@@ -93,7 +161,8 @@ function plansOp(array $op, ?array &$plan, PlanIds $ids, PlanLimits $limits, int
 
             return ['ok' => true];
         case 'prepare':
-            [$plan, $outcome] = PlanMachine::prepare($needs(), $op['run_failed'], $limits, $now, null);
+            [$plan, $outcome] = PlanMachine::prepare($needs(), $op['run_failed'], $limits, $now, null,
+                $ledger !== null && PlanBudget::exhaustion($ledger) !== null);
 
             return ['outcome' => $outcome];
         case 'claim':

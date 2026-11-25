@@ -71,6 +71,19 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
         return $failure;
     }
 
+    /**
+     * A plan's shared budget is spent (G-366). `$limit` names which:
+     * `steps`, `cost` or `cost_unmetered`.
+     */
+    public static function planBudget(string $limit): self
+    {
+        $failure = new self("This plan step may not proceed (plan_budget_exhausted): the plan's shared {$limit} budget is spent.");
+        $failure->errorCode = 'plan_budget_exhausted';
+        $failure->reason = $limit;
+
+        return $failure;
+    }
+
     public static function callBudget(string $code): self
     {
         $failure = new self(match ($code) {
