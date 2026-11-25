@@ -59,6 +59,8 @@ it('reads a paused run as awaiting approval rather than as a failure', function 
         TextResponseFake::make()
             ->withText('')
             ->withFinishReason(FinishReason::Pause)
+            // As a provider returns it: the step's calls are the response's too.
+            ->withToolCalls([new ToolCall('call_1', 'execute_op', [])])
             ->withSteps(collect([
                 new Step(
                     text: '',

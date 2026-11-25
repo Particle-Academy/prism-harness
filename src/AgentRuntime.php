@@ -7,12 +7,13 @@ namespace Prism\Harness;
 use Closure;
 use Generator;
 use Illuminate\Container\Container;
-use Illuminate\Support\Collection;
 use Prism\Harness\Context\MemoryHooks;
 use Prism\Harness\Context\SummarisingCompaction;
 use Prism\Harness\Contracts\CallCostObserver;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Events\FlowToolRefused;
+use Prism\Harness\Events\HarnessEvent;
+use Prism\Harness\Events\RunCancelled;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunResumed;
@@ -49,6 +50,7 @@ use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\TurnAttachments;
+use Prism\Harness\Tools\CancelGuardedTool;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolPolicy;
@@ -59,10 +61,7 @@ use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
-use Prism\Prism\Streaming\Events\ErrorEvent;
-use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
-use Prism\Prism\Streaming\StreamCollector;
 use Prism\Prism\Structured\Response as StructuredResponse;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
@@ -235,7 +234,12 @@ final readonly class AgentRuntime
                 throw $failure;
             }
 
-            $session->beginRun($runId, $mode->name, $provider, $model);
+            // A cancelled run never resumes (G-285): refused before it begins.
+            if ($session->resumesCancelledRun($prompt)) {
+                throw RunNotPermitted::cancelled();
+            }
+            $resumedFrom = $this->resumedFrom($session, $prompt);
+            $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId);
 
             // A root run opens the tree's account; a child inherits it. Either
             // way there is exactly one ledger per tree from here down.
@@ -249,140 +253,146 @@ final readonly class AgentRuntime
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: true);
             $budget = $run->budget;
+            $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
+            try {
+                return $this->sendRun($session, $prompt, $toolNames, $attachments, $runId, $mode, $provider, $model, $run, $budget);
+            } finally {
+                $unwatch();
+            }
+        }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
+    }
 
-            event(new RunStarted(
-                sessionKey: $session->key(),
-                runId: $runId,
-                mode: $mode->name,
-                provider: $provider,
-                model: $model,
-                parentRunId: $run->parentRunId,
-                rootRunId: $run->rootRunId(),
-                harnessAgent: $session->agent(),
-            ));
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $attachments
+     */
+    private function sendRun(Session $session, string $prompt, ?array $toolNames, array $attachments, string $runId, AgentMode $mode, string $provider, string $model, RunContext $run, RunBudget $budget): AgentResponse
+    {
+        event(new RunStarted(
+            sessionKey: $session->key(),
+            runId: $runId,
+            mode: $mode->name,
+            provider: $provider,
+            model: $model,
+            parentRunId: $run->parentRunId,
+            rootRunId: $run->rootRunId(),
+            harnessAgent: $session->agent(),
+        ));
 
-            // The tree's allowance, not this node's wish. A child was already
-            // handed a budget narrowed against what the tree had left when it
-            // was spawned; this re-checks at the moment of spending, because a
-            // sibling may have consumed the remainder in between.
-            $stop = $run->ledger->exhaustion($budget);
-            if (! $run->capped() && $stop !== null) {
-                $session->failRun($runId, 'budget');
+        // The tree's allowance, not this node's wish. A child was already
+        // handed a budget narrowed against what the tree had left when it
+        // was spawned; this re-checks at the moment of spending, because a
+        // sibling may have consumed the remainder in between.
+        $stop = $run->ledger->exhaustion($budget);
+        if (! $run->capped() && $stop !== null) {
+            $refusal = $run->ledger->refusal($stop);
+            $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
 
-                throw $run->ledger->refusal($stop);
+            throw $refusal;
+        }
+
+        try {
+            $run = $this->observedRun($run);
+            $this->assertMeteredCompaction($run);
+            // The history is read HERE, once, and handed to Prism as
+            // messages rather than as a Thread. See newMessages() for why
+            // this run has to know exactly which message objects it sent.
+            $history = iterator_to_array($session->thread()->messages(), false);
+
+            $generation = Prism::text()
+                ->using($provider, $model)
+                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
+                ->withTelemetryMetadata(sessionId: $session->key());
+
+            if ($mode->providerOptions !== []) {
+                $generation->withProviderOptions($mode->providerOptions);
             }
 
-            try {
-                $run = $this->observedRun($run);
-                $this->assertMeteredCompaction($run);
-                // The history is read HERE, once, and handed to Prism as
-                // messages rather than as a Thread. See newMessages() for why
-                // this run has to know exactly which message objects it sent.
-                $history = iterator_to_array($session->thread()->messages(), false);
+            $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
+            if ($systemPrompt !== '') {
+                $generation->withSystemPrompt($systemPrompt);
+            }
 
-                $generation = Prism::text()
-                    ->using($provider, $model)
-                    ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
-                    ->withTelemetryMetadata(sessionId: $session->key());
+            $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+            if ($tools !== []) {
+                $generation->withTools($tools)->withMaxSteps(! $run->capped() ? $this->requestSteps($session, $run) : 1);
+            }
+            if ($budget->maxOutputTokensPerCall !== null) {
+                $generation->withMaxTokens($budget->maxOutputTokensPerCall);
+            }
+            // ONE MODEL STEP PER PROVIDER REQUEST, always (G-285). The run's
+            // cancel flag is read before every step and before every tool, so
+            // a Stop from another process lands at the next step rather than
+            // after the whole run. Core's own multi-step loop has no point
+            // between steps where it could be read.
+            $response = ! $run->capped()
+                ? (new StepCalls)->text($generation, $run,
+                    function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
+                        $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
+                    }, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                        $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                        $history = $messages;
+                    })
+                : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
+                    function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
+                        $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
+                    }, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                        $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                        $history = $messages;
+                    });
+            $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
+            if ($failed) {
+                $session->failRun($runId, $response->finishReason->value);
+            } else {
+                $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
+            }
 
-                if ($mode->providerOptions !== []) {
-                    $generation->withProviderOptions($mode->providerOptions);
-                }
+            // Every step was charged before its provider call; an uncapped
+            // run's reported cost is recorded once after the run.
+            if (! $run->capped()) {
+                $run->ledger->recordCost($this->costOf($response));
+            }
 
-                $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
-                if ($systemPrompt !== '') {
-                    $generation->withSystemPrompt($systemPrompt);
-                }
+            $agentResponse = new AgentResponse(
+                runId: $runId,
+                response: $response,
+                parentRunId: $run->parentRunId,
+                rootRunId: $run->rootRunId(),
+            );
 
-                $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
-                if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps(! $run->capped() ? $this->requestSteps($session, $run) : 1);
-                }
-                if ($budget->maxOutputTokensPerCall !== null) {
-                    $generation->withMaxTokens($budget->maxOutputTokensPerCall);
-                }
-                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId) || app(RunTrees::class)->holds($runId);
-                $response = ! $run->capped()
-                    ? ($stepOnly ? (new StepCalls)->text($generation, $run,
-                        function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
-                        }, function (array $messages) use ($session, &$history, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
-                            $history = $messages;
-                        }) : $generation->asText())
-                    : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
-                        function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
-                        }, function (array $messages) use ($session, &$history, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
-                            $history = $messages;
-                        });
-                if (! $run->capped() && ! $stepOnly) {
-                    $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
-                }
-                $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
-                if ($failed) {
-                    $session->failRun($runId, $response->finishReason->value);
-                } else {
-                    $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
-                }
-
-                // Shared trees charge each step before its provider call.
-                // Ordinary runs retain their aggregate accounting here; an
-                // uncapped run's reported cost is recorded once after the run.
-                if (! $run->capped()) {
-                    if (! $stepOnly) {
-                        $run->ledger->recordSteps(count($response->steps));
-                    }
-                    $run->ledger->recordCost($this->costOf($response));
-                }
-
-                $agentResponse = new AgentResponse(
-                    runId: $runId,
-                    response: $response,
-                    parentRunId: $run->parentRunId,
-                    rootRunId: $run->rootRunId(),
-                );
-
-                if ($failed) {
-                    event(new RunFailed($session->key(), $runId, $response->finishReason->value,
-                        $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
-                } else {
-                    event(new RunFinished(
-                        sessionKey: $session->key(),
-                        runId: $runId,
-                        finishReason: $response->finishReason->value,
-                        steps: count($response->steps),
-                        // Surfaced on the event, not left for a listener to infer
-                        // from the finish reason: a paused run is what an
-                        // application has to put in front of a person, and it is
-                        // the one end state that needs someone to act.
-                        awaitingApproval: $agentResponse->awaitingApproval(),
-                        parentRunId: $run->parentRunId,
-                        rootRunId: $run->rootRunId(),
-                        harnessAgent: $session->agent(),
-                    ));
-                }
-
-                return $agentResponse;
-            } catch (Throwable $failure) {
-                if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
-                    throw $failure;
-                }
-                $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
-
-                event(new RunFailed(
+            $cancelled = $this->announceEnd($session, $runId, $run, $failed
+                ? new RunFailed($session->key(), $runId, $response->finishReason->value,
+                    $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
+                : new RunFinished(
                     sessionKey: $session->key(),
                     runId: $runId,
-                    exception: $failure::class,
+                    finishReason: $response->finishReason->value,
+                    steps: count($response->steps),
+                    // Surfaced on the event, not left for a listener to infer
+                    // from the finish reason: a paused run is what an
+                    // application has to put in front of a person, and it is
+                    // the one end state that needs someone to act.
+                    awaitingApproval: $agentResponse->awaitingApproval(),
                     parentRunId: $run->parentRunId,
                     rootRunId: $run->rootRunId(),
                     harnessAgent: $session->agent(),
                 ));
-
+        } catch (Throwable $failure) {
+            if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
                 throw $failure;
             }
-        }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
+            $this->failRunOn($session, $runId, $run, $failure);
+
+            throw $failure;
+        }
+
+        // A cancel that landed after the last step still ends the run
+        // cancelled (G-285); its answer is kept in the thread.
+        if ($cancelled) {
+            throw RunNotPermitted::cancelled();
+        }
+
+        return $agentResponse;
     }
 
     /**
@@ -454,7 +464,12 @@ final readonly class AgentRuntime
                 throw $failure;
             }
 
-            $session->beginRun($runId, $mode->name, $provider, $model);
+            // A cancelled run never resumes (G-285): refused before it begins.
+            if ($session->resumesCancelledRun($prompt)) {
+                throw RunNotPermitted::cancelled();
+            }
+            $resumedFrom = $this->resumedFrom($session, $prompt);
+            $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId);
 
             $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
@@ -465,139 +480,141 @@ final readonly class AgentRuntime
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: true);
-            $budget = $run->budget;
+            $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
+            try {
+                return $this->sendStructuredRun($session, $prompt, $schema, $toolNames, $attachments, $runId, $mode, $provider, $model, $run);
+            } finally {
+                $unwatch();
+            }
+        }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
+    }
 
-            event(new RunStarted(
-                sessionKey: $session->key(),
-                runId: $runId,
-                mode: $mode->name,
-                provider: $provider,
-                model: $model,
-                parentRunId: $run->parentRunId,
-                rootRunId: $run->rootRunId(),
-                harnessAgent: $session->agent(),
-            ));
+    /**
+     * @param  list<string>|null  $toolNames
+     * @param  array<array-key, mixed>  $attachments
+     */
+    private function sendStructuredRun(Session $session, string $prompt, Schema $schema, ?array $toolNames, array $attachments, string $runId, AgentMode $mode, string $provider, string $model, RunContext $run): StructuredAgentResponse
+    {
+        $budget = $run->budget;
 
-            $stop = $run->ledger->exhaustion($budget);
-            if (! $run->capped() && $stop !== null) {
-                $session->failRun($runId, 'budget');
+        event(new RunStarted(
+            sessionKey: $session->key(),
+            runId: $runId,
+            mode: $mode->name,
+            provider: $provider,
+            model: $model,
+            parentRunId: $run->parentRunId,
+            rootRunId: $run->rootRunId(),
+            harnessAgent: $session->agent(),
+        ));
 
-                throw $run->ledger->refusal($stop);
+        $stop = $run->ledger->exhaustion($budget);
+        if (! $run->capped() && $stop !== null) {
+            $refusal = $run->ledger->refusal($stop);
+            $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
+
+            throw $refusal;
+        }
+
+        try {
+            $run = $this->observedRun($run);
+            $this->assertMeteredCompaction($run);
+            $history = iterator_to_array($session->thread()->messages(), false);
+            $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
+
+            $generation = Prism::structured()
+                ->using($provider, $model)
+                ->withSchema($schema)
+                ->withMessages($userMessage instanceof UserMessage ? [...$history, $userMessage] : $history)
+                ->withTelemetryMetadata(sessionId: $session->key());
+
+            if ($mode->providerOptions !== []) {
+                $generation->withProviderOptions($mode->providerOptions);
             }
 
-            try {
-                $run = $this->observedRun($run);
-                $this->assertMeteredCompaction($run);
-                $history = iterator_to_array($session->thread()->messages(), false);
-                $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
+            $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
+            if ($systemPrompt !== '') {
+                $generation->withSystemPrompt($systemPrompt);
+            }
 
-                $generation = Prism::structured()
-                    ->using($provider, $model)
-                    ->withSchema($schema)
-                    ->withMessages($userMessage instanceof UserMessage ? [...$history, $userMessage] : $history)
-                    ->withTelemetryMetadata(sessionId: $session->key());
+            $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+            if ($tools !== []) {
+                $generation->withTools($tools)->withMaxSteps(! $run->capped() ? $this->requestSteps($session, $run) : 1);
+            }
+            if ($budget->maxOutputTokensPerCall !== null) {
+                $generation->withMaxTokens($budget->maxOutputTokensPerCall);
+            }
+            // One model step per provider request, so the cancel flag is read
+            // between steps (G-285); see send().
+            $response = ! $run->capped()
+                ? (new StepCalls)->structured($generation, $run,
+                    function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
+                        $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
+                    }, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                        $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                        $history = $messages;
+                        $userMessage = null;
+                    })
+                : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
+                    function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
+                        $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
+                    }, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                        $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                        $history = $messages;
+                        $userMessage = null;
+                    });
 
-                if ($mode->providerOptions !== []) {
-                    $generation->withProviderOptions($mode->providerOptions);
-                }
+            $violation = $this->violationIn($schema, $response);
 
-                $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
-                if ($systemPrompt !== '') {
-                    $generation->withSystemPrompt($systemPrompt);
-                }
+            if ($violation instanceof StructuredSchemaViolation) {
+                throw $violation;
+            }
 
-                $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
-                if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps(! $run->capped() ? $this->requestSteps($session, $run) : 1);
-                }
-                if ($budget->maxOutputTokensPerCall !== null) {
-                    $generation->withMaxTokens($budget->maxOutputTokensPerCall);
-                }
-                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId) || app(RunTrees::class)->holds($runId);
-                $response = ! $run->capped()
-                    ? ($stepOnly ? (new StepCalls)->structured($generation, $run,
-                        function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
-                            $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
-                        }, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
-                            $history = $messages;
-                            $userMessage = null;
-                        }) : $generation->asStructured())
-                    : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
-                        function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
-                            $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
-                        }, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
-                            $history = $messages;
-                            $userMessage = null;
-                        });
+            $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
+            if ($failed) {
+                $session->failRun($runId, $response->finishReason->value);
+            } else {
+                $session->completeRun($runId, $response->finishReason->value, $this->structuredToolCallNames($response));
+            }
 
-                if (! $run->capped() && ! $stepOnly) {
-                    $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
-                }
+            if (! $run->capped()) {
+                $run->ledger->recordCost($response->usage->cost);
+            }
 
-                $violation = $this->violationIn($schema, $response);
-
-                if ($violation instanceof StructuredSchemaViolation) {
-                    throw $violation;
-                }
-
-                $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
-                if ($failed) {
-                    $session->failRun($runId, $response->finishReason->value);
-                } else {
-                    $session->completeRun($runId, $response->finishReason->value, $this->structuredToolCallNames($response));
-                }
-
-                if (! $run->capped()) {
-                    if (! $stepOnly) {
-                        $run->ledger->recordSteps(count($response->steps));
-                    }
-                    $run->ledger->recordCost($response->usage->cost);
-                }
-
-                if ($failed) {
-                    event(new RunFailed($session->key(), $runId, $response->finishReason->value,
-                        $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
-                } else {
-                    event(new RunFinished(
-                        sessionKey: $session->key(),
-                        runId: $runId,
-                        finishReason: $response->finishReason->value,
-                        steps: count($response->steps),
-                        // A structured run returns a document or raises, so it has
-                        // no state in which somebody has to decide something.
-                        awaitingApproval: false,
-                        parentRunId: $run->parentRunId,
-                        rootRunId: $run->rootRunId(),
-                        harnessAgent: $session->agent(),
-                    ));
-                }
-
-                return new StructuredAgentResponse(
-                    runId: $runId,
-                    response: $response,
-                    parentRunId: $run->parentRunId,
-                    rootRunId: $run->rootRunId(),
-                );
-            } catch (Throwable $failure) {
-                if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
-                    throw $failure;
-                }
-                $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
-
-                event(new RunFailed(
+            $cancelled = $this->announceEnd($session, $runId, $run, $failed
+                ? new RunFailed($session->key(), $runId, $response->finishReason->value,
+                    $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
+                : new RunFinished(
                     sessionKey: $session->key(),
                     runId: $runId,
-                    exception: $failure::class,
+                    finishReason: $response->finishReason->value,
+                    steps: count($response->steps),
+                    // A structured run returns a document or raises, so it has
+                    // no state in which somebody has to decide something.
+                    awaitingApproval: false,
                     parentRunId: $run->parentRunId,
                     rootRunId: $run->rootRunId(),
                     harnessAgent: $session->agent(),
                 ));
-
+        } catch (Throwable $failure) {
+            if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
                 throw $failure;
             }
-        }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
+            $this->failRunOn($session, $runId, $run, $failure);
+
+            throw $failure;
+        }
+
+        if ($cancelled) {
+            throw RunNotPermitted::cancelled();
+        }
+
+        return new StructuredAgentResponse(
+            runId: $runId,
+            response: $response,
+            parentRunId: $run->parentRunId,
+            rootRunId: $run->rootRunId(),
+        );
     }
 
     /**
@@ -852,177 +869,10 @@ final readonly class AgentRuntime
             throw RunNotPermitted::callBudget('budget_observer_uncapped');
         }
 
-        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        if ($context !== null || $mode->subagents !== [] || app(Plans::class)->servingSharedPlan($session, $prompt, $context) !== null
-            || $session->childTree() !== null) {
-            yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);
-
-            return;
-        }
-        [$provider, $model] = $this->bindingFor($session, $mode, $context);
-        $runId = $tagger->claimRunId();
-        $tagger->bind($session->key(), $runId, null, null, $session->agent());
-        $tagger->history(fn (): iterable => $session->thread()->messages());
-
-        $namedRun = $session->agent() === null ? null : $this->boundedAgentRun($session, RunContext::root($runId, new RunBudget(
-            maxSteps: $this->ceilingFor($session, $mode),
-            maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
-        )));
-        $pausedSteps = $this->pausedSteps($session, $prompt, $context, $runId);
-        $namedRun?->ledger->recordSteps($pausedSteps);
-        if ($namedRun !== null && ($stop = $namedRun->ledger->exhaustion($namedRun->budget)) !== null) {
-            throw RunNotPermitted::exhausted($stop);
-        }
-        if ($namedRun === null && $pausedSteps >= $mode->maxSteps) {
-            throw RunNotPermitted::exhausted(sprintf('step budget exhausted (%d of %d used)', $pausedSteps, $mode->maxSteps));
-        }
-
-        $session->beginRun($runId, $mode->name, $provider, $model);
-
-        event(new RunStarted(
-            sessionKey: $session->key(),
-            runId: $runId,
-            mode: $mode->name,
-            provider: $provider,
-            model: $model,
-            harnessAgent: $session->agent(),
-        ));
-
-        // ASSEMBLED BY CORE, NOT REBUILT HERE. See the loop below.
-        /** @var array{messages: list<mixed>, response: TextResponse}|null $collected */
-        $collected = null;
-        $tools = [];
-        $finishReason = FinishReason::Unknown;
-
-        try {
-            $generation = Prism::text()
-                ->using($provider, $model)
-                ->withThread($session->thread())
-                ->withTelemetryMetadata(sessionId: $session->key())
-                ->withPrompt($prompt, $attachments);
-
-            if ($mode->providerOptions !== []) {
-                $generation->withProviderOptions($mode->providerOptions);
-            }
-
-            $systemPrompt = app(MemoryHooks::class)->systemPrompt($this->skills->augmentPrompt($mode->systemPrompt, $mode->skills), $session, $prompt);
-            if ($systemPrompt !== '') {
-                $generation->withSystemPrompt($systemPrompt);
-            }
-
-            if ($session->agent() !== null) {
-                $tools = $this->ownedOffer($mode, $session, $toolNames, $namedRun, $runId)['tools'];
-            } else {
-                $names = $this->toolNamesFor($mode, $toolNames);
-                if ($mode->skills !== []) {
-                    $names[] = 'skill_read';
-                }
-                $resolved = $this->tools->resolve(array_values(array_unique($names)), $session);
-                foreach ($resolved as $name => $tool) {
-                    if ($mode->needsApproval($name)) {
-                        $resolved[$name] = $this->gated($session, $tool, $runId);
-                    }
-                }
-                // G-360: the plan tools, after the mode's gate, as in authorizedTools().
-                foreach (app(Plans::class)->tools($session, $mode->name) as $name => $tool) {
-                    $resolved[$name] = $tool;
-                }
-                $tools = $this->authorizer->allowed($session, $resolved);
-            }
-            $tools = $this->approvalScopedOffer($session, $tools);
-            $tagger->offered($this->toolNames($tools));
-            if ($tools !== []) {
-                $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps - $pausedSteps : $this->requestSteps($session, $namedRun));
-            }
-            $maxOutput = $namedRun === null
-                ? $this->nullableIntConfig('max_output_tokens_per_call', $session)
-                : $namedRun->budget->maxOutputTokensPerCall;
-            if ($maxOutput !== null) {
-                $generation->withMaxTokens($maxOutput);
-            }
-
-            // The transcript is assembled by CORE, not rebuilt here.
-            //
-            // An earlier draft accumulated deltas into messages itself, and had
-            // to document that the result could differ from what `send()`
-            // stores. That difference is invisible by construction: a thread is
-            // replayed to a model as context, so a message assembled slightly
-            // wrong never surfaces as an error — only, much later, as a model
-            // that remembers the conversation differently than it happened.
-            // Telling callers to choose between streaming and a faithful record
-            // was a workaround for a gap on our side, not a design.
-            //
-            // `StreamCollector` yields every event through untouched and hands
-            // back the same Message objects and Response the non-streaming path
-            // builds. A streamed turn and a sent turn now record the SAME
-            // transcript, because the same code wrote both.
-            $collector = new StreamCollector(
-                $generation->asStream(),
-                null,
-                function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
-                    $collected = ['messages' => $messages->all(), 'response' => $response];
-                },
-            );
-
-            foreach ($collector->collect() as $event) {
-                if ($event instanceof ErrorEvent) {
-                    $finishReason = FinishReason::Error;
-                } elseif ($event instanceof StreamEndEvent && $finishReason !== FinishReason::Error) {
-                    $finishReason = $event->finishReason === FinishReason::Error
-                        ? FinishReason::Error
-                        : ($event->usage === null ? FinishReason::Unknown : $event->finishReason);
-                }
-
-                $tagger->observe($event);
-                yield $event;
-            }
-        } catch (Throwable $failure) {
-            $session->failRun($runId, $failure::class);
-
-            event(new RunFailed(
-                sessionKey: $session->key(),
-                runId: $runId,
-                exception: $failure::class,
-                harnessAgent: $session->agent(),
-            ));
-
-            throw $failure;
-        } finally {
-            if ($namedRun !== null && $collected !== null) {
-                $namedRun->ledger->recordSteps(count($collected['response']->steps));
-                $namedRun->ledger->recordCost($this->costOf($collected['response']));
-            }
-            // Reached on completion, on an exception, AND when an abandoned
-            // generator is destroyed. Recording whatever arrived beats losing a
-            // partial turn: a conversation missing the half the user already
-            // watched stream past is the worse outcome.
-            if ($session->run()['status'] === 'running') {
-                // The user's own turn, then whatever core assembled. A stream
-                // abandoned before StreamEnd never fires the collector's
-                // callback, so `$collected` is null and only the prompt is
-                // recorded — a partial turn kept rather than a whole one lost,
-                // and honest about how far it got.
-                $messages = [new UserMessage($prompt, $attachments), ...($collected['messages'] ?? [])];
-
-                $this->recordTurn($session, $messages, $runId, $tools);
-                if (in_array($finishReason, [FinishReason::Error, FinishReason::Unknown], true)) {
-                    $session->failRun($runId, $finishReason->value);
-                    event(new RunFailed($session->key(), $runId, $finishReason->value, harnessAgent: $session->agent()));
-                } else {
-                    $session->completeRun($runId, $finishReason->value);
-                    event(new RunFinished(
-                        sessionKey: $session->key(),
-                        runId: $runId,
-                        finishReason: $finishReason->value,
-                        steps: count($collected['response']->steps ?? []),
-                        awaitingApproval: false,
-                        harnessAgent: $session->agent(),
-                    ));
-                }
-            }
-            $this->rememberSeq($session, $runId, $tagger);
-            ToolRefusals::forget($runId);
-        }
+        // The step path, always (G-285): it reads the run's cancel flag before
+        // every model step and every tool call, which core's own multi-step
+        // stream has no point to do.
+        yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);
     }
 
     /**
@@ -1041,11 +891,17 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         )));
         $run = $this->boundedAgentRun($session, $run);
+        // A cancelled run never resumes (G-285): refused before it begins.
+        if ($session->resumesCancelledRun($prompt)) {
+            throw RunNotPermitted::cancelled();
+        }
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
         $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: false);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
-        $session->beginRun($runId, $mode->name, $provider, $model);
+        $resumedFrom = $this->resumedFrom($session, $prompt);
+        $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId());
+        $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
         event($tagger->resuming()
@@ -1101,11 +957,11 @@ final readonly class AgentRuntime
                     $recorded = true;
                 }));
         } catch (Throwable $failure) {
-            $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
-            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+            $this->failRunOn($session, $runId, $run, $failure);
 
             throw $failure;
         } finally {
+            $unwatch();
             if ($completedCall) {
                 $run->ledger->recordCost($reportedCost);
             }
@@ -1115,10 +971,10 @@ final readonly class AgentRuntime
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
-                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+                    $this->announceEnd($session, $runId, $run, new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 } else {
                     $session->completeRun($runId, $finish->value);
-                    event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
+                    $this->announceEnd($session, $runId, $run, new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
                         $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 }
             }
@@ -1144,11 +1000,17 @@ final readonly class AgentRuntime
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
         )));
         $run = $this->boundedAgentRun($session, $run);
+        // A cancelled run never resumes (G-285): refused before it begins.
+        if ($session->resumesCancelledRun($prompt)) {
+            throw RunNotPermitted::cancelled();
+        }
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
         $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: false);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
-        $session->beginRun($runId, $mode->name, $provider, $model);
+        $resumedFrom = $this->resumedFrom($session, $prompt);
+        $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId());
+        $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
         event($tagger->resuming()
@@ -1196,21 +1058,21 @@ final readonly class AgentRuntime
                     $recorded = true;
                 }));
         } catch (Throwable $failure) {
-            $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
-            event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+            $this->failRunOn($session, $runId, $run, $failure);
 
             throw $failure;
         } finally {
+            $unwatch();
             if (($session->run()['status'] ?? null) === 'running') {
                 if (! $recorded && $prompt !== '') {
                     $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
-                    event(new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+                    $this->announceEnd($session, $runId, $run, new RunFailed($session->key(), $runId, $finish->value, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 } else {
                     $session->completeRun($runId, $finish->value);
-                    event(new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
+                    $this->announceEnd($session, $runId, $run, new RunFinished($session->key(), $runId, $finish->value, $steps, $awaitingApproval,
                         $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
                 }
             }
@@ -1229,6 +1091,83 @@ final readonly class AgentRuntime
     private function executionContext(?RunContext $context): ?RunContext
     {
         return $context?->metadataOnly === true ? null : $context;
+    }
+
+    /**
+     * The parked run an empty-prompt turn continues, read before the new run
+     * begins (G-285): a cancel written for it while this turn waited on the
+     * session lock must stop this turn too. Null for a new prompt.
+     */
+    private function resumedFrom(Session $session, string $prompt): ?string
+    {
+        $id = $prompt === '' ? ($session->run()['id'] ?? null) : null;
+
+        return is_string($id) ? $id : null;
+    }
+
+    /**
+     * Watch this run's durable cancel flag on its tree's ledger (G-285), for
+     * as long as the run executes in this process. Returns the unwatch.
+     *
+     * @return Closure(): void
+     */
+    private function watchCancel(Session $session, string $runId, RunContext $run, ?string $resumedFrom = null): Closure
+    {
+        return $run->ledger->watchCancel(static fn (): bool => $session->cancelRequestedFor($runId)
+            || ($resumedFrom !== null && $resumedFrom !== $runId && $session->cancelRequestedFor($resumedFrom)));
+    }
+
+    /**
+     * End a run refused before it called anything: cancelled, with its event,
+     * or failed on its budget, which has never announced itself.
+     */
+    private function endRun(Session $session, string $runId, RunContext $run, string $why): void
+    {
+        if ($why === 'cancelled') {
+            $session->cancelRun($runId);
+            $this->announceEnd($session, $runId, $run, null);
+
+            return;
+        }
+        $session->failRun($runId, $why);
+        if ($session->runWasCancelled($runId)) {
+            $this->announceEnd($session, $runId, $run, null);
+        }
+    }
+
+    /**
+     * End a run that threw: cancelled when a cancel stopped it, failed
+     * otherwise, and announced either way.
+     */
+    private function failRunOn(Session $session, string $runId, RunContext $run, Throwable $failure): void
+    {
+        if ($failure instanceof RunNotPermitted && $failure->code() === 'run_cancelled') {
+            $session->cancelRun($runId);
+        } else {
+            $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
+        }
+        $this->announceEnd($session, $runId, $run, new RunFailed($session->key(), $runId, $failure::class,
+            $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+    }
+
+    /**
+     * Fire the run's terminal event — or {@see RunCancelled} INSTEAD of it,
+     * when the run ended cancelled (G-285). Returns whether it was cancelled.
+     */
+    private function announceEnd(Session $session, string $runId, RunContext $run, ?HarnessEvent $event): bool
+    {
+        if (! $session->runWasCancelled($runId)) {
+            if ($event !== null) {
+                event($event);
+            }
+
+            return false;
+        }
+        $turnId = $session->run()['turn_id'] ?? null;
+        event(new RunCancelled($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent(),
+            is_string($turnId) ? $turnId : null));
+
+        return true;
     }
 
     /**
@@ -1650,7 +1589,7 @@ final readonly class AgentRuntime
     private function authorizedTools(AgentMode $mode, Session $session, ?array $toolNames, RunContext $run, string $runId): array
     {
         if ($session->agent() !== null) {
-            return $this->approvalScopedOffer($session, $this->ownedOffer($mode, $session, $toolNames, $run, $runId)['tools']);
+            return $this->cancelGuarded($this->approvalScopedOffer($session, $this->ownedOffer($mode, $session, $toolNames, $run, $runId)['tools']), $run, $runId);
         }
         $names = $this->toolNamesFor($mode, $toolNames);
         if ($mode->skills !== []) {
@@ -1681,7 +1620,23 @@ final readonly class AgentRuntime
             $resolved[$name] = $tool;
         }
 
-        return $this->approvalScopedOffer($session, $this->authorizer->allowed($session, $resolved));
+        return $this->cancelGuarded($this->approvalScopedOffer($session, $this->authorizer->allowed($session, $resolved)), $run, $runId);
+    }
+
+    /**
+     * Every offered tool checks the run's cancel flag immediately before it
+     * runs (G-285). See {@see CancelGuardedTool} for why, and for the tools
+     * it leaves as they are.
+     *
+     * @param  list<Tool>  $tools
+     * @return list<Tool>
+     */
+    private function cancelGuarded(array $tools, RunContext $run, string $runId): array
+    {
+        $ledger = $run->ledger;
+
+        return array_map(static fn (Tool $tool): Tool => CancelGuardedTool::guard($tool,
+            static fn (): bool => $ledger->cancelRequested(), $runId), $tools);
     }
 
     /**

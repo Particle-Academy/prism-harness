@@ -877,9 +877,55 @@ process of your own that does not go through Octane or the queue worker (a custo
 Artisan command) has no such boundary: call `app()->forgetScopedInstances()` between units of
 work, as the queue worker does.
 
+## Cancelling a run
+
+A run executing in one process can be stopped from another: a web request stopping a run in a
+queue worker.
+
+```php
+use Prism\Harness\Enums\CancelOutcome;
+
+// In the web request, after YOUR authorization check:
+$outcome = $session->cancel($runId);   // CancelOutcome::Ok, NotRunning, NoTurn, Unsupported or Refused
+```
+
+- **The flag is durable.** `cancel()` writes it to the session's durable store, so the process
+  running the run reads it at its next check. Nothing in memory is shared.
+- **Where it is checked.** Before every model step and before every tool call. A tool call
+  that is already running is **not interrupted**: it finishes, its result is recorded, and the
+  next tool or step is refused with `Not run: the run was cancelled.` The run then ends
+  `cancelled`, and `send()` and `sendStructured()` throw `RunNotPermitted` with code
+  `run_cancelled`. A cancel that lands during the run's last model call still ends the run
+  `cancelled`; the answer that call produced is kept in the thread.
+- **Events.** `RunCancelRequested` fires the moment the flag is written, in the process that
+  wrote it. `RunCancelled` fires when the run stops, instead of `RunFinished` or `RunFailed`.
+  Both carry the run's `run_id`, `parent_run_id`, `root_run_id` and `harness_agent`, and
+  `turnId` when the run serves an ACP turn.
+- **A run parked on an approval** is cancelled at once. Its approvals read
+  `$session->approvalStatus($id) === 'cancelled'`, never `pending`, and `approve()`, `deny()`,
+  `decide()` and `streamDecision()` throw `ApprovalNotPending` for them. A cancelled run never
+  resumes: an empty-prompt turn that would continue it throws `run_cancelled`.
+- **The whole tree stops.** Cancelling a run stops the run tree it belongs to: its subagents'
+  child runs, and the workflow it is a node of (every later node and worker is refused). A
+  plan whose step turn was cancelled is blocked with `run_cancelled`, and `resume()` continues
+  it with a new run.
+- **The outcome.** `ok`: the flag is set. `not-running`: one of this session's runs that has
+  already ended; nothing changed, and cancelling twice is `ok` then `not-running`. `no-turn`:
+  the session has no run. `unsupported`: the ephemeral store cannot hold a lock outside a
+  callback (both built-in stores can). `refused`: the id is not one of this session's runs,
+  whether malformed, made up or another session's.
+
+**Who may cancel is your decision.** The session is scoped to a participant, so nobody can
+cancel another participant's run through it, but whether this user may stop THIS run is a
+question only your application can answer. Authorize before calling, as for `approve()`.
+
+**One model step per provider request.** So that the flag can be read between steps, every
+run takes one model step per provider request. The provider receives the same requests as
+before; telemetry reports one generation per model step.
+
 ## Events
 
-`RunStarted`, `RunFinished` and `RunFailed` are ordinary Laravel events — broadcast them over
+`RunStarted`, `RunFinished`, `RunFailed`, `RunCancelRequested` and `RunCancelled` are ordinary Laravel events — broadcast them over
 Reverb, queue them, or ignore them.
 
 They are deliberately **not telemetry**. Telemetry is observability: sampled, droppable, read

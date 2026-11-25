@@ -681,7 +681,9 @@ it('treats a turnId/actor-only context as metadata: same path and budget as no c
             ->and($steps[1])->toBe($steps[0])
             ->and($steps[2])->toBe($steps[0])
             ->and($steps[4])->toBe($steps[3])
-            ->and($steps[0])->toBeGreaterThan(1)
+            // Every path takes one model step per request since G-285, so the
+            // cancel flag is read between steps: the paths agree on this too.
+            ->and($steps[0])->toBe(1)
             ->and($steps[5])->toBe(1);
     });
     expect($tagged)->toBe($bare)

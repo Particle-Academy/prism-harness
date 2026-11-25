@@ -18,7 +18,7 @@ use Prism\Prism\ValueObjects\Messages\UserMessage;
 require_once __DIR__.'/Support/CallBudgetFixtures.php';
 require_once __DIR__.'/Support/CallBudgetHttpFixtures.php';
 
-it('preserves ordinary uncapped wire bytes and generation telemetry grouping', function (string $shape): void {
+it('preserves ordinary uncapped wire bytes, and reports one generation per model step', function (string $shape): void {
     config()->set('prism.providers.anthropic.api_key', 'synthetic-test-key');
     config()->set('prism.telemetry.enabled', true);
     config()->set('prism.telemetry.capture_content', false);
@@ -71,13 +71,21 @@ it('preserves ordinary uncapped wire bytes and generation telemetry grouping', f
             callBudgetRun($shape, $session, null);
         }
         Http::assertSentCount(3);
+        // Core runs the three steps as ONE generation. Harness runs one model
+        // step per request since G-285, so it can read the run's cancel flag
+        // between steps: three generations, one per step, each its own trace.
+        $generations = $leg === 'core' ? 1 : 3;
         expect(array_column($events, 'type'))->toContain(GenerationStarted::class, GenerationCompleted::class)
-            ->and(count(array_filter($events, fn (array $event): bool => $event['type'] === GenerationStarted::class)))->toBe(1)
-            ->and(count(array_filter($events, fn (array $event): bool => $event['type'] === GenerationCompleted::class)))->toBe(1)
-            ->and($traces)->toHaveCount(1);
+            ->and(count(array_filter($events, fn (array $event): bool => $event['type'] === GenerationStarted::class)))->toBe($generations)
+            ->and(count(array_filter($events, fn (array $event): bool => $event['type'] === GenerationCompleted::class)))->toBe($generations)
+            ->and(count(array_filter($events, fn (array $event): bool => $event['type'] === StepCompleted::class)))->toBe(3)
+            ->and($traces)->toHaveCount($generations);
         $legs[] = ['wire' => Http::recorded()->map(fn (array $pair): string => $pair[0]->body())->all(),
-            'telemetry' => $events];
+            // What each tool call reported, in order: the same calls ran.
+            'tools' => array_values(array_map(fn (array $event): array => $event['payload'],
+                array_filter($events, fn (array $event): bool => $event['type'] === ToolInvoked::class)))];
     }
+    // The provider sees exactly the same bytes either way.
     expect(json_encode($legs[1], JSON_THROW_ON_ERROR))->toBe(json_encode($legs[0], JSON_THROW_ON_ERROR));
 })->with(['send', 'structured', 'stream']);
 

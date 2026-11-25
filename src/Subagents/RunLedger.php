@@ -60,6 +60,22 @@ final class RunLedger
 
     private bool $guarding = false;
 
+    /**
+     * The reason a ledger stopped by a person's cancel carries (G-285), so a
+     * cancel is never confused with a spent budget.
+     */
+    public const CANCELLED = 'run cancelled';
+
+    /**
+     * Durable cancel flags this tree watches, one per run executing on it in
+     * this process (G-285). Not part of the snapshot: each reads the store.
+     *
+     * @var array<int, \Closure(): bool>
+     */
+    private array $cancelProbes = [];
+
+    private int $probeSequence = 0;
+
     public function __construct(
         public readonly string $rootRunId,
         private float $startedAt = 0.0,
@@ -144,6 +160,10 @@ final class RunLedger
      */
     public function refusal(string $reason): RunNotPermitted
     {
+        if ($reason === self::CANCELLED) {
+            return RunNotPermitted::cancelled();
+        }
+
         return $this->guard === null || $this->guarding
             ? RunNotPermitted::exhausted($reason)
             : $this->guard->refusal($this, $reason);
@@ -275,7 +295,7 @@ final class RunLedger
         $stop = $this->unmeteredRuns > 0 ? $this->exhaustion($budget)
             : $this->exhaustion(new RunBudget($budget->maxSteps, maxSeconds: $budget->maxSeconds, maxToolCalls: $budget->maxToolCalls));
         if ($stop !== null) {
-            throw RunNotPermitted::exhausted($stop);
+            throw $stop === self::CANCELLED && $this->cancelled ? RunNotPermitted::cancelled() : RunNotPermitted::exhausted($stop);
         }
     }
 
@@ -409,6 +429,53 @@ final class RunLedger
         });
     }
 
+    /**
+     * Watch a run's durable cancel flag (G-285). Every check this tree makes
+     * before a step, a tool or a child reads it; once one reads true the tree
+     * is cancelled, for every run on it, and stays cancelled. Returns the
+     * unwatch, called when that run ends.
+     *
+     * @internal Registered by the runtime for each run it executes.
+     *
+     * @param  \Closure(): bool  $probe
+     * @return \Closure(): void
+     */
+    public function watchCancel(\Closure $probe): \Closure
+    {
+        $id = ++$this->probeSequence;
+        $this->cancelProbes[$id] = $probe;
+
+        return function () use ($id): void {
+            unset($this->cancelProbes[$id]);
+        };
+    }
+
+    /**
+     * Whether a person cancelled this tree (G-285), reading every watched
+     * flag now. A budget stop is not a cancel and never reads as one.
+     */
+    public function cancelRequested(): bool
+    {
+        return $this->guarded(fn (): bool => $this->pollCancel());
+    }
+
+    private function pollCancel(): bool
+    {
+        if ($this->cancelled) {
+            return $this->cancelReason === self::CANCELLED;
+        }
+        foreach ($this->cancelProbes as $probe) {
+            if ($probe()) {
+                $this->cancelled = true;
+                $this->cancelReason = self::CANCELLED;
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public function cancelled(): bool
     {
         return $this->guarded(fn (): bool => $this->cancelled);
@@ -447,6 +514,7 @@ final class RunLedger
 
     private function exhaustionNow(RunBudget $budget): ?string
     {
+        $this->pollCancel();
         if ($this->cancelled) {
             return $this->cancelReason ?? 'cancelled';
         }

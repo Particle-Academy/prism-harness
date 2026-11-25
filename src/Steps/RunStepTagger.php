@@ -94,6 +94,12 @@ final class RunStepTagger
     }
 
     /** Whether this stream continues a parked run under that run's own id. */
+    /** The ACP turn these steps serve, when they serve one. */
+    public function turnId(): ?string
+    {
+        return $this->turnId;
+    }
+
     public function resuming(): bool
     {
         return $this->resuming;

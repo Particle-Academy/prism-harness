@@ -86,6 +86,12 @@ final readonly class IndexedSessionStore implements HeldSessionLocks
         $this->heldLocks()->releaseFencedLock($key, $token);
     }
 
+    /** Whether the wrapped store can hold a lock outside a callback. */
+    public function supportsHeldLocks(): bool
+    {
+        return $this->inner instanceof HeldSessionLocks;
+    }
+
     private function heldLocks(): HeldSessionLocks
     {
         if (! $this->inner instanceof HeldSessionLocks) {

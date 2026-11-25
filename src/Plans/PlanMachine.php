@@ -38,6 +38,9 @@ final class PlanMachine
 
     public const LIVE = ['proposed', 'active', 'waiting', 'blocked'];
 
+    /** The reason a plan blocks when a person cancelled its step's run (G-285). resume() continues it. */
+    public const RUN_CANCELLED = 'run_cancelled';
+
     public const TERMINAL = ['done', 'failed', 'skipped'];
 
     // ------------------------------------------------------------------
@@ -397,13 +400,22 @@ final class PlanMachine
      * @param  array<string, mixed>  $plan
      * @return array{0: array<string, mixed>, 1: array{0: string, 1: ?string}}
      */
-    public static function prepare(array $plan, bool $runFailed, PlanLimits $limits, int $now, ?string $runId, bool $budgetExhausted = false): array
+    public static function prepare(array $plan, bool $runFailed, PlanLimits $limits, int $now, ?string $runId, bool $budgetExhausted = false, bool $runCancelled = false): array
     {
         if ($plan['status'] !== 'active') {
             return [$plan, ['not_active', $plan['status']]];
         }
         $original = $plan;
-        $plan = self::settle($plan, $runFailed, $limits);
+        // G-285: the head step's own turn was cancelled by a person. The step
+        // goes back to todo and the plan stops, once: the next advance does
+        // not quietly start a new run the person just asked to stop.
+        $head = self::headIndex($plan);
+        $cancelledTurn = $runCancelled && $head !== null && $plan['steps'][$head]['owner'] === 'agent'
+            && $plan['steps'][$head]['state'] === 'running';
+        $plan = self::settle($plan, $runFailed || $runCancelled, $limits);
+        if ($cancelledTurn && $plan['status'] === 'active') {
+            $plan = self::block($plan, self::RUN_CANCELLED);
+        }
 
         $head = self::headIndex($plan);
         $outcome = null;
