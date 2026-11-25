@@ -16,6 +16,7 @@ use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Schema\ArraySchema;
 use Prism\Prism\Schema\EnumSchema;
@@ -462,9 +463,10 @@ final class Plans
      * a claim whose worker died is still live) is not the plan's: it spends
      * nothing from the plan's budget and is never refused for it.
      *
-     * A run handed a run tree of its own (a subagent, a workflow node) cannot
-     * also spend from the plan's ledger, so it is refused rather than let
-     * around it.
+     * The plan's own turn handed a run tree of its own (a subagent, a
+     * workflow node) cannot also spend from the plan's ledger, so it is
+     * refused rather than let around it. A host context on a child's turn is
+     * narrowed to what the plan's ledger holds for it instead.
      *
      * @internal Called by the runtime once a run's own budget is known.
      *
@@ -477,7 +479,7 @@ final class Plans
         if ($target === null) {
             return $run;
         }
-        if ($context !== null && ! $context->metadataOnly) {
+        if ($target['refused']) {
             throw PlanRefused::because('plan.budget_context');
         }
 
@@ -583,12 +585,11 @@ final class Plans
      */
     public function assertDecisionsFunded(Session $session, array $approvalIds, ?RunContext $context): void
     {
-        $context = $context?->metadataOnly === true ? null : $context;
         $ledger = $this->decisionLedger($session, $approvalIds, $context);
         if ($ledger === null) {
             return;
         }
-        if ($context !== null) {
+        if ($ledger['refused']) {
             throw PlanRefused::because('plan.budget_context');
         }
         $spent = $this->exhaustionAt($session->planStore(), $ledger['session'], $ledger['plan']);
@@ -598,56 +599,71 @@ final class Plans
     }
 
     /**
-     * The shared ledger a turn spends from: its own plan's, when the turn is
-     * the plan's own; else, for a subagent child resumed outside the runner,
-     * the ledger of the plan turn that started it.
+     * The shared ledger a turn spends from, as {@see PlanBudget::route()}
+     * decides: its own plan's, when the turn is the plan's own; else, for a
+     * turn on a subagent child the runner did not start (an answer, a new
+     * message, or a host context, which the ledger narrows), the ledger of
+     * the plan turn that started it. `refused` marks the plan's own turn
+     * handed a run tree of its own.
      *
-     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}}|null
+     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}, refused: bool}|null
      */
     private function ledgerFor(Session $session, string $prompt, ?RunContext $context): ?array
     {
         if (! $this->enabled()) {
             return null;
         }
-        if ($this->enabledFor($session)) {
-            $plan = $this->load($session);
-            if ($plan !== null && $this->ownTurn($session, $plan, $prompt)) {
-                $settings = $this->budgetFor($session, $plan['id']);
+        $plan = $this->enabledFor($session) ? $this->load($session) : null;
+        $step = self::activeAgentStep($plan);
+        $advancing = $step !== null && isset($this->advancing[$session->key()]);
+        $stepApproval = $step !== null && $step['approvalIds'] !== []
+            && array_intersect($step['approvalIds'], $session->thread()->pausedApprovalIds()) !== [];
 
-                return $settings['mode'] === 'shared' ? ['session' => $session->key(), 'plan' => $plan['id'], 'settings' => $settings] : null;
-            }
-        }
-
-        return $context === null || $context->metadataOnly ? $this->childLedger($session) : null;
+        return $this->routedLedger($session, $plan, $prompt, $advancing, $stepApproval, $context);
     }
 
     /**
      * The shared ledger a decision on these approvals would resume into.
      *
      * @param  list<string>  $approvalIds
-     * @return array{session: string, plan: string}|null
+     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}, refused: bool}|null
      */
     private function decisionLedger(Session $session, array $approvalIds, ?RunContext $context): ?array
     {
         if (! $this->enabled() || $approvalIds === []) {
             return null;
         }
-        if ($this->enabledFor($session)) {
-            $plan = $this->load($session);
-            $step = self::activeAgentStep($plan);
-            if ($plan !== null && $step !== null && array_intersect($step['approvalIds'], $approvalIds) !== []) {
-                return $this->budgetFor($session, $plan['id'])['mode'] === 'shared' ? ['session' => $session->key(), 'plan' => $plan['id']] : null;
-            }
+        $plan = $this->enabledFor($session) ? $this->load($session) : null;
+        $step = self::activeAgentStep($plan);
+        $stepApproval = $step !== null && array_intersect($step['approvalIds'], $approvalIds) !== [];
+
+        // A decision resumes as a turn with no new message.
+        return $this->routedLedger($session, $plan, '', false, $stepApproval, $context);
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $plan
+     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}, refused: bool}|null
+     */
+    private function routedLedger(Session $session, ?array $plan, string $prompt, bool $advancing, bool $stepApproval, ?RunContext $context): ?array
+    {
+        $route = PlanBudget::route(app(RunTrees::class)->contextKind($context), $prompt, $advancing, $stepApproval,
+            $session->childTree() !== null, $session->childPlanLedger() !== null)['plan'];
+        if (($route === 'own' || $route === 'refused') && $plan !== null) {
+            $settings = $this->budgetFor($session, $plan['id']);
+
+            return $settings['mode'] === 'shared'
+                ? ['session' => $session->key(), 'plan' => $plan['id'], 'settings' => $settings, 'refused' => $route === 'refused'] : null;
         }
 
-        return $context === null ? $this->childLedger($session) : null;
+        return $route === 'child' ? $this->childLedger($session) : null;
     }
 
     /**
      * The plan ledger saved with a subagent child, while it is still that
      * plan's shared ledger.
      *
-     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}}|null
+     * @return array{session: string, plan: string, settings: array{mode: string, max_steps: ?int, max_cost_micros: ?int}, refused: bool}|null
      */
     private function childLedger(Session $session): ?array
     {
@@ -660,28 +676,7 @@ final class Plans
             return null;
         }
 
-        return [...$saved, 'settings' => ['mode' => 'shared', 'max_steps' => $record['max_steps'], 'max_cost_micros' => $record['max_cost_micros']]];
-    }
-
-    /**
-     * Whether a turn is one of the plan's own: the turn advance() runs for
-     * the step it claimed, or a turn with no new message that continues an
-     * approval the step asked for.
-     *
-     * @param  array<string, mixed>  $plan
-     */
-    private function ownTurn(Session $session, array $plan, string $prompt): bool
-    {
-        $step = self::activeAgentStep($plan);
-        if ($step === null) {
-            return false;
-        }
-        if (isset($this->advancing[$session->key()])) {
-            return true;
-        }
-
-        return $prompt === '' && $step['approvalIds'] !== []
-            && array_intersect($step['approvalIds'], $session->thread()->pausedApprovalIds()) !== [];
+        return [...$saved, 'settings' => ['mode' => 'shared', 'max_steps' => $record['max_steps'], 'max_cost_micros' => $record['max_cost_micros']], 'refused' => false];
     }
 
     /**

@@ -1960,15 +1960,19 @@ final readonly class AgentRuntime
     private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, bool $begun): RunContext
     {
         try {
-            // A root run, or a child resumed outside the runner, which
-            // continues the run tree it was started in.
-            if ($context === null) {
-                $run = app(RunTrees::class)->rootRun($session, $runId, $run);
-            }
+            // A root run opens a tree; any turn on a child session the runner
+            // did not start continues the run tree it was started in, a host
+            // context narrowed to what that tree has left.
+            $run = app(RunTrees::class)->rootRun($session, $runId, $run, $context);
 
             return app(Plans::class)->planTurn($session, $runId, $run, $context, $prompt);
         } catch (Throwable $failure) {
             if (! $begun || ($failure instanceof SessionLockLost && $failure->isWriteRejected())) {
+                // No run state to close, so nothing else settles what the
+                // run tree holds for this run: return it now rather than let
+                // it be charged in full when it expires.
+                app(RunTrees::class)->finished($session, $runId);
+
                 throw $failure;
             }
             $refused = $failure instanceof RunNotPermitted || $failure instanceof PlanRefused;
@@ -2248,7 +2252,7 @@ final readonly class AgentRuntime
         return ($context === null ? $this->floatConfig('max_cost_usd') : $context->budget->maxCostUsd) !== null
             || $this->agentCeiling($session) !== null
             // A shared plan budget with a cost cap prices every call (G-366).
-            || ($context === null && (app(Plans::class)->servingSharedPlan($session, $prompt)['max_cost_micros'] ?? null) !== null);
+            || (app(Plans::class)->servingSharedPlan($session, $prompt, $context)['max_cost_micros'] ?? null) !== null;
     }
 
     /**

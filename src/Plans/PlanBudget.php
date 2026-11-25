@@ -261,6 +261,51 @@ final class PlanBudget
         return $state;
     }
 
+    /**
+     * Which budgets a turn spends from. Pure, so every language answers it
+     * the same way (prism-parity harness-plans).
+     *
+     * `$context` is the run context the turn was handed: `none`, `metadata`
+     * (a turnId/actor only, the same as none), `runner` (a context of a run
+     * this runtime is running, such as the subagent runner's child) or
+     * `host` (any other context the host built). `$advancing` is true for
+     * the turn advance() runs for a claimed agent step, and `$stepApproval`
+     * when the approval the turn would resume is one that step asked for.
+     * `$savedTree` and `$savedPlanLedger` say whether the session is a
+     * subagent child saved with a run tree and a shared plan budget.
+     *
+     * The answer:
+     * - `tree`: `open` (a root run that opens a tree of its own), `continue`
+     *   (hold what the saved tree has left; a host context is narrowed to
+     *   it) or `none` (the runner's own context already spends from it).
+     * - `plan`: `own` (the plan's own turn spends from its budget), `child`
+     *   (the saved plan budget; a host context is narrowed to it), `refused`
+     *   (`plan.budget_context`: the plan's own turn handed a run tree of its
+     *   own) or `none`.
+     *
+     * The prompt matters only to whether a turn is the plan's own: a new
+     * message on a child session continues its tree and plan budget exactly
+     * as an answer to its approval does. No route gives a child a fresh
+     * budget, and a host context can only narrow one.
+     *
+     * @return array{tree: 'open'|'continue'|'none', plan: 'own'|'child'|'refused'|'none'}
+     */
+    public static function route(string $context, string $prompt, bool $advancing, bool $stepApproval, bool $savedTree, bool $savedPlanLedger): array
+    {
+        if (! in_array($context, ['none', 'metadata', 'runner', 'host'], true)) {
+            throw new InvalidArgumentException('Unknown run context kind ['.$context.'].');
+        }
+        $bare = $context === 'none' || $context === 'metadata';
+        $tree = $context === 'runner' ? 'none' : ($savedTree ? 'continue' : ($bare ? 'open' : 'none'));
+        if ($advancing || ($prompt === '' && $stepApproval)) {
+            $plan = $bare ? 'own' : 'refused';
+        } else {
+            $plan = $context !== 'runner' && $savedPlanLedger ? 'child' : 'none';
+        }
+
+        return ['tree' => $tree, 'plan' => $plan];
+    }
+
     public static function micros(?float $usd): ?int
     {
         return $usd === null ? null : (int) round($usd * 1_000_000);
