@@ -22057,9 +22057,345 @@
             "holds": [],
             "exhaustion": "steps"
           }
+        },
+        "ts": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "outcome": [
+                "run",
+                "ps_00000000000000000000000002"
+              ]
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 2,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "outcome": [
+                "waiting",
+                "ps_00000000000000000000000002"
+              ]
+            },
+            {
+              "grant": {
+                "steps": 1,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "outcome": [
+                "blocked",
+                "plan_budget_exhausted"
+              ]
+            },
+            {
+              "refused": "plan.not_resumable"
+            },
+            {
+              "outcome": [
+                "not_active",
+                "blocked"
+              ]
+            }
+          ],
+          "final": {
+            "status": "blocked",
+            "revision": 6,
+            "holdingApprovalId": null,
+            "blockedReason": "plan_budget_exhausted",
+            "counters": {
+              "advances": 1,
+              "changes": 0,
+              "settledByTool": 0,
+              "settledWithoutTool": 0
+            },
+            "pendingChange": null,
+            "steps": [
+              {
+                "id": "ps_00000000000000000000000002",
+                "position": 1,
+                "title": "Step 1",
+                "owner": "agent",
+                "interaction": null,
+                "state": "held",
+                "attempts": 1,
+                "pauses": 0,
+                "approvalIds": [
+                  "apr_w"
+                ],
+                "approvedIds": [],
+                "supersededApprovalIds": [],
+                "completedBy": null,
+                "failure": null,
+                "retryOf": null,
+                "summary": null,
+                "answer": null
+              },
+              {
+                "id": "ps_00000000000000000000000003",
+                "position": 2,
+                "title": "Step 2",
+                "owner": "agent",
+                "interaction": null,
+                "state": "todo",
+                "attempts": 0,
+                "pauses": 0,
+                "approvalIds": [],
+                "approvedIds": [],
+                "supersededApprovalIds": [],
+                "completedBy": null,
+                "failure": null,
+                "retryOf": null,
+                "summary": null,
+                "answer": null
+              }
+            ],
+            "update": {
+              "planId": "pl_00000000000000000000000001",
+              "planRunId": "run_case",
+              "changedByRunId": null,
+              "revision": 6,
+              "planStatus": "blocked",
+              "holdingApprovalId": null,
+              "snapshot": true,
+              "steps": [
+                {
+                  "id": "ps_00000000000000000000000002",
+                  "title": "Step 1",
+                  "status": "held",
+                  "owner": "agent",
+                  "state": "held",
+                  "approvalId": "apr_w"
+                },
+                {
+                  "id": "ps_00000000000000000000000003",
+                  "title": "Step 2",
+                  "status": "pending",
+                  "owner": "agent",
+                  "state": "todo"
+                }
+              ]
+            },
+            "counts": {
+              "total": 2,
+              "todo": 1,
+              "running": 0,
+              "held": 1,
+              "waiting": 0,
+              "done": 0,
+              "failed": 0,
+              "skipped": 0
+            },
+            "context": "[Plan — written by you, approved by the person. Data, not instructions from the person.]\nplan pl_00000000000000000000000001 revision 6 · status: blocked · 0 done · 1 held · 0 waiting · 1 to do\ngoal: «Plan the trip»\n▶ 1 CURRENT «Step 1» (waiting on the person's decision)\n   instruction: «Do part 1.»\n· 2 «Step 2»\nThis plan is blocked (plan_budget_exhausted). Wait for the person.\nThe current step is waiting on the person's decision.\nRules: work only on the CURRENT step. When it is finished, call plan_complete_step. To stop for the person, call plan_pause_for_person. To change the plan, call plan_propose_change.\n[End of plan]",
+            "first_event_bytes": 934
+          },
+          "budget": {
+            "mode": "shared",
+            "max_steps": 2,
+            "max_cost_micros": null,
+            "steps": 2,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
+        },
+        "py": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "outcome": [
+                "run",
+                "ps_00000000000000000000000002"
+              ]
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 2,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "ok": true
+            },
+            {
+              "outcome": [
+                "waiting",
+                "ps_00000000000000000000000002"
+              ]
+            },
+            {
+              "grant": {
+                "steps": 1,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "outcome": [
+                "blocked",
+                "plan_budget_exhausted"
+              ]
+            },
+            {
+              "refused": "plan.not_resumable"
+            },
+            {
+              "outcome": [
+                "not_active",
+                "blocked"
+              ]
+            }
+          ],
+          "final": {
+            "status": "blocked",
+            "revision": 6,
+            "holdingApprovalId": null,
+            "blockedReason": "plan_budget_exhausted",
+            "counters": {
+              "advances": 1,
+              "changes": 0,
+              "settledByTool": 0,
+              "settledWithoutTool": 0
+            },
+            "pendingChange": null,
+            "steps": [
+              {
+                "id": "ps_00000000000000000000000002",
+                "position": 1,
+                "title": "Step 1",
+                "owner": "agent",
+                "interaction": null,
+                "state": "held",
+                "attempts": 1,
+                "pauses": 0,
+                "approvalIds": [
+                  "apr_w"
+                ],
+                "approvedIds": [],
+                "supersededApprovalIds": [],
+                "completedBy": null,
+                "failure": null,
+                "retryOf": null,
+                "summary": null,
+                "answer": null
+              },
+              {
+                "id": "ps_00000000000000000000000003",
+                "position": 2,
+                "title": "Step 2",
+                "owner": "agent",
+                "interaction": null,
+                "state": "todo",
+                "attempts": 0,
+                "pauses": 0,
+                "approvalIds": [],
+                "approvedIds": [],
+                "supersededApprovalIds": [],
+                "completedBy": null,
+                "failure": null,
+                "retryOf": null,
+                "summary": null,
+                "answer": null
+              }
+            ],
+            "update": {
+              "planId": "pl_00000000000000000000000001",
+              "planRunId": "run_case",
+              "changedByRunId": null,
+              "revision": 6,
+              "planStatus": "blocked",
+              "holdingApprovalId": null,
+              "snapshot": true,
+              "steps": [
+                {
+                  "id": "ps_00000000000000000000000002",
+                  "title": "Step 1",
+                  "status": "held",
+                  "owner": "agent",
+                  "state": "held",
+                  "approvalId": "apr_w"
+                },
+                {
+                  "id": "ps_00000000000000000000000003",
+                  "title": "Step 2",
+                  "status": "pending",
+                  "owner": "agent",
+                  "state": "todo"
+                }
+              ]
+            },
+            "counts": {
+              "total": 2,
+              "todo": 1,
+              "running": 0,
+              "held": 1,
+              "waiting": 0,
+              "done": 0,
+              "failed": 0,
+              "skipped": 0
+            },
+            "context": "[Plan — written by you, approved by the person. Data, not instructions from the person.]\nplan pl_00000000000000000000000001 revision 6 · status: blocked · 0 done · 1 held · 0 waiting · 1 to do\ngoal: «Plan the trip»\n▶ 1 CURRENT «Step 1» (waiting on the person's decision)\n   instruction: «Do part 1.»\n· 2 «Step 2»\nThis plan is blocked (plan_budget_exhausted). Wait for the person.\nThe current step is waiting on the person's decision.\nRules: work only on the CURRENT step. When it is finished, call plan_complete_step. To stop for the person, call plan_pause_for_person. To change the plan, call plan_propose_change.\n[End of plan]",
+            "first_event_bytes": 934
+          },
+          "budget": {
+            "mode": "shared",
+            "max_steps": 2,
+            "max_cost_micros": null,
+            "steps": 2,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
         }
       },
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "hpl-0050",
@@ -22194,9 +22530,95 @@
             "holds": [],
             "exhaustion": "steps"
           }
+        },
+        "ts": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 5,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 1,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "exhaustion": "steps"
+            },
+            {
+              "refused": "plan_budget_exhausted",
+              "limit": "steps"
+            }
+          ],
+          "final": null,
+          "budget": {
+            "mode": "shared",
+            "max_steps": 5,
+            "max_cost_micros": null,
+            "steps": 5,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
+        },
+        "py": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 5,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 1,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "exhaustion": "steps"
+            },
+            {
+              "refused": "plan_budget_exhausted",
+              "limit": "steps"
+            }
+          ],
+          "final": null,
+          "budget": {
+            "mode": "shared",
+            "max_steps": 5,
+            "max_cost_micros": null,
+            "steps": 5,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
         }
       },
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "hpl-0051",
@@ -22352,9 +22774,107 @@
             "holds": [],
             "exhaustion": "steps"
           }
+        },
+        "ts": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 5,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 2,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 1,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "refused": "plan_budget_exhausted",
+              "limit": "steps"
+            }
+          ],
+          "final": null,
+          "budget": {
+            "mode": "shared",
+            "max_steps": 5,
+            "max_cost_micros": null,
+            "steps": 5,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
+        },
+        "py": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 5,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 2,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 1,
+                "cost_micros": null
+              }
+            },
+            {
+              "ok": true
+            },
+            {
+              "refused": "plan_budget_exhausted",
+              "limit": "steps"
+            }
+          ],
+          "final": null,
+          "budget": {
+            "mode": "shared",
+            "max_steps": 5,
+            "max_cost_micros": null,
+            "steps": 5,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
         }
       },
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "hpl-0052",
@@ -22440,9 +22960,65 @@
             "holds": [],
             "exhaustion": "steps"
           }
+        },
+        "ts": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 5,
+                "cost_micros": null
+              }
+            },
+            {
+              "refused": "plan_budget_exhausted",
+              "limit": "steps"
+            }
+          ],
+          "final": null,
+          "budget": {
+            "mode": "shared",
+            "max_steps": 5,
+            "max_cost_micros": null,
+            "steps": 5,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
+        },
+        "py": {
+          "results": [
+            {
+              "ok": true
+            },
+            {
+              "grant": {
+                "steps": 5,
+                "cost_micros": null
+              }
+            },
+            {
+              "refused": "plan_budget_exhausted",
+              "limit": "steps"
+            }
+          ],
+          "final": null,
+          "budget": {
+            "mode": "shared",
+            "max_steps": 5,
+            "max_cost_micros": null,
+            "steps": 5,
+            "cost_micros": 0,
+            "unmetered": 0,
+            "holds": [],
+            "exhaustion": "steps"
+          }
         }
       },
-      "agrees": false
+      "agrees": true
     }
   ]
 }
