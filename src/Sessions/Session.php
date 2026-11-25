@@ -1002,6 +1002,33 @@ class Session
     }
 
     /**
+     * The durable run tree of the parked run an empty-prompt turn resumes
+     * (G-381): the run its paused approvals were issued in, read from the
+     * thread, so it holds after the ephemeral half has expired. Null for a
+     * new prompt, or a run in no durable tree.
+     *
+     * @internal Read by RunTrees when a root turn begins.
+     *
+     * @return array{session: string, run: string}|null
+     */
+    public function resumedRunTree(string $prompt): ?array
+    {
+        if ($prompt !== '') {
+            return null;
+        }
+        $thread = $this->thread();
+        foreach ($thread->pausedApprovalIds() as $approvalId) {
+            $runId = $thread->approvalRunId($approvalId);
+            $tree = $runId === null ? null : $this->runTree($runId);
+            if ($tree !== null) {
+                return $tree;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * The durable run tree a run of this session began in (G-381), or null
      * for a run in the host's tree, in none, or not remembered.
      *

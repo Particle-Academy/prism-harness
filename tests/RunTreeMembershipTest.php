@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Illuminate\Support\Facades\Event;
 use Prism\Harness\Enums\CancelOutcome;
 use Prism\Harness\Events\RunCancelRequested;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Subagents\RunBudget;
@@ -231,4 +232,49 @@ it('cancels the parked root of a child\'s tree, and nothing in a host tree besid
 
     expect(g381Session('Ada')->approvalStatus($rootApproval->approvalId))->toBe('cancelled')
         ->and($bobChild->approvalStatus($bobChild->thread()->pendingApprovalIds()[0]))->toBe('pending');
+});
+
+// A root that resumes after a person approved its call runs under a new run
+// id, and it stays in the tree its parked run began in: the subagents it
+// delegated before the approval are in that tree, so a cancel of the resumed
+// root stops them, and a cancel of one of them stops the resumed root.
+function g381ParkedTreeAfterRootResume(): array
+{
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['search']);
+    config()->set('prism-harness.agent.modes.op_runner.requires_approval', ['search']);
+    G360::calls([['run_op', ['task' => 'Run the Op']]]);
+    G360::calls([['search', ['query' => 'child']]]);
+    G360::calls([['search', ['query' => 'root']]]);
+    $first = g381Session('Ada')->send('go')->pendingApprovals()[0];
+    $firstRun = (string) (g381Session('Ada')->run()['id'] ?? '');
+    G360::calls([['search', ['query' => 'root again']]]);
+    $second = g381Session('Ada')->approve($first->approvalId)->pendingApprovals()[0];
+    $secondRun = (string) (g381Session('Ada')->run()['id'] ?? '');
+    expect($secondRun)->not->toBe($firstRun);
+
+    return [$second, $secondRun];
+}
+
+it('stops the subagents of a resumed root when the resumed root is cancelled', function (): void {
+    [, $secondRun] = g381ParkedTreeAfterRootResume();
+    $child = g381Session('Ada', 'chat::sub::run_op');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1);
+    $searches = $this->searches;
+
+    expect(g381Session('Ada')->cancel($secondRun))->toBe(CancelOutcome::Ok)
+        ->and($child->approvalStatus($pending[0]))->toBe('cancelled')
+        ->and(fn () => $child->approve($pending[0]))->toThrow(ApprovalNotPending::class)
+        ->and($this->searches)->toBe($searches);
+});
+
+it('stops a resumed root when a subagent it delegated before the approval is cancelled', function (): void {
+    [$second] = g381ParkedTreeAfterRootResume();
+    $child = g381Session('Ada', 'chat::sub::run_op');
+    $searches = $this->searches;
+
+    expect($child->cancel((string) ($child->run()['id'] ?? '')))->toBe(CancelOutcome::Ok)
+        ->and(g381Session('Ada')->approvalStatus($second->approvalId))->toBe('cancelled')
+        ->and(fn () => g381Session('Ada')->approve($second->approvalId))->toThrow(ApprovalNotPending::class)
+        ->and($this->searches)->toBe($searches);
 });

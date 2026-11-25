@@ -215,7 +215,7 @@ final readonly class AgentRuntime
             try {
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
                 // Which run tree this run belongs to: decided once, here (G-381).
-                $membership = app(RunTrees::class)->begin($session, $runId, $context);
+                $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
                 [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
@@ -453,7 +453,7 @@ final readonly class AgentRuntime
             try {
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
                 // Which run tree this run belongs to: decided once, here (G-381).
-                $membership = app(RunTrees::class)->begin($session, $runId, $context);
+                $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
                 [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
             } catch (Throwable $failure) {
                 // As in send(): no run exists yet, so there is no run state to
@@ -892,7 +892,7 @@ final readonly class AgentRuntime
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         $runId = $tagger->claimRunId();
         // Which run tree this run belongs to: decided once, here (G-381).
-        $membership = app(RunTrees::class)->begin($session, $runId, $context);
+        $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
         [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
         $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
@@ -1003,7 +1003,7 @@ final readonly class AgentRuntime
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         $runId = $tagger->claimRunId();
         // Which run tree this run belongs to: decided once, here (G-381).
-        $membership = app(RunTrees::class)->begin($session, $runId, $context);
+        $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
         [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
         $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),

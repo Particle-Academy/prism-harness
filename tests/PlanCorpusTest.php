@@ -140,7 +140,7 @@ function plansTreeOp(array $op): array
 {
     try {
         return $op['op'] === 'tree_membership'
-            ? ['membership' => RunTrees::membership($op['context'], $op['session'], $op['run'], $op['parent'], $op['saved_tree'], $op['saved_depth'], $op['context_depth'])]
+            ? ['membership' => RunTrees::membership($op['context'], $op['session'], $op['run'], $op['parent'], $op['saved_tree'], $op['saved_depth'], $op['context_depth'], $op['resumed_tree'])]
             : ['refs' => RunTrees::keptRefs($op['membership'], $op['plan_ledger'], $op['saved_tree'], $op['saved_plan_ledger'], $op['saved_tree_cancelled'])];
     } catch (InvalidArgumentException) {
         return ['invalid' => true];

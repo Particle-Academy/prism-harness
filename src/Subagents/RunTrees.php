@@ -65,7 +65,7 @@ final class RunTrees
      *
      * @return array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: 'open'|'continue'|'none'}
      */
-    public function begin(Session $session, string $runId, ?RunContext $context): array
+    public function begin(Session $session, string $runId, ?RunContext $context, string $prompt = ''): array
     {
         $kind = $this->contextKind($context);
         $parent = null;
@@ -77,8 +77,10 @@ final class RunTrees
             }
         }
 
+        $bare = $kind === 'none' || $kind === 'metadata';
+
         return self::membership($kind, $session->key(), $runId, $parent, $session->childTree(), $session->childDepth(),
-            $kind === 'none' || $kind === 'metadata' || $context === null ? 0 : $context->depth);
+            $bare || $context === null ? 0 : $context->depth, $bare ? $session->resumedRunTree($prompt) : null);
     }
 
     /**
@@ -188,8 +190,10 @@ final class RunTrees
             ];
             $now = time();
             $ttl = self::holdTtl();
-            $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($key, $settings, $now, $ttl): array {
-                $state ??= PlanBudget::open($key, $settings);
+            $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($tree, $key, $settings, $now, $ttl): array {
+                // Named by the tree's root run: a root resuming its parked run
+                // holds under its own run id in the tree that run began.
+                $state ??= PlanBudget::open($tree['run'], $settings);
 
                 return PlanBudget::reserve($state, $key, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
             });
@@ -380,18 +384,20 @@ final class RunTrees
      *  - Any other turn on a session that saved a tree continues that tree,
      *    spending from a hold of its own, at least as deep as it was started.
      *  - A host context on a session that saved none is in the host's tree.
-     *  - No context, or a metadata-only one, opens a tree of its own.
+     *  - No context, or a metadata-only one, opens a tree of its own, or,
+     *    resuming its parked run, stays in the tree that run began in.
      *
      * A host context's own root and parent run ids are deliberately not
      * inputs: they are the host's statement, not a fact this runtime holds.
      *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int}|null  $parent
      * @param  array{session: string, run: string}|null  $savedTree
+     * @param  array{session: string, run: string}|null  $resumedTree  the tree the parked run a root turn resumes began in
      * @return array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: 'open'|'continue'|'none'}
      *
      * @throws InvalidArgumentException for an unknown context kind
      */
-    public static function membership(string $kind, string $session, string $run, ?array $parent, ?array $savedTree, int $savedDepth, int $contextDepth): array
+    public static function membership(string $kind, string $session, string $run, ?array $parent, ?array $savedTree, int $savedDepth, int $contextDepth, ?array $resumedTree = null): array
     {
         if (! in_array($kind, ['none', 'metadata', 'runner', 'host'], true)) {
             throw new InvalidArgumentException('Unknown run context kind ['.$kind.'].');
@@ -411,7 +417,14 @@ final class RunTrees
             return ['tree' => 'host', 'spends' => null, 'depth' => max($savedDepth, $contextDepth), 'route' => 'none'];
         }
 
-        return ['tree' => ['session' => $session, 'run' => $run], 'spends' => $run, 'depth' => $savedDepth, 'route' => 'open'];
+        // A root turn that resumes its parked run stays in the tree that run
+        // began in: its subagents parked there belong to the same tree, and a
+        // cancel of either must reach the other. It still spends from a
+        // budget entry of its own.
+        $tree = $resumedTree === null ? ['session' => $session, 'run' => $run]
+            : ['session' => $resumedTree['session'], 'run' => $resumedTree['run']];
+
+        return ['tree' => $tree, 'spends' => $run, 'depth' => $savedDepth, 'route' => 'open'];
     }
 
     /**
