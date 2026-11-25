@@ -278,3 +278,35 @@ it('stops a resumed root when a subagent it delegated before the approval is can
         ->and(fn () => g381Session('Ada')->approve($second->approvalId))->toThrow(ApprovalNotPending::class)
         ->and($this->searches)->toBe($searches);
 });
+
+// The resumed root spends from its own budget, never from what the tree's
+// record holds for the subagents parked in it: after it delegates again and
+// parks again, the earlier child can still be approved and run.
+it('leaves a parked subagent its tree budget after the root resumed, delegated and parked again', function (): void {
+    config()->set('prism-harness.agent.modes.chat.max_steps', 6);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['search']);
+    config()->set('prism-harness.agent.modes.op_runner.requires_approval', ['search']);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'run_op' => ['description' => 'Run an Op.', 'mode' => 'op_runner', 'max_steps' => 5],
+        'scout' => ['description' => 'Scout.', 'mode' => 'deep_runner', 'max_steps' => 3],
+    ]);
+    G360::calls([['run_op', ['task' => 'Run the Op']]]);
+    G360::calls([['search', ['query' => 'child']]]);
+    G360::calls([['search', ['query' => 'root']]]);
+    $first = g381Session('Ada')->send('go')->pendingApprovals()[0];
+    G360::calls([['scout', ['task' => 'Scout']]]);
+    G360::text('Scouted.');
+    G360::calls([['search', ['query' => 'root again']]]);
+    g381Session('Ada')->approve($first->approvalId);
+    expect(g381Session('Ada')->thread()->pendingApprovalIds())->toHaveCount(1);
+
+    $child = g381Session('Ada', 'chat::sub::run_op');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1);
+    $searches = $this->searches;
+    G360::text('Child done.');
+    $child->approve($pending[0]);
+
+    expect($this->searches)->toBe($searches + 1)
+        ->and($child->run()['status'])->toBe('completed');
+});

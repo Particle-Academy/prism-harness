@@ -191,8 +191,16 @@ final class RunTrees
             $now = time();
             $ttl = self::holdTtl();
             $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($tree, $key, $settings, $now, $ttl): array {
-                // Named by the tree's root run: a root resuming its parked run
-                // holds under its own run id in the tree that run began.
+                // A root resuming its parked run is in the tree that run
+                // began, but spends from its own budget: when that tree's
+                // record already exists (the parked run delegated before),
+                // it is left alone, so the resumed root never takes from
+                // what the subagents parked in it have left. Otherwise it is
+                // opened here, named by the tree's root run, and held under
+                // the run that spends.
+                if ($state !== null && $key !== $tree['run']) {
+                    return [null, null];
+                }
                 $state ??= PlanBudget::open($tree['run'], $settings);
 
                 return PlanBudget::reserve($state, $key, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
