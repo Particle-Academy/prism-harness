@@ -56,6 +56,7 @@ function runPlansCase(array $case): array
             $results[] = match (true) {
                 $op['op'] === 'binding_route' => plansBindingOp($op, $savedBinding),
                 $op['op'] === 'binding_context' => plansBindingContextOp($op, $savedBinding),
+                in_array($op['op'], ['tree_membership', 'kept_refs'], true) => plansTreeOp($op),
                 str_starts_with($op['op'], 'budget_') => plansBudgetOp($op, $ledger, $now),
                 default => plansOp($op, $plan, $ids, $limits, $now, $marked, $ledger),
             };
@@ -114,7 +115,7 @@ function plansBindingContextOp(array $op, bool &$savedBinding): array
         $context = $context->withBinding(new ChildBinding('custom-cheap', 'cheap-model'));
     }
     if ($context !== null && $op['runner_started']) {
-        $context = $trees->startingChild($context);
+        $context = $trees->startingChild($context, 'run_parent', 'parent');
     }
     if ($context !== null && $op['rebound']) {
         $context = $context->withBinding(new ChildBinding('custom-cheap', 'cheap-model'));
@@ -126,6 +127,24 @@ function plansBindingContextOp(array $op, bool &$savedBinding): array
     $savedBinding = $savedBinding || $route['save'];
 
     return ['kind' => $kind, 'route' => $route];
+}
+
+/**
+ * Which run tree a run belongs to, and what a child saves (G-381): the pure
+ * RunTrees::membership and RunTrees::keptRefs the runtime asks.
+ *
+ * @param  array<string, mixed>  $op
+ * @return array<string, mixed>
+ */
+function plansTreeOp(array $op): array
+{
+    try {
+        return $op['op'] === 'tree_membership'
+            ? ['membership' => RunTrees::membership($op['context'], $op['session'], $op['run'], $op['parent'], $op['saved_tree'], $op['saved_depth'], $op['context_depth'], $op['resumed_tree'])]
+            : ['refs' => RunTrees::keptRefs($op['membership'], $op['plan_ledger'], $op['saved_tree'], $op['saved_plan_ledger'], $op['saved_tree_cancelled'])];
+    } catch (InvalidArgumentException) {
+        return ['invalid' => true];
+    }
 }
 
 /**

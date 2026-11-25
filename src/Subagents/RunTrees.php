@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Subagents;
 
 use Closure;
+use InvalidArgumentException;
 use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Plans\PlanBudget;
@@ -42,66 +43,110 @@ final class RunTrees
     private array $runs = [];
 
     /**
-     * For each run the runner's own context is running, the live run it
-     * spends from (its key in $runs), or null under a tree the host built.
-     * A child it starts is found through its parent run id, never through a
-     * ledger another session may share.
+     * Every run of this process, by run id, until it ends: the run tree it
+     * belongs to, decided once when it began ({@see self::membership()}), the
+     * session it runs on and the ledger it spends from. The one record that
+     * childStarted, the kept references, the depth and the budget route read;
+     * a child the runner starts takes its parent's from here.
      *
-     * @var array<string, ?string>
+     * @var array<string, array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string, session: string, ledger: RunLedger}>
      */
-    private array $lineage = [];
+    private array $members = [];
 
     /**
-     * A run is starting. A turn on a child session the runner did not start
-     * (an answer to its approval, a new message, or a run context the host
-     * built) continues the tree its binding names: it holds what that tree
-     * has left, and its run is narrowed to the hold, so a host context can
-     * only lower what the tree allows. Any other root run opens a tree of its
-     * own, kept in memory until it starts a child. A run on the runner's own
-     * context already spends from its tree and is left alone.
+     * Which run tree a run that is beginning belongs to (G-381), from facts
+     * this runtime holds and nothing a host states: for the runner's own
+     * context, the recorded membership of the live parent run the runner
+     * started it from, accepted only while that run is live on the session
+     * the runner named and the context spends from that run's own ledger; for
+     * any other turn, the tree and depth the session saved.
+     *
+     * @internal Called by the runtime once, before the run's binding is chosen.
+     *
+     * @return array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: 'open'|'continue'|'none'}
+     */
+    public function begin(Session $session, string $runId, ?RunContext $context, string $prompt = ''): array
+    {
+        $kind = $this->contextKind($context);
+        $parent = null;
+        if ($kind === 'runner' && $context !== null) {
+            $mark = $this->childContexts[$context] ?? null;
+            $live = is_array($mark) ? ($this->members[$mark['run']] ?? null) : null;
+            if ($live !== null && $live['session'] === $mark['session'] && $live['ledger'] === $context->ledger) {
+                $parent = ['tree' => $live['tree'], 'spends' => $live['spends'], 'depth' => $live['depth']];
+            }
+        }
+
+        $bare = $kind === 'none' || $kind === 'metadata';
+
+        return self::membership($kind, $session->key(), $runId, $parent, $session->childTree(), $session->childDepth(),
+            $bare || $context === null ? 0 : $context->depth, $bare ? $session->resumedRunTree($prompt) : null);
+    }
+
+    /**
+     * A run is starting, under the membership it began with: a root opens a
+     * tree of its own, kept in memory until it starts a child; a turn that
+     * continues a saved tree (an answer to a child's approval, a new message,
+     * or a run context the host built) holds what that tree has left, and its
+     * run is narrowed to the hold, so a host context can only lower what the
+     * tree allows. Any other run spends from the context it was given.
      *
      * @internal Called by the runtime once a run's budget is known.
      *
-     * @throws RunNotPermitted when the tree the child belongs to is spent
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
+     *
+     * @throws RunNotPermitted when the tree the child belongs to is spent or cancelled
      */
-    public function rootRun(Session $session, string $runId, RunContext $run, ?RunContext $context = null): RunContext
+    public function rootRun(Session $session, string $runId, RunContext $run, array $membership): RunContext
     {
-        $route = PlanBudget::route($this->contextKind($context), '', false, false, $session->childTree() !== null, false)['tree'];
-        if ($route === 'none') {
-            if ($context !== null && $this->contextKind($context) === 'runner') {
-                $this->lineage[$runId] = $this->entryKey($context);
-            }
-
+        $this->members[$runId] = [...$membership, 'session' => $session->key(), 'ledger' => $run->ledger];
+        $route = $membership['route'];
+        if ($route !== 'open' && $route !== 'continue') {
             return $run;
         }
-        $tree = $route === 'continue' ? $session->childTree() : null;
+        $tree = $membership['tree'];
+        if (! is_array($tree)) {
+            return $run;
+        }
+        // A root resuming its parked run is in the tree that run began,
+        // under a new run id or (on the stream path) the parked run's own.
+        // When that run delegated, the tree has a record, and the resumed
+        // root holds what it has left and is narrowed to it, as any other
+        // turn continuing the tree: the tree's allowance holds across the
+        // pause. A new root never finds one: its tree is named by its fresh
+        // run id, and is written only once it delegates.
+        // Two resumes of one parked root never run at once: a run starts
+        // under the session lock, so the second sees the first's record.
+        if ($route === 'open' && $this->recordOf($session, $tree) !== null) {
+            $route = 'continue';
+        }
         // A turn on a child of a cancelled tree never runs (G-285): the
         // person stopped the whole tree, this child included.
-        if ($tree !== null && $this->treeCancelled($session, $tree)) {
+        if ($route === 'continue' && $this->treeCancelled($session, $tree)) {
             throw RunNotPermitted::cancelled();
         }
         $entry = [
-            'session' => $session->key(), 'tree' => $tree ?? ['session' => $session->key(), 'run' => $runId],
+            'session' => $session->key(), 'tree' => $tree,
             'budget' => $run->budget, 'ledger' => $run->ledger, 'steps' => $run->ledger->steps(),
             'cost' => $run->ledger->costUsd(), 'unmetered' => $run->ledger->unmeteredRuns(), 'held' => false,
         ];
-        if ($tree === null) {
+        if ($route === 'open') {
             $this->runs[$runId] = $entry;
 
             return $run;
         }
-
         $budget = $run->budget;
         $turnCost = $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost']));
         $now = time();
         $ttl = self::holdTtl();
-        $grant = $this->write($session->planStore(), $tree, static function (?array $state) use ($runId, $budget, $entry, $turnCost, $now, $ttl): array {
+        $steps = max(0, $budget->maxSteps - $entry['steps']);
+        $grant = $this->write($session->planStore(), $tree, static function (?array $state) use ($runId, $steps, $turnCost, $now, $ttl): array {
             if ($state === null) {
                 // The tree's record is gone: closed, never a fresh budget.
                 return [null, ['refused' => PlanBudget::EXHAUSTED, 'limit' => 'steps']];
             }
 
-            return PlanBudget::reserve($state, $runId, max(0, $budget->maxSteps - $entry['steps']), $turnCost, $now, $ttl);
+            return PlanBudget::reserve($state, $runId, $steps, $turnCost, $now, $ttl);
         });
         if (isset($grant['refused'])) {
             throw RunNotPermitted::exhausted((string) $grant['limit']);
@@ -131,23 +176,25 @@ final class RunTrees
     }
 
     /**
-     * A child is starting under a run tree: the tree it belongs to, opened
-     * in the durable store the first time its root starts a child. Null when
-     * the tree's root is not a run of this runtime (a host-made context).
+     * A child is starting under a run tree: the tree its membership names,
+     * opened in the durable store the first time the run it spends from (a
+     * root of this runtime) starts a child. Null for a child in the host's
+     * tree or in none.
      *
      * @internal Saved with the child's binding.
      *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route?: string}  $membership
      * @return array{session: string, run: string}|null
      */
-    public function childStarted(Session $child, RunContext $context): ?array
+    public function childStarted(Session $child, array $membership): ?array
     {
-        $rootRunId = $context->rootRunId();
-        $key = $this->entryKey($context);
-        $entry = $key === null ? null : $this->runs[$key];
-        if ($entry === null) {
+        $tree = $membership['tree'];
+        if (! is_array($tree)) {
             return null;
         }
-        if (! $entry['held']) {
+        $key = $membership['spends'];
+        $entry = $key === null ? null : ($this->runs[$key] ?? null);
+        if ($entry !== null && ! $entry['held']) {
             $budget = $entry['budget'];
             $settings = [
                 'mode' => 'shared',
@@ -156,15 +203,23 @@ final class RunTrees
             ];
             $now = time();
             $ttl = self::holdTtl();
-            $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($rootRunId, $settings, $now, $ttl): array {
-                $state ??= PlanBudget::open($rootRunId, $settings);
+            $grant = $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($tree, $key, $settings, $now, $ttl): array {
+                // Named by the tree's root run; held under the run that
+                // spends (a root resuming a parked run that never delegated
+                // opens its tree's record here).
+                $state ??= PlanBudget::open($tree['run'], $settings);
 
-                return PlanBudget::reserve($state, $rootRunId, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
+                return PlanBudget::reserve($state, $key, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
             });
+            // A refused hold refuses the delegation: the tree has nothing
+            // left for the run that would spend it.
+            if (is_array($grant) && isset($grant['refused'])) {
+                throw RunNotPermitted::exhausted((string) $grant['limit']);
+            }
             $this->runs[$key]['held'] = true;
         }
 
-        return $entry['tree'];
+        return $tree;
     }
 
     /**
@@ -178,12 +233,23 @@ final class RunTrees
      */
     public function assertDecisionsFunded(Session $session, ?RunContext $context): void
     {
-        $tree = $session->childTree();
-        if ($tree === null || PlanBudget::route($this->contextKind($context), '', false, false, true, false)['tree'] !== 'continue') {
+        // The turn the decision resumes, as it would begin.
+        $membership = $this->begin($session, 'decision', $context, '');
+        $tree = $membership['tree'];
+        if (! is_array($tree)) {
             return;
         }
-        $state = $session->planStore()->get(self::key($tree));
-        if (! is_array($state) || ($state['planId'] ?? null) !== $tree['run']) {
+        $state = $this->recordOf($session, $tree);
+        if ($membership['route'] === 'open') {
+            // A root resuming its parked run is held to its tree's record
+            // only when the parked run delegated and opened one.
+            if ($tree['run'] === 'decision' || $state === null) {
+                return;
+            }
+        } elseif ($membership['route'] !== 'continue') {
+            return;
+        }
+        if ($state === null) {
             throw RunNotPermitted::exhausted('steps');
         }
         [, $grant] = PlanBudget::reserve($state, 'decision', 1, null, time(), self::holdTtl());
@@ -200,7 +266,7 @@ final class RunTrees
      */
     public function finished(Session $session, string $runId): void
     {
-        unset($this->lineage[$runId]);
+        unset($this->members[$runId]);
         $entry = $this->runs[$runId] ?? null;
         if ($entry === null || $entry['session'] !== $session->key()) {
             return;
@@ -222,67 +288,30 @@ final class RunTrees
     }
 
     /**
-     * The child contexts the subagent runner built, held weakly. Only these
-     * (and a context of a live tree here) may save a child's binding.
+     * The child contexts the subagent runner built, held weakly, each with
+     * the run it was started from and that run's session: the parent the
+     * runner took from the turn calling the subagent tool.
      *
-     * @var WeakMap<RunContext, true>|null
+     * @var WeakMap<RunContext, array{run: string, session: string}>|null
      */
     private ?WeakMap $childContexts = null;
 
     /**
-     * @internal Called by the subagent runner for the context it starts a child under.
+     * @internal Called by the subagent runner for the context it starts a
+     * child under, with the run whose turn is starting it.
      */
-    public function startingChild(RunContext $context): RunContext
+    public function startingChild(RunContext $context, string $parentRunId, string $parentSession): RunContext
     {
         $this->childContexts ??= new WeakMap;
-        $this->childContexts[$context] = true;
+        $this->childContexts[$context] = ['run' => $parentRunId, 'session' => $parentSession];
 
         return $context;
     }
 
     /**
-     * Whether this is the runner's own context for a child started under a
-     * run tree the HOST built (G-285): its run belongs to no durable tree,
-     * so a cancel of it marks no tree the child session saved earlier.
-     *
-     * @internal
-     */
-    public function underHostTree(?RunContext $context): bool
-    {
-        return $context !== null && isset($this->childContexts[$context]) && $this->entryKey($context) === null;
-    }
-
-    /**
-     * The live run of this runtime a context spends from: the root run its
-     * ledger names, or else the run it was started from. A child resumed
-     * under a context the host built continues its saved tree under its OWN
-     * run id while its ledger is the host's, so the children it starts are
-     * found through their parent run id (and, deeper down, through the run
-     * that parent spends from). A ledger is never enough on its own: a host
-     * may hand one context to several sessions.
-     */
-    private function entryKey(RunContext $context): ?string
-    {
-        if (isset($this->runs[$context->rootRunId()])) {
-            return $context->rootRunId();
-        }
-        $parent = $context->parentRunId;
-        if ($parent === null) {
-            return null;
-        }
-        if (isset($this->runs[$parent]) && $this->runs[$parent]['ledger'] === $context->ledger) {
-            return $parent;
-        }
-
-        return $this->lineage[$parent] ?? null;
-    }
-
-    /**
      * The kind of context a turn was handed, for {@see ChildBinding::route()}:
-     * `runner` for the context the subagent runner built to start a child,
-     * even under a run tree the host built. The same kind as {@see self::contextKind()},
-     * so the binding and the budget routes read one context the same way.
-     * A context the host builds and binds itself is never the runner's.
+     * the same kind as {@see self::contextKind()}, so the binding and the
+     * budget routes read one context the same way.
      *
      * @internal
      *
@@ -294,10 +323,10 @@ final class RunTrees
     }
 
     /**
-     * What kind of run context a turn was handed, for {@see PlanBudget::route()}:
-     * `runner` when it is a context of a run this runtime is running (its
-     * ledger is that run's), `host` for any other context that states a run
-     * tree.
+     * What kind of run context a turn was handed: `runner` only for the
+     * context the subagent runner built and marked to start a child, even
+     * under a run tree the host built. Any other context that states a run
+     * tree is the host's, whatever ledger or run ids it carries.
      *
      * @internal
      *
@@ -308,18 +337,11 @@ final class RunTrees
         if ($context === null) {
             return 'none';
         }
-        // The context the subagent runner built to start a child is the
-        // runner's, even under a run tree the host built: it spends from the
-        // tree it was derived from and never from a tree its session saved.
         if (isset($this->childContexts[$context])) {
             return 'runner';
         }
-        if ($context->metadataOnly) {
-            return 'metadata';
-        }
-        $entry = $this->runs[$context->rootRunId()] ?? null;
 
-        return $entry !== null && $entry['ledger'] === $context->ledger ? 'runner' : 'host';
+        return $context->metadataOnly ? 'metadata' : 'host';
     }
 
     /**
@@ -342,6 +364,19 @@ final class RunTrees
 
             return $result;
         }, 10, 5);
+    }
+
+    /**
+     * The tree's budget record, or null when it has none.
+     *
+     * @param  array{session: string, run: string}  $tree
+     * @return array<string, mixed>|null
+     */
+    private function recordOf(Session $session, array $tree): ?array
+    {
+        $state = $session->planStore()->get(self::key($tree));
+
+        return is_array($state) && ($state['planId'] ?? null) === $tree['run'] ? $state : null;
     }
 
     /** @param array{session: string, run: string} $tree */
@@ -375,6 +410,85 @@ final class RunTrees
     public function treeCancelled(Session $session, ?array $tree): bool
     {
         return $tree !== null && is_array($session->planStore()->get(self::key($tree).':cancelled'));
+    }
+
+    /**
+     * Which run tree a run belongs to (G-381): decided ONCE, when the run
+     * begins, and the one record every consumer reads.
+     *
+     *  - The runner's own context (`runner`) takes the recorded membership of
+     *    the live parent run it was started from, verified by the runtime:
+     *    the same tree, the same run it spends from, one level deeper. With no
+     *    verified parent it is in no tree, at the depth the context states.
+     *    The tree its session saved is never read: that is for turns the
+     *    runner did not start.
+     *  - Any other turn on a session that saved a tree continues that tree,
+     *    spending from a hold of its own, at least as deep as it was started.
+     *  - A host context on a session that saved none is in the host's tree.
+     *  - No context, or a metadata-only one, opens a tree of its own, or,
+     *    resuming its parked run, stays in the tree that run began in.
+     *
+     * A host context's own root and parent run ids are deliberately not
+     * inputs: they are the host's statement, not a fact this runtime holds.
+     *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int}|null  $parent
+     * @param  array{session: string, run: string}|null  $savedTree
+     * @param  array{session: string, run: string}|null  $resumedTree  the tree the parked run a root turn resumes began in
+     * @return array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: 'open'|'continue'|'none'}
+     *
+     * @throws InvalidArgumentException for an unknown context kind
+     */
+    public static function membership(string $kind, string $session, string $run, ?array $parent, ?array $savedTree, int $savedDepth, int $contextDepth, ?array $resumedTree = null): array
+    {
+        if (! in_array($kind, ['none', 'metadata', 'runner', 'host'], true)) {
+            throw new InvalidArgumentException('Unknown run context kind ['.$kind.'].');
+        }
+        $savedDepth = max(0, $savedDepth);
+        $contextDepth = max(0, $contextDepth);
+        if ($kind === 'runner') {
+            return $parent === null
+                ? ['tree' => 'none', 'spends' => null, 'depth' => $contextDepth, 'route' => 'none']
+                : ['tree' => $parent['tree'], 'spends' => $parent['spends'], 'depth' => max(0, $parent['depth']) + 1, 'route' => 'none'];
+        }
+        if ($savedTree !== null) {
+            return ['tree' => ['session' => $savedTree['session'], 'run' => $savedTree['run']], 'spends' => $run,
+                'depth' => $kind === 'host' ? max($savedDepth, $contextDepth) : $savedDepth, 'route' => 'continue'];
+        }
+        if ($kind === 'host') {
+            return ['tree' => 'host', 'spends' => null, 'depth' => max($savedDepth, $contextDepth), 'route' => 'none'];
+        }
+
+        // A root turn that resumes its parked run stays in the tree that run
+        // began in: its subagents parked there belong to the same tree, and a
+        // cancel of either must reach the other. It still spends from a
+        // budget entry of its own.
+        $tree = $resumedTree === null ? ['session' => $session, 'run' => $run]
+            : ['session' => $resumedTree['session'], 'run' => $resumedTree['run']];
+
+        return ['tree' => $tree, 'spends' => $run, 'depth' => $savedDepth, 'route' => 'open'];
+    }
+
+    /**
+     * The run tree and plan ledger the runner saves with a child (G-381):
+     * the tree it is in, with the plan ledger of the run it spends from. A
+     * child in the host's tree, or in none, has no durable tree to name, so
+     * what it saved before is kept, never replaced with nothing, unless a
+     * person cancelled that tree: starting the child again is then a new
+     * delegation, not a run of the cancelled tree.
+     *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route?: string}  $membership
+     * @param  array{session: string, plan: string}|null  $planLedger
+     * @param  array{session: string, run: string}|null  $savedTree
+     * @param  array{session: string, plan: string}|null  $savedPlanLedger
+     * @return array{tree: array{session: string, run: string}|null, plan_ledger: array{session: string, plan: string}|null}
+     */
+    public static function keptRefs(array $membership, ?array $planLedger, ?array $savedTree, ?array $savedPlanLedger, bool $savedTreeCancelled): array
+    {
+        if (is_array($membership['tree'])) {
+            return ['tree' => $membership['tree'], 'plan_ledger' => $planLedger];
+        }
+
+        return $savedTreeCancelled ? ['tree' => null, 'plan_ledger' => null] : ['tree' => $savedTree, 'plan_ledger' => $savedPlanLedger];
     }
 
     private static function holdTtl(): int

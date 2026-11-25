@@ -214,7 +214,9 @@ final readonly class AgentRuntime
 
             try {
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-                [$provider, $model] = $this->bindingFor($session, $mode, $context);
+                // Which run tree this run belongs to: decided once, here (G-381).
+                $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
+                [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
                 // run the session never started trips its own state guard —
@@ -241,11 +243,11 @@ final readonly class AgentRuntime
             }
             $resumedFrom = $this->resumedFrom($session, $prompt);
             $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
-                hostTree: app(RunTrees::class)->underHostTree($context));
+                tree: $membership);
 
             // A root run opens the tree's account; a child inherits it. Either
             // way there is exactly one ledger per tree from here down.
-            $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
+            $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
@@ -253,7 +255,7 @@ final readonly class AgentRuntime
             )));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-            $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: true);
+            $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true);
             $budget = $run->budget;
             $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
             try {
@@ -450,7 +452,9 @@ final readonly class AgentRuntime
 
             try {
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-                [$provider, $model] = $this->bindingFor($session, $mode, $context);
+                // Which run tree this run belongs to: decided once, here (G-381).
+                $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
+                [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
             } catch (Throwable $failure) {
                 // As in send(): no run exists yet, so there is no run state to
                 // fail — only an event to fire.
@@ -472,9 +476,9 @@ final readonly class AgentRuntime
             }
             $resumedFrom = $this->resumedFrom($session, $prompt);
             $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
-                hostTree: app(RunTrees::class)->underHostTree($context));
+                tree: $membership);
 
-            $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
+            $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
@@ -482,7 +486,7 @@ final readonly class AgentRuntime
             )));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-            $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: true);
+            $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true);
             $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
             try {
                 return $this->sendStructuredRun($session, $prompt, $schema, $toolNames, $attachments, $runId, $mode, $provider, $model, $run);
@@ -886,9 +890,11 @@ final readonly class AgentRuntime
     private function streamStepTree(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
     {
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
-        $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
+        // Which run tree this run belongs to: decided once, here (G-381).
+        $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
+        [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
+        $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
@@ -899,12 +905,12 @@ final readonly class AgentRuntime
             throw RunNotPermitted::cancelled();
         }
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-        $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: false);
+        $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: false);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $resumedFrom = $this->resumedFrom($session, $prompt);
         $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId(),
-            app(RunTrees::class)->underHostTree($context));
+            $membership);
         $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
@@ -995,9 +1001,11 @@ final readonly class AgentRuntime
     private function streamCapped(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, RunStepTagger $tagger): Generator
     {
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
-        $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
+        // Which run tree this run belongs to: decided once, here (G-381).
+        $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
+        [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
+        $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxCostUsd: $this->floatConfig('max_cost_usd'),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
@@ -1009,12 +1017,12 @@ final readonly class AgentRuntime
             throw RunNotPermitted::cancelled();
         }
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-        $run = $this->planRun($session, $runId, $run, $context, $prompt, begun: false);
+        $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: false);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $resumedFrom = $this->resumedFrom($session, $prompt);
         $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId(),
-            app(RunTrees::class)->underHostTree($context));
+            $membership);
         $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
@@ -1916,14 +1924,17 @@ final readonly class AgentRuntime
      * turn is one of the plan's own (G-366); unchanged otherwise. Any failure
      * after the run began closes the run first: a refusal as every other
      * budget refusal does, and a store or lock error as a failed run.
+     *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
      */
-    private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, bool $begun): RunContext
+    private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, array $membership, bool $begun): RunContext
     {
         try {
             // A root run opens a tree; any turn on a child session the runner
             // did not start continues the run tree it was started in, a host
-            // context narrowed to what that tree has left.
-            $run = app(RunTrees::class)->rootRun($session, $runId, $run, $context);
+            // context narrowed to what that tree has left. Read from the
+            // membership the run began with.
+            $run = app(RunTrees::class)->rootRun($session, $runId, $run, $membership);
 
             return app(Plans::class)->planTurn($session, $runId, $run, $context, $prompt);
         } catch (Throwable $failure) {
@@ -2216,20 +2227,16 @@ final readonly class AgentRuntime
     }
 
     /**
-     * A root context for a run the subagent runner did not start, at the depth
-     * the runner gave the session when it was a child. A resumed child then
-     * delegates under the same {@see RunContext::MAX_DEPTH} as it would inside
-     * its tree.
+     * The run at the depth its membership gives it (G-381): the runner's
+     * child one level below the run it was started from; a turn the runner
+     * did not start at least as deep as the session was started, a host
+     * context putting it deeper but never shallower.
      *
-     * A context the host supplied is held to the saved depth too: it may only
-     * narrow, so it can put the child deeper but never shallower than the
-     * runner did. The runner's own context is already at the depth it saved.
+     * @param  array{depth: int}  $membership
      */
-    private function atSavedChildDepth(Session $session, RunContext $run): RunContext
+    private function atMemberDepth(array $membership, RunContext $run): RunContext
     {
-        $depth = $session->childDepth();
-
-        return $depth > $run->depth ? $run->atDepth($depth) : $run;
+        return $run->depth === $membership['depth'] ? $run : $run->atDepth($membership['depth']);
     }
 
     /**
@@ -2239,9 +2246,10 @@ final readonly class AgentRuntime
      * then the global default. A subagent's child: see {@see ChildBinding} —
      * the child session's own override slot is not read.
      *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
      * @return array{string, string}
      */
-    private function bindingFor(Session $session, AgentMode $mode, ?RunContext $context): array
+    private function bindingFor(Session $session, AgentMode $mode, ?RunContext $context, array $membership): array
     {
         // A child's binding is SAVED with its session, inside the lock, so a
         // run on that session the runner did not start (the host answering an
@@ -2282,25 +2290,24 @@ final readonly class AgentRuntime
             'root' => null,
         };
         if ($route['save'] && $context !== null && $child !== null) {
-            // With the shared plan budget the tree spends from, if any, so
-            // the child resumed outside the runner spends from it too (G-366).
-            // And the run tree it belongs to, whose budget a resumed child continues.
-            $ledger = app(Plans::class)->ledgerOf($context->rootRunId());
-            $tree = app(RunTrees::class)->childStarted($session, $context);
-            // Under a run tree the host built there is no durable tree to
-            // name: the references the child saved before are kept, never
-            // replaced with nothing, so a later turn the runner does not start
-            // still continues the tree it last had rather than a fresh root
-            // budget.
-            // A tree a person cancelled is not kept: the runner starting the
-            // child again is a new delegation, not a run of that tree.
-            if ($tree === null && ! app(RunTrees::class)->treeCancelled($session, $session->childTree())) {
-                $tree = $session->childTree();
-                $ledger = $session->childPlanLedger();
-            }
-            if ($saved != $child || $session->childDepth() !== $context->depth
-                || $session->childPlanLedger() !== $ledger || $session->childTree() !== $tree) {
-                $session->rememberChildBinding($child, $context->depth, $ledger, $tree);
+            // The run tree the child is in, with the shared plan budget of the
+            // run it spends from (G-366), so a child resumed outside the
+            // runner continues both; under a tree the host built, what it
+            // saved before unless a person cancelled that tree. All from the
+            // membership the run began with (G-381).
+            $trees = app(RunTrees::class);
+            $trees->childStarted($session, $membership);
+            $savedTree = $session->childTree();
+            $refs = RunTrees::keptRefs(
+                $membership,
+                $membership['spends'] === null ? null : app(Plans::class)->ledgerOf($membership['spends']),
+                $savedTree,
+                $session->childPlanLedger(),
+                $trees->treeCancelled($session, $savedTree),
+            );
+            if ($saved != $child || $session->childDepth() !== $membership['depth']
+                || $session->childPlanLedger() !== $refs['plan_ledger'] || $savedTree !== $refs['tree']) {
+                $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree']);
             }
         }
 
