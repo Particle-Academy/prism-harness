@@ -46,6 +46,7 @@ use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Enums\FinishReason;
+use Prism\Prism\Enums\TelemetryOperation;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\ErrorEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
@@ -134,9 +135,9 @@ final readonly class AgentRuntime
      * @param  Closure(): TResult  $run
      * @return TResult
      */
-    private function resolvedFirst(TextPending|StructuredPending $generation, Closure $record, Closure $run): mixed
+    private function resolvedFirst(Session $session, TextPending|StructuredPending $generation, Closure $record, Closure $run): mixed
     {
-        $approved = new ApprovedTools(inGeneration: true);
+        $approved = new ApprovedTools($generation instanceof StructuredPending ? TelemetryOperation::Structured : TelemetryOperation::Text, $session->key());
         $approved->resolve($generation, $record);
 
         return $approved->within($run);
@@ -275,7 +276,7 @@ final readonly class AgentRuntime
                         }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }) : $this->resolvedFirst($generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                        }) : $this->resolvedFirst($session, $generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                         }, fn (): TextResponse => $generation->asText()))
@@ -487,7 +488,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }) : $this->resolvedFirst($generation, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                        }) : $this->resolvedFirst($session, $generation, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
@@ -882,7 +883,7 @@ final readonly class AgentRuntime
             // before the stream, as on the send paths (G-380): resolved inside
             // the stream, an approved call whose result was then lost (a
             // telemetry listener that threw) ran again on the next resume.
-            $approved = new ApprovedTools(inGeneration: true);
+            $approved = new ApprovedTools(TelemetryOperation::Stream, $session->key());
             $resolution = $approved->resolve($generation, function (array $messages) use ($session, &$history, &$promptRecorded, $prompt, $runId, &$tools): void {
                 $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                 $history = $messages;

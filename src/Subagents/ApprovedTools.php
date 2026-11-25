@@ -19,9 +19,11 @@ use Prism\Prism\Streaming\EventID;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Structured\PendingRequest as StructuredPending;
+use Prism\Prism\Structured\Request as StructuredRequest;
 use Prism\Prism\Telemetry\Telemetry;
 use Prism\Prism\Telemetry\TelemetryContext;
 use Prism\Prism\Text\PendingRequest as TextPending;
+use Prism\Prism\Text\Request as TextRequest;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Throwable;
@@ -50,7 +52,15 @@ final class ApprovedTools
     /** @var WeakMap<object, true>|null dispatchers the GenerationStarted hook is on */
     private static ?WeakMap $hooked = null;
 
-    public function __construct(private readonly bool $inGeneration = false) {}
+    /**
+     * @param  TelemetryOperation|null  $inGeneration  the operation of the core
+     *                                                 generation this resolution stands in for (the plain paths)
+     * @param  string|null  $sessionId  that generation's telemetry session id
+     */
+    public function __construct(
+        private readonly ?TelemetryOperation $inGeneration = null,
+        private readonly ?string $sessionId = null,
+    ) {}
 
     /**
      * Resolve the approvals the request carries, record the result message
@@ -73,10 +83,13 @@ final class ApprovedTools
      * the other calls' events from being sent.
      *
      * When the resolution stands in for core's generation ($inGeneration, the
-     * plain send paths) it opens a context of its own if none is open, so the
-     * calls are reported at all, and its events are dispatched inside the
-     * generation that follows (see within()), in that generation's trace, as
-     * core reported them on 0.26.7 when it resolved inside the generation.
+     * plain send and stream paths) it opens a context of its own if none is
+     * open, so the calls are reported at all, and its events are dispatched
+     * inside the generation that follows (see within()), in that generation's
+     * trace, as core reported them on 0.26.7 when it resolved inside the
+     * generation. If the resolution fails, no generation follows; it starts
+     * that generation itself and ends it, as core's did when a tool threw out
+     * of it, so the events are still in a generation's trace.
      * The step-by-step paths (subagents, a cost cap, every stream) open none,
      * as on 0.26.7, and dispatch what a host context of their own produced
      * once the record is written.
@@ -88,13 +101,14 @@ final class ApprovedTools
     {
         $request = $generation->toRequest();
         $context = null;
-        if ($this->inGeneration && Telemetry::enabled() && Telemetry::current() === null) {
+        if ($this->inGeneration !== null && Telemetry::enabled() && Telemetry::current() === null) {
             $context = new TelemetryContext(
                 traceId: (string) Str::uuid(),
-                operation: $generation instanceof StructuredPending ? TelemetryOperation::Structured : TelemetryOperation::Text,
+                operation: $this->inGeneration,
                 provider: (string) $request->provider(),
                 model: $request->model(),
                 startedAt: microtime(true),
+                sessionId: $this->sessionId,
             );
             Telemetry::stack()->push($context);
         }
@@ -128,7 +142,7 @@ final class ApprovedTools
                     report($unrecorded);
                 }
             }
-            $this->announce(null);
+            $this->announceFailed($request);
 
             throw $failure;
         } finally {
@@ -139,7 +153,7 @@ final class ApprovedTools
             $record($messages);
             $generation->withMessages($messages);
         }
-        if (! $this->inGeneration) {
+        if ($this->inGeneration === null) {
             $this->announce(null);
         }
 
@@ -195,6 +209,31 @@ final class ApprovedTools
         } finally {
             self::$waiting = array_values(array_filter(self::$waiting, fn (self $waiting): bool => $waiting !== $this));
             $this->announce(null);
+        }
+    }
+
+    /**
+     * After a failed resolution: on the plain paths, start the generation the
+     * resolution stood in for, dispatch the held events in it and end it, as
+     * core's generation did when a tool threw out of it (started, no
+     * GenerationFailed for a tool's own exception, ended); elsewhere dispatch
+     * them in their own context.
+     */
+    private function announceFailed(TextRequest|StructuredRequest $request): void
+    {
+        $failed = null;
+        if ($this->inGeneration !== null && $this->held !== []) {
+            try {
+                $failed = Telemetry::start($this->inGeneration, (string) $request->provider(), $request->model(), $request, null, $this->sessionId);
+            } catch (Throwable $listener) {
+                report($listener);
+                $failed = Telemetry::current();
+            }
+        }
+        try {
+            $this->announce($failed);
+        } finally {
+            Telemetry::end($failed);
         }
     }
 
