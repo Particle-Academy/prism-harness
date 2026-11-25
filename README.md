@@ -1118,7 +1118,7 @@ the host owns account persistence and coordination across workers. Child output-
 ceilings can narrow, never raise, the parent's ceiling. Config-based budgets use
 `max_output_tokens_per_call` (under `prism-harness.agent` or a subagent declaration).
 
-Harness requires Prism core `^0.152`, which provides the provider request projection API.
+Harness requires Prism core `^0.155`; the provider request projection API it uses here arrived in 0.152.
 The input bound counts UTF-8 **bytes** of the configured provider's projected JSON
 request, plus 64 tokens per message/tool for framing. Anthropic and OpenAI projections
 include the actual message mapping, tools, provider options and structured instructions.
