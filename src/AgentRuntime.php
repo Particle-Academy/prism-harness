@@ -117,30 +117,29 @@ final readonly class AgentRuntime
 
     /**
      * Resolve the approvals a resumed run carries before the generation, and
-     * record them, as the step-by-step paths already do (G-380).
+     * record them, as the step-by-step paths already do (G-380); then run the
+     * generation.
      *
      * Core would otherwise run an approved call inside its generation and
      * report it with ToolInvoked before the harness records the result. A
      * telemetry listener that threw there would lose that record, and the
-     * approved call would run again when the run resumed. Here each call's
-     * event is dispatched when its resolution step returns, and a listener
-     * failure is reported, never thrown, so the resolution always finishes and
-     * is recorded. Known limit: the event still reaches its listeners before
-     * the record is written, so a listener that ends the process in a way PHP
-     * cannot catch (a time limit, running out of memory, a killed worker)
-     * loses the record, as it would have on 0.26.7.
+     * approved call would run again when the run resumed. Here the events are
+     * held until the record is written, then dispatched inside the generation
+     * as it starts, in its trace, as on 0.26.7; a listener failure is
+     * reported, never thrown. See ApprovedTools.
      *
-     * @template T of TextPending|StructuredPending
+     * @template TResult
      *
-     * @param  T  $generation
      * @param  Closure(list<Message>):void  $record
-     * @return T
+     * @param  Closure(): TResult  $run
+     * @return TResult
      */
-    private function resolvedFirst(TextPending|StructuredPending $generation, Closure $record): TextPending|StructuredPending
+    private function resolvedFirst(TextPending|StructuredPending $generation, Closure $record, Closure $run): mixed
     {
-        (new ApprovedTools(inGeneration: true))->resolve($generation, $record);
+        $approved = new ApprovedTools(inGeneration: true);
+        $approved->resolve($generation, $record);
 
-        return $generation;
+        return $approved->within($run);
     }
 
     /**
@@ -279,7 +278,7 @@ final readonly class AgentRuntime
                         }) : $this->resolvedFirst($generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        })->asText())
+                        }, fn (): TextResponse => $generation->asText()))
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -492,7 +491,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        })->asStructured())
+                        }, fn (): StructuredResponse => $generation->asStructured()))
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);

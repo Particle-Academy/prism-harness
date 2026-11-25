@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace Prism\Harness\Subagents;
 
 use Closure;
+use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
+use Illuminate\Support\Testing\Fakes\EventFake;
 use Prism\Prism\Concerns\CallsTools;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\TelemetryOperation;
+use Prism\Prism\Events\Telemetry\GenerationStarted;
 use Prism\Prism\Events\Telemetry\ToolInvoked;
 use Prism\Prism\Streaming\EventID;
 use Prism\Prism\Streaming\Events\StreamEvent;
@@ -21,6 +24,7 @@ use Prism\Prism\Text\PendingRequest as TextPending;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Throwable;
+use WeakMap;
 
 /**
  * Core resolves approvals before HTTP, potentially expanding input after our
@@ -30,6 +34,20 @@ use Throwable;
 final class ApprovedTools
 {
     use CallsTools;
+
+    /**
+     * The resolution's ToolInvoked events (dispatch arguments), held until
+     * its result is recorded.
+     *
+     * @var list<array<int, mixed>>
+     */
+    private array $held = [];
+
+    /** @var list<self> resolutions whose events wait for their generation */
+    private static array $waiting = [];
+
+    /** @var WeakMap<object, true>|null dispatchers the GenerationStarted hook is on */
+    private static ?WeakMap $hooked = null;
 
     public function __construct(private readonly bool $inGeneration = false) {}
 
@@ -44,21 +62,23 @@ final class ApprovedTools
      *
      * Core reports each call it runs with a ToolInvoked telemetry event, and
      * only under a telemetry context. The resolver is stepped one result at a
-     * time and each step's events are dispatched after the step: a listener
-     * that throws is reported, never thrown, so it can neither stop the
-     * resolution before its result is recorded (an approved call whose result
-     * was lost would run again on the next resume) nor keep the other calls'
-     * events from being sent.
+     * time and each step's ToolInvoked events are held, not dispatched, until
+     * the resolution's result is recorded. No listener runs between an
+     * approved call and its record, so not even a listener that ends the
+     * process in a way PHP cannot catch can lose the record (an approved call
+     * whose result was lost would run again on the next resume). Each held
+     * event is then dispatched on its own, and a listener that throws is
+     * reported, never thrown, so it can neither undo the resolution nor keep
+     * the other calls' events from being sent.
      *
-     * Those events still reach their listeners before the record is written,
-     * so a listener that ends the process in a way PHP cannot catch (a time
-     * limit, running out of memory, a killed worker) loses the record. A
-     * context of this resolution's own is therefore opened only when it stands
-     * in for core's generation ($inGeneration, the plain send paths), which on
-     * 0.26.7 ran the approved call under its own context and reported it the
-     * same way. The step-by-step paths (subagents, a cost cap, every stream)
-     * open none, as on 0.26.7: without a host context of its own, no listener
-     * runs between an approved call and its record there.
+     * When the resolution stands in for core's generation ($inGeneration, the
+     * plain send paths) it opens a context of its own if none is open, so the
+     * calls are reported at all, and its events are dispatched inside the
+     * generation that follows (see within()), in that generation's trace, as
+     * core reported them on 0.26.7 when it resolved inside the generation.
+     * The step-by-step paths (subagents, a cost cap, every stream) open none,
+     * as on 0.26.7, and dispatch what a host context of their own produced
+     * once the record is written.
      *
      * @param  Closure(list<Message>):void  $record
      * @return list<StreamEvent>
@@ -84,9 +104,9 @@ final class ApprovedTools
             // replay a side effect if the consumer abandons the generator at
             // that yield.
             $resolver = $this->resolveToolApprovalsAndYieldEvents($request, EventID::generate());
-            while (self::held(static fn (): bool => $resolver->valid())) {
+            while ($this->step(static fn (): bool => $resolver->valid())) {
                 $events[] = $resolver->current();
-                self::held(static function () use ($resolver): bool {
+                $this->step(static function () use ($resolver): bool {
                     $resolver->next();
 
                     return true;
@@ -107,6 +127,7 @@ final class ApprovedTools
                     report($unrecorded);
                 }
             }
+            $this->announce(null);
 
             throw $failure;
         } finally {
@@ -117,8 +138,87 @@ final class ApprovedTools
             $record($messages);
             $generation->withMessages($messages);
         }
+        if (! $this->inGeneration) {
+            $this->announce(null);
+        }
 
         return $events;
+    }
+
+    /**
+     * Run the generation that follows the resolution, dispatching the held
+     * events when it starts, in its trace: as GenerationStarted reaches its
+     * listeners, after the ones the application registered at boot (a tracing
+     * bridge opens the trace there). Whatever no generation took is
+     * dispatched in its own context once the run ends.
+     *
+     * @template TResult
+     *
+     * @param  Closure(): TResult  $run
+     * @return TResult
+     */
+    public function within(Closure $run): mixed
+    {
+        if ($this->held === []) {
+            return $run();
+        }
+        self::hook();
+        self::$waiting[] = $this;
+        try {
+            return $run();
+        } finally {
+            self::$waiting = array_values(array_filter(self::$waiting, fn (self $waiting): bool => $waiting !== $this));
+            $this->announce(null);
+        }
+    }
+
+    /**
+     * Dispatch the held events, each on its own, into the given generation's
+     * context or, without one, in the context they were made in.
+     */
+    private function announce(?TelemetryContext $generation): void
+    {
+        $held = $this->held;
+        $this->held = [];
+        foreach ($held as $args) {
+            $event = $args[0] ?? null;
+            if ($generation !== null && $event instanceof ToolInvoked) {
+                $args = [new ToolInvoked(
+                    $generation->withStep(Telemetry::stack()->stepFor($generation->traceId)),
+                    $event->toolName,
+                    $event->toolCallId,
+                    $event->durationMs,
+                    $event->toolCall,
+                    $event->toolResult,
+                    $event->failed,
+                    $event->failure,
+                )];
+            }
+            try {
+                Event::dispatch(...$args);
+            } catch (Throwable $failure) {
+                report($failure);
+            }
+        }
+    }
+
+    private static function hook(): void
+    {
+        $events = Event::getFacadeRoot();
+        if (! is_object($events)) {
+            return;
+        }
+        self::$hooked ??= new WeakMap;
+        if (isset(self::$hooked[$events])) {
+            return;
+        }
+        self::$hooked[$events] = true;
+        Event::listen(GenerationStarted::class, static function (GenerationStarted $started): void {
+            $waiting = end(self::$waiting);
+            if ($waiting instanceof self) {
+                $waiting->announce($started->context);
+            }
+        });
     }
 
     /**
@@ -167,19 +267,29 @@ final class ApprovedTools
     }
 
     /**
-     * One step of the resolver, with core's ToolInvoked events held until it
-     * returns and a listener failure reported, never thrown.
+     * One step of the resolver, with core's ToolInvoked events taken into the
+     * held list as it returns. A listener failure is reported, never thrown.
+     *
+     * Laravel's Event::defer holds the step's events, but dispatches them all
+     * in one loop as the step returns (before the record, and one throwing
+     * listener stops the rest), so they are taken out of its deferred list
+     * first. Where that list cannot be read (a dispatcher that is not
+     * Laravel's), the deferral dispatches them as the step returns.
      *
      * @param  Closure(): bool  $step
      */
-    private static function held(Closure $step): bool
+    private function step(Closure $step): bool
     {
         $done = false;
         $result = false;
         try {
             Event::defer(function () use ($step, &$done, &$result): void {
-                $result = $step();
-                $done = true;
+                try {
+                    $result = $step();
+                    $done = true;
+                } finally {
+                    $this->held = [...$this->held, ...(self::takeDeferred() ?? [])];
+                }
             }, [ToolInvoked::class]);
         } catch (Throwable $failure) {
             if (! $done) {
@@ -189,5 +299,29 @@ final class ApprovedTools
         }
 
         return $result;
+    }
+
+    /**
+     * Empty the dispatcher's deferred events and return them.
+     *
+     * @return list<array<int, mixed>>|null null when they cannot be read
+     */
+    private static function takeDeferred(): ?array
+    {
+        $events = Event::getFacadeRoot();
+        if ($events instanceof EventFake) {
+            $events = $events->dispatcher;
+        }
+        if (! $events instanceof Dispatcher || ! property_exists(Dispatcher::class, 'deferredEvents')) {
+            return null;
+        }
+        $take = Closure::bind(static function (Dispatcher $events): array {
+            $deferred = array_values($events->deferredEvents);
+            $events->deferredEvents = [];
+
+            return $deferred;
+        }, null, Dispatcher::class);
+
+        return $take($events);
     }
 }
