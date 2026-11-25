@@ -72,3 +72,21 @@ it('runs an approved call once when a telemetry listener throws', function (stri
         expect($seen)->toContain('weather');
     }
 })->with(['approve', 'streamDecision']);
+
+// One listener failure costs no other call its event.
+it('still reports every approved call when the listener throws on the first', function (): void {
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['search', 'weather']);
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('What time is the game, and do I need a coat?')->pendingApprovals();
+    expect($pending)->toHaveCount(2);
+    $seen = [];
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use (&$seen): void {
+        $seen[] = $event->toolName;
+        throw new RuntimeException('listener failed');
+    });
+
+    $session->decide(array_map(fn ($approval) => new ToolApprovalResponse($approval->approvalId, true), $pending));
+
+    expect($this->ran)->toBe(['search' => 1, 'weather' => 1])
+        ->and($seen)->toBe(['search', 'weather']);
+});
