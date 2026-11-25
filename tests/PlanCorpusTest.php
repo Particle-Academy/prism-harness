@@ -10,6 +10,7 @@ use Prism\Harness\Plans\PlanLimits;
 use Prism\Harness\Plans\PlanMachine;
 use Prism\Harness\Plans\PlanText;
 use Prism\Harness\Plans\PlanView;
+use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Tools\ToolPolicy;
 
 // The cross-language plans corpus (G-360, prism-parity suites/harness-plans).
@@ -44,13 +45,16 @@ function runPlansCase(array $case): array
     $plan = null;
     $marked = null;
     $ledger = null;
+    $savedBinding = false;
     $results = [];
     foreach ($case['ops'] as $op) {
         $now = $op['now'] ?? ($case['now'] ?? 1767225600);
         try {
-            $results[] = str_starts_with($op['op'], 'budget_')
-                ? plansBudgetOp($op, $ledger, $now)
-                : plansOp($op, $plan, $ids, $limits, $now, $marked, $ledger);
+            $results[] = match (true) {
+                $op['op'] === 'binding_route' => plansBindingOp($op, $savedBinding),
+                str_starts_with($op['op'], 'budget_') => plansBudgetOp($op, $ledger, $now),
+                default => plansOp($op, $plan, $ids, $limits, $now, $marked, $ledger),
+            };
         } catch (PlanRefused $refused) {
             $results[] = ['refused' => $refused->code()];
         }
@@ -62,6 +66,27 @@ function runPlansCase(array $case): array
     }
 
     return $out;
+}
+
+/**
+ * Which binding a turn runs on, and whether it is saved (ChildBinding::route).
+ * Whether a binding is saved carries from op to op, as it does on a session:
+ * a turn the route saves for leaves the next turn with a saved binding.
+ *
+ * @param  array<string, mixed>  $op
+ * @return array<string, mixed>
+ */
+function plansBindingOp(array $op, bool &$savedBinding): array
+{
+    $saved = $op['saved_binding'] ?? $savedBinding;
+    try {
+        $route = ChildBinding::route($op['context'], $op['supplied_binding'], $saved, $op['linked']);
+    } catch (InvalidArgumentException) {
+        return ['invalid' => true];
+    }
+    $savedBinding = $saved || $route['save'];
+
+    return ['route' => $route];
 }
 
 /**
