@@ -2,9 +2,12 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Events\Telemetry\GenerationStarted;
+use Prism\Prism\Events\Telemetry\ToolInvoked;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Tests\Fixtures\Participant;
@@ -87,3 +90,37 @@ it('records the calls resolved before a tool throws, so the next resume does not
     'plain stream' => ['plain', 'streamDecision'],
     'subagents, decide' => ['subagents', 'decide'],
 ]);
+
+// On 0.26.7 core resolved inside its generation, so when a tool threw out of
+// the resolution its events were still in that generation's trace (core
+// started it, and ends it without GenerationFailed for a tool's own
+// exception). On the plain paths the resolution that fails before the
+// generation now starts that generation itself, so its events are not left in
+// a trace of their own; the call resolved before the failure is announced
+// after its result is recorded.
+it('reports the calls of a failed resolution inside a generation trace on the plain path', function (): void {
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('What time is the game, and do I need a coat?')->pendingApprovals();
+    $started = [];
+    $seen = [];
+    Event::listen(GenerationStarted::class, function (GenerationStarted $event) use (&$started): void {
+        $started[$event->context->traceId] = $event->context;
+    });
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use ($session, &$started, &$seen): void {
+        $seen[] = [$event->toolName, $event->failed, isset($started[$event->context->traceId]),
+            $started[$event->context->traceId]->sessionId ?? null,
+            $session->thread()->storedMessages()->where('type', 'tool_result')->get()
+                ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])
+                ->where('tool_call_id', $event->toolCallId)->count()];
+    });
+
+    try {
+        $session->decide(array_map(fn ($approval) => new ToolApprovalResponse($approval->approvalId, true), $pending));
+    } catch (LogicException) {
+    }
+
+    expect($seen)->toBe([
+        ['search', false, true, $session->key(), 1],
+        ['weather', true, true, $session->key(), 0],
+    ]);
+});
