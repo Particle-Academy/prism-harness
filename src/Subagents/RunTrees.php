@@ -225,6 +225,18 @@ final class RunTrees
     }
 
     /**
+     * Whether this is the runner's own context for a child started under a
+     * run tree the HOST built (G-285): its run belongs to no durable tree,
+     * so a cancel of it marks no tree the child session saved earlier.
+     *
+     * @internal
+     */
+    public function underHostTree(?RunContext $context): bool
+    {
+        return $context !== null && isset($this->childContexts[$context]) && ! isset($this->runs[$context->rootRunId()]);
+    }
+
+    /**
      * The kind of context a turn was handed, for {@see ChildBinding::route()}:
      * `runner` for the context the subagent runner built to start a child,
      * even under a run tree the host built. The same kind as {@see self::contextKind()},

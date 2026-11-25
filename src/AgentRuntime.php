@@ -240,7 +240,8 @@ final readonly class AgentRuntime
                 throw RunNotPermitted::cancelled();
             }
             $resumedFrom = $this->resumedFrom($session, $prompt);
-            $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId);
+            $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
+                hostTree: app(RunTrees::class)->underHostTree($context));
 
             // A root run opens the tree's account; a child inherits it. Either
             // way there is exactly one ledger per tree from here down.
@@ -470,7 +471,8 @@ final readonly class AgentRuntime
                 throw RunNotPermitted::cancelled();
             }
             $resumedFrom = $this->resumedFrom($session, $prompt);
-            $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId);
+            $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
+                hostTree: app(RunTrees::class)->underHostTree($context));
 
             $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
@@ -901,7 +903,8 @@ final readonly class AgentRuntime
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $resumedFrom = $this->resumedFrom($session, $prompt);
-        $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId());
+        $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId(),
+            app(RunTrees::class)->underHostTree($context));
         $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
@@ -1010,7 +1013,8 @@ final readonly class AgentRuntime
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $resumedFrom = $this->resumedFrom($session, $prompt);
-        $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId());
+        $session->beginRun($runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), $tagger->turnId(),
+            app(RunTrees::class)->underHostTree($context));
         $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
