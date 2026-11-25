@@ -40,10 +40,11 @@ final readonly class StepCalls
     {
         $this->assertUncapped($run);
         $builder = new TextBuilder;
+        $approved = new ApprovedTools;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved);
                 // A resolved approval may itself delegate and consume the remainder.
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
@@ -66,6 +67,8 @@ final readonly class StepCalls
 
             return $combined;
         } finally {
+            // The resolution's reports, if its generation never took them.
+            $approved->announce();
             if ($builder->steps->isNotEmpty()) {
                 $record($builder->toResponse());
             }
@@ -83,10 +86,11 @@ final readonly class StepCalls
         // came, when it is the only one: rebuilding it would re-decode a text
         // the provider already declined to read as a document.
         $single = null;
+        $approved = new ApprovedTools;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved);
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
                 $request = $generation->toRequest();
@@ -125,6 +129,8 @@ final readonly class StepCalls
 
             return $builder->steps->isEmpty() ? $response : ($single !== null && $builder->steps->count() === 1 ? $single : $builder->toResponse());
         } finally {
+            // The resolution's reports, if its generation never took them.
+            $approved->announce();
             if ($single !== null && $builder->steps->count() === 1) {
                 $record($single);
             } elseif ($builder->steps->isNotEmpty()) {
@@ -143,65 +149,72 @@ final readonly class StepCalls
     public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): Generator
     {
         $this->assertUncapped($run);
-        do {
-            $run->ledger->assertCallAvailable($run->budget);
-            foreach ((new ApprovedTools)->resolve($generation, $resolved) as $event) {
-                yield $event;
-            }
-            $run->ledger->assertCallAvailable($run->budget);
-            $generation->withMaxSteps(1);
-            $request = $generation->toRequest();
-            $collected = null;
-            $approvals = [];
-            $final = false;
-            $failed = false;
-            $failureFinish = null;
-            $run->ledger->recordSteps(1);
-            $collector = new StreamCollector($generation->asStream(), null,
-                function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
-                    $collected = ['messages' => $messages->all(), 'response' => $response];
-                });
-            foreach ($collector->collect() as $event) {
-                if ($event instanceof ErrorEvent) {
-                    $failed = true;
-                    $failureFinish = FinishReason::Error;
-                } elseif ($event instanceof StreamEndEvent) {
-                    if (in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true)
-                        || $event->usage === null) {
-                        $failed = true;
-                        $failureFinish ??= $event->finishReason === FinishReason::Error
-                            ? FinishReason::Error : FinishReason::Unknown;
-                    }
-                    $final = ! $failed;
+        $approved = new ApprovedTools;
+        try {
+            do {
+                $run->ledger->assertCallAvailable($run->budget);
+                foreach ($approved->resolve($generation, $resolved) as $event) {
+                    yield $event;
                 }
-                if ($event instanceof ToolApprovalRequestEvent) {
-                    $approvals[] = $event->approvalRequest();
-                }
-                yield $event;
-            }
-            if ($collected === null) {
-                return;
-            }
-            $messages = $collected['messages'];
-            $response = $collected['response'];
-            if ($failed || ! $final) {
+                $run->ledger->assertCallAvailable($run->budget);
+                $generation->withMaxSteps(1);
+                $request = $generation->toRequest();
+                $collected = null;
                 $approvals = [];
-                [$messages, $response] = $this->refuseFailedStream($messages, $response, $failureFinish ?? FinishReason::Unknown);
-            }
-            if ($approvals !== []) {
-                foreach ($messages as $index => $message) {
-                    if ($message instanceof AssistantMessage) {
-                        $ids = array_map(fn (ToolCall $call): string => $call->id, $message->toolCalls);
-                        $pending = array_values(array_filter($approvals, fn (ToolApprovalRequest $approval): bool => in_array($approval->toolCallId, $ids, true)));
-                        $messages[$index] = new AssistantMessage($message->content, $message->toolCalls, $message->additionalContent, $pending);
+                $final = false;
+                $failed = false;
+                $failureFinish = null;
+                $run->ledger->recordSteps(1);
+                $collector = new StreamCollector($generation->asStream(), null,
+                    function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
+                        $collected = ['messages' => $messages->all(), 'response' => $response];
+                    });
+                foreach ($collector->collect() as $event) {
+                    if ($event instanceof ErrorEvent) {
+                        $failed = true;
+                        $failureFinish = FinishReason::Error;
+                    } elseif ($event instanceof StreamEndEvent) {
+                        if (in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true)
+                            || $event->usage === null) {
+                            $failed = true;
+                            $failureFinish ??= $event->finishReason === FinishReason::Error
+                                ? FinishReason::Error : FinishReason::Unknown;
+                        }
+                        $final = ! $failed;
+                    }
+                    if ($event instanceof ToolApprovalRequestEvent) {
+                        $approvals[] = $event->approvalRequest();
+                    }
+                    yield $event;
+                }
+                if ($collected === null) {
+                    return;
+                }
+                $messages = $collected['messages'];
+                $response = $collected['response'];
+                if ($failed || ! $final) {
+                    $approvals = [];
+                    [$messages, $response] = $this->refuseFailedStream($messages, $response, $failureFinish ?? FinishReason::Unknown);
+                }
+                if ($approvals !== []) {
+                    foreach ($messages as $index => $message) {
+                        if ($message instanceof AssistantMessage) {
+                            $ids = array_map(fn (ToolCall $call): string => $call->id, $message->toolCalls);
+                            $pending = array_values(array_filter($approvals, fn (ToolApprovalRequest $approval): bool => in_array($approval->toolCallId, $ids, true)));
+                            $messages[$index] = new AssistantMessage($message->content, $message->toolCalls, $message->additionalContent, $pending);
+                        }
                     }
                 }
-            }
-            $record($messages, $response);
-            $generation->withMessages([...$request->messages(), ...$messages]);
-        } while ($final && ! $failed && $approvals === []
-            && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
-            && $run->ledger->steps() < $run->budget->maxSteps);
+                $record($messages, $response);
+                $generation->withMessages([...$request->messages(), ...$messages]);
+            } while ($final && ! $failed && $approvals === []
+                && $this->continues($response->finishReason, $response->toolCalls, $response->toolResults, stream: true)
+                && $run->ledger->steps() < $run->budget->maxSteps);
+        } finally {
+            // The resolution's reports, if its generation never took them
+            // (a refused admission, a stream dropped before it started).
+            $approved->announce();
+        }
     }
 
     /** @param list<Message> $messages

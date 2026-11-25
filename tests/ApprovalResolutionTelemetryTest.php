@@ -17,8 +17,9 @@ use Tests\Support\G360;
 // step. Core reports every tool it runs with a ToolInvoked telemetry event,
 // and the harness, which runs that resolution itself so it can persist the
 // result and check the run's budget and cancel flag before the next request,
-// keeps reporting it: on every path, under a telemetry context of its own
-// that opens no generation.
+// keeps reporting it on every path: once the result is recorded, inside the
+// trace of the generation the result is sent in. The resolution opens no
+// generation of its own.
 
 beforeEach(function (): void {
     G360::reset();
