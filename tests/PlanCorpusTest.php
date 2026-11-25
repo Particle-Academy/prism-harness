@@ -97,6 +97,9 @@ function plansBudgetOp(array $op, ?array &$ledger, int $now): array
                 return ['ok' => true];
             case 'budget_exhaustion':
                 return ['exhaustion' => PlanBudget::exhaustion($ledger)];
+            case 'budget_route':
+                return ['route' => PlanBudget::route($op['context'], $op['prompt'], $op['advancing'], $op['step_approval'],
+                    $op['saved_tree'], $op['saved_plan_ledger'])];
         }
     } catch (InvalidArgumentException) {
         return ['invalid' => true];

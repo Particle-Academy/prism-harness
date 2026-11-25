@@ -441,3 +441,51 @@ it('refuses, recording nothing, an approval for a child whose shared plan budget
         ->and($this->weatherRan)->toBe(0)
         ->and(count(Http::recorded()))->toBe($before);
 });
+
+it('charges a host-supplied run context on a resumed child to the shared plan budget, never around it', function (): void {
+    [$child, $id] = g366PausedChild(10);
+
+    G360::text('Child answer.');
+    $child->approve($id, true, null, RunContext::root('host_root', new RunBudget(100)));
+
+    expect($this->weatherRan)->toBe(1)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(5);
+});
+
+it('refuses, recording nothing, a host-supplied run context on a child whose shared plan budget is spent', function (): void {
+    [$child, $id] = g366PausedChild(4);
+    $before = count(Http::recorded());
+
+    expect(fn () => $child->approve($id, true, null, RunContext::root('host_root', new RunBudget(100))))
+        ->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
+    expect($child->thread()->pendingApprovalIds())->toBe([$id])
+        ->and($this->weatherRan)->toBe(0)
+        ->and(count(Http::recorded()))->toBe($before);
+});
+
+it('charges a new message to a child session to the shared plan budget it was started under', function (): void {
+    [$child] = g366PausedChild(10);
+
+    G360::text('Child answer.');
+    $child->send('New question');
+
+    expect(G360::session()->plan()->budget()['steps'])->toBe(5);
+});
+
+it('settles the run tree hold when a streamed child resume fails on the plan budget write', function (): void {
+    [$child, $id] = g366PausedChild(10);
+    $tree = $child->childTree();
+    expect($tree)->not->toBeNull();
+    DB::statement("CREATE TRIGGER g366_budget_down_i BEFORE INSERT ON harness_session_state
+        WHEN NEW.key LIKE '%:plan-budget' AND NEW.key NOT LIKE 'lock:%'
+        BEGIN SELECT RAISE(ABORT, 'store down'); END");
+    DB::statement("CREATE TRIGGER g366_budget_down_u BEFORE UPDATE ON harness_session_state
+        WHEN NEW.key LIKE '%:plan-budget' AND NEW.key NOT LIKE 'lock:%'
+        BEGIN SELECT RAISE(ABORT, 'store down'); END");
+    G360::text('unused');
+
+    expect(fn () => iterator_to_array($child->streamDecision([new ToolApprovalResponse($id, true)]), false))
+        ->toThrow(QueryException::class);
+    $record = $child->planStore()->get($tree['session'].':run-tree:'.$tree['run']);
+    expect($record['holds'])->toBe([]);
+});

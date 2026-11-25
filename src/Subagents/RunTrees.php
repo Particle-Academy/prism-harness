@@ -41,18 +41,25 @@ final class RunTrees
     private array $runs = [];
 
     /**
-     * A root run is starting. A child resumed outside the runner continues
-     * the tree its binding names: it holds what that tree has left, and its
-     * run is narrowed to the hold. Any other root run opens a tree of its
-     * own, kept in memory until it starts a child.
+     * A run is starting. A turn on a child session the runner did not start
+     * (an answer to its approval, a new message, or a run context the host
+     * built) continues the tree its binding names: it holds what that tree
+     * has left, and its run is narrowed to the hold, so a host context can
+     * only lower what the tree allows. Any other root run opens a tree of its
+     * own, kept in memory until it starts a child. A run on the runner's own
+     * context already spends from its tree and is left alone.
      *
-     * @internal Called by the runtime once a root run's budget is known.
+     * @internal Called by the runtime once a run's budget is known.
      *
      * @throws RunNotPermitted when the tree the child belongs to is spent
      */
-    public function rootRun(Session $session, string $runId, RunContext $run): RunContext
+    public function rootRun(Session $session, string $runId, RunContext $run, ?RunContext $context = null): RunContext
     {
-        $tree = $session->childTree();
+        $route = PlanBudget::route($this->contextKind($context), '', false, false, $session->childTree() !== null, false)['tree'];
+        if ($route === 'none') {
+            return $run;
+        }
+        $tree = $route === 'continue' ? $session->childTree() : null;
         $entry = [
             'session' => $session->key(), 'tree' => $tree ?? ['session' => $session->key(), 'run' => $runId],
             'budget' => $run->budget, 'ledger' => $run->ledger, 'steps' => $run->ledger->steps(),
@@ -150,11 +157,8 @@ final class RunTrees
      */
     public function assertDecisionsFunded(Session $session, ?RunContext $context): void
     {
-        if ($context !== null && ! $context->metadataOnly) {
-            return;
-        }
         $tree = $session->childTree();
-        if ($tree === null) {
+        if ($tree === null || PlanBudget::route($this->contextKind($context), '', false, false, true, false)['tree'] !== 'continue') {
             return;
         }
         $state = $session->planStore()->get(self::key($tree));
@@ -193,6 +197,29 @@ final class RunTrees
             // The hold stays and is charged in full once it expires.
             report(new RuntimeException('A run tree budget update failed: '.$failure::class.'.'));
         }
+    }
+
+    /**
+     * What kind of run context a turn was handed, for {@see PlanBudget::route()}:
+     * `runner` when it is a context of a run this runtime is running (its
+     * ledger is that run's), `host` for any other context that states a run
+     * tree.
+     *
+     * @internal
+     *
+     * @return 'none'|'metadata'|'runner'|'host'
+     */
+    public function contextKind(?RunContext $context): string
+    {
+        if ($context === null) {
+            return 'none';
+        }
+        if ($context->metadataOnly) {
+            return 'metadata';
+        }
+        $entry = $this->runs[$context->rootRunId()] ?? null;
+
+        return $entry !== null && $entry['ledger'] === $context->ledger ? 'runner' : 'host';
     }
 
     /**

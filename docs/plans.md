@@ -110,7 +110,8 @@ reason `plan_budget_exhausted`, the plan is blocked with that reason,
 
 The plan's own turns are the turn `advance()` runs for the step it claimed, the
 resume of an approval that step asked for, and a subagent child those turns
-started, resumed outside the runner. Other turns on the session spend nothing
+started, on any turn the runner did not start (an answer, a new message, or a
+host run context, which is narrowed to what is left). Other turns on the session spend nothing
 from the plan's budget and are never refused for it. A decision on the step's
 approval is refused with `plan_budget_exhausted`, recording nothing, once the
 shared budget is spent; a step held on an approval when the budget is spent

@@ -661,7 +661,11 @@ refused with `RunNotPermitted` once the tree's allowance is spent; a decision on
 approval is then refused the same way with nothing recorded, so the approval is never consumed
 by a resume that cannot run. A hold whose run never settled is charged in full once the run
 lock's TTL has passed. When the child was started by a turn that spent from a shared plan
-budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). A child
+budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). The same holds
+for every turn on the child session the runner did not start: a new message sent with `send()`
+instead of an answer continues the tree and the plan budget exactly as an answer does, and a run
+context the host passes in can only narrow them. The host context's limits are lowered to what
+the tree and the plan budget have left, and the turn is refused only when they are spent. A child
 started under a run context the host built itself, rather than a run of this runtime, has no
 tree record, and is resumed on its own root budget.
 
@@ -1455,7 +1459,9 @@ limit throws when plans are used, before anything runs.
 
 The plan's own turns are the turn `advance()` runs for the step it claimed, the
 resume of an approval that step asked for, and a subagent child those turns
-started when it is resumed outside the runner. Any other turn on the session,
+started, on any turn the runner did not start: an answer, a new message, or a
+run context the host passes in, which is narrowed to what the plan has left
+rather than refused. Any other turn on the session,
 such as the person chatting while a step waits on their approval, spends
 nothing from the plan's budget and is never refused for it. A decision on an
 approval the step asked for is refused with `plan_budget_exhausted`, recording
