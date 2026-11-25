@@ -243,7 +243,7 @@ final readonly class AgentRuntime
 
             // A root run opens the tree's account; a child inherits it. Either
             // way there is exactly one ledger per tree from here down.
-            $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
+            $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
@@ -471,7 +471,7 @@ final readonly class AgentRuntime
             $resumedFrom = $this->resumedFrom($session, $prompt);
             $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId);
 
-            $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
+            $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
@@ -885,7 +885,7 @@ final readonly class AgentRuntime
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
-        $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
+        $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
@@ -993,7 +993,7 @@ final readonly class AgentRuntime
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
-        $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
+        $run = $this->atSavedChildDepth($session, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxCostUsd: $this->floatConfig('max_cost_usd'),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
@@ -2215,12 +2215,16 @@ final readonly class AgentRuntime
      * the runner gave the session when it was a child. A resumed child then
      * delegates under the same {@see RunContext::MAX_DEPTH} as it would inside
      * its tree.
+     *
+     * A context the host supplied is held to the saved depth too: it may only
+     * narrow, so it can put the child deeper but never shallower than the
+     * runner did. The runner's own context is already at the depth it saved.
      */
     private function atSavedChildDepth(Session $session, RunContext $run): RunContext
     {
         $depth = $session->childDepth();
 
-        return $depth > 0 ? $run->atDepth($depth) : $run;
+        return $depth > $run->depth ? $run->atDepth($depth) : $run;
     }
 
     /**
@@ -2244,7 +2248,17 @@ final readonly class AgentRuntime
         // session whose thread is linked beneath a parent but has no saved
         // binding is refused rather than run on the root rules, which would
         // send the child's conversation to a provider nobody chose for it.
+        //
+        // Only the runner's own context writes the saved binding. A context
+        // the host built may carry a binding too, but once one is saved it
+        // wins: a host context may narrow what the tree has left, never move
+        // the child to another provider or model, reset its depth, or replace
+        // the run tree and plan budget it continues with nothing.
         $child = $context?->binding;
+        if ($child !== null && $session->childBinding() !== null
+            && app(RunTrees::class)->contextKind($context) !== 'runner') {
+            $child = null;
+        }
         if ($child !== null) {
             // With the shared plan budget the tree spends from, if any, so
             // the child resumed outside the runner spends from it too (G-366).

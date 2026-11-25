@@ -257,8 +257,8 @@ it('refuses a delegation past the maximum depth from a child resumed outside the
 // cannot move the child to another provider or model.
 it('keeps the saved child binding when a host context on the resume carries another', function (string $answer): void {
     configureResumeAgents(
-        planMode: ['subagents' => ['research' => ['mode' => 'research', 'provider' => 'custom-cheap', 'model' => 'cheap-model']]],
-        researchMode: ['tools' => ['lookup'], 'requires_approval' => ['lookup']],
+        planMode: ['max_steps' => 20, 'subagents' => ['research' => ['mode' => 'research', 'provider' => 'custom-cheap', 'model' => 'cheap-model']]],
+        researchMode: ['max_steps' => 20, 'tools' => ['lookup'], 'requires_approval' => ['lookup']],
     );
     app(ToolRegistry::class)->forAgent('planner')->register((new Tool)->as('lookup')->for('Look it up.')->withStringParameter('q', 'Query')
         ->using(fn (string $q): string => 'found'), 'binding-test');
