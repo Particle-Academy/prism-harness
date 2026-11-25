@@ -79,6 +79,10 @@ final readonly class StepCalls
     {
         $this->assertUncapped($run);
         $builder = new StructuredBuilder;
+        // A response that came back with no steps of its own is kept as it
+        // came, when it is the only one: rebuilding it would re-decode a text
+        // the provider already declined to read as a document.
+        $single = null;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
@@ -88,6 +92,7 @@ final readonly class StepCalls
                 $request = $generation->toRequest();
                 $run->ledger->recordSteps(1);
                 $response = $generation->asStructured();
+                $single = $builder->steps->isEmpty() && $response->steps->isEmpty() ? $response : null;
                 if ($response->steps->isEmpty()) {
                     $messages = [...$request->messages(), new AssistantMessage($response->text, $response->toolCalls, $response->additionalContent)];
                     if ($response->toolResults !== []) {
@@ -118,9 +123,11 @@ final readonly class StepCalls
             } while ($this->continues($response->finishReason, $response->toolCalls, $response->toolResults)
                 && $run->ledger->steps() < $run->budget->maxSteps);
 
-            return $builder->steps->isEmpty() ? $response : $builder->toResponse();
+            return $builder->steps->isEmpty() ? $response : ($single !== null && $builder->steps->count() === 1 ? $single : $builder->toResponse());
         } finally {
-            if ($builder->steps->isNotEmpty()) {
+            if ($single !== null && $builder->steps->count() === 1) {
+                $record($single);
+            } elseif ($builder->steps->isNotEmpty()) {
                 $record($builder->toResponse());
             } elseif (isset($response)) {
                 $record($response);

@@ -84,6 +84,20 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
         return $failure;
     }
 
+    /**
+     * A person cancelled this run, or the run tree it belongs to (G-285).
+     * Its own code, `run_cancelled`: a stop someone asked for is not a spent
+     * budget, and a caller must never report it as one.
+     */
+    public static function cancelled(): self
+    {
+        $failure = new self('This run may not proceed (run_cancelled): it was cancelled.');
+        $failure->errorCode = 'run_cancelled';
+        $failure->reason = 'run cancelled';
+
+        return $failure;
+    }
+
     public static function callBudget(string $code): self
     {
         $failure = new self(match ($code) {

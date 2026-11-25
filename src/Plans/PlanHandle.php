@@ -57,7 +57,7 @@ final class PlanHandle
             try {
                 $response = $this->session->send($this->prompt($step), context: $context);
             } catch (RunNotPermitted $refused) {
-                return $this->stoppedOnBudget() ?? throw $refused;
+                return $this->stoppedOnCancel($refused) ?? $this->stoppedOnBudget() ?? throw $refused;
             } finally {
                 $serving();
             }
@@ -93,7 +93,7 @@ final class PlanHandle
                     yield $runStep;
                 }
             } catch (RunNotPermitted $refused) {
-                return $this->stoppedOnBudget() ?? throw $refused;
+                return $this->stoppedOnCancel($refused) ?? $this->stoppedOnBudget() ?? throw $refused;
             } finally {
                 $serving();
             }
@@ -201,9 +201,11 @@ final class PlanHandle
         }
         $run = $this->session->run();
         $runFailed = is_array($run) && ($run['status'] ?? null) === 'failed';
+        // A run a person cancelled, in this process or another (G-285).
+        $runCancelled = is_array($run) && ($run['status'] ?? null) === 'cancelled';
         $now = $this->plans->now();
         $spent = $plan['status'] === 'active' ? $this->plans->budgetExhaustion($this->session, $plan['id']) : null;
-        [$next, $outcome] = PlanMachine::prepare($plan, $runFailed, $this->plans->limits(), $now, null, $spent !== null);
+        [$next, $outcome] = PlanMachine::prepare($plan, $runFailed, $this->plans->limits(), $now, null, $spent !== null, $runCancelled);
         if ($next !== $plan) {
             $this->plans->write($this->session, $next, $plan['revision']);
         }
@@ -228,6 +230,21 @@ final class PlanHandle
         }
 
         throw PlanRefused::because('plan.conflict');
+    }
+
+    /**
+     * A turn a person cancelled (G-285) stops the plan: prepare settles the
+     * step back to todo and blocks the plan with `run_cancelled`, so the
+     * next advance does not start the run again. Null for any other refusal.
+     */
+    private function stoppedOnCancel(RunNotPermitted $refused): ?AdvanceOutcome
+    {
+        if ($refused->code() !== 'run_cancelled') {
+            return null;
+        }
+        [$outcome] = $this->prepare();
+
+        return $outcome;
     }
 
     /**

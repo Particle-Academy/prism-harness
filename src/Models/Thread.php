@@ -703,6 +703,25 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
+     * The run that asked for an approval id, read from the stored row that
+     * carries the request; null when no row in this thread issued it (G-285).
+     *
+     * @internal
+     */
+    public function approvalRunId(string $approvalId): ?string
+    {
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position', 'desc')->cursor() as $stored) {
+            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && ($request['approval_id'] ?? null) === $approvalId) {
+                    return is_string($stored->run_id) && $stored->run_id !== '' ? $stored->run_id : null;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * The call an approval id was requested for, or null.
      *
      * @return array{name: string, arguments: mixed}|null

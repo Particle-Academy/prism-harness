@@ -3,11 +3,14 @@
 declare(strict_types=1);
 
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Testing\TextResponseFake;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Fixtures\Participant;
 
 it('runs through the durable session and records the complete exchange', function (): void {
@@ -112,13 +115,15 @@ it('lets a caller raise the step ceiling above the mode default', function (): v
     ]);
     config()->set('prism-harness.agent.modes.chat.tools', ['allowed_tool']);
     config()->set('prism-harness.agent.modes.chat.max_steps', 10);
-    $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
+    $fake = Prism::fake(stepCeilingLoop(30));
 
     $ada = Participant::create(['name' => 'Ada']);
     harness()->for($ada)->session('chat')->usingMaxSteps(20)->send('Build something large');
 
+    // One model step per request since G-285, so the ceiling is the number
+    // of steps the run may take, not a field on the first request.
     $fake->assertRequest(function (array $requests): void {
-        expect($requests[0]->maxSteps())->toBe(20);
+        expect($requests)->toHaveCount(20);
     });
 });
 
@@ -131,13 +136,15 @@ it('never lets a caller raise the step ceiling past the operator ceiling', funct
     ]);
     config()->set('prism-harness.agent.modes.chat.tools', ['allowed_tool']);
     config()->set('prism-harness.agent.max_steps_ceiling', 12);
-    $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
+    $fake = Prism::fake(stepCeilingLoop(30));
 
     $ada = Participant::create(['name' => 'Ada']);
     harness()->for($ada)->session('chat')->usingMaxSteps(500)->send('Ask for the moon');
 
+    // One model step per request since G-285, so the ceiling is the number
+    // of steps the run may take, not a field on the first request.
     $fake->assertRequest(function (array $requests): void {
-        expect($requests[0]->maxSteps())->toBe(12);
+        expect($requests)->toHaveCount(12);
     });
 });
 
@@ -147,12 +154,29 @@ it('uses the mode default when the caller asks for nothing', function (): void {
     ]);
     config()->set('prism-harness.agent.modes.chat.tools', ['allowed_tool']);
     config()->set('prism-harness.agent.modes.chat.max_steps', 7);
-    $fake = Prism::fake([TextResponseFake::make()->withText('done')]);
+    $fake = Prism::fake(stepCeilingLoop(30));
 
     $ada = Participant::create(['name' => 'Ada']);
     harness()->for($ada)->session('chat')->send('Ordinary work');
 
+    // One model step per request since G-285, so the ceiling is the number
+    // of steps the run may take, not a field on the first request.
     $fake->assertRequest(function (array $requests): void {
-        expect($requests[0]->maxSteps())->toBe(7);
+        expect($requests)->toHaveCount(7);
     });
 });
+
+/**
+ * A model that calls `allowed_tool` on every step and never stops by itself,
+ * so the step ceiling is the only thing that ends the run.
+ *
+ * @return list<TextResponseFake>
+ */
+function stepCeilingLoop(int $steps): array
+{
+    return array_map(fn (int $i): TextResponseFake => TextResponseFake::make()
+        ->withText('')
+        ->withFinishReason(FinishReason::ToolCalls)
+        ->withToolCalls([new ToolCall('call_'.$i, 'allowed_tool', [])])
+        ->withToolResults([new ToolResult('call_'.$i, 'allowed_tool', [], 'yes')]), range(1, $steps));
+}

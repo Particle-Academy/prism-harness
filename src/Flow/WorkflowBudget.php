@@ -167,7 +167,9 @@ final class WorkflowBudget implements LedgerGuard
             $snapshot['cancelled'] = true;
             $snapshot['cancel_reason'] = $reason;
             $state['exhausted_at'] = now()->toIso8601String();
-            $this->pendingEvent = new WorkflowBudgetExhausted(
+            // A cancel is announced by the run that was cancelled, never as a
+            // spent budget.
+            $this->pendingEvent = $reason === RunLedger::CANCELLED ? null : new WorkflowBudgetExhausted(
                 $this->runKey, $ledger->rootRunId, $reason,
                 $snapshot['steps'], $snapshot['tool_calls'], $snapshot['cost_usd'],
             );
@@ -178,7 +180,8 @@ final class WorkflowBudget implements LedgerGuard
 
         $state = [...$state, ...$snapshot];
         $ledger->restore($state);
-        $this->pendingFailure = RunNotPermitted::workflowBudget($reason);
+        $this->pendingFailure = $reason === RunLedger::CANCELLED
+            ? RunNotPermitted::cancelled() : RunNotPermitted::workflowBudget($reason);
 
         return [$state, null];
     }
@@ -192,6 +195,12 @@ final class WorkflowBudget implements LedgerGuard
      */
     private function exhaustionReason(RunNotPermitted $refused, array $state): ?string
     {
+        // A person cancelled a run in this workflow (G-285): the whole
+        // workflow stops, recorded once, and every later node is refused.
+        if ($refused->code() === 'run_cancelled') {
+            return RunLedger::CANCELLED;
+        }
+
         if ($refused->code() === 'workflow_budget_exhausted') {
             return $refused->reason() ?? 'workflow budget exhausted';
         }

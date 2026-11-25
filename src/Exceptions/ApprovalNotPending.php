@@ -21,4 +21,10 @@ final class ApprovalNotPending extends InvalidArgumentException
     {
         return new self("No pending approval has the id [{$approvalId}]. It was never issued, or it has already been answered.");
     }
+
+    /** The approval belongs to a run a person cancelled: it is settled, and the run never resumes (G-285). */
+    public static function cancelled(string $approvalId): self
+    {
+        return new self("The approval [{$approvalId}] is settled: the run that asked for it was cancelled.");
+    }
 }

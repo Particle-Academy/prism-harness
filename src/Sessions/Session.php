@@ -13,6 +13,9 @@ use Prism\Harness\Contracts\AgentTaskSource;
 use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Contracts\HeldSessionLocks;
 use Prism\Harness\Contracts\SessionStore;
+use Prism\Harness\Enums\CancelOutcome;
+use Prism\Harness\Events\RunCancelled;
+use Prism\Harness\Events\RunCancelRequested;
 use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Exceptions\PlansDisabled;
@@ -787,10 +790,16 @@ class Session
      */
     protected function assertDecisionsPending(array $decisions): void
     {
-        $pending = array_fill_keys($this->thread()->pendingApprovalIds(), true);
+        $thread = $this->thread();
+        $pending = array_fill_keys($thread->pendingApprovalIds(), true);
         foreach ($decisions as $decision) {
             if (! isset($pending[$decision->approvalId])) {
                 throw ApprovalNotPending::forId($decision->approvalId);
+            }
+            // Settled-cancelled, never pending: a cancelled run never resumes (G-285).
+            $runId = $thread->approvalRunId($decision->approvalId);
+            if ($runId !== null && $this->cancelRequestedFor($runId)) {
+                throw ApprovalNotPending::cancelled($decision->approvalId);
             }
             // Answered once: the same id again in this batch is a repeat.
             unset($pending[$decision->approvalId]);
@@ -805,20 +814,282 @@ class Session
         return $this->approve($approval, false, $reason, $context);
     }
 
-    /** @return array<string, mixed>|null */
+    /**
+     * This session's latest run, or null when it has none.
+     *
+     * A run parked on an approval when a person cancelled it reads `status`
+     * `cancelled` (G-285): the cancel is durable even though the parked run
+     * had no process to write it.
+     *
+     * @return array<string, mixed>|null
+     */
     public function run(): ?array
     {
         $run = $this->state()['run'] ?? null;
+        if (! is_array($run)) {
+            return null;
+        }
+        $status = $run['status'] ?? null;
+        if ($status !== 'running' && $status !== 'cancelled' && is_string($run['id'] ?? null) && $this->cancelRequestedFor($run['id'])) {
+            $run['status'] = 'cancelled';
+        }
 
-        return is_array($run) ? $run : null;
+        return $run;
     }
 
-    public function beginRun(string $id, string $mode, string $provider, string $model): self
+    /**
+     * How many run ids a session remembers, so cancel() can tell one of its
+     * own earlier runs (`not-running`) from an id it never issued (`refused`).
+     */
+    private const RUN_HISTORY = 20;
+
+    public function beginRun(string $id, string $mode, string $provider, string $model, ?string $parentRunId = null, ?string $rootRunId = null, ?string $turnId = null): self
     {
-        return $this->write('run', [
-            'id' => $id, 'status' => 'running', 'mode' => $mode,
-            'provider' => $provider, 'model' => $model, 'started_at' => now()->toIso8601String(),
+        $history = is_array($this->state()['run_history'] ?? null) ? array_values(array_filter($this->state()['run_history'], 'is_string')) : [];
+        $history = array_slice(array_values(array_unique([...$history, $id])), -self::RUN_HISTORY);
+
+        return $this->writeAll([
+            'run' => [
+                'id' => $id, 'status' => 'running', 'mode' => $mode,
+                'provider' => $provider, 'model' => $model, 'started_at' => now()->toIso8601String(),
+                // The run's tags, so a cancel from another process carries them.
+                'parent_run_id' => $parentRunId, 'root_run_id' => $rootRunId, 'turn_id' => $turnId,
+            ],
+            'run_history' => $history,
         ]);
+    }
+
+    /**
+     * Ask this session's run to stop (G-285), from any process.
+     *
+     * The flag is DURABLE: written to the session's durable store, so a queue
+     * worker running the run sees it at its next check even when the request
+     * calling this is a different process. The run checks it between model
+     * steps and before each tool call, and stops at the first check after the
+     * flag is set. A tool call already executing is NOT interrupted: it
+     * finishes, its result is recorded, and the next step or tool is refused.
+     * The run then ends `cancelled`, with {@see RunCancelled}, and never
+     * resumes. Cancelling a run stops the whole run tree it belongs to: its
+     * subagents, and the workflow it is a node of.
+     *
+     * A run parked on an approval is cancelled at once: every approval it is
+     * waiting on reads as settled-cancelled ({@see self::approvalStatus()}),
+     * and deciding one is refused.
+     *
+     * The run id must be this session's run. An id this session never issued
+     * is `refused`, whatever session it belongs to.
+     *
+     * WHO MAY CANCEL IS THE APPLICATION'S DECISION, as with approve(): the
+     * session is scoped to a participant, but "this user may stop THIS run"
+     * is a question only the host can answer. Authorize before calling.
+     */
+    public function cancel(string $runId): CancelOutcome
+    {
+        $this->assertWritableResolution();
+        if (! $this->runtime instanceof AgentRuntime || $this->heldLocks() === null) {
+            return CancelOutcome::Unsupported;
+        }
+        if (preg_match('/\Arun_[0-9a-f]{24}\z/D', $runId) !== 1) {
+            return CancelOutcome::Refused;
+        }
+
+        /** @var list<RunCancelRequested|RunCancelled> $events */
+        $events = [];
+        $outcome = $this->underCancelLock(function () use ($runId, &$events): CancelOutcome {
+            // Read fresh: the run is written by whichever process executes it.
+            $this->cachedState = null;
+            $state = $this->state();
+            $run = is_array($state['run'] ?? null) ? $state['run'] : null;
+            if ($run === null) {
+                return CancelOutcome::NoTurn;
+            }
+            if (($run['id'] ?? null) !== $runId) {
+                $history = is_array($state['run_history'] ?? null) ? $state['run_history'] : [];
+
+                return in_array($runId, $history, true) ? CancelOutcome::NotRunning : CancelOutcome::Refused;
+            }
+            $tag = static fn (string $key): ?string => is_string($run[$key] ?? null) ? $run[$key] : null;
+            $requested = $this->cancelRequestedFor($runId);
+            $status = $run['status'] ?? null;
+            if ($status === 'running') {
+                // Twice is harmless: the flag is already set, and the run
+                // stops once. Only the first cancel announces it.
+                if (! $requested) {
+                    $this->recordCancel($runId);
+                    $events[] = new RunCancelRequested($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
+                        $this->agent(), $tag('turn_id'), 'running');
+                }
+
+                return CancelOutcome::Ok;
+            }
+            if ($requested || $status === 'cancelled' || ! $this->parkedOn($runId)) {
+                return CancelOutcome::NotRunning;
+            }
+            // Parked on a person: no process is running it, so it is settled
+            // here. Its approvals now read as cancelled and cannot be decided.
+            $this->recordCancel($runId);
+            $events[] = new RunCancelRequested($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
+                $this->agent(), $tag('turn_id'), 'parked');
+            $events[] = new RunCancelled($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
+                $this->agent(), $tag('turn_id'));
+
+            return CancelOutcome::Ok;
+        });
+        foreach ($events as $event) {
+            event($event);
+        }
+
+        return $outcome;
+    }
+
+    /**
+     * Where an approval stands (G-285): `pending`, `approved`, `denied`,
+     * `cancelled` (its run was cancelled before anyone decided), `superseded`
+     * (never decided, and a later turn ended it), or `unknown` (this thread
+     * never issued it). An approval in a cancelled run never reads `pending`.
+     */
+    public function approvalStatus(string $approvalId): string
+    {
+        $thread = $this->thread();
+        $runId = $thread->approvalRunId($approvalId);
+        if ($runId === null) {
+            return 'unknown';
+        }
+        $decided = $thread->approvalDecisions();
+        if (array_key_exists($approvalId, $decided)) {
+            return $decided[$approvalId] ? 'approved' : 'denied';
+        }
+        if ($this->cancelRequestedFor($runId)) {
+            return 'cancelled';
+        }
+
+        return in_array($approvalId, $thread->pendingApprovalIds(), true) ? 'pending' : 'superseded';
+    }
+
+    /**
+     * Whether a person cancelled this run (G-285), read from the durable store.
+     *
+     * @internal Read by the runtime's cancel checks.
+     */
+    public function cancelRequestedFor(string $runId): bool
+    {
+        $record = $this->durable->get($this->cancelKey());
+        $runs = is_array($record['runs'] ?? null) ? $record['runs'] : [];
+
+        return array_key_exists($runId, $runs);
+    }
+
+    /**
+     * Whether an empty-prompt turn would continue a run parked on approvals
+     * that a person cancelled (G-285). Such a turn is refused: a cancelled
+     * run never resumes.
+     *
+     * @internal
+     */
+    public function resumesCancelledRun(string $prompt): bool
+    {
+        if ($prompt !== '') {
+            return false;
+        }
+        $thread = $this->thread();
+        foreach ($thread->pausedApprovalIds() as $approvalId) {
+            $runId = $thread->approvalRunId($approvalId);
+            if ($runId !== null && $this->cancelRequestedFor($runId)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * End a run as cancelled (G-285).
+     *
+     * @internal Called by the runtime when a cancel stopped the run.
+     */
+    public function cancelRun(string $id): self
+    {
+        return $this->finishRun($id, 'cancelled', ['failure' => 'cancelled']);
+    }
+
+    /**
+     * Whether this run ended cancelled (G-285).
+     *
+     * @internal
+     */
+    public function runWasCancelled(string $id): bool
+    {
+        $run = $this->run();
+
+        return is_array($run) && ($run['id'] ?? null) === $id && ($run['status'] ?? null) === 'cancelled';
+    }
+
+    /** Whether this run's thread rows end on approvals nobody has decided yet. */
+    private function parkedOn(string $runId): bool
+    {
+        $thread = $this->thread();
+        foreach ($thread->pendingApprovalIds() as $approvalId) {
+            if ($thread->approvalRunId($approvalId) === $runId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function recordCancel(string $runId): void
+    {
+        $record = $this->durable->get($this->cancelKey()) ?? [];
+        $runs = is_array($record['runs'] ?? null) ? $record['runs'] : [];
+        $runs[$runId] = now()->toIso8601String();
+        // Bounded: the newest flags are the ones a run or an approval can still ask about.
+        $runs = array_slice($runs, -self::RUN_HISTORY, preserve_keys: true);
+        $this->durable->put($this->cancelKey(), ['runs' => $runs]);
+    }
+
+    /**
+     * Run a cancel decision, or a run's end, under this session's cancel lock,
+     * so a cancel racing a run's last step cannot both return `ok` and leave
+     * the run `completed`: whichever takes the lock second sees the other.
+     *
+     * Its own key, never the session lock, which the running run holds. The
+     * order is always session lock, then cancel lock, so they cannot deadlock.
+     *
+     * @template T
+     *
+     * @param  Closure(): T  $work
+     * @return T
+     */
+    private function underCancelLock(Closure $work): mixed
+    {
+        $store = $this->heldLocks();
+        if ($store === null) {
+            return $work();
+        }
+        $key = $this->key().':cancel-lock';
+        $token = $store->acquireFencedLock($key, 10, 10);
+        try {
+            return $work();
+        } finally {
+            $store->releaseFencedLock($key, $token);
+        }
+    }
+
+    /** The ephemeral store, when it can hold a lock outside a callback; null when it cannot. */
+    private function heldLocks(): ?HeldSessionLocks
+    {
+        $store = $this->ephemeral;
+        if (! $store instanceof HeldSessionLocks
+            || ($store instanceof IndexedSessionStore && ! $store->supportsHeldLocks())) {
+            return null;
+        }
+
+        return $store;
+    }
+
+    private function cancelKey(): string
+    {
+        return $this->key().':cancel';
     }
 
     /**
@@ -1025,9 +1296,17 @@ class Session
 
     protected function write(string $key, mixed $value): self
     {
+        return $this->writeAll([$key => $value]);
+    }
+
+    /** @param array<string, mixed> $values written together, in one store write */
+    protected function writeAll(array $values): self
+    {
         $this->assertWritableResolution();
         $state = $this->state();
-        $state[$key] = $value;
+        foreach ($values as $key => $value) {
+            $state[$key] = $value;
+        }
 
         if ($this->writeFence !== null) {
             if (! ($this->writeFence)($state)) {
@@ -1050,9 +1329,19 @@ class Session
             throw new \LogicException('Harness run state changed while the run was active.');
         }
 
-        $this->write('run', [
-            ...$run, ...$details, 'status' => $status, 'finished_at' => now()->toIso8601String(),
-        ]);
+        // Under the cancel lock (G-285): a cancel that set the flag before
+        // this point ends the run cancelled, even when its last step had
+        // already finished, so a cancel that returned `ok` is never followed
+        // by a run that reads `completed`.
+        $this->underCancelLock(function () use ($id, $run, $status, $details): void {
+            if ($status !== 'cancelled' && $this->cancelRequestedFor($id)) {
+                $details = ['failure' => 'cancelled', 'ended_as' => $status];
+                $status = 'cancelled';
+            }
+            $this->write('run', [
+                ...$run, ...$details, 'status' => $status, 'finished_at' => now()->toIso8601String(),
+            ]);
+        });
 
         // G-360: when the run is over, the plan reads the thread it left:
         // the approvals the run staged, and the ones a new message ended.

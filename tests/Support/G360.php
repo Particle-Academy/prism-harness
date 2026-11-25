@@ -22,12 +22,29 @@ final class G360
     /** @var list<string> */
     public static array $queue = [];
 
+    /**
+     * Called as each model request arrives, before it is answered, with the
+     * 1-based number of that request: what another process does while the
+     * provider is thinking (G-285).
+     *
+     * @var (\Closure(int): void)|null
+     */
+    public static ?\Closure $onRequest = null;
+
+    private static int $requests = 0;
+
     public static function reset(): void
     {
         self::$call = 0;
         self::$queue = [];
+        self::$onRequest = null;
+        self::$requests = 0;
         Http::preventStrayRequests();
         Http::fake(['*' => function ($request) {
+            self::$requests++;
+            if (self::$onRequest !== null) {
+                (self::$onRequest)(self::$requests);
+            }
             $next = array_shift(self::$queue);
             if ($next === null) {
                 throw new \RuntimeException('The scripted model has no response left.');
