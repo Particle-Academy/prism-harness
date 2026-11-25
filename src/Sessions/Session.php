@@ -916,6 +916,7 @@ class Session
                 // stops once. Only the first cancel announces it.
                 if (! $requested) {
                     $this->recordCancel($runId);
+                    $this->cancelTreeOf($runId, $run);
                     $events[] = new RunCancelRequested($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
                         $this->agent(), $tag('turn_id'), 'running');
                 }
@@ -928,6 +929,7 @@ class Session
             // Parked on a person: no process is running it, so it is settled
             // here. Its approvals now read as cancelled and cannot be decided.
             $this->recordCancel($runId);
+            $this->cancelTreeOf($runId, $run);
             $events[] = new RunCancelRequested($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
                 $this->agent(), $tag('turn_id'), 'parked');
             $events[] = new RunCancelled($this->key(), $runId, $tag('parent_run_id'), $tag('root_run_id'),
@@ -976,7 +978,13 @@ class Session
         $record = $this->durable->get($this->cancelKey());
         $runs = is_array($record['runs'] ?? null) ? $record['runs'] : [];
 
-        return array_key_exists($runId, $runs);
+        // A run of a run tree a person cancelled is cancelled with it,
+        // whichever session the cancel was made on: a subagent child of the
+        // tree, and the root of the tree this run opened.
+        $trees = app(RunTrees::class);
+
+        return array_key_exists($runId, $runs) || $trees->treeCancelled($this, $this->childTree())
+            || $trees->treeCancelled($this, ['session' => $this->key(), 'run' => $runId]);
     }
 
     /**
@@ -1035,6 +1043,34 @@ class Session
         }
 
         return false;
+    }
+
+    /**
+     * Mark the run tree a cancelled run belongs to, so the other runs of it
+     * parked in other sessions, or running in other processes, stop too.
+     *
+     *  - A run on a child session that the runner did not start, or that the
+     *    runner started in the child's saved tree, belongs to that tree.
+     *  - A root run belongs to the tree it opened.
+     *  - A run the runner started under a run tree the host built belongs to
+     *    no durable tree, so only its own flag is set; a tree the session
+     *    saved earlier is a different tree and is left alone.
+     *
+     * @param  array<string, mixed>  $run  the run's record, with its tags
+     */
+    private function cancelTreeOf(string $runId, array $run): void
+    {
+        $saved = $this->childTree();
+        $parent = is_string($run['parent_run_id'] ?? null) ? $run['parent_run_id'] : null;
+        $root = is_string($run['root_run_id'] ?? null) ? $run['root_run_id'] : null;
+        $tree = match (true) {
+            $saved !== null && ($parent === null || $root === $saved['run']) => $saved,
+            $parent === null => ['session' => $this->key(), 'run' => $runId],
+            default => null,
+        };
+        if ($tree !== null) {
+            app(RunTrees::class)->cancelTree($this, $tree);
+        }
     }
 
     private function recordCancel(string $runId): void

@@ -328,3 +328,51 @@ it('keeps the saved child binding when a host context on the resume carries anot
         ['who' => 'child', 'provider' => 'custom-cheap', 'model' => 'cheap-model'],
     ]);
 })->with(['approve', 'streamDecision']);
+
+// A child the runner starts again, now under a run tree the host built, keeps
+// the run tree reference it saved under an earlier tree. The runner's own
+// context spends from the host's tree and is never held against the saved one,
+// and the saved one is never replaced with nothing, so a later turn the runner
+// does not start still continues it rather than a fresh root budget.
+it('runs a child started again under a host-built tree even when the tree it saved before is spent, and keeps that tree', function (): void {
+    configureResumeAgents(
+        planMode: ['max_steps' => 3, 'subagents' => [
+            'research' => ['mode' => 'research', 'provider' => 'custom-cheap', 'model' => 'cheap-model'],
+        ]],
+        researchMode: ['tools' => []],
+    );
+    $requests = [];
+    Http::fake(function (HttpRequest $wire) use (&$requests) {
+        $body = $wire->data();
+        $messages = $body['messages'] ?? [];
+        $first = $messages[0]['content'] ?? null;
+        $firstText = is_string($first) ? $first : (is_array($first) ? ($first[0]['text'] ?? null) : null);
+        $who = $firstText === 't' ? 'child' : 'parent';
+        $last = end($messages);
+        $lastIsResult = is_array($last) && is_array($last['content'] ?? null)
+            && in_array('tool_result', array_column($last['content'], 'type'), true);
+        $requests[] = ['who' => $who, 'provider' => parse_url($wire->url(), PHP_URL_HOST) === 'cheap.test' ? 'custom-cheap' : 'anthropic'];
+        $call = $who === 'parent' && ! $lastIsResult
+            ? ['type' => 'tool_use', 'id' => 'delegate-'.count($requests), 'name' => 'research', 'input' => ['task' => 't']]
+            : null;
+
+        return Http::response([
+            'id' => 'tree-'.count($requests), 'type' => 'message', 'role' => 'assistant', 'model' => $body['model'] ?? '',
+            'content' => $call !== null ? [$call] : [['type' => 'text', 'text' => $who.' answer']],
+            'stop_reason' => $call !== null ? 'tool_use' : 'end_turn', 'stop_sequence' => null,
+            'usage' => ['input_tokens' => 3, 'output_tokens' => 2],
+        ]);
+    });
+
+    bindingSession('planner', 'plan')->send('go');
+    $child = bindingSession('planner', 'research', 'binding::sub::research');
+    $tree = $child->childTree();
+    expect($tree)->not->toBeNull();
+
+    $before = count($requests);
+    bindingSession('planner', 'plan')->send('again', null, [], RunContext::root('host_root', new RunBudget(100)));
+
+    expect(array_values(array_filter(array_slice($requests, $before), fn (array $r): bool => $r['who'] === 'child')))
+        ->toBe([['who' => 'child', 'provider' => 'custom-cheap']])
+        ->and($child->childTree())->toBe($tree);
+});

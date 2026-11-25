@@ -11,6 +11,7 @@ use Prism\Prism\ValueObjects\ToolError;
 use Prism\Prism\ValueObjects\ToolOutput;
 use ReflectionClass;
 use ReflectionMethod;
+use ReflectionProperty;
 
 /**
  * A tool that checks its run's cancel flag immediately before it runs (G-285).
@@ -55,7 +56,14 @@ final class CancelGuardedTool extends Tool
         }
         /** @var self $guarded */
         $guarded = (new ReflectionClass(self::class))->newInstanceWithoutConstructor();
-        $state = Closure::bind(static fn (Tool $source): array => get_object_vars($source), null, Tool::class)($tool);
+        // Only the state Tool itself declares: guardable() leaves alone any
+        // subclass with properties of its own, so nothing else is copied.
+        $declared = array_map(static fn (ReflectionProperty $property): string => $property->getName(),
+            array_filter((new ReflectionClass(Tool::class))->getProperties(), static fn (ReflectionProperty $property): bool => ! $property->isStatic()));
+        $state = array_intersect_key(
+            Closure::bind(static fn (Tool $source): array => get_object_vars($source), null, Tool::class)($tool),
+            array_flip($declared),
+        );
         Closure::bind(static function (Tool $target, array $state): void {
             foreach ($state as $name => $value) {
                 $target->{$name} = $value;
@@ -90,6 +98,13 @@ final class CancelGuardedTool extends Tool
         }
         if ($tool::class === Tool::class) {
             return true;
+        }
+        // A subclass with state of its own would need that state on the copy,
+        // as dynamic properties PHP deprecates. Left as it is.
+        foreach ((new ReflectionClass($tool))->getProperties() as $property) {
+            if (! $property->isStatic() && $property->getDeclaringClass()->getName() !== Tool::class) {
+                return false;
+            }
         }
         foreach ((new ReflectionClass(Tool::class))->getMethods(ReflectionMethod::IS_PUBLIC | ReflectionMethod::IS_PROTECTED) as $method) {
             if (in_array($method->getName(), ['handle', '__construct'], true) || $method->isStatic()) {

@@ -2283,6 +2283,17 @@ final readonly class AgentRuntime
             // And the run tree it belongs to, whose budget a resumed child continues.
             $ledger = app(Plans::class)->ledgerOf($context->rootRunId());
             $tree = app(RunTrees::class)->childStarted($session, $context);
+            // Under a run tree the host built there is no durable tree to
+            // name: the references the child saved before are kept, never
+            // replaced with nothing, so a later turn the runner does not start
+            // still continues the tree it last had rather than a fresh root
+            // budget.
+            // A tree a person cancelled is not kept: the runner starting the
+            // child again is a new delegation, not a run of that tree.
+            if ($tree === null && ! app(RunTrees::class)->treeCancelled($session, $session->childTree())) {
+                $tree = $session->childTree();
+                $ledger = $session->childPlanLedger();
+            }
             if ($saved != $child || $session->childDepth() !== $context->depth
                 || $session->childPlanLedger() !== $ledger || $session->childTree() !== $tree) {
                 $session->rememberChildBinding($child, $context->depth, $ledger, $tree);

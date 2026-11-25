@@ -26,7 +26,7 @@ returns `FORMULA_ENGINE_UNAVAILABLE` and registered documents remain UNCHECKED.
 ```php
 $session = PrismHarness::for($user)->session('support');
 
-$session->usingMode('plan')->usingModel('claude-sonnet-4-5');
+$session->usingMode('plan')->usingModel('claude-sonnet-5-5');
 
 $session->lock(function (Session $session) {
     // whatever must not happen twice
@@ -172,7 +172,7 @@ use Prism\Harness\Models\Thread;
 $thread = Thread::forParticipant($user, 'support');
 
 $response = Prism::text()
-    ->using(Provider::Anthropic, 'claude-sonnet-4-5')
+    ->using(Provider::Anthropic, 'claude-sonnet-5-5')
     ->withThread($thread)              // everything said so far
     ->withPrompt('And after that?')    // the turn being taken now
     ->asText();
@@ -270,7 +270,7 @@ and **rewrites that summary** each time rather than appending — an append-only
 précis grows without bound while looking like it compacts.
 
 ```php
-'context' => ['summarise_with' => 'claude-haiku-4-5-20251001', 'keep_recent' => 20],
+'context' => ['summarise_with' => 'claude-haiku-5-5', 'keep_recent' => 20],
 ```
 
 **Try `keep_recent` alone first.** It costs nothing, cannot rewrite anything, and
@@ -598,14 +598,14 @@ declaration each take an optional `provider` and `model`, next to the agent's ow
 'agents' => [
     'planner' => [
         'owner' => 'app',
-        'model' => 'claude-sonnet-4-5',
+        'model' => 'claude-sonnet-5-5',
         'modes' => [
             'plan' => [
-                'model' => 'claude-opus-4-1',        // this mode only
+                'model' => 'claude-opus-5-5',        // this mode only
                 'tools' => ['research', 'audit'],     // named agents offer listed subagents
                 'agents' => ['auditor'],              // agents this mode may delegate to
                 'subagents' => [
-                    'research' => ['mode' => 'research', 'model' => 'claude-haiku-4-5'],
+                    'research' => ['mode' => 'research', 'model' => 'claude-haiku-5-5'],
                     'audit' => ['mode' => 'audit', 'agent' => 'auditor'],
                 ],
             ],
@@ -910,7 +910,8 @@ $outcome = $session->cancel($runId);   // CancelOutcome::Ok, NotRunning, NoTurn,
   `cancelled`; the answer that call produced is kept in the thread. Three kinds of tool are
   not checked one by one inside a step, and are stopped by the check before the next model
   step instead: tools marked `concurrent()` (they start together), Laravel MCP tools, and a
-  `Tool` subclass that overrides any of `Tool`'s methods other than `handle()`.
+  `Tool` subclass that overrides any of `Tool`'s methods other than `handle()` or declares
+  properties of its own.
 - **Events.** `RunCancelRequested` fires the moment the flag is written, in the process that
   wrote it. `RunCancelled` fires when the run stops, instead of `RunFinished` or `RunFailed`.
   Both carry the run's `run_id`, `parent_run_id`, `root_run_id` and `harness_agent`, and
@@ -919,10 +920,12 @@ $outcome = $session->cancel($runId);   // CancelOutcome::Ok, NotRunning, NoTurn,
   `$session->approvalStatus($id) === 'cancelled'`, never `pending`, and `approve()`, `deny()`,
   `decide()` and `streamDecision()` throw `ApprovalNotPending` for them. A cancelled run never
   resumes: an empty-prompt turn that would continue it throws `run_cancelled`.
-- **The whole tree stops.** Cancelling a run stops the run tree it belongs to: its subagents'
-  child runs, and the workflow it is a node of (every later node and worker is refused). A
-  plan whose step turn was cancelled is blocked with `run_cancelled`, and `resume()` continues
-  it with a new run.
+- **The whole tree stops.** Cancelling a run stops the run tree it belongs to: its
+  subagents' child runs, and the workflow it is a node of (every later node and worker is refused). A
+  subagent child parked on an approval, in its own session, is cancelled with the tree: its
+  approvals read `cancelled` and cannot be decided, and no later turn on the child continues
+  that tree. A plan whose step turn was cancelled, or whose step is held on an approval of a
+  cancelled run, is blocked with `run_cancelled`, and `resume()` continues it with a new run.
 - **The outcome.** `ok`: the flag is set. `not-running`: one of this session's runs that has
   already ended; nothing changed, and cancelling twice is `ok` then `not-running`. `no-turn`:
   the session has no run. `unsupported`: the ephemeral store cannot hold a lock outside a

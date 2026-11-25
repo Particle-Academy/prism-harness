@@ -61,6 +61,11 @@ final class RunTrees
             return $run;
         }
         $tree = $route === 'continue' ? $session->childTree() : null;
+        // A turn on a child of a cancelled tree never runs (G-285): the
+        // person stopped the whole tree, this child included.
+        if ($tree !== null && $this->treeCancelled($session, $tree)) {
+            throw RunNotPermitted::cancelled();
+        }
         $entry = [
             'session' => $session->key(), 'tree' => $tree ?? ['session' => $session->key(), 'run' => $runId],
             'budget' => $run->budget, 'ledger' => $run->ledger, 'steps' => $run->ledger->steps(),
@@ -222,7 +227,8 @@ final class RunTrees
     /**
      * The kind of context a turn was handed, for {@see ChildBinding::route()}:
      * `runner` for the context the subagent runner built to start a child,
-     * even under a run tree the host built, otherwise {@see self::contextKind()}.
+     * even under a run tree the host built. The same kind as {@see self::contextKind()},
+     * so the binding and the budget routes read one context the same way.
      * A context the host builds and binds itself is never the runner's.
      *
      * @internal
@@ -231,7 +237,7 @@ final class RunTrees
      */
     public function bindingContextKind(?RunContext $context): string
     {
-        return $context !== null && isset($this->childContexts[$context]) ? 'runner' : $this->contextKind($context);
+        return $this->contextKind($context);
     }
 
     /**
@@ -248,6 +254,12 @@ final class RunTrees
     {
         if ($context === null) {
             return 'none';
+        }
+        // The context the subagent runner built to start a child is the
+        // runner's, even under a run tree the host built: it spends from the
+        // tree it was derived from and never from a tree its session saved.
+        if (isset($this->childContexts[$context])) {
+            return 'runner';
         }
         if ($context->metadataOnly) {
             return 'metadata';
@@ -283,6 +295,33 @@ final class RunTrees
     private static function key(array $tree): string
     {
         return $tree['session'].':run-tree:'.$tree['run'];
+    }
+
+    /**
+     * A person cancelled a run of this tree (G-285): every run in it stops,
+     * the ones parked on a person in other sessions included. Kept apart from
+     * the tree's budget record, durable, and never evicted, so a child
+     * answered long after the cancel still reads it.
+     *
+     * @internal Written by {@see Session::cancel()}.
+     *
+     * @param  array{session: string, run: string}  $tree
+     */
+    public function cancelTree(Session $session, array $tree): void
+    {
+        $session->planStore()->put(self::key($tree).':cancelled', ['at' => now()->toIso8601String()]);
+    }
+
+    /**
+     * Whether a person cancelled a run of this tree (G-285).
+     *
+     * @internal
+     *
+     * @param  array{session: string, run: string}|null  $tree
+     */
+    public function treeCancelled(Session $session, ?array $tree): bool
+    {
+        return $tree !== null && is_array($session->planStore()->get(self::key($tree).':cancelled'));
     }
 
     private static function holdTtl(): int

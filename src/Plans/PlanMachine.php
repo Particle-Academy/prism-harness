@@ -400,12 +400,29 @@ final class PlanMachine
      * @param  array<string, mixed>  $plan
      * @return array{0: array<string, mixed>, 1: array{0: string, 1: ?string}}
      */
-    public static function prepare(array $plan, bool $runFailed, PlanLimits $limits, int $now, ?string $runId, bool $budgetExhausted = false, bool $runCancelled = false): array
+    public static function prepare(array $plan, bool $runFailed, PlanLimits $limits, int $now, ?string $runId, bool $budgetExhausted = false, bool $runCancelled = false, bool $heldCancelled = false): array
     {
         if ($plan['status'] !== 'active') {
             return [$plan, ['not_active', $plan['status']]];
         }
         $original = $plan;
+        // G-285: the head step is held on approvals whose run a person
+        // cancelled. Nobody can answer them, so the step goes back to todo
+        // and the plan stops, once, as for a cancelled turn; resume() then
+        // starts it again with a new run.
+        $head = self::headIndex($plan);
+        $cancelledHold = $heldCancelled && $head !== null && $plan['steps'][$head]['owner'] === 'agent'
+            && $plan['steps'][$head]['state'] === 'held';
+        if ($cancelledHold) {
+            $step = $plan['steps'][$head];
+            $step['supersededApprovalIds'] = array_values(array_unique([...$step['supersededApprovalIds'], ...$step['approvalIds']]));
+            $step['approvalIds'] = [];
+            $step['state'] = 'todo';
+            $step['claim'] = null;
+            $step['report'] = null;
+            $step['lastSettle'] = 'run_failed';
+            $plan['steps'][$head] = $step;
+        }
         // G-285: the head step's own turn was cancelled by a person. The step
         // goes back to todo and the plan stops, once: the next advance does
         // not quietly start a new run the person just asked to stop.
@@ -413,7 +430,7 @@ final class PlanMachine
         $cancelledTurn = $runCancelled && $head !== null && $plan['steps'][$head]['owner'] === 'agent'
             && $plan['steps'][$head]['state'] === 'running';
         $plan = self::settle($plan, $runFailed || $runCancelled, $limits);
-        if ($cancelledTurn && $plan['status'] === 'active') {
+        if (($cancelledTurn || $cancelledHold) && $plan['status'] === 'active') {
             $plan = self::block($plan, self::RUN_CANCELLED);
         }
 

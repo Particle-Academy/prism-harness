@@ -189,6 +189,30 @@ final class PlanHandle
     }
 
     /**
+     * Whether the plan's head step is held on approvals that all belong to a
+     * run a person cancelled (G-285): they read `cancelled` and nobody can
+     * answer them.
+     *
+     * @param  array<string, mixed>  $plan
+     */
+    private function heldOnCancelledRun(array $plan): bool
+    {
+        $head = $plan['status'] === 'active' ? PlanMachine::headIndex($plan) : null;
+        $step = $head === null ? null : $plan['steps'][$head];
+        $ids = is_array($step['approvalIds'] ?? null) ? $step['approvalIds'] : [];
+        if ($step === null || $step['state'] !== 'held' || $ids === []) {
+            return false;
+        }
+        foreach ($ids as $id) {
+            if (! is_string($id) || $this->session->approvalStatus($id) !== 'cancelled') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
      * Settle, check limits, choose, and claim, under the plan lock.
      *
      * @return array{0: AdvanceOutcome, 1: array<string, mixed>|null}
@@ -205,7 +229,7 @@ final class PlanHandle
         $runCancelled = is_array($run) && ($run['status'] ?? null) === 'cancelled';
         $now = $this->plans->now();
         $spent = $plan['status'] === 'active' ? $this->plans->budgetExhaustion($this->session, $plan['id']) : null;
-        [$next, $outcome] = PlanMachine::prepare($plan, $runFailed, $this->plans->limits(), $now, null, $spent !== null, $runCancelled);
+        [$next, $outcome] = PlanMachine::prepare($plan, $runFailed, $this->plans->limits(), $now, null, $spent !== null, $runCancelled, $this->heldOnCancelledRun($plan));
         if ($next !== $plan) {
             $this->plans->write($this->session, $next, $plan['revision']);
         }
