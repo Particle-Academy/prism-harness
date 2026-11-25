@@ -87,6 +87,21 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
         return $failure;
     }
 
+    /**
+     * A subagent's child session, linked beneath its parent, has no saved
+     * provider and model binding. Running it on the root rules would send the
+     * child's conversation to a provider its declaration did not choose, so
+     * it is refused instead.
+     */
+    public static function unboundChild(): self
+    {
+        $failure = new self('This subagent child session has no saved provider and model binding, so it may not run outside the subagent runner.');
+        $failure->errorCode = 'child_binding_missing';
+        $failure->reason = 'child_binding_missing';
+
+        return $failure;
+    }
+
     public static function refusedByHost(Throwable $previous): self
     {
         $failure = new self('The host refused this model call.', 0, $previous);

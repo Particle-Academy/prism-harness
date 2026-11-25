@@ -174,12 +174,17 @@ class Session
      * The provider and model binding the subagent runner gave this session's
      * child runs, or null for a session that has never been a child (G-321 E).
      *
+     * Kept in the DURABLE half, beside the thread and its pending approvals.
+     * A child is resumed by a person answering one of those approvals, which
+     * may happen long after the ephemeral half has expired; a binding stored
+     * there would be gone by then and the child would run on the root rules.
+     *
      * @internal Read by the runtime for a run the runner did not start.
      */
     public function childBinding(): ?ChildBinding
     {
-        $saved = $this->state()['child_binding'] ?? null;
-        if (! is_array($saved)) {
+        $saved = $this->savedChild();
+        if ($saved === null) {
             return null;
         }
         $field = static fn (string $key): ?string => is_string($saved[$key] ?? null) ? $saved[$key] : null;
@@ -187,15 +192,44 @@ class Session
         return new ChildBinding($field('provider'), $field('model'), $field('parent_mode_provider'), $field('parent_mode_model'));
     }
 
-    /** @internal Written by the runtime when the subagent runner starts a child run. */
-    public function rememberChildBinding(ChildBinding $binding): self
+    /**
+     * The nesting depth the subagent runner gave this session's child runs,
+     * or 0 for a session that has never been a child.
+     *
+     * @internal Read by the runtime, so a resumed child cannot delegate past
+     * {@see RunContext::MAX_DEPTH}.
+     */
+    public function childDepth(): int
     {
-        return $this->write('child_binding', [
+        $depth = $this->savedChild()['depth'] ?? null;
+
+        return is_int($depth) && $depth > 0 ? $depth : 0;
+    }
+
+    /** @internal Written by the runtime when the subagent runner starts a child run. */
+    public function rememberChildBinding(ChildBinding $binding, int $depth): self
+    {
+        $this->assertWritableResolution();
+        $durable = $this->durable->get($this->durableKey()) ?? [];
+        $durable['child_binding'] = [
             'provider' => $binding->provider,
             'model' => $binding->model,
             'parent_mode_provider' => $binding->parentModeProvider,
             'parent_mode_model' => $binding->parentModeModel,
-        ]);
+            'depth' => $depth,
+        ];
+        $this->durable->put($this->durableKey(), $durable);
+
+        return $this;
+    }
+
+    /** @return array<string, mixed>|null */
+    private function savedChild(): ?array
+    {
+        $durable = $this->durable->get($this->durableKey()) ?? [];
+        $saved = $durable['child_binding'] ?? null;
+
+        return is_array($saved) ? $saved : null;
     }
 
     /**

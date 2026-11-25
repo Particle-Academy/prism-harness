@@ -237,12 +237,12 @@ final readonly class AgentRuntime
 
             // A root run opens the tree's account; a child inherits it. Either
             // way there is exactly one ledger per tree from here down.
-            $run = $context ?? RunContext::root($runId, new RunBudget(
+            $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
-            ));
+            )));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $budget = $run->budget;
@@ -453,12 +453,12 @@ final readonly class AgentRuntime
 
             $session->beginRun($runId, $mode->name, $provider, $model);
 
-            $run = $context ?? RunContext::root($runId, new RunBudget(
+            $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
                 maxSteps: $this->ceilingFor($session, $mode),
                 maxCostUsd: $this->floatConfig('max_cost_usd'),
                 maxSeconds: $this->nullableIntConfig('max_seconds'),
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
-            ));
+            )));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
             $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
             $budget = $run->budget;
@@ -1030,11 +1030,11 @@ final readonly class AgentRuntime
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
-        $run = $context ?? RunContext::root($runId, new RunBudget(
+        $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
-        ));
+        )));
         $run = $this->boundedAgentRun($session, $run);
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
@@ -1131,12 +1131,12 @@ final readonly class AgentRuntime
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
         [$provider, $model] = $this->bindingFor($session, $mode, $context);
         $runId = $tagger->claimRunId();
-        $run = $context ?? RunContext::root($runId, new RunBudget(
+        $run = $context ?? $this->atSavedChildDepth($session, RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxCostUsd: $this->floatConfig('max_cost_usd'),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
             maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
-        ));
+        )));
         $run = $this->boundedAgentRun($session, $run);
         $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
@@ -2206,6 +2206,19 @@ final readonly class AgentRuntime
     }
 
     /**
+     * A root context for a run the subagent runner did not start, at the depth
+     * the runner gave the session when it was a child. A resumed child then
+     * delegates under the same {@see RunContext::MAX_DEPTH} as it would inside
+     * its tree.
+     */
+    private function atSavedChildDepth(Session $session, RunContext $run): RunContext
+    {
+        $depth = $session->childDepth();
+
+        return $depth > 0 ? $run->atDepth($depth) : $run;
+    }
+
+    /**
      * The provider and model this run requests, per field (G-321 E).
      *
      * A root run: session override, then the mode, then the agent default,
@@ -2220,13 +2233,22 @@ final readonly class AgentRuntime
         // run on that session the runner did not start (the host answering an
         // approval the child stopped on, say) keeps the provider and model the
         // runner gave it, and still never reads the child's own override slot.
+        //
+        // Saved in the session's DURABLE half, with the child's depth: a person
+        // may answer the approval after the ephemeral half has expired. A
+        // session whose thread is linked beneath a parent but has no saved
+        // binding is refused rather than run on the root rules, which would
+        // send the child's conversation to a provider nobody chose for it.
         $child = $context?->binding;
         if ($child !== null) {
-            if ($session->childBinding() != $child) {
-                $session->rememberChildBinding($child);
+            if ($session->childBinding() != $child || $session->childDepth() !== $context->depth) {
+                $session->rememberChildBinding($child, $context->depth);
             }
         } else {
             $child = $session->childBinding();
+            if ($child === null && $session->thread()->parent_thread_id !== null) {
+                throw RunNotPermitted::unboundChild();
+            }
         }
 
         return [

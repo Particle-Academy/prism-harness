@@ -645,11 +645,16 @@ child running on it would spend against a choice nobody made for the child. A pa
 model does not cross into another agent, because that agent usually exists for its provider.
 The child session's own override slot is not read: the runner owns that address.
 
-**A child keeps its binding when it is resumed.** The runner saves the child's binding with the
-child's session. A run on that session the runner did not start, such as the host answering an
-approval the child stopped on with `approve()`, `decide()` or `streamDecision()`, uses the same
-provider and model. The resumed run is a new root run: its step and cost budget, and the
-agent's `spend_ceiling`, are counted from that run, not from the tree the child was started in.
+**A child keeps its binding when it is resumed.** The runner saves the child's binding, and its
+nesting depth, in the durable half of the child's session, beside its thread and pending
+approvals, so it outlives the ephemeral TTL. A run on that session the runner did not start, such
+as the host answering an approval the child stopped on with `approve()`, `decide()` or
+`streamDecision()`, uses the same provider and model, and may not delegate past the maximum
+nesting depth from where the child sat in its tree. A session whose thread is linked beneath a
+parent but has no saved binding (a child started by a release before this one, say) is refused
+with `RunNotPermitted` (`child_binding_missing`) rather than run on the root rules. The resumed
+run is a new root run: its step and cost budget, and the agent's `spend_ceiling`, are counted
+from that run, not from the tree the child was started in.
 
 **Delegating to another agent is declared, never inherited.** A subagent with `'agent' => 'auditor'`
 is accepted only when the parent mode lists `auditor` in `agents`. Otherwise the mode is refused
