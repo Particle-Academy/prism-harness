@@ -843,7 +843,7 @@ class Session
      */
     private const RUN_HISTORY = 20;
 
-    public function beginRun(string $id, string $mode, string $provider, string $model, ?string $parentRunId = null, ?string $rootRunId = null, ?string $turnId = null): self
+    public function beginRun(string $id, string $mode, string $provider, string $model, ?string $parentRunId = null, ?string $rootRunId = null, ?string $turnId = null, bool $hostTree = false): self
     {
         $history = is_array($this->state()['run_history'] ?? null) ? array_values(array_filter($this->state()['run_history'], 'is_string')) : [];
         $history = array_slice(array_values(array_unique([...$history, $id])), -self::RUN_HISTORY);
@@ -854,6 +854,9 @@ class Session
                 'provider' => $provider, 'model' => $model, 'started_at' => now()->toIso8601String(),
                 // The run's tags, so a cancel from another process carries them.
                 'parent_run_id' => $parentRunId, 'root_run_id' => $rootRunId, 'turn_id' => $turnId,
+                // Started by the runner under a run tree the host built: in
+                // no durable tree, so a cancel of it marks none (G-285).
+                'host_tree' => $hostTree,
             ],
             'run_history' => $history,
         ]);
@@ -1049,12 +1052,13 @@ class Session
      * Mark the run tree a cancelled run belongs to, so the other runs of it
      * parked in other sessions, or running in other processes, stop too.
      *
-     *  - A run on a child session that the runner did not start, or that the
-     *    runner started in the child's saved tree, belongs to that tree.
-     *  - A root run belongs to the tree it opened.
      *  - A run the runner started under a run tree the host built belongs to
      *    no durable tree, so only its own flag is set; a tree the session
      *    saved earlier is a different tree and is left alone.
+     *  - Any other run on a child session belongs to the tree it saved: a
+     *    turn the runner did not start continues it, and a child the runner
+     *    starts under a tree of this runtime saved that tree, however deep.
+     *  - A root run belongs to the tree it opened.
      *
      * @param  array<string, mixed>  $run  the run's record, with its tags
      */
@@ -1062,9 +1066,9 @@ class Session
     {
         $saved = $this->childTree();
         $parent = is_string($run['parent_run_id'] ?? null) ? $run['parent_run_id'] : null;
-        $root = is_string($run['root_run_id'] ?? null) ? $run['root_run_id'] : null;
         $tree = match (true) {
-            $saved !== null && ($parent === null || $root === $saved['run']) => $saved,
+            ($run['host_tree'] ?? false) === true => null,
+            $saved !== null => $saved,
             $parent === null => ['session' => $this->key(), 'run' => $runId],
             default => null,
         };

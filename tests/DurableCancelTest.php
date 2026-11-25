@@ -584,3 +584,46 @@ it('does not mark the tree a child saved before when its run under a host-built 
         ->and($child->childTree())->toBe($saved)
         ->and(app(RunTrees::class)->treeCancelled($child, $saved))->toBeFalse();
 });
+
+// A child resumed outside the runner continues its run tree, and a grandchild
+// it starts belongs to that tree too: cancelling the grandchild marks the
+// tree, so every other run of it stops.
+it('marks the run tree when a grandchild started by a resumed child is cancelled', function (): void {
+    config()->set('prism-harness.agent.modes.deep_runner', [
+        'system_prompt' => 'You dig.', 'tools' => ['search'], 'skills' => [], 'max_steps' => 4,
+    ]);
+    config()->set('prism-harness.agent.modes.op_runner', [
+        'system_prompt' => 'You run one Op.', 'tools' => ['weather'], 'requires_approval' => ['weather'], 'skills' => [], 'max_steps' => 6,
+        'subagents' => ['dig' => ['description' => 'Dig.', 'mode' => 'deep_runner', 'max_steps' => 3]],
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', []);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'run_op' => ['description' => 'Run an Op.', 'mode' => 'op_runner', 'max_steps' => 5],
+    ]);
+    $participant = Participant::query()->firstOrCreate(['name' => 'Ada']);
+    G360::calls([['run_op', ['task' => 'Run the billing Op']]]);
+    G360::calls([['weather', ['city' => 'Detroit']]]);
+    G360::text('Root done.');
+    g285Worker()->send('go');
+    $child = app(PrismHarness::class)->for($participant)->session('chat::sub::run_op');
+    $tree = $child->childTree();
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($tree)->not->toBeNull()->and($pending)->toHaveCount(1);
+
+    $outcome = null;
+    $this->during['search'] = function () use (&$outcome, $participant): void {
+        $grandchild = app(PrismHarness::class)->for($participant)->session('chat::sub::run_op::sub::dig');
+        $outcome = g285Cancel($grandchild, (string) ($grandchild->run()['id'] ?? ''));
+    };
+    G360::calls([['dig', ['task' => 'Dig into billing']]]);
+    G360::calls([['search', ['query' => 'billing']]]);
+    G360::text('Spare.');
+    G360::text('Spare.');
+    try {
+        $child->approve($pending[0]);
+    } catch (RunNotPermitted) {
+    }
+
+    expect($outcome)->toBe(CancelOutcome::Ok)
+        ->and(app(RunTrees::class)->treeCancelled($child, $tree))->toBeTrue();
+});
