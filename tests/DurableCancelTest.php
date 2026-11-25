@@ -19,6 +19,9 @@ use Prism\Harness\Models\Thread;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Stores\DatabaseSessionStore;
+use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Tools\CancelGuardedTool;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
@@ -512,4 +515,72 @@ it('blocks a plan whose step is held on an approval of a cancelled run', functio
         ->and($plan['steps'][0]['approvalIds'])->toBe([])
         ->and(Http::recorded())->toHaveCount($requests)
         ->and($this->ran['weather'])->toBe(0);
+});
+
+// A cancel made on a subagent child stops the whole tree, so a root parked on
+// its own approval reads cancelled too, and approving it runs nothing.
+it('cancels a parked root when a child of its tree is cancelled', function (): void {
+    config()->set('prism-harness.agent.modes.op_runner', [
+        'system_prompt' => 'You run one Op.', 'tools' => ['weather'], 'requires_approval' => ['weather'], 'skills' => [], 'max_steps' => 4,
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', ['search']);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['search']);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'run_op' => ['description' => 'Run an Op.', 'mode' => 'op_runner', 'max_steps' => 3],
+    ]);
+    G360::calls([['run_op', ['task' => 'Run the billing Op']]]);
+    G360::calls([['weather', ['city' => 'Detroit']]]);
+    G360::calls([['search', ['query' => 'billing']]]);
+    $root = g285Worker()->send('go')->pendingApprovals()[0];
+    $child = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::run_op');
+    $childRun = $child->run()['id'] ?? null;
+    expect($childRun)->toBeString()
+        ->and($child->thread()->pendingApprovalIds())->toHaveCount(1);
+
+    expect(g285Cancel($child, $childRun))->toBe(CancelOutcome::Ok);
+    $requests = count(Http::recorded());
+    G360::text('A cancelled root must never be asked for.');
+
+    expect(g285Web()->approvalStatus($root->approvalId))->toBe('cancelled')
+        ->and(fn () => g285Worker()->approve($root->approvalId))->toThrow(ApprovalNotPending::class)
+        ->and(Http::recorded())->toHaveCount($requests)
+        ->and($this->ran)->toBe(['search' => 0, 'weather' => 0]);
+});
+
+// A child the runner starts again under a run tree the host built keeps the
+// tree it saved before, but a cancel of its run there belongs to the host's
+// tree: the tree it saved before is not marked.
+it('does not mark the tree a child saved before when its run under a host-built tree is cancelled', function (): void {
+    config()->set('prism-harness.agent.modes.op_runner', [
+        'system_prompt' => 'You run one Op.', 'tools' => ['search'], 'skills' => [], 'max_steps' => 4,
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', []);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'run_op' => ['description' => 'Run an Op.', 'mode' => 'op_runner', 'max_steps' => 3],
+    ]);
+    G360::calls([['run_op', ['task' => 'First']]]);
+    G360::text('Child done.');
+    G360::text('Parent done.');
+    g285Worker()->send('go');
+    $child = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::run_op');
+    $saved = $child->childTree();
+    expect($saved)->not->toBeNull();
+
+    $outcome = null;
+    $this->during['search'] = function () use (&$outcome): void {
+        $web = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::run_op');
+        $outcome = g285Cancel($web, (string) ($web->run()['id'] ?? ''));
+    };
+    G360::calls([['run_op', ['task' => 'Again']]]);
+    G360::calls([['search', ['query' => 'billing']]]);
+    G360::text('Parent again.');
+    G360::text('Spare.');
+    try {
+        g285Worker()->send('again', null, [], RunContext::root('host_root', new RunBudget(20)));
+    } catch (RunNotPermitted) {
+    }
+
+    expect($outcome)->toBe(CancelOutcome::Ok)
+        ->and($child->childTree())->toBe($saved)
+        ->and(app(RunTrees::class)->treeCancelled($child, $saved))->toBeFalse();
 });
