@@ -119,7 +119,9 @@ function plansBindingContextOp(array $op, bool &$savedBinding): array
     if ($context !== null && $op['rebound']) {
         $context = $context->withBinding(new ChildBinding('custom-cheap', 'cheap-model'));
     }
-    $kind = $trees->bindingContextKind($context);
+    // The budget routes read the same kind: the runner's context is the runner's for both.
+    $kind = $trees->contextKind($context);
+    expect($trees->bindingContextKind($context))->toBe($kind);
     $route = ChildBinding::route($kind, $context?->binding !== null, $savedBinding, $op['linked']);
     $savedBinding = $savedBinding || $route['save'];
 
