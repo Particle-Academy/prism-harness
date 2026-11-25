@@ -128,7 +128,8 @@ final class RunTrees
     public function childStarted(Session $child, RunContext $context): ?array
     {
         $rootRunId = $context->rootRunId();
-        $entry = $this->runs[$rootRunId] ?? null;
+        $key = $this->entryKey($context);
+        $entry = $key === null ? null : $this->runs[$key];
         if ($entry === null) {
             return null;
         }
@@ -146,7 +147,7 @@ final class RunTrees
 
                 return PlanBudget::reserve($state, $rootRunId, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
             });
-            $this->runs[$rootRunId]['held'] = true;
+            $this->runs[$key]['held'] = true;
         }
 
         return $entry['tree'];
@@ -233,7 +234,28 @@ final class RunTrees
      */
     public function underHostTree(?RunContext $context): bool
     {
-        return $context !== null && isset($this->childContexts[$context]) && ! isset($this->runs[$context->rootRunId()]);
+        return $context !== null && isset($this->childContexts[$context]) && $this->entryKey($context) === null;
+    }
+
+    /**
+     * The live run of this runtime a context spends from: the root run its
+     * ledger names, or the run that holds that ledger. A child resumed under
+     * a context the host built continues its saved tree under its OWN run id
+     * while its ledger is the host's, so the children it starts are found by
+     * the ledger, not by the host's root run id.
+     */
+    private function entryKey(RunContext $context): ?string
+    {
+        if (isset($this->runs[$context->rootRunId()])) {
+            return $context->rootRunId();
+        }
+        foreach ($this->runs as $runId => $entry) {
+            if ($entry['ledger'] === $context->ledger) {
+                return (string) $runId;
+            }
+        }
+
+        return null;
     }
 
     /**
