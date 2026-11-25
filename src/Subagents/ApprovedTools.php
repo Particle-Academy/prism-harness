@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Subagents;
 
 use Closure;
+use Generator;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
@@ -166,6 +167,31 @@ final class ApprovedTools
         self::$waiting[] = $this;
         try {
             return $run();
+        } finally {
+            self::$waiting = array_values(array_filter(self::$waiting, fn (self $waiting): bool => $waiting !== $this));
+            $this->announce(null);
+        }
+    }
+
+    /**
+     * within() for a streamed generation: the stream is opened only once the
+     * hook is waiting, since a stream may announce its generation as it is
+     * opened or as it is first read.
+     *
+     * @param  Closure(): iterable<array-key, StreamEvent>  $open
+     * @return Generator<array-key, StreamEvent>
+     */
+    public function streamWithin(Closure $open): Generator
+    {
+        if ($this->held === []) {
+            yield from $open();
+
+            return;
+        }
+        self::hook();
+        self::$waiting[] = $this;
+        try {
+            yield from $open();
         } finally {
             self::$waiting = array_values(array_filter(self::$waiting, fn (self $waiting): bool => $waiting !== $this));
             $this->announce(null);

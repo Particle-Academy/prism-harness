@@ -812,13 +812,18 @@ final readonly class AgentRuntime
         $collected = null;
         $tools = [];
         $finishReason = FinishReason::Unknown;
+        // Whether the prompt went into the record with an approval resolution.
+        $promptRecorded = false;
 
         try {
+            // The thread's messages and the prompt, as withThread() and
+            // withPrompt() would assemble them, so an approval resolution can
+            // write the merged history back (see below).
+            $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()
                 ->using($provider, $model)
-                ->withThread($session->thread())
-                ->withTelemetryMetadata(sessionId: $session->key())
-                ->withPrompt($prompt, $attachments);
+                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
+                ->withTelemetryMetadata(sessionId: $session->key());
 
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);
@@ -871,8 +876,24 @@ final readonly class AgentRuntime
             // back the same Message objects and Response the non-streaming path
             // builds. A streamed turn and a sent turn now record the SAME
             // transcript, because the same code wrote both.
+            //
+            // Approval decisions already in the thread (a decide() that failed
+            // after recording them, for one) are resolved and recorded HERE,
+            // before the stream, as on the send paths (G-380): resolved inside
+            // the stream, an approved call whose result was then lost (a
+            // telemetry listener that threw) ran again on the next resume.
+            $approved = new ApprovedTools(inGeneration: true);
+            $resolution = $approved->resolve($generation, function (array $messages) use ($session, &$history, &$promptRecorded, $prompt, $runId, &$tools): void {
+                $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                $history = $messages;
+                $promptRecorded = $prompt !== '';
+            });
+            foreach ($resolution as $event) {
+                $tagger->observe($event);
+                yield $event;
+            }
             $collector = new StreamCollector(
-                $generation->asStream(),
+                $approved->streamWithin(fn (): Generator => $generation->asStream()),
                 null,
                 function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
                     $collected = ['messages' => $messages->all(), 'response' => $response];
@@ -916,7 +937,7 @@ final readonly class AgentRuntime
                 // callback, so `$collected` is null and only the prompt is
                 // recorded — a partial turn kept rather than a whole one lost,
                 // and honest about how far it got.
-                $messages = [new UserMessage($prompt, $attachments), ...($collected['messages'] ?? [])];
+                $messages = [...($promptRecorded ? [] : [new UserMessage($prompt, $attachments)]), ...($collected['messages'] ?? [])];
 
                 $this->recordTurn($session, $messages, $runId, $tools);
                 if (in_array($finishReason, [FinishReason::Error, FinishReason::Unknown], true)) {
