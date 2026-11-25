@@ -653,11 +653,17 @@ as the host answering an approval the child stopped on with `approve()`, `decide
 nesting depth from where the child sat in its tree. A session whose thread is linked beneath a
 parent but has no saved binding (a child started by a release before this one, say) is refused
 with `RunNotPermitted` (`child_binding_missing`) rather than run on the root rules. The resumed
-run is a new root run: its step and cost budget, and the agent's `spend_ceiling`, are counted
-from that run, not from the tree the child was started in. When the child was started by a turn
-that spent from a shared plan budget, the resumed run spends from that plan budget too, and a
-decision on the child's approval is refused (`plan_budget_exhausted`, nothing recorded) once that
-budget is spent.
+run continues the run tree the child was started in rather than getting a fresh root budget. The
+first time a root run starts a child, the tree's step and cost allowance is kept in the durable
+store, and the root run settles what the whole tree spent when it ends. The resumed run holds
+what the tree has left before it calls a provider, settles what it spent when it ends, and is
+refused with `RunNotPermitted` once the tree's allowance is spent; a decision on the child's
+approval is then refused the same way with nothing recorded, so the approval is never consumed
+by a resume that cannot run. A hold whose run never settled is charged in full once the run
+lock's TTL has passed. When the child was started by a turn that spent from a shared plan
+budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). A child
+started under a run context the host built itself, rather than a run of this runtime, has no
+tree record, and is resumed on its own root budget.
 
 **Delegating to another agent is declared, never inherited.** A subagent with `'agent' => 'auditor'`
 is accepted only when the parent mode lists `auditor` in `agents`. Otherwise the mode is refused

@@ -28,6 +28,7 @@ use Prism\Harness\Steps\RunStep;
 use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Tasks\StoreTaskSource;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Streaming\Events\StreamEvent;
@@ -224,11 +225,30 @@ class Session
     }
 
     /**
+     * The run tree this child was last started in, as the root session key
+     * and root run id; null for a session never started in a tree of this
+     * runtime. A child resumed outside the runner continues that tree's
+     * budget rather than starting a fresh one.
+     *
+     * @internal Read by RunTrees for a run the runner did not start.
+     *
+     * @return array{session: string, run: string}|null
+     */
+    public function childTree(): ?array
+    {
+        $tree = $this->savedChild()['tree'] ?? null;
+
+        return is_array($tree) && is_string($tree['session'] ?? null) && is_string($tree['run'] ?? null)
+            ? ['session' => $tree['session'], 'run' => $tree['run']] : null;
+    }
+
+    /**
      * @internal Written by the runtime when the subagent runner starts a child run.
      *
      * @param  array{session: string, plan: string}|null  $planLedger
+     * @param  array{session: string, run: string}|null  $tree
      */
-    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null): self
+    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null): self
     {
         $this->assertWritableResolution();
         $durable = $this->durable->get($this->durableKey()) ?? [];
@@ -241,6 +261,9 @@ class Session
         ];
         if ($planLedger !== null) {
             $durable['child_binding']['plan_ledger'] = $planLedger;
+        }
+        if ($tree !== null) {
+            $durable['child_binding']['tree'] = $tree;
         }
         $this->durable->put($this->durableKey(), $durable);
 
@@ -735,6 +758,7 @@ class Session
         // is then refused (G-366).
         app(Plans::class)->assertDecisionsFunded($this, array_map(
             static fn (ToolApprovalResponse $decision): string => $decision->approvalId, $decisions), $context);
+        app(RunTrees::class)->assertDecisionsFunded($this, $context);
 
         $this->runtime?->recordToolDecisions($this, $decisions);
         $this->thread()->record([
@@ -1033,6 +1057,8 @@ class Session
         // G-360: when the run is over, the plan reads the thread it left:
         // the approvals the run staged, and the ones a new message ended.
         app(Plans::class)->afterTurn($this);
+        // A root run that holds part of a run tree's budget settles it.
+        app(RunTrees::class)->finished($this, $id);
 
         return $this;
     }

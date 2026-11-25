@@ -45,6 +45,7 @@ use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Harness\Subagents\CallBudget;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\TurnAttachments;
@@ -300,7 +301,7 @@ final readonly class AgentRuntime
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId);
+                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId) || app(RunTrees::class)->holds($runId);
                 $response = ! $run->capped()
                     ? ($stepOnly ? (new StepCalls)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
@@ -512,7 +513,7 @@ final readonly class AgentRuntime
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId);
+                $stepOnly = $context !== null || $mode->subagents !== [] || app(Plans::class)->isPlanTurn($runId) || app(RunTrees::class)->holds($runId);
                 $response = ! $run->capped()
                     ? ($stepOnly ? (new StepCalls)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
@@ -852,7 +853,8 @@ final readonly class AgentRuntime
         }
 
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        if ($context !== null || $mode->subagents !== [] || app(Plans::class)->servingSharedPlan($session, $prompt, $context) !== null) {
+        if ($context !== null || $mode->subagents !== [] || app(Plans::class)->servingSharedPlan($session, $prompt, $context) !== null
+            || $session->childTree() !== null) {
             yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
             return;
@@ -1958,6 +1960,12 @@ final readonly class AgentRuntime
     private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, bool $begun): RunContext
     {
         try {
+            // A root run, or a child resumed outside the runner, which
+            // continues the run tree it was started in.
+            if ($context === null) {
+                $run = app(RunTrees::class)->rootRun($session, $runId, $run);
+            }
+
             return app(Plans::class)->planTurn($session, $runId, $run, $context, $prompt);
         } catch (Throwable $failure) {
             if (! $begun || ($failure instanceof SessionLockLost && $failure->isWriteRejected())) {
@@ -2281,9 +2289,12 @@ final readonly class AgentRuntime
         if ($child !== null) {
             // With the shared plan budget the tree spends from, if any, so
             // the child resumed outside the runner spends from it too (G-366).
+            // And the run tree it belongs to, whose budget a resumed child continues.
             $ledger = app(Plans::class)->ledgerOf($context->rootRunId());
-            if ($session->childBinding() != $child || $session->childDepth() !== $context->depth || $session->childPlanLedger() !== $ledger) {
-                $session->rememberChildBinding($child, $context->depth, $ledger);
+            $tree = app(RunTrees::class)->childStarted($session, $context);
+            if ($session->childBinding() != $child || $session->childDepth() !== $context->depth
+                || $session->childPlanLedger() !== $ledger || $session->childTree() !== $tree) {
+                $session->rememberChildBinding($child, $context->depth, $ledger, $tree);
             }
         } else {
             $child = $session->childBinding();

@@ -1,0 +1,232 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Prism\Harness\Subagents;
+
+use Closure;
+use Prism\Harness\Contracts\SessionStore;
+use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Plans\PlanBudget;
+use Prism\Harness\Sessions\Session;
+use RuntimeException;
+use Throwable;
+
+/**
+ * The durable half of a run tree's budget, for subagent children resumed
+ * outside the runner.
+ *
+ * A child that stops on an approval is resumed later on its own session, in a
+ * run the runner did not start. That run must not get a fresh root budget: it
+ * continues the run tree it belonged to. While the tree runs, its budget is
+ * the in-memory RunLedger every run in it shares. The first time a root run
+ * starts a child, the tree's allowance is written to the durable store as a
+ * ledger record (the shape {@see PlanBudget} keeps for a shared plan budget)
+ * with the root turn holding all of it; when the root turn ends it settles
+ * what the whole tree spent. A resumed child then holds what the tree has
+ * left before it runs, settles what it spent when it ends, and is refused
+ * once the tree's allowance is spent. A hold whose run never settled is
+ * charged in full once the run lock's TTL has passed, so a crash can only
+ * over-charge the tree.
+ *
+ * Bound as a singleton.
+ */
+final class RunTrees
+{
+    /**
+     * Root runs of this process, by run id, until they end.
+     *
+     * @var array<string, array{session: string, tree: array{session: string, run: string}, budget: RunBudget, ledger: RunLedger, steps: int, cost: float, unmetered: int, held: bool}>
+     */
+    private array $runs = [];
+
+    /**
+     * A root run is starting. A child resumed outside the runner continues
+     * the tree its binding names: it holds what that tree has left, and its
+     * run is narrowed to the hold. Any other root run opens a tree of its
+     * own, kept in memory until it starts a child.
+     *
+     * @internal Called by the runtime once a root run's budget is known.
+     *
+     * @throws RunNotPermitted when the tree the child belongs to is spent
+     */
+    public function rootRun(Session $session, string $runId, RunContext $run): RunContext
+    {
+        $tree = $session->childTree();
+        $entry = [
+            'session' => $session->key(), 'tree' => $tree ?? ['session' => $session->key(), 'run' => $runId],
+            'budget' => $run->budget, 'ledger' => $run->ledger, 'steps' => $run->ledger->steps(),
+            'cost' => $run->ledger->costUsd(), 'unmetered' => $run->ledger->unmeteredRuns(), 'held' => false,
+        ];
+        if ($tree === null) {
+            $this->runs[$runId] = $entry;
+
+            return $run;
+        }
+
+        $budget = $run->budget;
+        $turnCost = $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost']));
+        $now = time();
+        $ttl = self::holdTtl();
+        $grant = $this->write($session->planStore(), $tree, static function (?array $state) use ($runId, $budget, $entry, $turnCost, $now, $ttl): array {
+            if ($state === null) {
+                // The tree's record is gone: closed, never a fresh budget.
+                return [null, ['refused' => PlanBudget::EXHAUSTED, 'limit' => 'steps']];
+            }
+
+            return PlanBudget::reserve($state, $runId, max(0, $budget->maxSteps - $entry['steps']), $turnCost, $now, $ttl);
+        });
+        if (isset($grant['refused'])) {
+            throw RunNotPermitted::exhausted((string) $grant['limit']);
+        }
+
+        $narrowed = $run->withBudget(new RunBudget(
+            maxSteps: $entry['steps'] + (int) $grant['steps'],
+            maxCostUsd: $grant['cost_micros'] === null ? $budget->maxCostUsd : $entry['cost'] + $grant['cost_micros'] / 1_000_000,
+            maxSeconds: $budget->maxSeconds,
+            maxOutputTokensPerCall: $budget->maxOutputTokensPerCall,
+            maxToolCalls: $budget->maxToolCalls,
+        ));
+        $this->runs[$runId] = [...$entry, 'budget' => $narrowed->budget, 'ledger' => $narrowed->ledger, 'held' => true];
+
+        return $narrowed;
+    }
+
+    /**
+     * Whether this run spends from a durable run tree record, so its steps
+     * must be counted as they are taken.
+     *
+     * @internal
+     */
+    public function holds(string $runId): bool
+    {
+        return ($this->runs[$runId]['held'] ?? false) === true;
+    }
+
+    /**
+     * A child is starting under a run tree: the tree it belongs to, opened
+     * in the durable store the first time its root starts a child. Null when
+     * the tree's root is not a run of this runtime (a host-made context).
+     *
+     * @internal Saved with the child's binding.
+     *
+     * @return array{session: string, run: string}|null
+     */
+    public function childStarted(Session $child, RunContext $context): ?array
+    {
+        $rootRunId = $context->rootRunId();
+        $entry = $this->runs[$rootRunId] ?? null;
+        if ($entry === null) {
+            return null;
+        }
+        if (! $entry['held']) {
+            $budget = $entry['budget'];
+            $settings = [
+                'mode' => 'shared',
+                'max_steps' => max(0, $budget->maxSteps - $entry['steps']),
+                'max_cost_micros' => $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost'])),
+            ];
+            $now = time();
+            $ttl = self::holdTtl();
+            $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($rootRunId, $settings, $now, $ttl): array {
+                $state ??= PlanBudget::open($rootRunId, $settings);
+
+                return PlanBudget::reserve($state, $rootRunId, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
+            });
+            $this->runs[$rootRunId]['held'] = true;
+        }
+
+        return $entry['tree'];
+    }
+
+    /**
+     * Refuse, before anything is recorded, a decision on a child session
+     * whose run tree has nothing left: recorded, it would be consumed by a
+     * resume the tree then refuses, and the approved call would never run.
+     *
+     * @internal Called by the session before it records decisions.
+     *
+     * @throws RunNotPermitted
+     */
+    public function assertDecisionsFunded(Session $session, ?RunContext $context): void
+    {
+        if ($context !== null && ! $context->metadataOnly) {
+            return;
+        }
+        $tree = $session->childTree();
+        if ($tree === null) {
+            return;
+        }
+        $state = $session->planStore()->get(self::key($tree));
+        if (! is_array($state) || ($state['planId'] ?? null) !== $tree['run']) {
+            throw RunNotPermitted::exhausted('steps');
+        }
+        [, $grant] = PlanBudget::reserve($state, 'decision', 1, null, time(), self::holdTtl());
+        if (isset($grant['refused'])) {
+            throw RunNotPermitted::exhausted((string) $grant['limit']);
+        }
+    }
+
+    /**
+     * A run is over: a root run that holds part of a tree settles what the
+     * tree spent under it.
+     *
+     * @internal Called when a session finishes a run.
+     */
+    public function finished(Session $session, string $runId): void
+    {
+        $entry = $this->runs[$runId] ?? null;
+        if ($entry === null || $entry['session'] !== $session->key()) {
+            return;
+        }
+        unset($this->runs[$runId]);
+        if (! $entry['held']) {
+            return;
+        }
+        $ledger = $entry['ledger'];
+        $steps = $ledger->steps() - $entry['steps'];
+        $cost = $ledger->unmeteredRuns() > $entry['unmetered'] ? null : PlanBudget::micros(max(0.0, $ledger->costUsd() - $entry['cost']));
+        try {
+            $this->write($session->planStore(), $entry['tree'], static fn (?array $state): array => $state === null
+                ? [null, null] : [PlanBudget::settle($state, $runId, $steps, $cost), null]);
+        } catch (Throwable $failure) {
+            // The hold stays and is charged in full once it expires.
+            report(new RuntimeException('A run tree budget update failed: '.$failure::class.'.'));
+        }
+    }
+
+    /**
+     * One locked change to a tree's record.
+     *
+     * @param  array{session: string, run: string}  $tree
+     * @param  Closure(array<string, mixed>|null): array{0: array<string, mixed>|null, 1: mixed}  $change
+     */
+    private function write(SessionStore $store, array $tree, Closure $change): mixed
+    {
+        $key = self::key($tree);
+
+        return $store->withLock($key, function () use ($store, $key, $tree, $change): mixed {
+            $state = $store->get($key);
+            $state = is_array($state) && ($state['planId'] ?? null) === $tree['run'] ? $state : null;
+            [$next, $result] = $change($state);
+            if ($next !== null) {
+                $store->put($key, $next);
+            }
+
+            return $result;
+        }, 10, 5);
+    }
+
+    /** @param array{session: string, run: string} $tree */
+    private static function key(array $tree): string
+    {
+        return $tree['session'].':run-tree:'.$tree['run'];
+    }
+
+    private static function holdTtl(): int
+    {
+        $ttl = config('prism-harness.agent.lock_ttl', 300);
+
+        return is_int($ttl) && $ttl > 0 ? $ttl : 300;
+    }
+}

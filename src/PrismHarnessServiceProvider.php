@@ -31,6 +31,7 @@ use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Skills\SkillRegistry;
 use Prism\Harness\Stores\DatabaseWorkflowLedgerStore;
 use Prism\Harness\Stores\MemoryWorkflowLedgerStore;
+use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ContextRecallTool;
 use Prism\Harness\Tools\DoMathTool;
@@ -110,6 +111,7 @@ class PrismHarnessServiceProvider extends ServiceProvider
         $this->app->singleton(MemoryHooks::class, fn ($app): MemoryHooks => (new MemoryHooks)
             ->provide(new PlanContextProvider($app->make(Plans::class))));
         $this->app->singleton(Plans::class, fn ($app): Plans => new Plans);
+        $this->app->singleton(RunTrees::class, fn (): RunTrees => new RunTrees);
 
         $this->app->singleton(ToolPairGuard::class, fn ($app): ToolPairGuard => new ToolPairGuard);
 
