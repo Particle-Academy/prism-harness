@@ -22,6 +22,7 @@ use Prism\Harness\Subagents\Subagent;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
 
@@ -393,4 +394,28 @@ it('never rewrites the session durable record when a run starts', function (): v
 
     expect(array_filter($puts, fn (string $key): bool => str_ends_with($key, ':durable')))->toBe([])
         ->and(array_filter($puts, fn (string $key): bool => str_ends_with($key, ':run-trees')))->not->toBe([]);
+});
+
+// A stream resume of a parked root keeps the parked run's own id: it is held
+// to its tree's record all the same, so what it spends is charged there.
+it('holds a root resumed on the stream path to its tree record too', function (): void {
+    config()->set('prism-harness.agent.modes.chat.max_steps', 6);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['search']);
+    config()->set('prism-harness.agent.modes.op_runner.requires_approval', ['search']);
+    G360::calls([['run_op', ['task' => 'Run the Op']]]);
+    G360::calls([['search', ['query' => 'child']]]);
+    G360::calls([['search', ['query' => 'root']]]);
+    $root = g381Session('Ada')->send('go')->pendingApprovals()[0];
+    $rootRun = (string) (g381Session('Ada')->run()['id'] ?? '');
+    $child = g381Session('Ada', 'chat::sub::run_op');
+    G360::text('Child done.');
+    $child->approve($child->thread()->pendingApprovalIds()[0]);
+    $before = g381TreeRecord(g381Session('Ada'), $rootRun)['steps'];
+
+    G360::text('Root done.');
+    iterator_to_array(g381Session('Ada')->streamDecision([new ToolApprovalResponse($root->approvalId, true)]), false);
+    $record = g381TreeRecord(g381Session('Ada'), $rootRun);
+
+    expect($record['steps'])->toBe($before + 1)
+        ->and($record['steps'])->toBeLessThanOrEqual($record['max_steps']);
 });

@@ -108,11 +108,14 @@ final class RunTrees
         if (! is_array($tree)) {
             return $run;
         }
-        // A root resuming its parked run is in the tree that run began. When
-        // that run delegated, the tree has a record, and the resumed root
-        // holds what it has left and is narrowed to it, as any other turn
-        // continuing the tree: the tree's allowance holds across the pause.
-        if ($route === 'open' && $tree['run'] !== $runId && $this->recordOf($session, $tree) !== null) {
+        // A root resuming its parked run is in the tree that run began,
+        // under a new run id or (on the stream path) the parked run's own.
+        // When that run delegated, the tree has a record, and the resumed
+        // root holds what it has left and is narrowed to it, as any other
+        // turn continuing the tree: the tree's allowance holds across the
+        // pause. A new root never finds one: its tree is named by its fresh
+        // run id, and is written only once it delegates.
+        if ($route === 'open' && $this->recordOf($session, $tree) !== null) {
             $route = 'continue';
         }
         // A turn on a child of a cancelled tree never runs (G-285): the
