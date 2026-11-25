@@ -26,7 +26,7 @@ returns `FORMULA_ENGINE_UNAVAILABLE` and registered documents remain UNCHECKED.
 ```php
 $session = PrismHarness::for($user)->session('support');
 
-$session->usingMode('plan')->usingModel('claude-sonnet-4-5');
+$session->usingMode('plan')->usingModel('claude-sonnet-5-5');
 
 $session->lock(function (Session $session) {
     // whatever must not happen twice
@@ -172,7 +172,7 @@ use Prism\Harness\Models\Thread;
 $thread = Thread::forParticipant($user, 'support');
 
 $response = Prism::text()
-    ->using(Provider::Anthropic, 'claude-sonnet-4-5')
+    ->using(Provider::Anthropic, 'claude-sonnet-5-5')
     ->withThread($thread)              // everything said so far
     ->withPrompt('And after that?')    // the turn being taken now
     ->asText();
@@ -270,7 +270,7 @@ and **rewrites that summary** each time rather than appending — an append-only
 précis grows without bound while looking like it compacts.
 
 ```php
-'context' => ['summarise_with' => 'claude-haiku-4-5-20251001', 'keep_recent' => 20],
+'context' => ['summarise_with' => 'claude-haiku-5-5', 'keep_recent' => 20],
 ```
 
 **Try `keep_recent` alone first.** It costs nothing, cannot rewrite anything, and
@@ -598,14 +598,14 @@ declaration each take an optional `provider` and `model`, next to the agent's ow
 'agents' => [
     'planner' => [
         'owner' => 'app',
-        'model' => 'claude-sonnet-4-5',
+        'model' => 'claude-sonnet-5-5',
         'modes' => [
             'plan' => [
-                'model' => 'claude-opus-4-1',        // this mode only
+                'model' => 'claude-opus-5-5',        // this mode only
                 'tools' => ['research', 'audit'],     // named agents offer listed subagents
                 'agents' => ['auditor'],              // agents this mode may delegate to
                 'subagents' => [
-                    'research' => ['mode' => 'research', 'model' => 'claude-haiku-4-5'],
+                    'research' => ['mode' => 'research', 'model' => 'claude-haiku-5-5'],
                     'audit' => ['mode' => 'audit', 'agent' => 'auditor'],
                 ],
             ],
