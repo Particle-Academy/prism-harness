@@ -192,6 +192,49 @@ it('refuses to run a linked child session that has no saved binding rather than 
         ->and($requests)->toBe([]);
 });
 
+// A run context the host builds is not the runner's, so it cannot stand in for
+// the binding a linked child lost: the child is refused before any request,
+// whether the context carries a binding of its own or not.
+it('refuses a linked child that has no saved binding under a host context too', function (bool $withBinding): void {
+    configureResumeAgents(researchMode: ['tools' => []]);
+    $requests = [];
+    fakeBindingWire(null, $requests);
+
+    $parent = bindingSession('planner', 'plan');
+    $child = bindingSession('planner', 'research', 'binding::sub::research');
+    $child->thread()->linkBeneath($parent->thread(), 'run_lost');
+    $context = RunContext::root('host_root', new RunBudget(10));
+    $context = $withBinding ? $context->withBinding(new ChildBinding('custom-cheap', 'cheap-model')) : $context;
+
+    try {
+        $child->send('hello', null, [], $context);
+        $code = null;
+    } catch (RunNotPermitted $refused) {
+        $code = $refused->code();
+    }
+
+    expect($code)->toBe('child_binding_missing')
+        ->and($requests)->toBe([]);
+})->with(['with a binding' => true, 'without one' => false]);
+
+// A host context may bind the session it runs for that turn. Only the
+// runner's own context saves a binding, so the next turn with no context runs
+// on the root rules again.
+it('uses a host context binding on a session that was never a child for that turn only', function (): void {
+    configureResumeAgents(planMode: ['model' => 'mode-model']);
+    $requests = [];
+    fakeBindingWire(null, $requests);
+
+    $session = bindingSession('planner', 'plan');
+    $session->send('go', null, [], RunContext::root('host_root', new RunBudget(10))->withBinding(new ChildBinding('custom-cheap', 'cheap-model')));
+    bindingSession('planner', 'plan')->send('again');
+
+    expect($requests)->toBe([
+        ['who' => 'parent', 'provider' => 'custom-cheap', 'model' => 'cheap-model'],
+        ['who' => 'parent', 'provider' => 'anthropic', 'model' => 'mode-model'],
+    ]);
+});
+
 // A child resumed outside the runner keeps the depth the runner gave it, so a
 // delegation from it is refused at the same maximum depth as inside the tree.
 it('refuses a delegation past the maximum depth from a child resumed outside the runner', function (string $context): void {
