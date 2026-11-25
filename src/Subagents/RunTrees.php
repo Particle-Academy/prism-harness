@@ -115,6 +115,8 @@ final class RunTrees
         // turn continuing the tree: the tree's allowance holds across the
         // pause. A new root never finds one: its tree is named by its fresh
         // run id, and is written only once it delegates.
+        // Two resumes of one parked root never run at once: a run starts
+        // under the session lock, so the second sees the first's record.
         if ($route === 'open' && $this->recordOf($session, $tree) !== null) {
             $route = 'continue';
         }
@@ -137,13 +139,14 @@ final class RunTrees
         $turnCost = $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost']));
         $now = time();
         $ttl = self::holdTtl();
-        $grant = $this->write($session->planStore(), $tree, static function (?array $state) use ($runId, $budget, $entry, $turnCost, $now, $ttl): array {
+        $steps = max(0, $budget->maxSteps - $entry['steps']);
+        $grant = $this->write($session->planStore(), $tree, static function (?array $state) use ($runId, $steps, $turnCost, $now, $ttl): array {
             if ($state === null) {
                 // The tree's record is gone: closed, never a fresh budget.
                 return [null, ['refused' => PlanBudget::EXHAUSTED, 'limit' => 'steps']];
             }
 
-            return PlanBudget::reserve($state, $runId, max(0, $budget->maxSteps - $entry['steps']), $turnCost, $now, $ttl);
+            return PlanBudget::reserve($state, $runId, $steps, $turnCost, $now, $ttl);
         });
         if (isset($grant['refused'])) {
             throw RunNotPermitted::exhausted((string) $grant['limit']);
@@ -200,7 +203,7 @@ final class RunTrees
             ];
             $now = time();
             $ttl = self::holdTtl();
-            $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($tree, $key, $settings, $now, $ttl): array {
+            $grant = $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($tree, $key, $settings, $now, $ttl): array {
                 // Named by the tree's root run; held under the run that
                 // spends (a root resuming a parked run that never delegated
                 // opens its tree's record here).
@@ -208,6 +211,11 @@ final class RunTrees
 
                 return PlanBudget::reserve($state, $key, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
             });
+            // A refused hold refuses the delegation: the tree has nothing
+            // left for the run that would spend it.
+            if (is_array($grant) && isset($grant['refused'])) {
+                throw RunNotPermitted::exhausted((string) $grant['limit']);
+            }
             $this->runs[$key]['held'] = true;
         }
 

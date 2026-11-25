@@ -254,8 +254,7 @@ class Session
     public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null): self
     {
         $this->assertWritableResolution();
-        $durable = $this->durable->get($this->durableKey()) ?? [];
-        $durable['child_binding'] = [
+        $child = [
             'provider' => $binding->provider,
             'model' => $binding->model,
             'parent_mode_provider' => $binding->parentModeProvider,
@@ -263,12 +262,15 @@ class Session
             'depth' => $depth,
         ];
         if ($planLedger !== null) {
-            $durable['child_binding']['plan_ledger'] = $planLedger;
+            $child['plan_ledger'] = $planLedger;
         }
         if ($tree !== null) {
-            $durable['child_binding']['tree'] = $tree;
+            $child['tree'] = $tree;
         }
-        $this->durable->put($this->durableKey(), $durable);
+        // Under a key of its own (G-381): the session's durable record holds
+        // host state, such as capabilities, that another process may change
+        // while a child starts, and must never be rewritten from a stale read.
+        $this->durable->put($this->childKey(), ['child_binding' => $child]);
 
         return $this;
     }
@@ -276,10 +278,16 @@ class Session
     /** @return array<string, mixed>|null */
     private function savedChild(): ?array
     {
-        $durable = $this->durable->get($this->durableKey()) ?? [];
-        $saved = $durable['child_binding'] ?? null;
+        $saved = $this->durable->get($this->childKey())['child_binding'] ?? null;
+        // A binding saved before it had a key of its own.
+        $saved ??= ($this->durable->get($this->durableKey()) ?? [])['child_binding'] ?? null;
 
         return is_array($saved) ? $saved : null;
+    }
+
+    private function childKey(): string
+    {
+        return $this->key().':child';
     }
 
     /**

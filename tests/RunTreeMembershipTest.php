@@ -14,6 +14,7 @@ use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Stores\DatabaseSessionStore;
+use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunLedger;
@@ -418,4 +419,37 @@ it('holds a root resumed on the stream path to its tree record too', function ()
 
     expect($record['steps'])->toBe($before + 1)
         ->and($record['steps'])->toBeLessThanOrEqual($record['max_steps']);
+});
+
+// A child's binding, depth and tree are saved under a key of their own, so
+// saving them never rewrites the session's durable record, where a host keeps
+// capabilities another process may change while the child starts.
+it('saves a child binding without rewriting the session durable record', function (): void {
+    $puts = [];
+    $durable = new class(DB::connection(), $puts) extends DatabaseSessionStore
+    {
+        /** @param list<string> $puts */
+        public function __construct(ConnectionInterface $connection, private array &$puts)
+        {
+            parent::__construct($connection);
+        }
+
+        public function put(string $key, array $payload, ?int $ttlSeconds = null): void
+        {
+            $this->puts[] = $key;
+            parent::put($key, $payload, $ttlSeconds);
+        }
+    };
+    $session = new Session(Participant::query()->firstOrCreate(['name' => 'Ada']), 'chat::sub::run_op',
+        new DatabaseSessionStore(DB::connection()), $durable,
+        runtime: app(AgentRuntime::class));
+    $session->usingCapability('reports', ['on' => true]);
+    $puts = [];
+
+    $session->rememberChildBinding(new ChildBinding('openai', 'gpt-4o'), 2, null, ['session' => 'root', 'run' => 'run_root']);
+
+    expect(array_values(array_filter($puts, fn (string $key): bool => str_ends_with($key, ':durable'))))->toBe([])
+        ->and($session->childTree())->toBe(['session' => 'root', 'run' => 'run_root'])
+        ->and($session->childDepth())->toBe(2)
+        ->and($session->capability('reports'))->toBe(['on' => true]);
 });
