@@ -19,8 +19,10 @@ use Prism\Harness\Models\Thread;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Stores\DatabaseSessionStore;
+use Prism\Harness\Tools\CancelGuardedTool;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Prism\Prism\Tools\LaravelMcpTool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
@@ -405,4 +407,32 @@ it('keeps the tool call it guards identical in every other respect', function ()
         ->and($this->ran)->toBe(['search' => 1, 'weather' => 1])
         ->and(G360::outputs())->toBe(['call_g360_1' => 'Found it', 'call_g360_2' => 'Sunny'])
         ->and(Thread::query()->count())->toBe($thread + 1);
+});
+
+it('guards a plain tool, and leaves alone the tools a copy would change', function (): void {
+    $cancelled = false;
+    $plain = (new Tool)->as('plain')->for('Plain.')->using(fn (): string => 'ran');
+    $guarded = CancelGuardedTool::guard($plain, function () use (&$cancelled): bool {
+        return $cancelled;
+    }, null);
+
+    expect($guarded)->toBeInstanceOf(CancelGuardedTool::class)
+        ->and($guarded->name())->toBe('plain')
+        ->and($guarded->handle())->toBe('ran');
+    $cancelled = true;
+    expect($guarded->handle())->toBe(CancelGuardedTool::REFUSAL);
+
+    // Core filters Laravel MCP tools by class; a copy would slip past it.
+    $mcp = (new ReflectionClass(LaravelMcpTool::class))->newInstanceWithoutConstructor();
+    $concurrent = (new Tool)->as('together')->for('Concurrent.')->using(fn (): string => 'ran')->concurrent();
+    $overriding = new class extends Tool
+    {
+        public function name(): string
+        {
+            return 'mine';
+        }
+    };
+    foreach ([$mcp, $concurrent, $overriding] as $tool) {
+        expect(CancelGuardedTool::guard($tool, fn (): bool => true, null))->toBe($tool);
+    }
 });

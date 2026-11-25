@@ -896,7 +896,10 @@ $outcome = $session->cancel($runId);   // CancelOutcome::Ok, NotRunning, NoTurn,
   next tool or step is refused with `Not run: the run was cancelled.` The run then ends
   `cancelled`, and `send()` and `sendStructured()` throw `RunNotPermitted` with code
   `run_cancelled`. A cancel that lands during the run's last model call still ends the run
-  `cancelled`; the answer that call produced is kept in the thread.
+  `cancelled`; the answer that call produced is kept in the thread. Three kinds of tool are
+  not checked one by one inside a step, and are stopped by the check before the next model
+  step instead: tools marked `concurrent()` (they start together), Laravel MCP tools, and a
+  `Tool` subclass that overrides any of `Tool`'s methods other than `handle()`.
 - **Events.** `RunCancelRequested` fires the moment the flag is written, in the process that
   wrote it. `RunCancelled` fires when the run stops, instead of `RunFinished` or `RunFailed`.
   Both carry the run's `run_id`, `parent_run_id`, `root_run_id` and `harness_agent`, and

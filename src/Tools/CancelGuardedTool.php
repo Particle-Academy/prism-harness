@@ -6,6 +6,7 @@ namespace Prism\Harness\Tools;
 
 use Closure;
 use Prism\Prism\Tool;
+use Prism\Prism\Tools\LaravelMcpTool;
 use Prism\Prism\ValueObjects\ToolError;
 use Prism\Prism\ValueObjects\ToolOutput;
 use ReflectionClass;
@@ -40,8 +41,10 @@ final class CancelGuardedTool extends Tool
     /**
      * The guarded tool, or the tool itself when it cannot be guarded without
      * changing what it does: a tool class that overrides anything but
-     * handle(), or one that runs concurrently with the other calls of its
-     * step (those start together, so there is no "next" call to refuse).
+     * handle(), a Laravel MCP tool (core filters those by class), or one that
+     * runs concurrently with the other calls of its step (those start
+     * together, so there is no "next" call to refuse). A tool left as it is
+     * is still stopped by the check before the next model step.
      *
      * @param  Closure(): bool  $cancelled
      */
@@ -76,6 +79,12 @@ final class CancelGuardedTool extends Tool
 
     private static function guardable(Tool $tool): bool
     {
+        // Core decides by CLASS whether to offer a Laravel MCP tool at all
+        // (its eligibleForRegistration()), so a copy of another class would
+        // slip an ineligible tool past that filter. Left as it is.
+        if ($tool instanceof LaravelMcpTool) {
+            return false;
+        }
         if (Closure::bind(static fn (Tool $source): bool => $source->concurrent, null, Tool::class)($tool)) {
             return false;
         }
