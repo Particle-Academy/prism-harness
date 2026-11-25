@@ -1078,6 +1078,28 @@ it('records a refused workflow call once, as a refusal and with no arguments', f
         ->and($asked)->toBe(0);
 });
 
+it('still emits the deprecated FlowToolRefused beside ToolDenied, both carrying the refusal reason', function (): void {
+    $refused = [];
+    Event::listen('Prism\Harness\Events\FlowToolRefused', function (object $event) use (&$refused): void {
+        $refused[] = $event;
+    });
+    $denied = [];
+    Event::listen(FLOW_REFUSAL_EVENT, function (object $event) use (&$denied): void {
+        $denied[] = $event;
+    });
+    $invoker = flowSession()->flowTools()->toolInvoker();
+
+    expect(fn () => $invoker->invoke('mode_gated', ['target' => 'TOP-SECRET']))->toThrow(ToolNotAvailable::class);
+    expect(fn () => $invoker->invoke('plain', ['positional']))->toThrow(ToolNotAvailable::class);
+
+    expect($refused)->toHaveCount(2)
+        ->and($denied)->toHaveCount(2)
+        ->and(array_map(fn (object $event): array => [$event->tool, $event->runId, $event->reason], $refused))
+        ->toBe([['mode_gated', 'flow', 'approval'], ['plain', 'flow', 'arguments']])
+        ->and(array_map(fn (object $event): ?string => $event->reason, $denied))->toBe(['approval', 'arguments'])
+        ->and(json_encode($refused))->not->toContain('TOP-SECRET');
+});
+
 it('applies a tool policy revoked while the call policy is deciding', function (): void {
     config()->set('prism-harness.agent.authorize_tools', true);
     app()->forgetInstance(ToolAuthorizer::class);

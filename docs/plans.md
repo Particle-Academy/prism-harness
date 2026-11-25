@@ -34,7 +34,9 @@ ordinary tool approval, answered with `approve()`, `deny()`, `decide()` or
 `streamDecision()`. Turning this off is a host decision made in config
 (`plans.require_approval => false`). There is no per-call option, and nothing
 the model sends can change it. Plan changes and approval pauses always go to a
-person.
+person. A plan started without approval stays marked that way: the plan context
+tells the model it was "not reviewed by a person", even if approval is turned
+back on later, and says "approved by the person" only when one did.
 
 ## The agent's tools
 

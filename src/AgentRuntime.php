@@ -6,11 +6,13 @@ namespace Prism\Harness;
 
 use Closure;
 use Generator;
+use Illuminate\Container\Container;
 use Illuminate\Support\Collection;
 use Prism\Harness\Context\MemoryHooks;
 use Prism\Harness\Context\SummarisingCompaction;
 use Prism\Harness\Contracts\CallCostObserver;
 use Prism\Harness\Contracts\CompactionStrategy;
+use Prism\Harness\Events\FlowToolRefused;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunResumed;
@@ -73,7 +75,11 @@ final readonly class AgentRuntime
     /** The run id on decisions made for a workflow node, which has no harness run. */
     private const FLOW_RUN = 'flow';
 
-    /** The host tool policy, replaceable live; the runtime itself stays readonly. */
+    /**
+     * Where the host tool policy is kept when no container slot is bound (a
+     * runtime built by hand). In an application it lives in the container's
+     * SCOPED slot instead: see {@see self::policySlot()}.
+     */
     private ToolPolicySlot $policySlot;
 
     /** @param array<string, mixed> $config */
@@ -152,12 +158,48 @@ final readonly class AgentRuntime
     }
 
     /**
+     * Record approval decisions and continue the run, all under ONE hold of
+     * the session's fenced lock.
+     *
+     * `$record` runs first inside the lock, before a run id exists or any
+     * provider is called: it checks that every decision answers a pending
+     * approval and writes them. A session another request holds refuses with
+     * SessionLocked having written nothing, so the decision can be retried;
+     * two racing decisions for one approval cannot both pass the check.
+     *
+     * @internal Called by Session::decide().
+     *
+     * @param  Closure(): void  $record
+     */
+    public function resumeDecided(Session $session, Closure $record, ?RunContext $context = null): AgentResponse
+    {
+        $context = $this->executionContext($context);
+        $runId = null;
+
+        try {
+            // Resumed with an EMPTY prompt: the conversation already holds the
+            // request, the decisions and everything before them.
+            return $this->sendLocked($session, '', null, $context, [], $runId, $record);
+        } finally {
+            if ($runId !== null) {
+                ToolRefusals::forget($runId);
+            }
+        }
+    }
+
+    /**
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $attachments
      */
-    private function sendLocked(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, ?string &$runId): AgentResponse
+    private function sendLocked(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, ?string &$runId, ?Closure $beforeRun = null): AgentResponse
     {
-        return $session->fencedLock(function (Session $session) use ($prompt, $toolNames, $context, $attachments, &$runId): AgentResponse {
+        return $session->fencedLock(function (Session $session) use ($prompt, $toolNames, $context, $attachments, &$runId, $beforeRun): AgentResponse {
+            // Inside the lock and before a run exists: decisions are checked
+            // and written here, so a refusal leaves no run behind it.
+            if ($beforeRun !== null) {
+                $beforeRun();
+            }
+
             // The id comes FIRST, before anything that can throw.
             //
             // Mode resolution and provider config used to run ahead of it, so a
@@ -1527,7 +1569,9 @@ final readonly class AgentRuntime
     /** @param array<array-key, mixed> $arguments */
     private function recordFlowRefusal(Session $session, Tool $tool, array $arguments, string $reason, ToolNotAvailable $refusal): ToolNotAvailable
     {
-        $this->emitToolDecision(ToolDenied::class, $session, self::FLOW_RUN, $tool, $tool->name(), $arguments, 'policy');
+        $this->emitToolDecision(ToolDenied::class, $session, self::FLOW_RUN, $tool, $tool->name(), $arguments, 'policy', $reason);
+        // Deprecated, still emitted for listeners written against 0.26.
+        event(new FlowToolRefused($session->key(), self::FLOW_RUN, $tool->name(), $reason));
 
         return $refusal;
     }
@@ -1908,19 +1952,33 @@ final readonly class AgentRuntime
     /**
      * The host tool policy in force (G-326).
      *
-     * Configured by `prism-harness.agent.tool_policy` (the shared JSON shape)
-     * or set with {@see self::setToolPolicy()}; `ToolPolicy::none()` otherwise.
-     * Validated against the registered tools when first read.
+     * The policy set with {@see self::setToolPolicy()} for the current request
+     * or queued job; otherwise the deployment's, configured by
+     * `prism-harness.agent.tool_policy` (the shared JSON shape);
+     * `ToolPolicy::none()` when neither is set. Validated against the
+     * registered tools when first read.
      */
     public function toolPolicy(): ToolPolicy
     {
-        return $this->policySlot->policy ??= $this->admitPolicy(isset($this->config['tool_policy'])
+        $slot = $this->policySlot();
+
+        return $slot->policy ??= $this->admitPolicy(isset($this->config['tool_policy'])
             ? ToolPolicy::fromArray($this->config['tool_policy'])
             : ToolPolicy::none());
     }
 
     /**
-     * Replace the host tool policy (G-326). Never reachable from a tool.
+     * Replace the host tool policy for THIS request or queued job (G-326).
+     * Never reachable from a tool.
+     *
+     * The runtime is a singleton, so the policy is NOT kept on it: it lives in
+     * a scoped container slot, which Laravel empties when Octane starts the
+     * next request and when a queue worker starts the next job. A policy set
+     * for one tenant's request therefore never applies to a session a later
+     * request or job serves; that one gets the deployment's policy from config
+     * until its own host code sets another. Within one request or job it
+     * applies to every session the request runs, so a request or job that
+     * serves several tenants sets the policy before each one's runs.
      *
      * Applies from the next tool call. A call already waiting on a person
      * keeps waiting: a policy that would now allow it does not run it. A call
@@ -1931,7 +1989,18 @@ final readonly class AgentRuntime
      */
     public function setToolPolicy(ToolPolicy $policy): void
     {
-        $this->policySlot->policy = $this->admitPolicy($policy);
+        $this->policySlot()->policy = $this->admitPolicy($policy);
+    }
+
+    /**
+     * The scoped slot of the current request or job, when the application
+     * bound one (the service provider does); the runtime's own otherwise.
+     */
+    private function policySlot(): ToolPolicySlot
+    {
+        $container = Container::getInstance();
+
+        return $container->bound(ToolPolicySlot::class) ? $container->make(ToolPolicySlot::class) : $this->policySlot;
     }
 
     private function admitPolicy(ToolPolicy $policy): ToolPolicy
@@ -2033,18 +2102,23 @@ final readonly class AgentRuntime
     }
 
     /** @param class-string<ToolDecision> $event */
-    private function emitToolDecision(string $event, Session $session, string $runId, ?Tool $tool, string $name, mixed $arguments, string $decidedBy): void
+    private function emitToolDecision(string $event, Session $session, string $runId, ?Tool $tool, string $name, mixed $arguments, string $decidedBy, ?string $reason = null): void
     {
-        event(new $event(
-            sessionKey: $session->key(),
-            runId: $runId,
-            policyRevision: $this->toolPolicy()->revision,
-            server: $tool === null ? null : $this->tools->declarationOf($tool)['server'],
-            tool: $name,
-            argsDigest: CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments),
-            decidedBy: $decidedBy,
-            harnessAgent: $session->agent(),
-        ));
+        $fields = [
+            'sessionKey' => $session->key(),
+            'runId' => $runId,
+            'policyRevision' => $this->toolPolicy()->revision,
+            'server' => $tool === null ? null : $this->tools->declarationOf($tool)['server'],
+            'tool' => $name,
+            'argsDigest' => CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments),
+            'decidedBy' => $decidedBy,
+            'harnessAgent' => $session->agent(),
+        ];
+        if ($event === ToolDenied::class) {
+            $fields['reason'] = $reason;
+        }
+
+        event(new $event(...$fields));
     }
 
     /**

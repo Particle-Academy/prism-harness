@@ -578,6 +578,35 @@ it('starts a plan without asking only when the host config says so', function ()
         ->and(g360Plan()['status'])->toBe('active');
 });
 
+it('never tells the model a person approved a plan nobody reviewed, even after approval is switched back on', function (): void {
+    config()->set('prism-harness.plans.require_approval', false);
+    G360::calls([['plan_draft', g360Draft()]]);
+    G360::text('ok');
+    G360::session()->send('Plan the trip');
+    expect(g360Plan()['status'])->toBe('active');
+
+    // The host turns approval back on: this plan was still never reviewed.
+    config()->set('prism-harness.plans.require_approval', true);
+    G360::calls([['plan_complete_step', ['summary' => 'Booked the flight']]]);
+    G360::text('Step one is done.');
+    expect(G360::session()->plan()->advance()->status)->toBe('ran');
+
+    $body = json_encode(G360::request(count(Http::recorded()) - 2));
+    expect($body)->toContain('[Plan')->toContain('not reviewed by a person')
+        ->and($body)->not->toContain('approved by the person');
+});
+
+it('tells the model a person approved the plan only when one did', function (): void {
+    g360Active();
+    G360::calls([['plan_complete_step', ['summary' => 'Booked the flight']]]);
+    G360::text('Step one is done.');
+    expect(G360::session()->plan()->advance()->status)->toBe('ran');
+
+    $body = json_encode(G360::request(count(Http::recorded()) - 2));
+    expect($body)->toContain('approved by the person')
+        ->and($body)->not->toContain('not reviewed by a person');
+});
+
 it('refuses a malformed plans flag on a mode rather than reading it as on', function (): void {
     config()->set('prism-harness.agent.modes.chat.plans', 'false');
     app()->forgetInstance(ModeRegistry::class);

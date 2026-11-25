@@ -284,6 +284,22 @@ return [
         'authorize_tools' => env('HARNESS_AUTHORIZE_TOOLS', false),
 
         /*
+         * Approval-gated tools that run without asking a person (G-326).
+         * Unset: every gated tool asks. The shape, with exact names only:
+         *
+         *   'tool_policy' => [
+         *       'revision' => 'r1',
+         *       'allow' => [['tool' => 'search'], ['server' => 'files', 'tool' => 'read']],
+         *       'honor' => true,
+         *   ],
+         *
+         * Confirmation and approval tools, the plan tools and tools that
+         * declare `tier: destructive` are refused. AgentRuntime::setToolPolicy()
+         * replaces this for the current request or queued job only. See the
+         * README, "Tools that run without asking".
+         */
+
+        /*
          * The hard ceiling on a per-session step override.
          *
          * A mode's `max_steps` is a default, and a caller that holds a frozen,

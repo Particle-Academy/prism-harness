@@ -697,11 +697,16 @@ class Thread extends Model implements ThreadContract
      * How many calls of the turn paused at the transcript tail a person
      * approved, for this tool and these arguments, that have no result yet.
      *
+     * The FIRST recorded answer for an approval id is the answer, as in
+     * {@see self::approvalDecisions()} and in the history a provider is sent:
+     * a later approval never overrides an earlier denial.
+     *
      * @internal The evidence a gated tool requires before it runs.
      */
     public function approvedCallsAwaitingResult(string $name, string $argumentsDigest): int
     {
-        $approved = [];
+        /** @var array<string, bool> $answers by approval id; read newest first, so the last write is the first answer */
+        $answers = [];
         $finished = [];
         foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
             $payload = $stored->payload;
@@ -711,9 +716,9 @@ class Thread extends Model implements ThreadContract
                         $finished[$result['tool_call_id']] = true;
                     }
                 }
-                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
-                    if (is_array($response) && is_string($response['approval_id'] ?? null) && ($response['approved'] ?? false) === true) {
-                        $approved[$response['approval_id']] = true;
+                foreach (array_reverse($payload['tool_approval_responses'] ?? []) as $response) {
+                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                        $answers[$response['approval_id']] = ($response['approved'] ?? false) === true;
                     }
                 }
 
@@ -722,6 +727,7 @@ class Thread extends Model implements ThreadContract
             if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
                 return 0;
             }
+            $approved = array_filter($answers);
 
             $approvedCallIds = [];
             foreach ($payload['tool_approval_requests'] ?? [] as $request) {

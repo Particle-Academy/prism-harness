@@ -92,7 +92,7 @@ final class PlanTools
                     }
                     // Approval switched off by the host's config: the plan starts as written.
                     $plan = $this->proposal($arguments, $digest);
-                    $plan = PlanMachine::activate($plan, $digest, $this->plans->now(), $this->plans->runId($this->session));
+                    $plan = PlanMachine::activate($plan, $digest, $this->plans->now(), $this->plans->runId($this->session), approvedByPerson: false);
                     $this->plans->write($this->session, $plan, $this->plans->load($this->session)['revision'] ?? null);
 
                     return 'The plan is active; the host will run its steps one at a time.';
