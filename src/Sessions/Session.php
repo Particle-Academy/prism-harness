@@ -26,6 +26,7 @@ use Prism\Harness\Plans\PlanHandle;
 use Prism\Harness\Plans\Plans;
 use Prism\Harness\Steps\RunStep;
 use Prism\Harness\StructuredAgentResponse;
+use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Tasks\StoreTaskSource;
 use Prism\Prism\Contracts\Schema;
@@ -167,6 +168,34 @@ class Session
     public function usingProvider(string $provider): self
     {
         return $this->write('provider', $provider);
+    }
+
+    /**
+     * The provider and model binding the subagent runner gave this session's
+     * child runs, or null for a session that has never been a child (G-321 E).
+     *
+     * @internal Read by the runtime for a run the runner did not start.
+     */
+    public function childBinding(): ?ChildBinding
+    {
+        $saved = $this->state()['child_binding'] ?? null;
+        if (! is_array($saved)) {
+            return null;
+        }
+        $field = static fn (string $key): ?string => is_string($saved[$key] ?? null) ? $saved[$key] : null;
+
+        return new ChildBinding($field('provider'), $field('model'), $field('parent_mode_provider'), $field('parent_mode_model'));
+    }
+
+    /** @internal Written by the runtime when the subagent runner starts a child run. */
+    public function rememberChildBinding(ChildBinding $binding): self
+    {
+        return $this->write('child_binding', [
+            'provider' => $binding->provider,
+            'model' => $binding->model,
+            'parent_mode_provider' => $binding->parentModeProvider,
+            'parent_mode_model' => $binding->parentModeModel,
+        ]);
     }
 
     /**

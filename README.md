@@ -645,6 +645,12 @@ child running on it would spend against a choice nobody made for the child. A pa
 model does not cross into another agent, because that agent usually exists for its provider.
 The child session's own override slot is not read: the runner owns that address.
 
+**A child keeps its binding when it is resumed.** The runner saves the child's binding with the
+child's session. A run on that session the runner did not start, such as the host answering an
+approval the child stopped on with `approve()`, `decide()` or `streamDecision()`, uses the same
+provider and model. The resumed run is a new root run: its step and cost budget, and the
+agent's `spend_ceiling`, are counted from that run, not from the tree the child was started in.
+
 **Delegating to another agent is declared, never inherited.** A subagent with `'agent' => 'auditor'`
 is accepted only when the parent mode lists `auditor` in `agents`. Otherwise the mode is refused
 when it loads, before any provider request. Agent ids are checked exactly as written. A padded
