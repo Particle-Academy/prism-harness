@@ -673,3 +673,47 @@ it('marks the run tree when a grandchild of a child resumed under a host context
         ->and(app(RunTrees::class)->treeCancelled($child, $tree))->toBeTrue()
         ->and(g285Web()->run()['status'])->toBe('cancelled');
 });
+
+// A host may hand one run context to several sessions. A grandchild belongs to
+// the tree of the run it was started from, never to another session's run
+// that happens to spend from the same ledger.
+it('gives a grandchild the tree of its own parent when a host shares one context between people', function (): void {
+    config()->set('prism-harness.agent.modes.deep_runner', [
+        'system_prompt' => 'You dig.', 'tools' => [], 'skills' => [], 'max_steps' => 3,
+    ]);
+    config()->set('prism-harness.agent.modes.op_runner', [
+        'system_prompt' => 'You run one Op.', 'tools' => ['weather', 'search'], 'requires_approval' => ['weather'], 'skills' => [], 'max_steps' => 6,
+        'subagents' => ['dig' => ['description' => 'Dig.', 'mode' => 'deep_runner', 'max_steps' => 3]],
+    ]);
+    config()->set('prism-harness.agent.modes.chat.tools', []);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'run_op' => ['description' => 'Run an Op.', 'mode' => 'op_runner', 'max_steps' => 5],
+    ]);
+    $ada = Participant::query()->firstOrCreate(['name' => 'Ada']);
+    $bob = Participant::query()->firstOrCreate(['name' => 'Bob']);
+    $child = fn (Participant $who, string $scope = 'chat::sub::run_op') => app(PrismHarness::class)->for($who)->session($scope);
+    foreach (['Ada', 'Bob'] as $name) {
+        G360::calls([['run_op', ['task' => 'Run the Op']]]);
+        G360::calls([['weather', ['city' => 'Detroit']]]);
+        G360::text('Root done.');
+        g285Worker($name)->send('go');
+    }
+    $adaTree = $child($ada)->childTree();
+    $bobTree = $child($bob)->childTree();
+    expect($adaTree)->not->toBeNull()->and($bobTree)->not->toBeNull()->and($bobTree)->not->toBe($adaTree);
+
+    $shared = RunContext::root('host_shared', new RunBudget(100));
+    $this->during['search'] = function () use ($child, $bob, $shared): void {
+        $bobChild = $child($bob);
+        $bobChild->approve($bobChild->thread()->pendingApprovalIds()[0], true, null, $shared);
+    };
+    G360::calls([['search', ['query' => 'billing']]]);
+    G360::calls([['dig', ['task' => 'Dig']]]);
+    G360::text('Grandchild done.');
+    G360::text('Bob child done.');
+    G360::text('Ada child done.');
+    $adaChild = $child($ada);
+    $adaChild->approve($adaChild->thread()->pendingApprovalIds()[0], true, null, $shared);
+
+    expect($child($bob, 'chat::sub::run_op::sub::dig')->childTree())->toBe($bobTree);
+});

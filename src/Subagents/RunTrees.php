@@ -42,6 +42,16 @@ final class RunTrees
     private array $runs = [];
 
     /**
+     * For each run the runner's own context is running, the live run it
+     * spends from (its key in $runs), or null under a tree the host built.
+     * A child it starts is found through its parent run id, never through a
+     * ledger another session may share.
+     *
+     * @var array<string, ?string>
+     */
+    private array $lineage = [];
+
+    /**
      * A run is starting. A turn on a child session the runner did not start
      * (an answer to its approval, a new message, or a run context the host
      * built) continues the tree its binding names: it holds what that tree
@@ -58,6 +68,10 @@ final class RunTrees
     {
         $route = PlanBudget::route($this->contextKind($context), '', false, false, $session->childTree() !== null, false)['tree'];
         if ($route === 'none') {
+            if ($context !== null && $this->contextKind($context) === 'runner') {
+                $this->lineage[$runId] = $this->entryKey($context);
+            }
+
             return $run;
         }
         $tree = $route === 'continue' ? $session->childTree() : null;
@@ -186,6 +200,7 @@ final class RunTrees
      */
     public function finished(Session $session, string $runId): void
     {
+        unset($this->lineage[$runId]);
         $entry = $this->runs[$runId] ?? null;
         if ($entry === null || $entry['session'] !== $session->key()) {
             return;
@@ -239,23 +254,27 @@ final class RunTrees
 
     /**
      * The live run of this runtime a context spends from: the root run its
-     * ledger names, or the run that holds that ledger. A child resumed under
-     * a context the host built continues its saved tree under its OWN run id
-     * while its ledger is the host's, so the children it starts are found by
-     * the ledger, not by the host's root run id.
+     * ledger names, or else the run it was started from. A child resumed
+     * under a context the host built continues its saved tree under its OWN
+     * run id while its ledger is the host's, so the children it starts are
+     * found through their parent run id (and, deeper down, through the run
+     * that parent spends from). A ledger is never enough on its own: a host
+     * may hand one context to several sessions.
      */
     private function entryKey(RunContext $context): ?string
     {
         if (isset($this->runs[$context->rootRunId()])) {
             return $context->rootRunId();
         }
-        foreach ($this->runs as $runId => $entry) {
-            if ($entry['ledger'] === $context->ledger) {
-                return (string) $runId;
-            }
+        $parent = $context->parentRunId;
+        if ($parent === null) {
+            return null;
+        }
+        if (isset($this->runs[$parent]) && $this->runs[$parent]['ledger'] === $context->ledger) {
+            return $parent;
         }
 
-        return null;
+        return $this->lineage[$parent] ?? null;
     }
 
     /**
