@@ -855,13 +855,7 @@ class Session
         // the ephemeral half has expired, for as long as the run id is one
         // this session remembers.
         $membership = ['tree' => $tree['tree'] ?? 'none', 'depth' => $tree['depth'] ?? 0];
-        $this->assertWritableResolution();
-        $durable = $this->durable->get($this->durableKey()) ?? [];
-        $trees = is_array($durable['run_trees'] ?? null) ? $durable['run_trees'] : [];
-        unset($trees[$id]);
-        $trees[$id] = $membership;
-        $durable['run_trees'] = array_slice($trees, -self::RUN_HISTORY, preserve_keys: true);
-        $this->durable->put($this->durableKey(), $durable);
+        $this->rememberRunTree($id, $membership);
 
         return $this->writeAll([
             'run' => [
@@ -1036,8 +1030,8 @@ class Session
      */
     private function runTree(string $runId): ?array
     {
-        $durable = $this->durable->get($this->durableKey()) ?? [];
-        $tree = is_array($durable['run_trees'] ?? null) ? ($durable['run_trees'][$runId]['tree'] ?? null) : null;
+        $runs = $this->durable->get($this->runTreesKey())['runs'] ?? null;
+        $tree = is_array($runs) && is_array($runs[$runId] ?? null) ? ($runs[$runId]['tree'] ?? null) : null;
 
         return is_array($tree) && is_string($tree['session'] ?? null) && is_string($tree['run'] ?? null)
             ? ['session' => $tree['session'], 'run' => $tree['run']] : null;
@@ -1113,6 +1107,50 @@ class Session
         if ($tree !== null) {
             app(RunTrees::class)->cancelTree($this, $tree);
         }
+    }
+
+    /**
+     * Keep a run's tree under its own durable key (G-381), so it never
+     * rewrites the session's other durable state, written under the session
+     * lock the run begins in. The newest runs are kept, by an explicit
+     * sequence rather than the store's key order, and a run whose approvals
+     * the thread is still parked on is never dropped: a resume that keeps
+     * failing must not forget the tree it resumes.
+     *
+     * @param  array{tree: mixed, depth: mixed}  $membership
+     */
+    private function rememberRunTree(string $id, array $membership): void
+    {
+        $this->assertWritableResolution();
+        $stored = $this->durable->get($this->runTreesKey()) ?? [];
+        $runs = is_array($stored['runs'] ?? null) ? $stored['runs'] : [];
+        $seq = is_int($stored['seq'] ?? null) ? $stored['seq'] + 1 : 1;
+        $runs[$id] = [...$membership, 'seq' => $seq];
+        $parked = [];
+        $thread = $this->thread();
+        foreach ($thread->pausedApprovalIds() as $approvalId) {
+            $runId = $thread->approvalRunId($approvalId);
+            if ($runId !== null) {
+                $parked[$runId] = true;
+            }
+        }
+        $order = [];
+        foreach ($runs as $runId => $entry) {
+            $order[(string) $runId] = is_array($entry) && is_int($entry['seq'] ?? null) ? $entry['seq'] : 0;
+        }
+        arsort($order, SORT_NUMERIC);
+        $kept = [];
+        foreach ($order as $runId => $unused) {
+            if (count($kept) < self::RUN_HISTORY || isset($parked[$runId])) {
+                $kept[$runId] = $runs[$runId];
+            }
+        }
+        $this->durable->put($this->runTreesKey(), ['seq' => $seq, 'runs' => $kept]);
+    }
+
+    private function runTreesKey(): string
+    {
+        return $this->key().':run-trees';
     }
 
     private function recordCancel(string $runId): void

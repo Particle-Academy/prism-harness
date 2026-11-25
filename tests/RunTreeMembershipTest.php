@@ -2,12 +2,18 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\ConnectionInterface;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Http;
+use Prism\Harness\AgentRuntime;
 use Prism\Harness\Enums\CancelOutcome;
 use Prism\Harness\Events\RunCancelRequested;
 use Prism\Harness\Exceptions\ApprovalNotPending;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Stores\DatabaseSessionStore;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunLedger;
@@ -279,11 +285,13 @@ it('stops a resumed root when a subagent it delegated before the approval is can
         ->and($this->searches)->toBe($searches);
 });
 
-// The resumed root spends from its own budget, never from what the tree's
-// record holds for the subagents parked in it: after it delegates again and
-// parks again, the earlier child can still be approved and run.
-it('leaves a parked subagent its tree budget after the root resumed, delegated and parked again', function (): void {
-    config()->set('prism-harness.agent.modes.chat.max_steps', 6);
+// A root that resumes into a tree that already has a budget record holds
+// what the tree has left and is narrowed to it, like any other turn that
+// continues the tree: the tree's allowance holds across the approval pause.
+/** @return array{0: Session, 1: list<string>, 2: string} */
+function g381ResumedRootDelegatesAgain(int $maxSteps): array
+{
+    config()->set('prism-harness.agent.modes.chat.max_steps', $maxSteps);
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['search']);
     config()->set('prism-harness.agent.modes.op_runner.requires_approval', ['search']);
     config()->set('prism-harness.agent.modes.chat.subagents', [
@@ -294,14 +302,22 @@ it('leaves a parked subagent its tree budget after the root resumed, delegated a
     G360::calls([['search', ['query' => 'child']]]);
     G360::calls([['search', ['query' => 'root']]]);
     $first = g381Session('Ada')->send('go')->pendingApprovals()[0];
+    $firstRun = (string) (g381Session('Ada')->run()['id'] ?? '');
     G360::calls([['scout', ['task' => 'Scout']]]);
     G360::text('Scouted.');
     G360::calls([['search', ['query' => 'root again']]]);
-    g381Session('Ada')->approve($first->approvalId);
-    expect(g381Session('Ada')->thread()->pendingApprovalIds())->toHaveCount(1);
-
+    G360::text('Spare.');
+    try {
+        g381Session('Ada')->approve($first->approvalId);
+    } catch (RunNotPermitted) {
+    }
     $child = g381Session('Ada', 'chat::sub::run_op');
-    $pending = $child->thread()->pendingApprovalIds();
+
+    return [$child, $child->thread()->pendingApprovalIds(), $firstRun];
+}
+
+it('leaves a parked subagent what its tree has left after the root resumed, delegated and parked again', function (): void {
+    [$child, $pending] = g381ResumedRootDelegatesAgain(20);
     expect($pending)->toHaveCount(1);
     $searches = $this->searches;
     G360::text('Child done.');
@@ -309,4 +325,72 @@ it('leaves a parked subagent its tree budget after the root resumed, delegated a
 
     expect($this->searches)->toBe($searches + 1)
         ->and($child->run()['status'])->toBe('completed');
+});
+
+it('holds a resumed root to its tree record, so the tree never spends past its allowance', function (): void {
+    [$child, $pending, $firstRun] = g381ResumedRootDelegatesAgain(6);
+    $record = g381TreeRecord(g381Session('Ada'), $firstRun);
+    expect($record)->toBeArray()
+        ->and($record['steps'])->toBeLessThanOrEqual($record['max_steps'])
+        ->and($record['steps'])->toBe($record['max_steps']);
+    $searches = $this->searches;
+    $requests = count(Http::recorded());
+
+    // Spent, the tree refuses the parked child before anything is recorded.
+    expect(fn () => $child->approve($pending[0]))->toThrow(RunNotPermitted::class)
+        ->and($child->thread()->pendingApprovalIds())->toBe($pending)
+        ->and($this->searches)->toBe($searches)
+        ->and(count(Http::recorded()))->toBe($requests);
+});
+
+// A resume the spent tree refuses still begins a run, and the session keeps
+// the trees of its newest runs only. The run the thread is parked on is never
+// dropped, so retrying the refused resume never escapes the tree.
+it('keeps refusing a resume of a spent tree however often it is retried', function (): void {
+    g381ResumedRootDelegatesAgain(6);
+    $root = g381Session('Ada');
+    expect($root->thread()->pausedApprovalIds())->toHaveCount(1);
+    $searches = $this->searches;
+    $requests = count(Http::recorded());
+    $refusals = 0;
+    for ($try = 0; $try < 23; $try++) {
+        try {
+            g381Session('Ada')->send('');
+        } catch (RunNotPermitted) {
+            $refusals++;
+        }
+    }
+
+    expect($refusals)->toBe(23)
+        ->and($this->searches)->toBe($searches)
+        ->and(count(Http::recorded()))->toBe($requests);
+});
+
+// A run's tree is kept under a key of its own: starting a run never rewrites
+// the session's durable record, where a host keeps capabilities it may revoke
+// from another process while the run starts.
+it('never rewrites the session durable record when a run starts', function (): void {
+    $puts = [];
+    $durable = new class(DB::connection(), $puts) extends DatabaseSessionStore
+    {
+        /** @param list<string> $puts */
+        public function __construct(ConnectionInterface $connection, private array &$puts)
+        {
+            parent::__construct($connection);
+        }
+
+        public function put(string $key, array $payload, ?int $ttlSeconds = null): void
+        {
+            $this->puts[] = $key;
+            parent::put($key, $payload, $ttlSeconds);
+        }
+    };
+    $session = new Session(Participant::query()->firstOrCreate(['name' => 'Ada']), 'chat',
+        new DatabaseSessionStore(DB::connection()), $durable,
+        runtime: app(AgentRuntime::class));
+    G360::text('Done.');
+    $session->send('go');
+
+    expect(array_filter($puts, fn (string $key): bool => str_ends_with($key, ':durable')))->toBe([])
+        ->and(array_filter($puts, fn (string $key): bool => str_ends_with($key, ':run-trees')))->not->toBe([]);
 });

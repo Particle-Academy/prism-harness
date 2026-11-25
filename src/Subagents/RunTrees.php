@@ -108,6 +108,13 @@ final class RunTrees
         if (! is_array($tree)) {
             return $run;
         }
+        // A root resuming its parked run is in the tree that run began. When
+        // that run delegated, the tree has a record, and the resumed root
+        // holds what it has left and is narrowed to it, as any other turn
+        // continuing the tree: the tree's allowance holds across the pause.
+        if ($route === 'open' && $tree['run'] !== $runId && $this->recordOf($session, $tree) !== null) {
+            $route = 'continue';
+        }
         // A turn on a child of a cancelled tree never runs (G-285): the
         // person stopped the whole tree, this child included.
         if ($route === 'continue' && $this->treeCancelled($session, $tree)) {
@@ -191,16 +198,9 @@ final class RunTrees
             $now = time();
             $ttl = self::holdTtl();
             $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($tree, $key, $settings, $now, $ttl): array {
-                // A root resuming its parked run is in the tree that run
-                // began, but spends from its own budget: when that tree's
-                // record already exists (the parked run delegated before),
-                // it is left alone, so the resumed root never takes from
-                // what the subagents parked in it have left. Otherwise it is
-                // opened here, named by the tree's root run, and held under
-                // the run that spends.
-                if ($state !== null && $key !== $tree['run']) {
-                    return [null, null];
-                }
+                // Named by the tree's root run; held under the run that
+                // spends (a root resuming a parked run that never delegated
+                // opens its tree's record here).
                 $state ??= PlanBudget::open($tree['run'], $settings);
 
                 return PlanBudget::reserve($state, $key, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
@@ -223,13 +223,22 @@ final class RunTrees
     public function assertDecisionsFunded(Session $session, ?RunContext $context): void
     {
         // The turn the decision resumes, as it would begin.
-        $membership = $this->begin($session, 'decision', $context);
+        $membership = $this->begin($session, 'decision', $context, '');
         $tree = $membership['tree'];
-        if ($membership['route'] !== 'continue' || ! is_array($tree)) {
+        if (! is_array($tree)) {
             return;
         }
-        $state = $session->planStore()->get(self::key($tree));
-        if (! is_array($state) || ($state['planId'] ?? null) !== $tree['run']) {
+        $state = $this->recordOf($session, $tree);
+        if ($membership['route'] === 'open') {
+            // A root resuming its parked run is held to its tree's record
+            // only when the parked run delegated and opened one.
+            if ($tree['run'] === 'decision' || $state === null) {
+                return;
+            }
+        } elseif ($membership['route'] !== 'continue') {
+            return;
+        }
+        if ($state === null) {
             throw RunNotPermitted::exhausted('steps');
         }
         [, $grant] = PlanBudget::reserve($state, 'decision', 1, null, time(), self::holdTtl());
@@ -344,6 +353,19 @@ final class RunTrees
 
             return $result;
         }, 10, 5);
+    }
+
+    /**
+     * The tree's budget record, or null when it has none.
+     *
+     * @param  array{session: string, run: string}  $tree
+     * @return array<string, mixed>|null
+     */
+    private function recordOf(Session $session, array $tree): ?array
+    {
+        $state = $session->planStore()->get(self::key($tree));
+
+        return is_array($state) && ($state['planId'] ?? null) === $tree['run'] ? $state : null;
     }
 
     /** @param array{session: string, run: string} $tree */
