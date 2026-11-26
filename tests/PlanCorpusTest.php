@@ -14,6 +14,7 @@ use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunBudgets;
 use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunStarts;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Tools\ToolPolicy;
 
@@ -60,6 +61,8 @@ function runPlansCase(array $case): array
                 in_array($op['op'], ['tree_membership', 'kept_refs'], true) => plansTreeOp($op),
                 // How many model steps a run may take (G-387): the pure RunBudgets::allowance.
                 $op['op'] === 'step_allowance' => RunBudgets::allowance($op),
+                // Whether a runner start may begin, decided once before it writes anything (G-387).
+                $op['op'] === 'start_gate' => RunStarts::gate($op),
                 str_starts_with($op['op'], 'budget_') => plansBudgetOp($op, $ledger, $now),
                 default => plansOp($op, $plan, $ids, $limits, $now, $marked, $ledger),
             };

@@ -68,19 +68,10 @@ final readonly class SubagentRunner
     ): SubagentResult {
         $childRunId = 'run_'.bin2hex(random_bytes(12));
 
-        // A task with nothing in it is no instruction: refused before the
-        // child is built or touched. Run, an empty task would read as a
-        // resume of whatever the child is parked on. Blank is one explicit
-        // codepoint set, spelled the same in every language (never the
-        // language's own trim, which differs between them).
-        if (! is_string($task) || self::blank($task)) {
-            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
-                'the task is empty');
-        }
-
-        // EVERYTHING below runs inside the framing: any failure, in a check
+        // EVERYTHING below runs inside the framing: any failure, in a read
         // before the child starts as much as in the child, comes back as a
-        // framed `failed` result carrying only the exception's class.
+        // framed `failed` result carrying only the exception's class. A read
+        // that fails therefore fails CLOSED: nothing has been written yet.
         try {
             return $this->delegate($subagent, $parent, $context, $parentRunId, $task, $parentMode, $childRunId);
         } catch (Throwable $e) {
@@ -100,46 +91,61 @@ final readonly class SubagentRunner
     }
 
     /**
-     * Whether a task holds only blank codepoints (G-387): U+0009-U+000D,
-     * U+0020, U+0085, U+00A0, U+1680, U+2000-U+200D, U+2028, U+2029,
-     * U+202F, U+205F, U+2060, U+3000 and U+FEFF. The same set in all three
-     * languages. Text that is not valid UTF-8 is not blank.
+     * Whether a task holds only blank codepoints (G-387); see
+     * {@see RunStarts::blank()}, the one set every language spells the same.
      */
     public static function blank(string $task): bool
     {
-        return preg_match('/\A[\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200D}\x{2028}\x{2029}\x{202F}\x{205F}\x{2060}\x{3000}\x{FEFF}]*\z/u', $task) === 1;
+        return RunStarts::blank($task);
     }
 
+    /**
+     * The text the parent model is given for each refusal of the start gate:
+     * harness-written, never a host's or a store's words.
+     */
+    private const REASONS = [
+        'task_invalid' => 'the task is empty',
+        'task_blank' => 'the task is empty',
+        'too_deep' => 'subagent nesting reached the maximum depth of %d',
+        'cancelled' => 'the run was cancelled',
+        'time' => 'time budget exhausted',
+        'steps' => 'step budget exhausted: no steps remain in the run tree for this subagent',
+        'cost' => 'cost budget exhausted',
+        'cost_unenforceable' => 'cost budget cannot be enforced for this subagent',
+        'tool_calls' => 'tool call budget exhausted',
+        'child_busy' => 'the subagent is already running',
+        'child_waiting' => 'the subagent is waiting on a person\'s approval',
+        'tree' => 'the run tree has nothing left for this subagent',
+        'plan' => 'the plan budget has nothing left for this subagent',
+    ];
+
+    /**
+     * One runner start (G-387 round 7): every fact the start depends on is
+     * READ first, with nothing written (no session mode, no thread link, no
+     * thread row, no count, binding, hold or run state); the start gate
+     * ({@see RunStarts::gate()}) decides once; a refusal returns framed
+     * having written nothing. Only a start the gate lets through commits,
+     * in one order ({@see AgentRuntime::startChild()}), and once committed
+     * a later stop only stops model steps.
+     */
     private function delegate(
         Subagent $subagent,
         Session $parent,
         RunContext $context,
         string $parentRunId,
-        string $task,
+        mixed $task,
         ?AgentMode $parentMode,
         string $childRunId,
     ): SubagentResult {
-        // Checked BEFORE spawning, so an exhausted tree does not pay for a
-        // session, a thread row and a provider call to discover it is exhausted.
-        $stop = $context->ledger->exhaustion($context->budget);
-        if ($stop !== null) {
-            return SubagentResult::refused(
-                $subagent->name,
-                $childRunId,
-                $parentRunId,
-                $context->ledger->cancelled() ? SubagentOutcome::Cancelled : SubagentOutcome::Exhausted,
-                $stop,
-            );
-        }
-
         // The child runs in the agent the declaration names, or the parent's.
         // ModeRegistry already refused an agent the parent mode does not list.
         $childAgent = $subagent->agent ?? $parent->agent();
         // Marked as the runner's own, with the run it was started from: only
         // this context saves the child's binding, and the child is in that
         // run's tree only while it is live on this parent session and the
-        // context is its own (G-381).
-        $childContext = app(RunTrees::class)->startingChild($context->forChild($subagent, $parentRunId, $parent->thread()->getKey())
+        // context is its own (G-381). The parent's thread is READ, never
+        // created, by a start that may yet be refused.
+        $childContext = app(RunTrees::class)->startingChild($context->forChild($subagent, $parentRunId, Thread::existingAt($parent->address())?->getKey())
             ->withBinding(ChildBinding::for(
                 $subagent,
                 $parent->provider(),
@@ -147,59 +153,31 @@ final readonly class SubagentRunner
                 $parentMode ?? $this->modeOf($parent),
                 sameAgent: $childAgent === $parent->agent(),
             )), $parentRunId, $parent->key());
-
-        // Refused BEFORE the child's address is built. Two modes that name each
-        // other as subagents form a cycle that budgets would eventually stop,
-        // but only after each level had appended `::sub::<name>` to a scope
-        // column that truncates rather than errors — and two children truncated
-        // to the same string are one conversation.
-        if ($childContext->tooDeep()) {
-            return SubagentResult::refused(
-                $subagent->name,
-                $childRunId,
-                $parentRunId,
-                SubagentOutcome::Denied,
-                sprintf('subagent nesting reached the maximum depth of %d', RunContext::MAX_DEPTH),
-            );
-        }
-
-        // A child that has been narrowed to nothing is refused rather than run:
-        // a zero-step budget can only produce an empty answer, and an empty
-        // answer reads to the parent like the work was done. In the ledger's
-        // unit: the budget is a ceiling on the tree's running count, so what
-        // the child may take is what that ceiling leaves above it (G-387).
-        if ($childContext->budget->maxSteps - $context->ledger->steps() < 1) {
-            return SubagentResult::refused(
-                $subagent->name,
-                $childRunId,
-                $parentRunId,
-                SubagentOutcome::Exhausted,
-                'no steps remain in the run tree for this subagent',
-            );
-        }
-
-        // A child waiting on a person's approval is the person's to answer:
-        // a delegation into it would dismiss that approval. Refused before
-        // anything is written to the child.
         $child = $this->harness->forAgent($childAgent)->session(
             $parent->participant(), $subagent->scopeUnder($parent->scope()), $parent->actor(),
         );
-        if ($this->awaitsAPerson($child)) {
-            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
-                'the subagent is waiting on a person\'s approval');
-        }
-        // A turn on the child is running and holds its count: starting it
-        // again would reset that count under the running turn.
-        if (app(RunTrees::class)->delegationBusy($child)) {
-            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
-                'the subagent is already running');
+
+        $facts = [
+            ...$this->runtime->runnerStartFacts($child, $childContext, $context, $task, $subagent->mode),
+            // A turn on the child is running and holds its count: starting it
+            // again would reset that count under the running turn.
+            'child_busy' => app(RunTrees::class)->delegationBusy($child),
+            // A child waiting on a person's approval is the person's to
+            // answer: a delegation into it would dismiss that approval.
+            'child_pending' => $this->pendingOn($child),
+        ];
+        $verdict = RunStarts::gate($facts);
+        $refused = $verdict['gate']['refused'] ?? (isset($verdict['gate']['start']) ? null : 'task_invalid');
+        if ($refused !== null || ! is_string($task)) {
+            $refused ??= 'task_invalid';
+
+            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId,
+                SubagentOutcome::from(RunStarts::OUTCOMES[$refused] ?? 'denied'),
+                sprintf(self::REASONS[$refused] ?? 'the subagent may not start', RunContext::MAX_DEPTH));
         }
 
         try {
-            $child->usingMode($subagent->mode);
-            $child->thread()->linkBeneath($parent->thread(), $context->rootRunId());
-
-            $response = $this->runtime->send($child, $task, null, $childContext);
+            $response = $this->runtime->startChild($child, $task, $childContext, $subagent->mode, $parent, $context->rootRunId(), $facts['tree_left']);
 
             return new SubagentResult(
                 subagent: $subagent->name,
@@ -215,11 +193,13 @@ final readonly class SubagentRunner
         } catch (RunNotPermitted $e) {
             if ($e->code() === 'child_busy') {
                 return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
-                    'the subagent is already running');
+                    self::REASONS['child_busy']);
             }
 
-            // Not a failure of the child's work — the tree refused to let it
-            // spend. Reported as its own outcome so the parent does not retry.
+            // Not a failure of the child's work: the tree refused a hold that
+            // raced the gate, or a stop landed after the start committed.
+            // Reported as its own outcome so the parent does not retry. Every
+            // RunNotPermitted message is harness-written.
             return SubagentResult::refused(
                 $subagent->name,
                 $childRunId,
@@ -235,27 +215,34 @@ final readonly class SubagentRunner
     }
 
     /**
-     * Whether the child has an approval a person could still answer: one
-     * whose run was not cancelled, on a child whose decision would be
-     * accepted (its binding saved, its run tree not cancelled). An approval
-     * nobody can answer does not hold the child for ever.
+     * Whether the child has an approval a person could still answer
+     * (`answerable`: one whose run was not cancelled, on a child whose
+     * decision would be accepted, its binding saved and its run tree not
+     * cancelled), one nobody can answer (`unanswerable`, which does not hold
+     * the child for ever), or none. Reads only.
+     *
+     * @return 'none'|'answerable'|'unanswerable'
      */
-    private function awaitsAPerson(Session $child): bool
+    private function pendingOn(Session $child): string
     {
-        $pending = array_filter(Thread::existingAt($child->address())?->pendingApprovalIds() ?? [],
+        $thread = Thread::existingAt($child->address());
+        if ($thread === null) {
+            return 'none';
+        }
+        $pending = array_filter($thread->pendingApprovalIds(),
             static fn (string $id): bool => $child->approvalStatus($id) === 'pending');
         if ($pending === []) {
-            return false;
+            return 'none';
         }
         try {
             // The checks a decision on it would be refused by.
             $this->runtime->assertDecisionsActionable($child, null);
             app(RunTrees::class)->assertDecisionsFunded($child, null);
         } catch (RunNotPermitted) {
-            return false;
+            return 'unanswerable';
         }
 
-        return true;
+        return 'answerable';
     }
 
     /**

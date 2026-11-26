@@ -46,12 +46,12 @@ final class RunTrees
      * Every run of this process, by run id, until it ends: the run tree it
      * belongs to, decided once when it began ({@see self::membership()}), the
      * session it runs on and the ledger it spends from. The one record that
-     * childStarted, the kept references, the depth and the budget route read;
+     * the runner start's tree hold, the kept references, the depth and the budget route read;
      * a child the runner starts takes its parent's from here.
      *
      * The allowance the run was given when it began (G-387) is kept here
      * too, beside the ledger count it was given at, once it is known: what
-     * the run writes on the row it parks on, and what childStarted holds.
+     * the run writes on the row it parks on, and what a runner start's tree hold takes.
      *
      * @var array<string, array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string, session: string, ledger: RunLedger, allowance?: array{ceiling: int, used: int, own_left: int, tree_left: ?int, plan_left: ?int, allowance: int, acts_without_step: bool, used_at_park: int, left_at_park: int}, base?: int}>
      */
@@ -263,17 +263,16 @@ final class RunTrees
     }
 
     /**
-     * A child is starting under a run tree: the tree its membership names,
-     * opened in the durable store the first time the run it spends from (a
-     * root of this runtime) starts a child. Null for a child in the host's
-     * tree or in none.
-     *
-     * @internal Saved with the child's binding.
+     * The hold a runner start would take on its run tree (G-387): the run
+     * it spends from (a root of this runtime) opens the tree's record the
+     * first time it starts a child, holding its own allowance. Null when no
+     * hold applies (a child in the host's tree or in none, or a run that
+     * already holds).
      *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route?: string}  $membership
-     * @return array{session: string, run: string}|null
+     * @return array{key: string, tree: array{session: string, run: string}, settings: array{mode: string, max_steps: int, max_cost_micros: ?int}, steps: int}|null
      */
-    public function childStarted(Session $child, array $membership): ?array
+    private function startHold(array $membership): ?array
     {
         $tree = $membership['tree'];
         if (! is_array($tree)) {
@@ -281,34 +280,124 @@ final class RunTrees
         }
         $key = $membership['spends'];
         $entry = $key === null ? null : ($this->runs[$key] ?? null);
-        if ($entry !== null && ! $entry['held']) {
-            $budget = $entry['budget'];
-            // The spending run's allowance, recorded when it began (G-387).
-            $allowance = $this->members[$key]['allowance']['allowance'] ?? max(0, $budget->maxSteps - $entry['steps']);
-            $settings = [
-                'mode' => 'shared',
-                'max_steps' => $allowance,
-                'max_cost_micros' => $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost'])),
-            ];
-            $now = time();
-            $ttl = self::holdTtl();
-            $grant = $this->write($child->planStore(), $entry['tree'], static function (?array $state) use ($tree, $key, $settings, $now, $ttl): array {
-                // Named by the tree's root run; held under the run that
-                // spends (a root resuming a parked run that never delegated
-                // opens its tree's record here).
-                $state ??= PlanBudget::open($tree['run'], $settings);
-
-                return PlanBudget::reserve($state, $key, max(1, (int) $settings['max_steps']), $settings['max_cost_micros'], $now, $ttl);
-            });
-            // A refused hold refuses the delegation: the tree has nothing
-            // left for the run that would spend it.
-            if (is_array($grant) && isset($grant['refused'])) {
-                throw RunNotPermitted::exhausted((string) $grant['limit']);
-            }
-            $this->runs[$key]['held'] = true;
+        if ($entry === null || $entry['held']) {
+            return null;
         }
+        $budget = $entry['budget'];
+        // The spending run's allowance, recorded when it began (G-387).
+        $allowance = $this->members[$key]['allowance']['allowance'] ?? max(0, $budget->maxSteps - $entry['steps']);
 
-        return $tree;
+        return [
+            'key' => (string) $key,
+            // Named by the tree's root run; held under the run that spends
+            // (a root resuming a parked run that never delegated opens its
+            // tree's record here).
+            'tree' => $entry['tree'],
+            'settings' => [
+                'mode' => 'shared',
+                'max_steps' => (int) $allowance,
+                'max_cost_micros' => $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost'])),
+            ],
+            'steps' => max(1, (int) $allowance),
+        ];
+    }
+
+    /**
+     * What the run tree's record WOULD grant a runner start now, read without
+     * a write (G-387): a fact of the start gate. Null when no tree hold
+     * applies; 0 when the record would refuse it.
+     *
+     * @internal Read by the runtime for the start gate.
+     *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route?: string}  $membership
+     */
+    public function startGrant(Session $child, array $membership): ?int
+    {
+        $hold = $this->startHold($membership);
+        if ($hold === null) {
+            return null;
+        }
+        $tree = $hold['tree'];
+        $state = $this->recordOf($child, $tree) ?? PlanBudget::open($tree['run'], $hold['settings']);
+        [, $grant] = PlanBudget::reserve($state, $hold['key'], $hold['steps'], $hold['settings']['max_cost_micros'], time(), self::holdTtl());
+
+        return isset($grant['refused']) ? 0 : (int) $grant['steps'];
+    }
+
+    /**
+     * Commit step (a) of a runner start (G-387): the tree hold the gate read,
+     * in one conditional locked write. Refused (a sibling or another process
+     * spent the tree since the read, so it would now grant less than the
+     * gate saw), nothing is written and the start is refused. Returns the
+     * release, called when a later commit step fails: it returns the hold
+     * (and the record, when this hold opened it) exactly once.
+     *
+     * @internal Called by the runtime once the start gate let a start through.
+     *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route?: string}  $membership
+     * @return Closure(): void
+     *
+     * @throws RunNotPermitted when the tree no longer grants what the gate read
+     */
+    public function holdForStart(Session $child, array $membership, ?int $expected): Closure
+    {
+        $hold = $this->startHold($membership);
+        if ($hold === null) {
+            if ($expected !== null) {
+                // The gate saw a hold to take; there is none now.
+                throw RunNotPermitted::exhausted('steps');
+            }
+
+            return static function (): void {};
+        }
+        $now = time();
+        $ttl = self::holdTtl();
+        $opened = false;
+        $grant = $this->write($child->planStore(), $hold['tree'], static function (?array $state) use ($hold, $expected, $now, $ttl, &$opened): array {
+            $opened = $state === null;
+            [$next, $grant] = PlanBudget::reserve($state ?? PlanBudget::open($hold['tree']['run'], $hold['settings']),
+                $hold['key'], $hold['steps'], $hold['settings']['max_cost_micros'], $now, $ttl);
+            // Less than the gate read is a race lost: nothing is written.
+            if (isset($grant['refused']) || ($expected !== null && (int) $grant['steps'] < $expected)) {
+                return [null, ['refused' => true, 'limit' => (string) ($grant['limit'] ?? 'steps')]];
+            }
+
+            return [$next, $grant];
+        });
+        if (is_array($grant) && isset($grant['refused'])) {
+            throw RunNotPermitted::exhausted((string) $grant['limit']);
+        }
+        $key = $hold['key'];
+        $this->runs[$key]['held'] = true;
+        $released = false;
+
+        return function () use ($child, $hold, $key, $opened, &$released): void {
+            if ($released) {
+                return;
+            }
+            $released = true;
+            $this->runs[$key]['held'] = false;
+            $store = $child->planStore();
+            $recordKey = self::key($hold['tree']);
+            try {
+                $store->withLock($recordKey, function () use ($store, $recordKey, $hold, $key, $opened): void {
+                    $state = $store->get($recordKey);
+                    if (! is_array($state) || ($state['planId'] ?? null) !== $hold['tree']['run'] || ! isset($state['holds'][$key])) {
+                        return;
+                    }
+                    unset($state['holds'][$key]);
+                    if ($opened && $state['holds'] === [] && (int) $state['steps'] === 0 && (int) $state['unmetered'] === 0) {
+                        $store->forget($recordKey);
+
+                        return;
+                    }
+                    $store->put($recordKey, $state);
+                }, 10, 5);
+            } catch (Throwable $failure) {
+                // The hold stays and is charged in full once it expires.
+                report(new RuntimeException('A run tree hold release failed: '.$failure::class.'.'));
+            }
+        };
     }
 
     /**
@@ -386,28 +475,48 @@ final class RunTrees
     }
 
     /**
-     * The runner is starting a child (G-387): a new delegation, whose count
-     * of the steps the child uses starts at 0 under the ceiling the runner
-     * gave it. Every turn on the child the runner does not start spends
-     * from it, so the ceiling is the delegation's lifetime budget.
+     * Commit step (b) of a runner start (G-387): the child's records in ONE
+     * locked write. A new delegation, whose count of the steps the child
+     * uses starts at 0 under the ceiling the runner gave it, and `$save`
+     * writes the binding, depth, refs, ceiling and delegation id beside it.
+     * Every turn on the child the runner does not start spends from that
+     * count, so the ceiling is the delegation's lifetime budget.
      *
-     * @internal Called by the runtime when it saves a runner start's binding.
+     * The busy check is made again under the lock: a turn on the child that
+     * claimed its count since the gate read it (live, not past the lock TTL)
+     * keeps it, and the start is refused with nothing written. When `$save`
+     * fails, the count is put back as it was, so the binding and the count
+     * never name two delegations. Returns false when refused.
+     *
+     * @internal Called by the runtime once the tree hold is taken.
+     *
+     * @param  Closure(): void  $save
      */
-    public function startDelegation(Session $child, string $delegation, int $ceiling): bool
+    public function commitChild(Session $child, string $delegation, int $ceiling, Closure $save): bool
     {
         $key = self::delegationKey($child);
+        $store = $child->planStore();
 
-        return $child->planStore()->withLock($key, function () use ($child, $key, $delegation, $ceiling): bool {
-            // Refused in the same locked write as the reset: a turn on the
-            // child that holds the count (live, not past the lock TTL) keeps
-            // it. A record this runtime could not have written is reset.
-            $state = $child->planStore()->get($key);
+        return $store->withLock($key, function () use ($child, $store, $key, $delegation, $ceiling, $save): bool {
+            // A record this runtime could not have written is replaced.
+            $state = $store->get($key);
             $current = $child->childDelegation();
             if ($current !== null && self::validCount($state, $current)
                 && PlanBudget::expire($state, time(), self::holdTtl())['holds'] !== []) {
                 return false;
             }
-            $child->planStore()->put($key, PlanBudget::open($delegation, ['mode' => 'shared', 'max_steps' => max(0, $ceiling), 'max_cost_micros' => null]));
+            $store->put($key, PlanBudget::open($delegation, ['mode' => 'shared', 'max_steps' => max(0, $ceiling), 'max_cost_micros' => null]));
+            try {
+                $save();
+            } catch (Throwable $failure) {
+                if ($state === null) {
+                    $store->forget($key);
+                } else {
+                    $store->put($key, $state);
+                }
+
+                throw $failure;
+            }
 
             return true;
         }, 10, 5);
