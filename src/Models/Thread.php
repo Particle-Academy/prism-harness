@@ -583,6 +583,49 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
+     * Whether the approval paused at the transcript tail has a call the person
+     * has decided (approved or denied) that has no result yet: a resume has
+     * those decisions to act on before anything else.
+     *
+     * @internal
+     */
+    public function decidedCallsAwaitingResult(): bool
+    {
+        $answered = [];
+        $finished = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            $payload = $stored->payload;
+            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
+                foreach ($payload['tool_results'] ?? [] as $result) {
+                    if (is_array($result) && is_string($result['tool_call_id'] ?? null)) {
+                        $finished[$result['tool_call_id']] = true;
+                    }
+                }
+                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
+                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                        $answered[$response['approval_id']] = true;
+                    }
+                }
+
+                continue;
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                return false;
+            }
+            foreach ($payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && is_string($request['approval_id'] ?? null) && isset($answered[$request['approval_id']])
+                    && is_string($request['tool_call_id'] ?? null) && ! isset($finished[$request['tool_call_id']])) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+
+    /**
      * The calls of the approval paused at the transcript tail that have no
      * recorded decision, oldest first. Empty when nothing is waiting.
      *

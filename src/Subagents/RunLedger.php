@@ -288,6 +288,29 @@ final class RunLedger
         });
     }
 
+    /**
+     * Check cancellation and time before acting on the person's recorded
+     * decisions, but not the step limit. Resolving takes no model step: a run
+     * parked on its last step still runs the calls it was approved for and
+     * records their results, then stops on its step budget with no model step
+     * after them. A decision that was accepted is acted on.
+     */
+    public function assertResolutionAvailable(RunBudget $budget): void
+    {
+        $this->assertCallAvailable(self::withoutStepLimit($budget));
+    }
+
+    /** Whether the step limit is the only thing this run has spent. */
+    public function onlyStepsSpent(RunBudget $budget): bool
+    {
+        return $this->exhaustion($budget) !== null && $this->exhaustion(self::withoutStepLimit($budget)) === null;
+    }
+
+    private static function withoutStepLimit(RunBudget $budget): RunBudget
+    {
+        return new RunBudget(PHP_INT_MAX, $budget->maxCostUsd, $budget->maxSeconds, $budget->maxOutputTokensPerCall, $budget->maxToolCalls);
+    }
+
     private function assertCallAvailableNow(RunBudget $budget): void
     {
         // Cost admission uses >, allowing an exact fit (including a genuinely
