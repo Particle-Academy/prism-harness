@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 use Closure;
 use Illuminate\Database\QueryException;
+use Illuminate\Events\NullDispatcher;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\Exceptions\SessionLocked;
+use Prism\Harness\Exceptions\UnsupportedEventDispatcher;
 use Prism\Harness\Models\ThreadMessage;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Tools\ToolRegistry;
@@ -405,3 +407,134 @@ it('reports a host-deferred stream resolution in the stream generation, or a clo
         ->and($recorded)->toBe(1)
         ->and($traces[$trace] ?? 'a trace that never started')->toBe($end === 'finished outside' ? ['stream', 'completed'] : ['stream', 'failed:resolution_abandoned']);
 })->with(['finished outside', 'abandoned']);
+
+// A host whose Event::defer() covers a whole plain-stream resume gets, in its
+// flush, each approved call's ToolInvoked right after that call's own events
+// and inside the stream generation's open trace (before its
+// GenerationCompleted), as on 0.26.7, and only once the result is recorded.
+it('puts a host-deferred stream resolution back in 0.26.7\'s place', function (string $mode): void {
+    config()->set('prism-harness.agent.modes.chat.tools', ['transfer', 'refund']);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['transfer', 'refund']);
+    $ran = [];
+    app(ToolRegistry::class)->registerMany([
+        (new Tool)->as('transfer')->for('Transfer.')->withStringParameter('amount', 'Amount')->using(function (string $amount) use (&$ran): string {
+            $ran[] = 'transfer';
+            event('harness.test.audit', ['transfer']);
+
+            return 'sent';
+        }),
+        (new Tool)->as('refund')->for('Refund.')->withStringParameter('amount', 'Amount')->using(function (string $amount) use (&$ran): string {
+            $ran[] = 'refund';
+            event('harness.test.audit', ['refund']);
+
+            return 'refunded';
+        }),
+    ]);
+    Http::swap(new HttpFactory(app('events')));
+    Http::preventStrayRequests();
+    Http::fakeSequence()
+        ->push(['id' => 'c1', 'object' => 'chat.completion', 'model' => 'gpt-4o',
+            'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => null, 'tool_calls' => [
+                ['id' => 'call_transfer', 'type' => 'function', 'function' => ['name' => 'transfer', 'arguments' => '{"amount":"5"}']],
+                ['id' => 'call_refund', 'type' => 'function', 'function' => ['name' => 'refund', 'arguments' => '{"amount":"2"}']],
+            ]], 'finish_reason' => 'tool_calls']],
+            'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 1, 'total_tokens' => 2]])
+        ->push(streamResumeSse('streamed'), 200, ['Content-Type' => 'text/event-stream']);
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('Send five, refund two.')->pendingApprovals();
+    expect($pending)->toHaveCount(2);
+    $session->thread()->record([new ToolResultMessage(toolApprovalResponses: array_map(fn ($approval) => new ToolApprovalResponse($approval->approvalId, true), $pending))], $session->run()['id'] ?? null);
+
+    $open = [];
+    $order = [];
+    Event::listen('harness.test.audit', function (string $tool) use (&$order): void {
+        $order[] = 'audit:'.$tool;
+    });
+    Event::listen(GenerationStarted::class, function (GenerationStarted $event) use (&$open, &$order): void {
+        $open[$event->context->traceId] = true;
+        $order[] = 'started:'.$event->context->operation->value;
+    });
+    Event::listen(GenerationCompleted::class, function (GenerationCompleted $event) use (&$open, &$order): void {
+        unset($open[$event->context->traceId]);
+        $order[] = 'completed';
+    });
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use ($session, &$open, &$order): void {
+        $recorded = $session->thread()->storedMessages()->where('type', 'tool_result')->get()
+            ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])
+            ->where('tool_call_id', $event->toolCallId)->count();
+        $order[] = 'invoked:'.$event->toolName.(isset($open[$event->context->traceId]) ? ':open' : ':closed').($recorded > 0 ? ':recorded' : ':unrecorded');
+    });
+
+    $events = match ($mode) {
+        'all' => null,
+        'start, complete, tools' => [GenerationStarted::class, GenerationCompleted::class, ToolInvoked::class, 'harness.test.audit'],
+        'tools and audit' => [ToolInvoked::class, 'harness.test.audit'],
+    };
+    Event::defer(fn () => iterator_to_array($session->stream(''), false), $events);
+
+    expect($ran)->toBe(['transfer', 'refund']);
+    $calls = array_values(array_filter($order, fn (string $seen): bool => str_starts_with($seen, 'audit:') || str_starts_with($seen, 'invoked:')));
+    // With GenerationCompleted live ('tools and audit'), the stream's trace has
+    // closed by the host's flush, on 0.26.7 too; the order is still per call.
+    $state = $mode === 'tools and audit' ? 'closed' : 'open';
+    expect($calls)->toBe([
+        'audit:transfer', "invoked:transfer:{$state}:recorded",
+        'audit:refund', "invoked:refund:{$state}:recorded",
+    ]);
+    if ($mode !== 'tools and audit') {
+        // Both inside the stream's trace: started first, completed last.
+        expect($order[0])->toBe('started:stream')->and(end($order))->toBe('completed');
+    }
+})->with(['all', 'start, complete, tools', 'tools and audit']);
+
+// Core runs, and reports, only an approved call with no result yet. A thread
+// whose last tool step has nothing of that kind left (answered, or denied)
+// needs no hold, so it is served on any dispatcher; a denial reports nothing.
+it('needs the deferral internals only for an approved call still to run', function (string $state): void {
+    Http::swap(new HttpFactory(app('events')));
+    Http::preventStrayRequests();
+    Http::fakeSequence()
+        ->push(['id' => 'c1', 'object' => 'chat.completion', 'model' => 'gpt-4o',
+            'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => null, 'tool_calls' => [
+                ['id' => 'call_transfer', 'type' => 'function', 'function' => ['name' => 'transfer', 'arguments' => '{"amount":"5"}']],
+            ]], 'finish_reason' => 'tool_calls']],
+            'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 1, 'total_tokens' => 2]])
+        ->push(streamResumeChat('done'))->push(streamResumeChat('again'))->push(streamResumeChat('more'));
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('Send five.')->pendingApprovals();
+    $seen = [];
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use (&$seen): void {
+        $seen[] = $event->toolName;
+    });
+    if ($state === 'answered') {
+        // Approved, run and answered, on Laravel's dispatcher.
+        $session->decide([new ToolApprovalResponse($pending[0]->approvalId, true)]);
+        expect($this->runs)->toBe(1);
+    }
+    if ($state === 'denied') {
+        $session->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($pending[0]->approvalId, false, 'no')])], $session->run()['id'] ?? null);
+    }
+    if ($state === 'approved, still to run') {
+        $session->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($pending[0]->approvalId, true)])], $session->run()['id'] ?? null);
+    }
+    $seen = [];
+    $real = app('events');
+    Event::swap(new NullDispatcher($real));
+    try {
+        $turn = fn () => $session->send('And now?');
+        if ($state === 'approved, still to run') {
+            expect($turn)->toThrow(UnsupportedEventDispatcher::class, 'unsupported_event_dispatcher');
+            expect($this->runs)->toBe(0);
+        } else {
+            $turn();
+            expect($this->runs)->toBe($state === 'answered' ? 1 : 0);
+        }
+    } finally {
+        Event::swap($real);
+    }
+    // A denied call is answered without running and without a ToolInvoked.
+    if ($state === 'denied') {
+        $session->send('Once more?');
+        expect($seen)->toBe([])->and($this->runs)->toBe(0);
+    }
+})->with(['answered', 'denied', 'approved, still to run']);

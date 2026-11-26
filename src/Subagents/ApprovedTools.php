@@ -107,6 +107,18 @@ final class ApprovedTools
      */
     private array $inHost = [];
 
+    /**
+     * Where 0.26.7 had each held ToolInvoked in the host's deferred list, by
+     * the event's object id: the last entry holding an event object before
+     * it when its step returned (null when none), and how many entries came
+     * between. Used for the plain stream only, whose events are held because
+     * the host's deferral may end first; when it has not, they go back to
+     * that place (see arrived()).
+     *
+     * @var array<int, array{anchor: object|null, distance: int}>
+     */
+    private array $heldAfter = [];
+
     /** The length of the host's deferred list when the resolution began. */
     private ?int $hostStart = null;
 
@@ -325,9 +337,11 @@ final class ApprovedTools
      * Whether the resolution could dispatch a ToolInvoked at all, and so has
      * to be held: telemetry is on, a context is open for core to report under
      * (the one this resolution opens on the plain paths, or the host's own),
-     * and the last assistant step calls a tool with an approval configured.
-     * The last is core's own first check: without such a call its resolver
-     * returns before running anything.
+     * and the last assistant step has a call core will run and report: to a
+     * tool with an approval configured, with no result yet, and approved in
+     * the decisions that follow it. Those are core's own checks; a call that
+     * already has a result is skipped, and a denied or undecided one is
+     * answered without running and without a ToolInvoked.
      */
     private function holdNeeded(TextRequest|StructuredRequest $request): bool
     {
@@ -342,8 +356,28 @@ final class ApprovedTools
                 foreach ($request->tools() as $tool) {
                     $byName[$tool->name()] = $tool;
                 }
+                $results = [];
+                $approved = [];
+                for ($j = $i + 1; $j < count($messages); $j++) {
+                    if ($messages[$j] instanceof ToolResultMessage) {
+                        foreach ($messages[$j]->toolResults as $result) {
+                            $results[$result->toolCallId] = true;
+                        }
+                        foreach ($messages[$j]->toolApprovalResponses as $response) {
+                            if ($response->approved) {
+                                $approved[$response->approvalId] = true;
+                            }
+                        }
+                    }
+                }
+                $approvalIds = [];
+                foreach ($message->toolApprovalRequests as $approvalRequest) {
+                    $approvalIds[$approvalRequest->toolCallId] = $approvalRequest->approvalId;
+                }
                 foreach ($message->toolCalls as $call) {
-                    if (($byName[$call->name] ?? null)?->hasApprovalConfigured() === true) {
+                    if (($byName[$call->name] ?? null)?->hasApprovalConfigured() === true
+                        && ! isset($results[$call->id])
+                        && isset($approvalIds[$call->id], $approved[$approvalIds[$call->id]])) {
                         return true;
                     }
                 }
@@ -373,13 +407,105 @@ final class ApprovedTools
             && $started->context->sessionId === $this->sessionId;
     }
 
-    /** The generation has started: send everything into its trace. */
+    /**
+     * The generation has started: send everything into its trace. Held
+     * events that belong in a host's deferred list go back to where 0.26.7
+     * had them, right after the entry they followed, but only while the host
+     * still defers ToolInvoked and that entry is still in its list (the same
+     * deferral, not one that has ended or been replaced); otherwise they are
+     * dispatched now.
+     */
     private function arrived(TelemetryContext $generation, int $step): void
     {
         $this->retargetInHost($generation, $step);
-        $held = $this->held;
+        $held = self::retargeted($this->held, $generation, $step);
+        $after = [];
+        foreach ($this->held as $index => $args) {
+            $event = $args[0] ?? null;
+            if (is_object($event) && array_key_exists(spl_object_id($event), $this->heldAfter)) {
+                $after[$index] = $this->heldAfter[spl_object_id($event)];
+            }
+        }
         $this->held = [];
-        self::dispatchEach(self::retargeted($held, $generation, $step));
+        $this->heldAfter = [];
+        $rest = [];
+        if ($after !== []) {
+            $dispatcher = DeferredEvents::dispatcher();
+            if (DeferredEvents::defers(DeferredEvents::state($dispatcher), ToolInvoked::class)) {
+                $list = DeferredEvents::list($dispatcher);
+                foreach ($held as $index => $args) {
+                    $at = array_key_exists($index, $after) ? $this->placeAfter($list, $after[$index]['anchor'], $after[$index]['distance']) : null;
+                    if ($at === null) {
+                        $rest[] = $args;
+
+                        continue;
+                    }
+                    array_splice($list, $at, 0, [$args]);
+                    if (is_object($args[0] ?? null)) {
+                        $this->putBack[spl_object_id($args[0])] = true;
+                    }
+                }
+                DeferredEvents::replace($dispatcher, $list);
+                self::dispatchEach($rest);
+
+                return;
+            }
+        }
+        self::dispatchEach($held);
+    }
+
+    /**
+     * The index at which a held event goes: $distance entries after the
+     * anchor entry (from the start of the list when there was none), counting
+     * only entries that were there when its step returned (not the moved
+     * GenerationStarted, not held events already put back), then after any
+     * held event already put back there. Null when the anchor is no longer in
+     * the list, or the list is shorter than where the event was.
+     *
+     * @param  list<array<int, mixed>>  $list
+     */
+    private function placeAfter(array $list, ?object $anchor, int $distance): ?int
+    {
+        $at = 0;
+        if ($anchor !== null) {
+            $found = null;
+            foreach ($list as $index => $args) {
+                if (($args[0] ?? null) === $anchor) {
+                    $found = $index;
+
+                    break;
+                }
+            }
+            if ($found === null) {
+                return null;
+            }
+            $at = $found + 1;
+        }
+        $counted = 0;
+        while ($counted < $distance) {
+            if (! isset($list[$at])) {
+                return null;
+            }
+            $event = $list[$at][0] ?? null;
+            if (! ($event instanceof GenerationStarted && $this->standsInFor($event)) && ! (is_object($event) && $this->isMine($event))) {
+                $counted++;
+            }
+            $at++;
+        }
+        // After the held events already put back at the same place.
+        while (isset($list[$at]) && is_object($list[$at][0] ?? null) && $this->isMine($list[$at][0])) {
+            $at++;
+        }
+
+        return $at;
+    }
+
+    /** @var array<int, true> object ids of the held events put back into a host's list */
+    private array $putBack = [];
+
+    private function isMine(object $event): bool
+    {
+        return isset($this->putBack[spl_object_id($event)]);
     }
 
     /**
@@ -707,6 +833,26 @@ final class ApprovedTools
                 }
                 self::dispatchEach($own);
             } else {
+                if (DeferredEvents::defers($host, ToolInvoked::class)) {
+                    // The place 0.26.7 had them in the host's list: after
+                    // what the step's tool body deferred there.
+                    $list = DeferredEvents::list($dispatcher);
+                    $anchor = null;
+                    $distance = count($list);
+                    for ($k = count($list) - 1; $k >= 0; $k--) {
+                        if (is_object($list[$k][0] ?? null)) {
+                            $anchor = $list[$k][0];
+                            $distance = count($list) - $k - 1;
+
+                            break;
+                        }
+                    }
+                    foreach ($own as $args) {
+                        if (is_object($args[0] ?? null)) {
+                            $this->heldAfter[spl_object_id($args[0])] = ['anchor' => $anchor, 'distance' => $distance];
+                        }
+                    }
+                }
                 $this->held = [...$this->held, ...$own];
             }
         }
