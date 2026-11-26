@@ -1043,7 +1043,9 @@ parks on, and its resume continues from `harness_steps_used`, so a root that spe
 8 steps through a child before parking has 3 left, however many times it is approved. A
 value there that this runtime could not have written fails closed, with no steps left; a
 row written by an earlier release is counted from the transcript (a count missing beside a
-saved child ceiling fails closed: the two are written together). A spent allowance, of steps
+saved child ceiling fails closed: the two are written together). A new message starts a new run (it resumes
+no parked count) on the child's saved ceiling; what a child spends across runs is bounded by
+its run tree's record. A spent allowance, of steps
 or of cost, never refuses a decision, on any route: the approved calls run, their results are recorded, and
 the run then stops on its budget (`RunNotPermitted`) with no model step, identically on
 `send()`, `sendStructured()`, `stream()` and the decision routes. A new message, which

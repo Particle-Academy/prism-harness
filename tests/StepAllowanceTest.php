@@ -608,8 +608,11 @@ function g387Rows(Session $session): int
     return $session->thread()->storedMessages()->count();
 }
 
-it('refuses a new message to a child whose saved ceiling is spent, recording nothing', function (): void {
-    g387ParkedChild('worker', 1);
+it('refuses a new message to a child whose saved ceiling is 0, recording nothing', function (): void {
+    g387ParkedChild('worker', 2);
+    $child = g387Child('worker');
+    // As a store writer could leave it: the saved ceiling at 0.
+    $child->rememberChildBinding($child->childBinding(), $child->childDepth(), $child->childPlanLedger(), $child->childTree(), 0);
     $rows = g387Rows(g387Child('worker'));
     $before = g387Requests();
     g387Fresh();
@@ -617,6 +620,34 @@ it('refuses a new message to a child whose saved ceiling is spent, recording not
     expect(fn () => g387Child('worker')->send('A new question'))->toThrow(RunNotPermitted::class, 'step budget exhausted');
     expect(g387Rows(g387Child('worker')))->toBe($rows)
         ->and(g387Requests())->toBe($before);
+});
+
+// A new message starts a new run on the saved ceiling; what a child spends
+// across new messages outside the runner is bounded by its tree's record.
+it('never lets repeated new messages to a child spend past its tree record', function (): void {
+    config()->set('prism-harness.agent.modes.chat.max_steps', 6);
+    g387ParkedChild('worker', 2);
+    $child = g387Child('worker');
+    $tree = $child->childTree();
+    $key = $tree['session'].':run-tree:'.$tree['run'];
+    $record = $child->planStore()->get($key);
+    G360::$queue = [];
+    for ($i = 0; $i < 40; $i++) {
+        G360::calls([['echo', ['text' => 'e'.$i]]]);
+    }
+    $before = g387Requests();
+
+    for ($i = 0; $i < 8; $i++) {
+        g387Fresh();
+        try {
+            g387Child('worker')->send('Question '.$i);
+        } catch (RunNotPermitted) {
+        }
+    }
+
+    $after = g387Child('worker')->planStore()->get($key);
+    expect(g387Requests() - $before)->toBe($record['max_steps'] - $record['steps'])
+        ->and($after['steps'])->toBe($after['max_steps']);
 });
 
 it('refuses a new message to a child whose tree a sibling spent, recording nothing', function (): void {

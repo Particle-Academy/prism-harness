@@ -1939,9 +1939,8 @@ final readonly class AgentRuntime
      *
      *  - `used`: what the parked run this turn resumes wrote it had used, on
      *    the row it parked on, children included, for ANY turn that resumes
-     *    one except a runner start (no context, metadata or host), and for
-     *    any turn on a child with a saved ceiling, a new message included.
-     *    Never less than the run's own transcript rows show it took: a row
+     *    one except a runner start (no context, metadata or host); 0 for a
+     *    new message, which starts a new run. Never less than the run's own transcript rows show it took: a row
      *    forged lower gains nothing. A value this runtime could not have
      *    written fails closed, with nothing left, and so does a count absent
      *    beside a saved ceiling (the two are written together). A row with
@@ -1966,9 +1965,10 @@ final readonly class AgentRuntime
         $state = 'none';
         $used = 0;
         $savedCeiling = $kind === 'runner' ? null : $session->childStepCeiling();
-        // A child's saved ceiling bounds every turn the runner did not start,
-        // a new message included: its count continues the parked run's.
-        if ($kind !== 'runner' && ($prompt === '' || $savedCeiling !== null)) {
+        // Only a turn that resumes a parked run continues its count. A new
+        // message starts a new run, held to the saved ceiling afresh; what a
+        // child spends across runs is bounded by its run tree's record.
+        if ($kind !== 'runner' && $prompt === '') {
             [$state, $written] = $session->thread()->pausedStepsUsed();
             // Written together with the saved ceiling: absent beside one, the
             // row is not this runtime's, and it fails closed.
