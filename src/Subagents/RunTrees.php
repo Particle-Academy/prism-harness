@@ -378,7 +378,7 @@ final class RunTrees
         $cost = $ledger->unmeteredRuns() > $entry['unmetered'] ? null : PlanBudget::micros(max(0.0, $ledger->costUsd() - $entry['cost']));
         try {
             $this->write($session->planStore(), $entry['tree'], static fn (?array $state): array => $state === null
-                ? [null, null] : [PlanBudget::settle($state, $runId, $steps, $cost), null]);
+                ? [null, null] : [PlanBudget::settleRun($state, $runId, $steps, $cost), null]);
         } catch (Throwable $failure) {
             // The hold stays and is charged in full once it expires.
             report(new RuntimeException('A run tree budget update failed: '.$failure::class.'.'));
@@ -428,7 +428,9 @@ final class RunTrees
         $ttl = self::holdTtl();
         $used = $store->withLock($key, function () use ($store, $key, $delegation, $runId, $allow, $now, $ttl): int {
             $state = $store->get($key);
-            if (! is_array($state) || ($state['planId'] ?? null) !== $delegation || ! is_array($state['holds'] ?? null)) {
+            // Anything this runtime could not have written, and a second
+            // claim by a run that already holds, FAIL CLOSED.
+            if (! self::validCount($state, $delegation) || isset($state['holds'][$runId])) {
                 return -1;
             }
             $state = PlanBudget::expire($state, $now, $ttl);
@@ -466,19 +468,71 @@ final class RunTrees
         try {
             $store->withLock($key, function () use ($store, $key, $hold, $runId, $steps): void {
                 $state = $store->get($key);
-                if (! is_array($state) || ($state['planId'] ?? null) !== $hold['delegation']) {
+                // A record this runtime could not have written is left as
+                // it is: never repaired into a permissive one.
+                if (! self::validCount($state, $hold['delegation'])) {
                     return;
                 }
-                // Counted whether or not a hold was taken: a run with no
-                // grant that still took a step (it cannot) is never free.
-                unset($state['holds'][$runId]);
-                $state['steps'] = (int) $state['steps'] + $steps;
+                // The run's own charge, live or already charged in full on
+                // expiry, is replaced with what it took: counted once. A run
+                // that held nothing is still counted.
+                if (isset($state['holds'][$runId]) || isset($state['expired'][$runId])) {
+                    $state = PlanBudget::settleRun($state, $runId, $steps, 0);
+                } else {
+                    $state['steps'] += $steps;
+                }
                 $store->put($key, $state);
             }, 10, 5);
         } catch (Throwable $failure) {
             // The hold stays and is charged in full once it expires.
             report(new RuntimeException('A delegation count update failed: '.$failure::class.'.'));
         }
+    }
+
+    /**
+     * Whether a turn on this child holds its delegation count right now (a
+     * live hold, not yet past the lock TTL). The runner does not start the
+     * child again over it: the reset would wipe the running turn's hold.
+     *
+     * @internal
+     */
+    public function delegationBusy(Session $child): bool
+    {
+        $state = $child->planStore()->get(self::delegationKey($child));
+        $delegation = $child->childDelegation();
+        if ($delegation === null || ! self::validCount($state, $delegation)) {
+            return false;
+        }
+
+        return PlanBudget::expire($state, time(), self::holdTtl())['holds'] !== [];
+    }
+
+    /**
+     * A delegation count as this runtime writes it: its own id, and every
+     * count a safe non-negative integer.
+     *
+     * @phpstan-assert-if-true array<string, mixed> $state
+     */
+    private static function validCount(mixed $state, string $delegation): bool
+    {
+        if (! is_array($state) || ($state['planId'] ?? null) !== $delegation
+            || ! RunBudgets::validUsed($state['steps'] ?? null) || ! RunBudgets::validUsed($state['max_steps'] ?? null)
+            || ! RunBudgets::validUsed($state['cost_micros'] ?? null) || ! is_array($state['holds'] ?? null)) {
+            return false;
+        }
+        foreach ($state['holds'] as $hold) {
+            if (! is_array($hold) || ! RunBudgets::validUsed($hold['steps'] ?? null) || ! RunBudgets::validUsed($hold['at'] ?? null)
+                || ! RunBudgets::validUsed($hold['cost_micros'] ?? null)) {
+                return false;
+            }
+        }
+        foreach (is_array($state['expired'] ?? []) ? ($state['expired'] ?? []) : [null] as $charged) {
+            if (! is_array($charged) || ! RunBudgets::validUsed($charged['steps'] ?? null) || ! RunBudgets::validUsed($charged['cost_micros'] ?? null)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static function delegationKey(Session $child): string

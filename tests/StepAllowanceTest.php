@@ -2,8 +2,10 @@
 
 declare(strict_types=1);
 
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Schema;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Exceptions\ApprovalNotPending;
@@ -1048,4 +1050,370 @@ it('acts on an approved subagent call on a spent run with the runner exhausted r
     expect(g387Requests())->toBe($before)
         ->and($results)->toContain('exhausted')
         ->and(g387Root()->thread()->pendingApprovalIds())->toBe([]);
+});
+
+// ---------------------------------------------------------------------------
+// G-387 round 3: the second final review's findings.
+// ---------------------------------------------------------------------------
+
+/** The bodies of every provider request so far, as one string. */
+function g387Sent(): string
+{
+    return collect(Http::recorded())->map(fn ($pair): string => (string) $pair[0]->body())->implode("\n");
+}
+
+/** A root that may delegate to `worker` (declared `$declared`), with the given mode for it. */
+function g387Delegating(int $declared = 2, int $rootSteps = 8): void
+{
+    config()->set('prism-harness.agent.modes.chat.tools', []);
+    config()->set('prism-harness.agent.modes.chat.max_steps', $rootSteps);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'worker' => ['description' => 'Work.', 'mode' => 'work', 'max_steps' => $declared],
+    ]);
+}
+
+function g387Delegation(Session $child): mixed
+{
+    return $child->planStore()->get($child->key().':delegation-steps');
+}
+
+/** Move every live hold on a durable budget record `$seconds` into the past. */
+function g387Backdate(string $key, int $seconds): void
+{
+    $store = g387Root()->planStore();
+    $state = $store->get($key);
+    foreach ($state['holds'] as $id => $hold) {
+        $state['holds'][$id]['at'] = $hold['at'] - $seconds;
+    }
+    $store->put($key, $state);
+}
+
+function g387PutDelegation(Session $child, mixed $state): void
+{
+    $child->planStore()->put($child->key().':delegation-steps', $state);
+}
+
+// 1. Everything the runner does before and around the child is framed:
+// any exception becomes `failed` with its class name, never its message.
+it('frames a store failure in the runner pre-checks, so no exception text reaches the model', function (): void {
+    g387Delegating();
+    g387Child('worker')->thread();
+    Thread::retrieved(function (Thread $thread): void {
+        if (str_contains((string) $thread->scope, '::sub::')) {
+            throw new RuntimeException('SECRET-host=db.internal key=sk-live-123');
+        }
+    });
+    G360::calls([['worker', ['task' => 'Go']]]);
+    G360::text('Handled.');
+    g387Pad();
+
+    g387Root()->send('Go');
+
+    $outputs = implode(' ', G360::outputs());
+    expect(g387Sent())->not->toContain('SECRET-host')
+        ->and($outputs)->toContain('failed with RuntimeException');
+});
+
+it('denies a subagent task that is not a string, never a raw error', function (mixed $task): void {
+    g387Delegating();
+    G360::calls([['worker', ['task' => $task]]]);
+    G360::text('Handled.');
+    g387Pad();
+
+    g387Root()->send('Go');
+
+    $outputs = implode(' ', G360::outputs());
+    expect($outputs)->toContain('"outcome":"denied"')
+        ->and(g387Sent())->not->toContain('Tool execution error');
+})->with(['null' => [null], 'a number' => [42], 'a list' => [['a']]]);
+
+// 2. The durable count fails closed on anything this runtime could not have written.
+it('fails closed on a delegation count with a garbage field', function (Closure $mutate): void {
+    g387ParkedChild('worker', 3);
+    $child = g387Child('worker');
+    $state = g387Delegation($child);
+    g387PutDelegation($child, $mutate($state));
+    $written = g387Delegation(g387Child('worker'));
+    g387Echoes();
+    $before = g387Requests();
+
+    for ($i = 0; $i < 3; $i++) {
+        g387Fresh();
+        try {
+            g387Child('worker')->send('Question '.$i);
+        } catch (RunNotPermitted) {
+        }
+    }
+
+    expect(g387Requests())->toBe($before)
+        // Never repaired into a permissive record.
+        ->and(g387Delegation(g387Child('worker')))->toBe($written);
+})->with([
+    'negative steps' => [fn (array $s): array => [...$s, 'steps' => -5]],
+    'string steps' => [fn (array $s): array => [...$s, 'steps' => 'x']],
+    'null steps' => [fn (array $s): array => [...$s, 'steps' => null]],
+    'fractional steps' => [fn (array $s): array => [...$s, 'steps' => 1.5]],
+    'no steps' => [function (array $s): array {
+        unset($s['steps']);
+
+        return $s;
+    }],
+    'holds not a map' => [fn (array $s): array => [...$s, 'holds' => 'x']],
+    'no holds' => [function (array $s): array {
+        unset($s['holds']);
+
+        return $s;
+    }],
+    'a negative hold' => [fn (array $s): array => [...$s, 'holds' => ['run_x' => ['steps' => -1, 'cost_micros' => 0, 'at' => time()]]]],
+    'a hold with a garbage time' => [fn (array $s): array => [...$s, 'holds' => ['run_x' => ['steps' => 1, 'cost_micros' => 0, 'at' => 'x']]]],
+    'max_steps garbage' => [fn (array $s): array => [...$s, 'max_steps' => 'x']],
+]);
+
+it('never repairs a delegation count that turns garbage while a turn runs', function (): void {
+    g387ParkedChild('worker', 4);
+    $pending = g387Child('worker')->thread()->pendingApprovalIds();
+    g387Echoes();
+    $fired = false;
+    G360::$onRequest = function () use (&$fired): void {
+        if (! $fired) {
+            $fired = true;
+            g387PutDelegation(g387Child('worker'), [...g387Delegation(g387Child('worker')), 'steps' => 'x']);
+        }
+    };
+
+    try {
+        g387Child('worker')->approve($pending[0]);
+    } catch (RunNotPermitted) {
+    }
+    G360::$onRequest = null;
+
+    expect(g387Delegation(g387Child('worker'))['steps'])->toBe('x');
+});
+
+// 4. A settle replaces the run's own charge, live or expired: counted once.
+it('counts an expired-then-settled hold once, so a 400 s turn that took 1 of 4 leaves 3', function (): void {
+    g387ParkedChild('worker', 5);
+    $pending = g387Child('worker')->thread()->pendingApprovalIds();
+    g387Pad();
+    $fired = false;
+    G360::$onRequest = function () use (&$fired): void {
+        if (! $fired) {
+            $fired = true;
+            // 400 s on: the live run's hold is past the lock TTL (300 s).
+            g387Backdate(g387Child('worker')->key().':delegation-steps', 400);
+            // Another claimant on the count then charges that hold in full.
+            app(RunTrees::class)->claimDelegation(g387Child('worker'), 'run_other', RunLedger::start('other'), fn (int $used): int => 0);
+        }
+    };
+    try {
+        g387Child('worker')->approve($pending[0]);
+    } catch (RunNotPermitted) {
+    }
+    G360::$onRequest = null;
+    expect(g387Delegation(g387Child('worker'))['steps'])->toBe(2);
+
+    g387Echoes();
+    $before = g387Requests();
+    g387ApproveAll(fn (): Session => g387Child('worker'), null, 1);
+
+    expect(g387Requests() - $before)->toBe(3);
+});
+
+it('counts a tree hold that expired while its run was live once, at what it took', function (): void {
+    config()->set('prism-harness.agent.modes.chat.tools', []);
+    config()->set('prism-harness.agent.modes.chat.max_steps', 20);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'worker_a' => ['description' => 'Work.', 'mode' => 'work', 'max_steps' => 8],
+        'worker_b' => ['description' => 'Work.', 'mode' => 'work', 'max_steps' => 8],
+    ]);
+    G360::calls([['worker_a', ['task' => 'Go']]]);
+    G360::calls([['weather', ['city' => 'Oslo']]]);
+    G360::calls([['worker_b', ['task' => 'Go']]]);
+    G360::calls([['weather', ['city' => 'Rome']]]);
+    G360::text('Both asked.');
+    g387Pad();
+    g387Root()->send('Go');
+    $tree = g387Child('worker_a')->childTree();
+    $key = $tree['session'].':run-tree:'.$tree['run'];
+    $settled = g387Root()->planStore()->get($key)['steps'];
+    $a = g387Child('worker_a')->thread()->pendingApprovalIds();
+    $b = g387Child('worker_b')->thread()->pendingApprovalIds();
+    $fired = false;
+    G360::$onRequest = function () use (&$fired, $b, $key): void {
+        if (! $fired) {
+            $fired = true;
+            // 400 s on: A's live hold on the tree is past the lock TTL, and
+            // B's resume (another session, another lock) expires it.
+            g387Backdate($key, 400);
+            try {
+                g387Child('worker_b')->approve($b[0]);
+            } catch (RunNotPermitted) {
+            }
+        }
+    };
+
+    try {
+        g387Child('worker_a')->approve($a[0]);
+    } catch (RunNotPermitted) {
+    }
+    G360::$onRequest = null;
+
+    // Each child took one model step: the tree counts two, never A's hold in full.
+    expect(g387Root()->planStore()->get($key)['steps'])->toBe($settled + 2);
+});
+
+// 5. No re-delegation over a running turn, and no second claim by one run.
+it('refuses a delegation into a child while a turn on it holds its count', function (): void {
+    g387ParkedChild('worker', 4);
+    $pending = g387Child('worker')->thread()->pendingApprovalIds();
+    g387Pad();
+    $result = null;
+    $holds = null;
+    G360::$onRequest = function () use (&$result, &$holds): void {
+        if ($result === null) {
+            $holds = g387Delegation(g387Child('worker'))['holds'];
+            $result = app(SubagentRunner::class)->run(new Subagent('worker', 'Work.', 'work', new RunBudget(4)), g387Root(),
+                RunContext::root('run_root', new RunBudget(8)), 'run_root', 'Start over');
+        }
+    };
+
+    try {
+        g387Child('worker')->approve($pending[0]);
+    } catch (RunNotPermitted) {
+    }
+    G360::$onRequest = null;
+
+    expect($result?->outcome->value)->toBe('denied')
+        ->and($holds)->not->toBe([]);
+});
+
+it('refuses a second claim on the count by a run that already holds', function (): void {
+    g387ParkedChild('worker', 4);
+    $trees = app(RunTrees::class);
+    $ledger = RunLedger::start('x');
+
+    $first = $trees->claimDelegation(g387Child('worker'), 'run_twice', $ledger, fn (int $used): int => 1);
+    $second = $trees->claimDelegation(g387Child('worker'), 'run_twice', $ledger, fn (int $used): int => 1);
+
+    expect($first)->toBe(1)->and($second)->toBe(-1);
+});
+
+// 6. Blank is one explicit codepoint set, the same in all three languages.
+function g387Blanks(): array
+{
+    $codepoints = [...range(0x09, 0x0D), 0x20, 0x85, 0xA0, 0x1680, ...range(0x2000, 0x200D), 0x2028, 0x2029, 0x202F, 0x205F, 0x2060, 0x3000, 0xFEFF];
+    $rows = [];
+    foreach ($codepoints as $codepoint) {
+        $rows[sprintf('U+%04X', $codepoint)] = [mb_chr($codepoint, 'UTF-8')];
+    }
+    $rows['a mixed run'] = [mb_chr(0x20, 'UTF-8').mb_chr(0xA0, 'UTF-8').mb_chr(0x200B, 'UTF-8').mb_chr(0x3000, 'UTF-8').mb_chr(0xFEFF, 'UTF-8')."\t\n"];
+
+    return $rows;
+}
+
+it('refuses a task made only of blank codepoints', function (string $task): void {
+    $result = app(SubagentRunner::class)->run(new Subagent('worker', 'Work.', 'work', new RunBudget(2)), g387Root(),
+        RunContext::root('run_root', new RunBudget(8)), 'run_root', $task);
+
+    expect($result->outcome->value)->toBe('denied')
+        ->and($result->reason)->toBe('the task is empty')
+        ->and(g387Requests())->toBe(0);
+})->with(g387Blanks());
+
+it('delegates a task with any character outside the blank set', function (string $task): void {
+    G360::text('Done.');
+
+    $result = app(SubagentRunner::class)->run(new Subagent('worker', 'Work.', 'work', new RunBudget(2)), g387Root(),
+        RunContext::root('run_root', new RunBudget(8)), 'run_root', $task);
+
+    expect($result->outcome->value)->toBe('completed');
+})->with([
+    'a letter among blanks' => [mb_chr(0xA0, 'UTF-8').'a'.mb_chr(0x3000, 'UTF-8')],
+    'U+200E' => [mb_chr(0x200E, 'UTF-8')],
+    'U+180E' => [mb_chr(0x180E, 'UTF-8')],
+]);
+
+// 7. A pending approval blocks re-delegation only while a person could answer it.
+it('lets the runner start again a child stuck on an approval nobody can answer', function (): void {
+    g387ParkedChild('worker', 2);
+    $child = g387Child('worker');
+    // The binding is gone: a decision on it would be refused (round 2, item 4).
+    (fn () => $this->durable->put($this->key().':child', []))->call($child);
+    G360::$queue = [];
+    G360::text('Done again.');
+
+    $result = app(SubagentRunner::class)->run(new Subagent('worker', 'Work.', 'work', new RunBudget(2)), g387Root(),
+        RunContext::root('run_root', new RunBudget(8)), 'run_root', 'Start over');
+
+    expect($result->outcome->value)->toBe('completed');
+});
+
+// 9. A denial runs nothing, so a spent tool-call or time limit does not refuse it.
+it('records a denial under a context whose tool-call or time limit is spent, and refuses an approval', function (string $limit): void {
+    G360::calls([['weather', ['city' => 'Paris']]]);
+    g387Pad();
+    g387Root()->send('Go');
+    $pending = g387Root()->thread()->pendingApprovalIds();
+    $context = fn (): RunContext => RunContext::root('host_run', $limit === 'tool calls'
+        ? new RunBudget(10, maxToolCalls: 0) : new RunBudget(10, maxSeconds: 0));
+
+    expect(fn () => g387Root()->approve($pending[0], true, null, $context()))->toThrow(RunNotPermitted::class);
+    expect(g387Root()->thread()->pendingApprovalIds())->toBe($pending);
+
+    try {
+        g387Root()->deny($pending[0], 'No.', $context());
+    } catch (RunNotPermitted) {
+    }
+
+    expect(g387Root()->approvalStatus($pending[0]))->toBe('denied')
+        ->and($this->ran['weather'])->toBe(0);
+})->with(['tool calls', 'time']);
+
+// 3. A child parked by the RELEASED code (v0.26.8: a linked thread, a
+// `::sub::` scope, nothing else saved), resumed by this code. The rows are
+// recorded from a run of the released code (tests/Fixtures/legacy-children).
+function g387LoadLegacyChild(bool $keepParentLink = true): void
+{
+    $dump = json_decode((string) file_get_contents(__DIR__.'/Fixtures/legacy-children/parked-child-v0.26.8.json'), true);
+    foreach ($dump['tables'] as $table => $rows) {
+        $columns = Schema::getColumnListing($table);
+        foreach ($rows as $row) {
+            $row = array_intersect_key($row, array_flip($columns));
+            if ($table === 'harness_threads' && ! $keepParentLink) {
+                $row['parent_thread_id'] = null;
+            }
+            DB::table($table)->insert($row);
+        }
+    }
+}
+
+it('refuses, recording nothing, a decision on a child the released code parked', function (): void {
+    g387LoadLegacyChild();
+    $child = g387Child('worker');
+    $pending = $child->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1);
+    $rows = g387Rows($child);
+    g387Pad();
+
+    expect(fn () => g387Child('worker')->approve($pending[0]))->toThrow(RunNotPermitted::class, 'no saved provider and model binding');
+    expect(g387Child('worker')->thread()->pendingApprovalIds())->toBe($pending)
+        ->and(g387Rows(g387Child('worker')))->toBe($rows)
+        ->and(g387Requests())->toBe(0);
+});
+
+it('fails closed on a released child that lost even its parent link: its address is a child\'s', function (): void {
+    g387LoadLegacyChild(keepParentLink: false);
+    expect(g387Child('worker')->thread()->parent_thread_id)->toBeNull()
+        ->and(g387Child('worker')->childBinding())->toBeNull();
+    $pending = g387Child('worker')->thread()->pendingApprovalIds();
+    g387Pad();
+
+    try {
+        g387Child('worker')->approve($pending[0]);
+    } catch (RunNotPermitted) {
+    }
+
+    // Its declared 2 (1 taken) is not known here: it gets no model step, never its mode's 8.
+    expect(g387Requests())->toBe(0)
+        ->and($this->ran['weather'])->toBe(1);
 });

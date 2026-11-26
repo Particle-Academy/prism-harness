@@ -293,7 +293,10 @@ class Session
      */
     public function isLinkedChild(): bool
     {
-        return $this->savedChild() !== null || $this->thread()->parent_thread_id !== null;
+        // The runner's address for a child, whatever was or was not saved
+        // with it (an earlier release saved less).
+        return str_contains($this->scope(), '::sub::')
+            || $this->savedChild() !== null || $this->thread()->parent_thread_id !== null;
     }
 
     /**
@@ -824,7 +827,8 @@ class Session
         // A decision the resuming turn could not act on at all (a lost child
         // binding, a cancelled or spent context) is refused here, with
         // nothing recorded, rather than consumed by a resume that refuses.
-        $this->runtime?->assertDecisionsActionable($this, $context);
+        $this->runtime?->assertDecisionsActionable($this, $context,
+            array_filter($decisions, static fn (ToolApprovalResponse $decision): bool => $decision->approved) === []);
         // A decision a spent shared plan budget could not run is refused
         // here, with nothing recorded, rather than consumed by a resume that
         // is then refused (G-366).
