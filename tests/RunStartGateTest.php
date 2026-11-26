@@ -430,12 +430,20 @@ it('reports a cancelled start with harness-written text only', function (): void
 // the write it races refuses the start with the child's records unchanged.
 // ---------------------------------------------------------------------------
 
-/** Run `$then` once, right after the first query that reads or writes a key containing `$needle`. */
+/**
+ * Run `$then` once, right after the first query that reads or writes a key
+ * containing `$needle` (or, for a `/regex/`, matching it).
+ */
 function sgAfterQuery(string $needle, Closure $then): void
 {
     $fired = false;
     DB::listen(function (QueryExecuted $query) use (&$fired, $needle, $then): void {
-        if ($fired || ! str_contains(implode('|', array_map('strval', $query->bindings)), $needle)) {
+        $hit = false;
+        foreach ($query->bindings as $binding) {
+            $binding = (string) $binding;
+            $hit = $hit || (str_starts_with($needle, '/') ? preg_match($needle, $binding) === 1 : str_contains($binding, $needle));
+        }
+        if ($fired || ! $hit) {
             return;
         }
         $fired = true;
@@ -464,7 +472,8 @@ it('refuses a start whose tree was spent between the gate read and the hold, wri
         $spent = PlanBudget::open(substr((string) $tree, strrpos((string) $tree, ':') + 1), ['mode' => 'shared', 'max_steps' => 1, 'max_cost_micros' => null]);
         $spent['steps'] = 1;
         // Another process spends the tree after this process read it.
-        sgAfterQuery(':run-tree:', function () use ($tree, $spent): void {
+        // The record itself, not its cancel flag, which the root's own checks read.
+        sgAfterQuery('/:run-tree:run_[0-9a-f]+\z/', function () use ($tree, $spent): void {
             sgRoot()->planStore()->put((string) $tree, $spent);
         });
     };
@@ -578,7 +587,7 @@ it('fails closed, writing nothing, when a gate read throws', function (string $n
         ->and(sgSent())->not->toContain('SECRET-host')
         ->and(sgRequests())->toBe(2)
         ->and($after)->toBe($before);
-})->with(['the tree record' => [':run-tree:'], 'the child count' => [':delegation-steps'], 'the child binding' => ['::sub::worker:child']]);
+})->with(['the tree record' => ['/:run-tree:run_[0-9a-f]+\z/'], 'the child count' => [':delegation-steps'], 'the child binding' => ['::sub::worker:child']]);
 
 // A start into a child whose only pending approval nobody can answer is a
 // committed start: the child runs, and that approval is superseded.
