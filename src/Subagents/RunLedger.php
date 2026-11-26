@@ -327,6 +327,16 @@ final class RunLedger
             && $this->exhaustionNow(self::forResolution($budget)) === null);
     }
 
+    /**
+     * Why acting on recorded decisions may not proceed now (a cancel, time,
+     * the tool-call count), or null. The check a decision is refused on
+     * before it is recorded, and the one the resume makes before it acts.
+     */
+    public function resolutionStop(RunBudget $budget): ?string
+    {
+        return $this->guarded(fn (): ?string => $this->exhaustionNow(self::forResolution($budget)));
+    }
+
     /** The limits acting on recorded decisions is held to: no steps, no cost. */
     private static function forResolution(RunBudget $budget): RunBudget
     {

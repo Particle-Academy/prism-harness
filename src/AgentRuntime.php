@@ -284,6 +284,39 @@ final readonly class AgentRuntime
     }
 
     /**
+     * Refuse, BEFORE a decision is recorded, one the resuming turn could not
+     * act on at all (G-387): run the checks that turn would run first. A
+     * linked child that lost its binding, or a supplied context that is
+     * cancelled or whose time or tool-call limit is spent, would refuse the
+     * resume after the decision was written, consuming the approval with
+     * nothing done. Steps and cost never refuse a decision: acting on it
+     * makes no model call. A cancelled run tree is refused by RunTrees.
+     *
+     * @internal Called by the session before it records decisions.
+     *
+     * @throws RunNotPermitted
+     */
+    public function assertDecisionsActionable(Session $session, ?RunContext $context): void
+    {
+        $context = $this->executionContext($context);
+        $route = ChildBinding::route(
+            app(RunTrees::class)->bindingContextKind($context),
+            $context?->binding !== null,
+            $session->childBinding() !== null,
+            $session->thread()->parent_thread_id !== null || $session->childTree() !== null || $session->childPlanLedger() !== null,
+        );
+        if ($route['binding'] === 'refused') {
+            throw RunNotPermitted::unboundChild();
+        }
+        if ($context !== null) {
+            $stop = $context->ledger->resolutionStop($context->budget);
+            if ($stop !== null) {
+                throw $context->ledger->refusal($stop);
+            }
+        }
+    }
+
+    /**
      * Refuse, before any provider call and before anything is recorded, a
      * run with nothing it may spend and no recorded decision to act on: the
      * tree's allowance, not this node's wish. The same check, and the same
@@ -1066,6 +1099,17 @@ final readonly class AgentRuntime
         event($tagger->resuming()
             ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
             : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+        // The same refusal as every other path, before anything is recorded:
+        // no user row, and no result closing an approval still pending.
+        try {
+            $this->refuseSpentRun($session, $runId, $run, $run->budget, $prompt);
+        } catch (Throwable $refused) {
+            $unwatch();
+            $this->rememberSeq($session, $runId, $tagger);
+            ToolRefusals::forget($runId);
+
+            throw $refused;
+        }
         $recorded = false;
         $finish = FinishReason::Unknown;
         $steps = 0;
@@ -1776,7 +1820,7 @@ final readonly class AgentRuntime
     {
         if ($session->agent() !== null) {
             $requested = $session->maxSteps() ?? $mode->maxSteps;
-            $ceiling = $this->nullableIntConfig('max_steps_ceiling', $session);
+            $ceiling = $this->stepCeilingConfig($session);
 
             return $ceiling === null ? $requested : min($requested, $ceiling);
         }
@@ -1786,9 +1830,34 @@ final readonly class AgentRuntime
             return $mode->maxSteps;
         }
 
-        $ceiling = $this->nullableIntConfig('max_steps_ceiling');
+        $ceiling = $this->stepCeilingConfig(null);
 
         return $ceiling === null ? $requested : min($requested, $ceiling);
+    }
+
+    /**
+     * `max_steps_ceiling` as a count (G-387): unset is no ceiling; a whole
+     * number is itself (a negative one 0); anything else, a non-finite or
+     * fractional number, one past the JSON-safe range, or a word, is 0. A
+     * ceiling that cannot be read never removes the cap.
+     */
+    private function stepCeilingConfig(?Session $session): ?int
+    {
+        $value = $session === null ? ($this->config['max_steps_ceiling'] ?? null) : $this->agentValue($session, 'max_steps_ceiling');
+        if ($value === null) {
+            return null;
+        }
+        if (is_int($value)) {
+            return max(0, min($value, 9007199254740991));
+        }
+        if (is_string($value) && preg_match('/\A[0-9]{1,15}\z/', $value) === 1) {
+            return (int) $value;
+        }
+        if (is_float($value) && is_finite($value) && floor($value) === $value && $value >= 0 && $value <= 9007199254740991) {
+            return (int) $value;
+        }
+
+        return 0;
     }
 
     /**
@@ -1957,7 +2026,7 @@ final readonly class AgentRuntime
     private function ownFacts(Session $session, AgentMode $mode, ?RunContext $context, string $prompt): array
     {
         $kind = app(RunTrees::class)->contextKind($context);
-        $cap = $session->agent() === null ? null : $this->nullableIntConfig('max_steps_ceiling', $session);
+        $cap = $session->agent() === null ? null : $this->stepCeilingConfig($session);
         if ($context !== null && $context->workflowNode) {
             $own = $this->ceilingFor($session, $mode);
             $cap = $cap === null ? $own : min($cap, $own);
@@ -1965,6 +2034,12 @@ final readonly class AgentRuntime
         $state = 'none';
         $used = 0;
         $savedCeiling = $kind === 'runner' ? null : $session->childStepCeiling();
+        // A linked child with no saved ceiling (an earlier release's, or one
+        // whose ceiling is gone) fails CLOSED: it acts on its decisions with
+        // no model step. Only a session that never was a child uses its mode.
+        if ($kind !== 'runner' && $savedCeiling === null && $session->isLinkedChild()) {
+            $savedCeiling = 0;
+        }
         // Only a turn that resumes a parked run continues its count. A new
         // message starts a new run, held to the saved ceiling afresh; what a
         // child spends across runs is bounded by its run tree's record.
@@ -2036,6 +2111,19 @@ final readonly class AgentRuntime
         try {
             $trees = app(RunTrees::class);
             $plans = app(Plans::class);
+            // A child's ceiling is its delegation's lifetime budget: the steps
+            // it used since the runner last started it, live holds of other
+            // runs included, are claimed from in ONE locked write, and this
+            // run holds what it may take until it ends.
+            $durable = $trees->claimDelegation($session, $runId, $run->ledger, function (int $durable) use ($facts): int {
+                return $this->allowanceOf([...$facts, 'used' => max((int) $facts['used'], $durable)])['own_left'];
+            });
+            if ($durable === -1) {
+                // The count is gone or is not this delegation's: FAIL CLOSED.
+                $facts['saved_ceiling'] = $facts['used'] = $this->allowanceOf($facts)['ceiling'];
+            } elseif ($durable !== null) {
+                $facts['used'] = max((int) $facts['used'], $durable);
+            }
             $own = $this->allowanceOf($facts)['own_left'];
             // A root run opens a tree; any turn on a child session the runner
             // did not start continues the run tree it was started in, a host
@@ -2340,7 +2428,7 @@ final readonly class AgentRuntime
         if ($session->agent() === null) {
             return $run->agent === null && $run->agentCeilingUsd === null ? $run : $run->forAgent(null, null);
         }
-        $stepCeiling = $steps ? $this->nullableIntConfig('max_steps_ceiling', $session) : null;
+        $stepCeiling = $steps ? $this->stepCeilingConfig($session) : null;
         $output = $this->nullableIntConfig('max_output_tokens_per_call', $session);
         $budget = $run->budget;
 
@@ -2457,12 +2545,12 @@ final readonly class AgentRuntime
             // The step ceiling the runner gave it (G-387): the ceiling of this
             // runner start's allowance, re-applied on every turn the runner
             // does not start. A runner start overwrites it.
+            // Every runner start is a new delegation: its count of the steps
+            // the child uses starts at 0 under the new ceiling.
             $ceiling = $this->allowanceOf($facts)['ceiling'];
-            if ($saved != $child || $session->childDepth() !== $membership['depth']
-                || $session->childPlanLedger() !== $refs['plan_ledger'] || $savedTree !== $refs['tree']
-                || $session->childStepCeiling() !== $ceiling) {
-                $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling);
-            }
+            $delegation = 'dlg_'.bin2hex(random_bytes(12));
+            $trees->startDelegation($session, $delegation, $ceiling);
+            $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation);
         }
 
         return [
