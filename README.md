@@ -189,6 +189,12 @@ the address, not a label hung off it. `Thread::forParticipant($user, 'coding')` 
 different conversation from `'support'`, and a fresh worker asking for the same address lands
 on the same thread rather than starting a new one.
 
+**`::sub::` in a scope is reserved for subagent children.** The subagent runner addresses a
+child at `{parent scope}::sub::{name}`, and a session whose scope has a `::sub::` segment is
+treated as a child: with no step ceiling saved by the runner it gets no model steps (it acts
+on decisions, and a new message to it is refused). Do not build host scopes that can contain
+`::sub::`, from user input or otherwise.
+
 **One live conversation per address is enforced by the database.** The nullable
 `live_key` key is derived by the model and uniquely indexed. A competing first-use
 insert is rejected, and resolution returns the winning row. `retire()` clears the key
@@ -678,11 +684,17 @@ person's decision: acting on an approved call makes no model call, so the call r
 is recorded, and the run then stops on its budget with no further model step. A decision the
 turn could not act on at all is refused before anything is recorded: a cancelled run tree, a
 linked child that lost its binding (`child_binding_missing`), or a run context whose run was
-cancelled or whose time or tool-call limit is spent. A denial runs nothing, so a spent time or
-tool-call limit does not refuse it; a cancelled run still does. A new message to a child with
+cancelled or whose time or tool-call limit is spent. A denial (approved: false) under a context
+whose time or tool-call limit is spent is still recorded, because recording it runs nothing:
+the approval is closed as denied. The continuation after it is then refused the way a spent run
+ends (`RunNotPermitted`, the run marked failed), and the denial's result is written by the next
+resume that can act. A cancelled run refuses the denial too. A resume under a context whose
+time is spent acts on no recorded approval at all: the decisions stay recorded for a later
+resume that can act. A new message to a child with
 nothing left is refused before anything is recorded. A hold whose run never settled is charged
-in full once the run lock's TTL has passed; a run that was still live and settles later has
-that charge replaced with what it took, so it is counted once. When the child was started by a turn that spent from a shared plan
+in full once the run lock's TTL has passed, and stays charged in full on a run tree or a plan
+budget. On a child's delegation count, a run that was still live and settles later has that
+charge replaced with what it took, so it is counted once there. When the child was started by a turn that spent from a shared plan
 budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). The same holds
 for every turn on the child session the runner did not start: a new message sent with `send()`
 instead of an answer continues the tree and the plan budget exactly as an answer does, and a run
@@ -1085,7 +1097,8 @@ A delegation into a child that is waiting on a person's approval is refused too:
 not be able to dismiss that approval by delegating again. An approval blocks the child only
 while a person could still answer it; one in a cancelled run or tree, or on a child that lost
 its binding, does not hold the child. Neither does the runner start a child again while a
-turn on it is running. Nothing is written to the child in any of these cases. Any exception
+turn on it is running (a hold a crashed turn left stops blocking once the run lock's TTL has
+passed). Nothing is written to the child in any of these cases. Any exception
 in the runner's own checks comes back as the framed `failed` result naming only the
 exception's class; its message goes to the application log, never to the model.
 

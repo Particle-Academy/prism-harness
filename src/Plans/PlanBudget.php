@@ -318,9 +318,10 @@ final class PlanBudget
      * replaced with what it took, whether its hold is still held or was
      * already charged in full on expiry while it ran (remembered by
      * {@see self::expire()} under its id). Counted once, never the actual
-     * steps on top of an expired full charge. {@see self::settle()} is the
-     * pure ledger rule the corpus pins (a dead run's expired hold stays
-     * charged in full); this is the runtime's for a run that did end.
+     * steps on top of an expired full charge. Used for a child's delegation
+     * count only; run trees and plan ledgers keep {@see self::settle()}, the
+     * pure ledger rule the corpus pins (an expired hold stays charged in
+     * full), as every language does.
      *
      * @param  array<string, mixed>  $state
      * @return array<string, mixed>
@@ -353,16 +354,19 @@ final class PlanBudget
      * @param  array<string, mixed>  $state
      * @return array<string, mixed>
      */
-    public static function expire(array $state, int $now, int $holdTtl): array
+    public static function expire(array $state, int $now, int $holdTtl, bool $remember = false): array
     {
         foreach ($state['holds'] as $id => $hold) {
             if ($now - $hold['at'] >= $holdTtl) {
                 unset($state['holds'][$id]);
                 $state['steps'] += $hold['steps'];
                 $state['cost_micros'] += $hold['cost_micros'];
-                // Remembered under the run's id, so a run that was still live
-                // and settles later replaces this charge instead of adding to it.
-                $state['expired'][$id] = ['steps' => $hold['steps'], 'cost_micros' => $hold['cost_micros']];
+                // Remembered under the run's id (a delegation count only), so a
+                // run that was still live and settles later replaces this
+                // charge instead of adding to it.
+                if ($remember) {
+                    $state['expired'][$id] = ['steps' => $hold['steps'], 'cost_micros' => $hold['cost_micros']];
+                }
             }
         }
 

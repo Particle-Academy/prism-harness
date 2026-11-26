@@ -213,6 +213,11 @@ final readonly class SubagentRunner
                 ],
             );
         } catch (RunNotPermitted $e) {
+            if ($e->code() === 'child_busy') {
+                return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
+                    'the subagent is already running');
+            }
+
             // Not a failure of the child's work — the tree refused to let it
             // spend. Reported as its own outcome so the parent does not retry.
             return SubagentResult::refused(
