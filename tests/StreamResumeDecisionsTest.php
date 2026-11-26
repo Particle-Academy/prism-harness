@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\Exceptions\SessionLocked;
@@ -147,8 +148,10 @@ it('sends the held events when the turn ends before announcing them', function (
     Event::listen(GenerationStarted::class, function (GenerationStarted $event) use (&$started): void {
         $started[$event->context->traceId] = true;
     });
-    Event::listen(GenerationFailed::class, function (GenerationFailed $event) use (&$failed): void {
+    $reasons = [];
+    Event::listen(GenerationFailed::class, function (GenerationFailed $event) use (&$failed, &$reasons): void {
         $failed[] = $event->context->traceId;
+        $reasons[] = $event->exception->getMessage();
     });
     Event::listen(ToolInvoked::class, function (ToolInvoked $event) use (&$started, &$seen, &$failed): void {
         $seen[] = [$event->toolName, isset($started[$event->context->traceId])];
@@ -169,10 +172,10 @@ it('sends the held events when the turn ends before announcing them', function (
     }
 
     expect($this->runs)->toBe(1)->and($seen)->toBe([['transfer', true]]);
-    if ($exit === 'failed record') {
-        // The stand-in generation is closed with the failure, not left open.
-        expect($failed)->toHaveCount(2)->and($failed[0])->toBe('event:'.$failed[1]);
-    }
+    // The stand-in generation is closed, not left open, with a failure that
+    // names no content.
+    expect($failed)->toHaveCount(2)->and($failed[0])->toBe('event:'.$failed[1])
+        ->and($reasons[0])->toStartWith($exit === 'failed record' ? 'resolution_not_recorded:' : 'resolution_abandoned:');
 })->with(['abandoned stream', 'failed record']);
 
 // On 0.26.7 core resolved a plain stream's recorded decisions inside asStream(),
@@ -204,3 +207,90 @@ it('fails the stream generation a failed plain stream resolution stands in for',
 
     expect(array_values($traces))->toBe([['stream', 'failed', ['transfer']]]);
 });
+
+// A failed record write never carries its content into telemetry. A database
+// exception's message holds the statement with its bindings: the row being
+// written, with the approved tool's arguments and result. With content capture
+// off (the default) none of that may reach a telemetry or harness event: not
+// an event's fields, not an exception's message, chain or trace.
+it('keeps a failed record write\'s content out of every telemetry event', function (string $route): void {
+    $marker = 'MARKER-'.bin2hex(random_bytes(6));
+    app(ToolRegistry::class)->register((new Tool)->as('transfer')->for('Transfer.')->withStringParameter('amount', 'Amount')
+        ->using(function (string $amount) use ($marker): string {
+            $this->runs++;
+
+            return 'sent '.$marker;
+        }));
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('Send five.')->pendingApprovals();
+    $failWrite = true;
+    ThreadMessage::creating(function (ThreadMessage $row) use (&$failWrite): void {
+        if ($failWrite && $row->type === 'tool_result' && ($row->payload['tool_results'] ?? []) !== []) {
+            $failWrite = false;
+            // What the database layer throws: the statement with the row bound.
+            throw new QueryException('testing', 'insert into "thread_messages" ("payload") values (?)', [json_encode($row->payload)], new PDOException('disk I/O error'));
+        }
+    });
+
+    $leaks = [];
+    $scan = function (mixed $value, string $where, array &$seen) use (&$scan, &$leaks, $marker): void {
+        if (is_string($value)) {
+            if (str_contains($value, $marker)) {
+                $leaks[] = $where;
+            }
+
+            return;
+        }
+        if (is_array($value)) {
+            foreach ($value as $key => $item) {
+                $scan($item, $where.'.'.$key, $seen);
+            }
+
+            return;
+        }
+        if (! is_object($value) || isset($seen[spl_object_id($value)])) {
+            return;
+        }
+        $seen[spl_object_id($value)] = true;
+        if ($value instanceof Throwable) {
+            for ($failure = $value; $failure !== null; $failure = $failure->getPrevious()) {
+                $scan($failure->getMessage(), $where.'.message', $seen);
+                $scan($failure->getTraceAsString(), $where.'.trace', $seen);
+            }
+
+            return;
+        }
+        foreach (get_object_vars($value) as $field => $item) {
+            $scan($item, $where.'->'.$field, $seen);
+        }
+    };
+    $telemetry = [];
+    Event::listen('*', function (string $name, array $payload) use ($scan, &$telemetry): void {
+        if (str_starts_with($name, 'Prism\\Prism\\Events\\Telemetry\\') || str_starts_with($name, 'Prism\\Harness\\Events\\')) {
+            $telemetry[] = class_basename($name);
+            $seen = [];
+            $scan($payload, class_basename($name), $seen);
+        }
+    });
+
+    $threw = null;
+    try {
+        match ($route) {
+            'approve' => $session->approve($pending[0]->approvalId),
+            'stream' => (function () use ($session, $pending): void {
+                $session->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($pending[0]->approvalId, true)])], $session->run()['id'] ?? null);
+                iterator_to_array($session->stream(''), false);
+            })(),
+        };
+    } catch (Throwable $failure) {
+        $threw = $failure;
+    }
+
+    // The caller still gets the database's own failure; telemetry hears of it
+    // only by class.
+    expect($threw)->toBeInstanceOf(QueryException::class)
+        ->and(str_contains($threw->getMessage(), $marker))->toBeTrue()
+        ->and($this->runs)->toBe(1)
+        ->and($telemetry)->toContain('ToolInvoked', 'GenerationFailed')
+        ->and($leaks)->toBe([]);
+})->with(['approve', 'stream']);
