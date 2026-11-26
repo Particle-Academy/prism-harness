@@ -2542,6 +2542,15 @@ final readonly class AgentRuntime
             // saved before unless a person cancelled that tree. All from the
             // membership the run began with (G-381).
             $trees = app(RunTrees::class);
+            // Every runner start is a new delegation: its count of the steps
+            // the child uses starts at 0 under the new ceiling. Reset FIRST,
+            // in one locked write that refuses while a turn on the child
+            // holds the count, so a refused start writes nothing else.
+            $ceiling = $this->allowanceOf($facts)['ceiling'];
+            $delegation = 'dlg_'.bin2hex(random_bytes(12));
+            if (! $trees->startDelegation($session, $delegation, $ceiling)) {
+                throw RunNotPermitted::childBusy();
+            }
             $trees->childStarted($session, $membership);
             $savedTree = $session->childTree();
             $refs = RunTrees::keptRefs(
@@ -2554,11 +2563,6 @@ final readonly class AgentRuntime
             // The step ceiling the runner gave it (G-387): the ceiling of this
             // runner start's allowance, re-applied on every turn the runner
             // does not start. A runner start overwrites it.
-            // Every runner start is a new delegation: its count of the steps
-            // the child uses starts at 0 under the new ceiling.
-            $ceiling = $this->allowanceOf($facts)['ceiling'];
-            $delegation = 'dlg_'.bin2hex(random_bytes(12));
-            $trees->startDelegation($session, $delegation, $ceiling);
             $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation);
         }
 

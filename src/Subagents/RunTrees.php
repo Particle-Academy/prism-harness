@@ -378,7 +378,7 @@ final class RunTrees
         $cost = $ledger->unmeteredRuns() > $entry['unmetered'] ? null : PlanBudget::micros(max(0.0, $ledger->costUsd() - $entry['cost']));
         try {
             $this->write($session->planStore(), $entry['tree'], static fn (?array $state): array => $state === null
-                ? [null, null] : [PlanBudget::settleRun($state, $runId, $steps, $cost), null]);
+                ? [null, null] : [PlanBudget::settle($state, $runId, $steps, $cost), null]);
         } catch (Throwable $failure) {
             // The hold stays and is charged in full once it expires.
             report(new RuntimeException('A run tree budget update failed: '.$failure::class.'.'));
@@ -393,11 +393,23 @@ final class RunTrees
      *
      * @internal Called by the runtime when it saves a runner start's binding.
      */
-    public function startDelegation(Session $child, string $delegation, int $ceiling): void
+    public function startDelegation(Session $child, string $delegation, int $ceiling): bool
     {
         $key = self::delegationKey($child);
-        $child->planStore()->withLock($key, function () use ($child, $key, $delegation, $ceiling): void {
+
+        return $child->planStore()->withLock($key, function () use ($child, $key, $delegation, $ceiling): bool {
+            // Refused in the same locked write as the reset: a turn on the
+            // child that holds the count (live, not past the lock TTL) keeps
+            // it. A record this runtime could not have written is reset.
+            $state = $child->planStore()->get($key);
+            $current = $child->childDelegation();
+            if ($current !== null && self::validCount($state, $current)
+                && PlanBudget::expire($state, time(), self::holdTtl())['holds'] !== []) {
+                return false;
+            }
             $child->planStore()->put($key, PlanBudget::open($delegation, ['mode' => 'shared', 'max_steps' => max(0, $ceiling), 'max_cost_micros' => null]));
+
+            return true;
         }, 10, 5);
     }
 
@@ -420,7 +432,9 @@ final class RunTrees
     {
         $delegation = $child->childDelegation();
         if ($delegation === null) {
-            return null;
+            // A ceiling and its delegation id are always saved together: a
+            // ceiling without a valid id was not written by this runtime.
+            return $child->childStepCeiling() === null ? null : -1;
         }
         $key = self::delegationKey($child);
         $store = $child->planStore();
@@ -430,10 +444,10 @@ final class RunTrees
             $state = $store->get($key);
             // Anything this runtime could not have written, and a second
             // claim by a run that already holds, FAIL CLOSED.
-            if (! self::validCount($state, $delegation) || isset($state['holds'][$runId])) {
+            if (! self::validCount($state, $delegation) || isset($state['holds'][$runId]) || isset($state['expired'][$runId])) {
                 return -1;
             }
-            $state = PlanBudget::expire($state, $now, $ttl);
+            $state = PlanBudget::expire($state, $now, $ttl, remember: true);
             $used = (int) $state['steps'];
             foreach ($state['holds'] as $hold) {
                 $used += (int) $hold['steps'];

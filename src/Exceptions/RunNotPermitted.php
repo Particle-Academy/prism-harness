@@ -120,6 +120,20 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
      * child's conversation to a provider its declaration did not choose, so
      * it is refused instead.
      */
+    /**
+     * The subagent runner may not start a child again while a turn on it
+     * holds its delegation count (G-387): the reset would wipe that turn's
+     * hold.
+     */
+    public static function childBusy(): self
+    {
+        $failure = new self('This subagent child is already running, so it may not be started again until that turn ends.');
+        $failure->errorCode = 'child_busy';
+        $failure->reason = 'child_busy';
+
+        return $failure;
+    }
+
     public static function unboundChild(): self
     {
         $failure = new self('This subagent child session has no saved provider and model binding, so it may not run outside the subagent runner.');
