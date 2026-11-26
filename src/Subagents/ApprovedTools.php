@@ -43,14 +43,17 @@ use WeakMap;
  * the results are recorded.
  *
  * The reports go out under the telemetry context of the run's NEXT generation
- * when it starts (the one the results are sent in), so a tracer that builds
- * tool spans only inside an open generation keeps them. When no generation
- * follows, they go out under a bare context of their own. Each is dispatched
+ * (the one the results are sent in), so a tracer that builds tool spans only
+ * inside an open generation keeps them. They are handed to that generation
+ * only for the length of the run's own call ({@see self::arm()}), never while
+ * the host has control, so no other generation (the host's own, another
+ * session's) can take them. When no generation takes them, they go out under
+ * a bare context of their own. Each is dispatched
  * on its own: a listener that throws is reported, never thrown, and costs no
  * other call its event.
  *
- * Call {@see self::announce()} once the next generation has returned (or
- * failed), in a `finally`.
+ * Call {@see self::arm()} immediately before the next generation call and
+ * {@see self::announce()} right after it returns or fails, in a `finally`.
  */
 final class ApprovedTools
 {
@@ -62,8 +65,13 @@ final class ApprovedTools
     /** @var list<ResolutionAnnouncement> resolutions in progress, innermost last */
     private static array $resolving = [];
 
-    /** @var list<ResolutionAnnouncement> recorded resolutions waiting for their generation */
-    private static array $waiting = [];
+    /**
+     * Recorded resolutions whose run's own generation call is in progress,
+     * innermost last, each with the telemetry stack depth it was armed at.
+     *
+     * @var list<array{ResolutionAnnouncement, int}>
+     */
+    private static array $armed = [];
 
     /** @var WeakMap<object, true>|null */
     private static ?WeakMap $listening = null;
@@ -122,12 +130,32 @@ final class ApprovedTools
             $record($messages);
             $generation->withMessages($messages);
         }
-        if ($announcement->pending() && Telemetry::enabled()) {
-            self::listen();
-            self::$waiting[] = $announcement;
-        }
 
         return $events;
+    }
+
+    /**
+     * Hand the last resolution's reports to the generation the run's next
+     * call starts. Call it immediately before that call, with nothing between
+     * that could return control to the host, and {@see self::announce()}
+     * right after the call returns or throws (on a stream, at its first
+     * event). Only a generation pushed directly on the telemetry stack as it
+     * is now takes them: one something else starts while that generation
+     * starts (a listener, say) sits above it and is passed over.
+     */
+    public function arm(): void
+    {
+        $announcement = $this->announcement;
+        if ($announcement === null || ! $announcement->pending() || ! Telemetry::enabled()) {
+            return;
+        }
+        foreach (self::$armed as [$armed]) {
+            if ($armed === $announcement) {
+                return;
+            }
+        }
+        self::listen();
+        self::$armed[] = [$announcement, ContextDepth::of(Telemetry::stack())];
     }
 
     /**
@@ -141,8 +169,7 @@ final class ApprovedTools
             return;
         }
         $this->announcement = null;
-        self::$waiting = array_values(array_filter(self::$waiting,
-            static fn (ResolutionAnnouncement $waiting): bool => $waiting !== $announcement));
+        self::disarm($announcement);
         $announcement->send();
     }
 
@@ -262,7 +289,13 @@ final class ApprovedTools
         return null;
     }
 
-    /** Listen, once per dispatcher, for the generation a waiting resolution's results are sent in. */
+    private static function disarm(ResolutionAnnouncement $announcement): void
+    {
+        self::$armed = array_values(array_filter(self::$armed,
+            static fn (array $armed): bool => $armed[0] !== $announcement));
+    }
+
+    /** Listen, once per dispatcher, for the generation an armed resolution's results are sent in. */
     private static function listen(): void
     {
         $events = app('events');
@@ -272,10 +305,15 @@ final class ApprovedTools
         }
         self::$listening[$events] = true;
         $events->listen(GenerationStarted::class, static function (GenerationStarted $event): void {
-            for ($i = count(self::$waiting) - 1; $i >= 0; $i--) {
-                $announcement = self::$waiting[$i];
-                if ($announcement->belongsTo($event->context)) {
-                    array_splice(self::$waiting, $i, 1);
+            $stack = Telemetry::stack();
+            if ($stack->current() !== $event->context) {
+                return;
+            }
+            $depth = ContextDepth::of($stack);
+            for ($i = count(self::$armed) - 1; $i >= 0; $i--) {
+                [$announcement, $armedAt] = self::$armed[$i];
+                if ($depth === $armedAt + 1 && $announcement->belongsTo($event->context)) {
+                    self::disarm($announcement);
                     $announcement->send($event->context);
 
                     return;

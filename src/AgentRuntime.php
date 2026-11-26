@@ -267,6 +267,19 @@ final readonly class AgentRuntime
     }
 
     /**
+     * A run whose ONLY spent limit is its step budget, parked on calls the
+     * person has decided and that have no result yet, still acts on those
+     * decisions: it runs the approved calls and records every result, and the
+     * step check after the resolution then stops it with no model step. The
+     * decision was accepted, so it is acted on; refused here, it would be
+     * consumed with nothing done, and every later resume refused the same way.
+     */
+    private function actsOnDecisionsFirst(Session $session, RunContext $run, RunBudget $budget): bool
+    {
+        return $run->ledger->onlyStepsSpent($budget) && $session->thread()->decidedCallsAwaitingResult();
+    }
+
+    /**
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $attachments
      */
@@ -288,7 +301,7 @@ final readonly class AgentRuntime
         // was spawned; this re-checks at the moment of spending, because a
         // sibling may have consumed the remainder in between.
         $stop = $run->ledger->exhaustion($budget);
-        if (! $run->capped() && $stop !== null) {
+        if (! $run->capped() && $stop !== null && ! $this->actsOnDecisionsFirst($session, $run, $budget)) {
             $refusal = $run->ledger->refusal($stop);
             $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
 
@@ -516,7 +529,7 @@ final readonly class AgentRuntime
         ));
 
         $stop = $run->ledger->exhaustion($budget);
-        if (! $run->capped() && $stop !== null) {
+        if (! $run->capped() && $stop !== null && ! $this->actsOnDecisionsFirst($session, $run, $budget)) {
             $refusal = $run->ledger->refusal($stop);
             $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
 

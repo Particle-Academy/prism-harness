@@ -179,3 +179,74 @@ it('gives a new prompt after the budget is spent a fresh budget', function (): v
     expect($next->awaitingApproval())->toBeTrue()
         ->and($this->modelCalls)->toBe(STEP_BUDGET_MAX + 1);
 });
+
+// A run that parks on an approval at its LAST step (3 of 3) has nothing left to
+// spend on a model step, but the person's decision is still accepted and acted
+// on: the approved call runs once and its result is recorded, then the run
+// stops on its own step budget with no further model step. A decision that is
+// accepted is acted on.
+it('acts on a decision taken at the last step, then stops on the budget', function (string $path, string $route): void {
+    if ($path === 'subagents') {
+        config()->set('prism-harness.agent.modes.child', ['system_prompt' => 'A child.', 'tools' => [], 'skills' => [], 'max_steps' => 1]);
+        config()->set('prism-harness.agent.modes.chat.subagents', ['run_child' => ['description' => 'Run a child.', 'mode' => 'child', 'max_steps' => 1]]);
+    }
+    if ($path === 'capped') {
+        config()->set('prism-harness.agent.max_cost_usd', 5.0);
+        config()->set('prism-harness.agent.max_output_tokens_per_call', 1000);
+        config()->set('prism-harness.pricing.openai.gpt-4o', ['inputPerMTok' => 2.5, 'outputPerMTok' => 10.0, 'toolOverheadTokens' => 300]);
+    }
+    $response = stepBudgetSession()->send('What is the weather?');
+    for ($index = 0; $index < STEP_BUDGET_MAX - 1; $index++) {
+        $response = stepBudgetSession()->approve($response->pendingApprovals()[0]);
+    }
+    expect($response->awaitingApproval())->toBeTrue()
+        ->and($this->modelCalls)->toBe(STEP_BUDGET_MAX)
+        ->and($this->ran)->toBe(STEP_BUDGET_MAX - 1);
+    $pending = $response->pendingApprovals()[0];
+
+    $refused = null;
+    try {
+        match ($route) {
+            'approve' => stepBudgetSession()->approve($pending),
+            'decide' => stepBudgetSession()->decide([new ToolApprovalResponse($pending->approvalId, true)]),
+            'streamDecision' => iterator_to_array(stepBudgetSession()->streamDecision([new ToolApprovalResponse($pending->approvalId, true)]), false),
+        };
+    } catch (RunNotPermitted $failure) {
+        $refused = $failure;
+    }
+
+    $stored = stepBudgetSession()->thread()->storedMessages()->where('type', 'tool_result')->get()
+        ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])
+        ->where('tool_call_id', $pending->toolCallId)->count();
+    expect($this->ran)->toBe(STEP_BUDGET_MAX)
+        ->and($stored)->toBe(1)
+        ->and($this->modelCalls)->toBe(STEP_BUDGET_MAX)
+        ->and($refused)->toBeInstanceOf(RunNotPermitted::class)
+        ->and($refused?->getMessage())->toContain('step budget exhausted (3 of 3 used)')
+        ->and(stepBudgetSession()->thread()->pendingApprovalIds())->toBe([]);
+
+    // A later resume finds nothing left to act on, and runs nothing again.
+    try {
+        stepBudgetSession()->send('');
+    } catch (RunNotPermitted) {
+    }
+    expect($this->ran)->toBe(STEP_BUDGET_MAX)->and($this->modelCalls)->toBe(STEP_BUDGET_MAX);
+})->with(['plain', 'subagents', 'capped'])->with(['approve', 'decide', 'streamDecision']);
+
+it('records a denial taken at the last step, then stops on the budget', function (): void {
+    $response = stepBudgetSession()->send('What is the weather?');
+    for ($index = 0; $index < STEP_BUDGET_MAX - 1; $index++) {
+        $response = stepBudgetSession()->approve($response->pendingApprovals()[0]);
+    }
+    $pending = $response->pendingApprovals()[0];
+
+    expect(fn () => stepBudgetSession()->approve($pending, false, 'Not now.'))
+        ->toThrow(RunNotPermitted::class, 'step budget exhausted (3 of 3 used)');
+
+    $results = stepBudgetSession()->thread()->storedMessages()->where('type', 'tool_result')->get()
+        ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])
+        ->where('tool_call_id', $pending->toolCallId)->pluck('result')->all();
+    expect($this->ran)->toBe(STEP_BUDGET_MAX - 1)
+        ->and($results)->toBe(['Not now.'])
+        ->and($this->modelCalls)->toBe(STEP_BUDGET_MAX);
+});

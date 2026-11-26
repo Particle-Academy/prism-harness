@@ -49,7 +49,9 @@ final readonly class BudgetedCalls
         $approved = new ApprovedTools;
         try {
             do {
-                $run->ledger->assertCallAvailable($run->budget);
+                // Not the step limit: a run parked on its last step still acts on
+                // the person's decisions, and the check after them stops it.
+                $run->ledger->assertResolutionAvailable($run->budget);
                 $approved->resolve($generation, $resolved);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
@@ -59,7 +61,13 @@ final readonly class BudgetedCalls
                 $outcome = 'failed';
                 try {
                     $run->ledger->recordSteps(1);
-                    $response = $generation->asText();
+                    // The resolution's reports go to THIS call's generation, and only it.
+                    $approved->arm();
+                    try {
+                        $response = $generation->asText();
+                    } finally {
+                        $approved->announce();
+                    }
                     $usage = $response->usage;
                     $billing = $response->additionalContent;
                     $outcome = 'completed';
@@ -101,7 +109,9 @@ final readonly class BudgetedCalls
         $approved = new ApprovedTools;
         try {
             do {
-                $run->ledger->assertCallAvailable($run->budget);
+                // Not the step limit: a run parked on its last step still acts on
+                // the person's decisions, and the check after them stops it.
+                $run->ledger->assertResolutionAvailable($run->budget);
                 $approved->resolve($generation, $resolved);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
@@ -111,7 +121,13 @@ final readonly class BudgetedCalls
                 $outcome = 'failed';
                 try {
                     $run->ledger->recordSteps(1);
-                    $response = $generation->asStructured();
+                    // The resolution's reports go to THIS call's generation, and only it.
+                    $approved->arm();
+                    try {
+                        $response = $generation->asStructured();
+                    } finally {
+                        $approved->announce();
+                    }
                     $usage = $response->usage;
                     $billing = $response->additionalContent;
                     $outcome = 'completed';
@@ -174,7 +190,9 @@ final readonly class BudgetedCalls
         $approved = new ApprovedTools;
         try {
             do {
-                $run->ledger->assertCallAvailable($run->budget);
+                // Not the step limit: a run parked on its last step still acts on
+                // the person's decisions, and the check after them stops it.
+                $run->ledger->assertResolutionAvailable($run->budget);
                 foreach ($approved->resolve($generation, $resolved) as $event) {
                     yield $event;
                 }
@@ -200,7 +218,11 @@ final readonly class BudgetedCalls
                         function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
                             $collected = ['messages' => $messages->all(), 'response' => $response];
                         });
+                    // The resolution's reports go to THIS stream's generation, which starts on
+                    // the first advance; they are sent before any event reaches the host.
+                    $approved->arm();
                     foreach ($collector->collect() as $event) {
+                        $approved->announce();
                         if ($event instanceof StepFinishEvent) {
                             $billingSteps++;
                             $billing = $event->additionalContent;

@@ -117,8 +117,10 @@ final class RunTrees
         // run id, and is written only once it delegates.
         // Two resumes of one parked root never run at once: a run starts
         // under the session lock, so the second sees the first's record.
+        $resumedRoot = false;
         if ($route === 'open' && $this->recordOf($session, $tree) !== null) {
             $route = 'continue';
+            $resumedRoot = true;
         }
         // A turn on a child of a cancelled tree never runs (G-285): the
         // person stopped the whole tree, this child included.
@@ -149,6 +151,23 @@ final class RunTrees
             return PlanBudget::reserve($state, $runId, $steps, $turnCost, $now, $ttl);
         });
         if (isset($grant['refused'])) {
+            // A resumed root whose tree is spent still acts on the decisions
+            // the person gave it: resolving them takes no model step, so it
+            // cannot overspend. It holds nothing and is narrowed to no further
+            // step, and the step check after the resolution stops it.
+            if ($resumedRoot && $session->thread()->decidedCallsAwaitingResult()) {
+                $spent = $run->withBudget(new RunBudget(
+                    maxSteps: $entry['steps'],
+                    maxCostUsd: $budget->maxCostUsd,
+                    maxSeconds: $budget->maxSeconds,
+                    maxOutputTokensPerCall: $budget->maxOutputTokensPerCall,
+                    maxToolCalls: $budget->maxToolCalls,
+                ));
+                $this->runs[$runId] = [...$entry, 'budget' => $spent->budget, 'ledger' => $spent->ledger];
+
+                return $spent;
+            }
+
             throw RunNotPermitted::exhausted((string) $grant['limit']);
         }
 
@@ -246,6 +265,14 @@ final class RunTrees
             if ($tree['run'] === 'decision' || $state === null) {
                 return;
             }
+            // A root acts on its decisions even when the tree is spent:
+            // resolving them takes no model step (see rootRun()). A decision
+            // is refused only when the run cannot act on it at all.
+            if ($this->treeCancelled($session, $tree)) {
+                throw RunNotPermitted::cancelled();
+            }
+
+            return;
         } elseif ($membership['route'] !== 'continue') {
             return;
         }
