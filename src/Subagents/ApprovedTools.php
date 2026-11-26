@@ -42,8 +42,8 @@ final class ApprovedTools
             // A tool that throws its own exception (one built
             // withoutErrorHandling()) stops the resolution before core merges
             // anything. The calls resolved before it have run, so their
-            // results are recorded first, as core would have merged them;
-            // otherwise the next resume would run them again.
+            // results are recorded first, as one tool result row with only
+            // what is new; otherwise the next resume would run them again.
             $resolved = [];
             foreach ($events as $event) {
                 if ($event instanceof ToolResultEvent) {

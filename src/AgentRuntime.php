@@ -34,6 +34,7 @@ use Prism\Harness\Structured\SchemaCheck;
 use Prism\Harness\Structured\StructuredTranscript;
 use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Harness\Subagents\CallBudget;
+use Prism\Harness\Subagents\ResolutionRecorder;
 use Prism\Harness\Subagents\ResolvedApprovals;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
@@ -237,13 +238,14 @@ final readonly class AgentRuntime
                 }
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+                $stepOnly = $context !== null || $mode->subagents !== [];
+                $recorder = $budget->maxCostUsd === null && ! $stepOnly ? ResolutionRecorder::for($history) : null;
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
+                    $generation->withTools($recorder?->watch($tools) ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $stepOnly = $context !== null || $mode->subagents !== [];
                 $response = $budget->maxCostUsd === null
                     ? ($stepOnly ? (new StepCalls)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
@@ -251,7 +253,7 @@ final readonly class AgentRuntime
                         }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }) : $generation->asText())
+                        }) : $this->recordingResolution($recorder, $session, $history, $runId, $tools, fn (): TextResponse => $generation->asText()))
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -445,13 +447,14 @@ final readonly class AgentRuntime
                 }
 
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
+                $stepOnly = $context !== null || $mode->subagents !== [];
+                $recorder = $budget->maxCostUsd === null && ! $stepOnly ? ResolutionRecorder::for($history) : null;
                 if ($tools !== []) {
-                    $generation->withTools($tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
+                    $generation->withTools($recorder?->watch($tools) ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
                 }
-                $stepOnly = $context !== null || $mode->subagents !== [];
                 $response = $budget->maxCostUsd === null
                     ? ($stepOnly ? (new StepCalls)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
@@ -460,7 +463,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }) : $generation->asStructured())
+                        }) : $this->recordingResolution($recorder, $session, $history, $runId, $tools, fn (): StructuredResponse => $generation->asStructured()))
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -890,9 +893,9 @@ final readonly class AgentRuntime
             // A resumed run's approved calls that core ran before the stream
             // ended without its own record of them (the consumer abandoned
             // the stream, or a tool threw its own exception): their results
-            // are recorded, merged as core would have merged them, after the
-            // prompt as in the request. Otherwise the next resume would run
-            // those calls again.
+            // are recorded, after the prompt as in the request, as one tool
+            // result row with only what is new. Otherwise the next resume
+            // would run those calls again.
             $resolution = $collected === null && $resolvedFirst !== []
                 ? ResolvedApprovals::merged(iterator_to_array($session->thread()->messages(), false), $resolvedFirst)
                 : null;
@@ -1761,6 +1764,42 @@ final readonly class AgentRuntime
         $at = $prompt instanceof UserMessage ? 1 : 0;
 
         return [...array_slice($transcript, 0, $at), ...$resolution, ...array_slice($transcript, $at)];
+    }
+
+    /**
+     * A plain send() or structured turn, with the results of the approved
+     * calls core resolved inside it recorded when the turn throws.
+     *
+     * Core keeps those results until the generation returns, so a turn that
+     * throws after they ran (a tool built withoutErrorHandling(), a provider
+     * failure on a later step) lost them, and the next resume ran the calls
+     * again. They are recorded before the failure goes on, as one tool result
+     * row with only what is new; a failure to record is reported, never put
+     * in place of the turn's own failure.
+     *
+     * @template T
+     *
+     * @param  list<Message>  $history
+     * @param  list<Tool>  $tools
+     * @param  Closure(): T  $generate
+     * @return T
+     */
+    private function recordingResolution(?ResolutionRecorder $recorder, Session $session, array $history, string $runId, array $tools, Closure $generate): mixed
+    {
+        try {
+            return $generate();
+        } catch (Throwable $failure) {
+            $resolved = $recorder === null ? null : ResolvedApprovals::merged($history, $recorder->results());
+            if ($resolved !== null) {
+                try {
+                    $this->recordTurn($session, $this->newMessageObjects($resolved, $history), $runId, $tools);
+                } catch (Throwable $unrecorded) {
+                    report($unrecorded);
+                }
+            }
+
+            throw $failure;
+        }
     }
 
     /** @param list<Message> $messages
