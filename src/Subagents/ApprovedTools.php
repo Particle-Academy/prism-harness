@@ -6,6 +6,7 @@ namespace Prism\Harness\Subagents;
 
 use Closure;
 use Generator;
+use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Str;
 use Prism\Harness\Exceptions\ResolutionAbandoned;
@@ -67,16 +68,12 @@ final class ApprovedTools
     private static function invokeToolCall(array $tools, ToolCall $toolCall, string $messageId): array
     {
         $run = static fn (): array => self::coreInvokeToolCall($tools, $toolCall, $messageId);
-        $dispatcher = DeferredEvents::dispatcher();
         if (self::$host === null) {
             return $run();
         }
-        if ($dispatcher === null) {
-            return Event::defer($run, []);
-        }
         $deferred = [];
         try {
-            return DeferredEvents::under($dispatcher, self::$host, $run, $deferred);
+            return DeferredEvents::under(DeferredEvents::dispatcher(), self::$host, $run, $deferred);
         } finally {
             self::$forHost = [...self::$forHost, ...$deferred];
         }
@@ -100,6 +97,18 @@ final class ApprovedTools
      * @var list<array<int, mixed>>
      */
     private array $held = [];
+
+    /**
+     * The resolution's ToolInvoked events left in the host's own deferred
+     * list (when the host defers ToolInvoked), where 0.26.7 put them; they
+     * are retargeted there, in place, into the generation that follows.
+     *
+     * @var list<ToolInvoked>
+     */
+    private array $inHost = [];
+
+    /** The length of the host's deferred list when the resolution began. */
+    private ?int $hostStart = null;
 
     /** The resolved request, for a generation the held events may need. */
     private TextRequest|StructuredRequest|null $request = null;
@@ -131,28 +140,27 @@ final class ApprovedTools
      *
      * Core reports each call it runs with a ToolInvoked telemetry event, and
      * only under a telemetry context. The resolver is stepped one result at a
-     * time and the resolver's own ToolInvoked events are held, not dispatched,
-     * until the resolution's result is recorded (a generation the approved
-     * tool runs itself reports live; see invokeToolCall). No listener runs
-     * between an
-     * approved call and its record, so not even a listener that ends the
-     * process in a way PHP cannot catch can lose the record (an approved call
-     * whose result was lost would run again on the next resume). Each held
-     * event is then dispatched on its own, and a listener that throws is
-     * reported, never thrown, so it can neither undo the resolution nor keep
-     * the other calls' events from being sent.
+     * time, and the resolver's own ToolInvoked events reach no listener until
+     * the resolution's result is recorded (a generation the approved tool runs
+     * itself reports as it runs; see invokeToolCall). So not even a listener
+     * that ends the process in a way PHP cannot catch can lose the record (an
+     * approved call whose result was lost would run again on the next
+     * resume). They are held here, or, when the host has an Event::defer() of
+     * its own open over ToolInvoked, left in the host's deferred list where
+     * 0.26.7 put them: the host flushes after the record. Each is dispatched
+     * on its own, and a listener that throws is reported, never thrown, so it
+     * can neither undo the resolution nor keep the other calls' events from
+     * being sent.
      *
      * When the resolution stands in for core's generation ($inGeneration, the
      * plain send and stream paths) it opens a context of its own if none is
-     * open, so the calls are reported at all, and its events are dispatched
-     * inside the generation that follows (see within()), in that generation's
-     * trace, as core reported them on 0.26.7 when it resolved inside the
-     * generation. If the resolution fails, no generation follows; it starts
-     * that generation itself and ends it, as core's did when a tool threw out
-     * of it, so the events are still in a generation's trace (see settle()).
-     * The step-by-step paths (subagents, a cost cap, every stream) open none,
-     * as on 0.26.7, and dispatch what a host context of their own produced
-     * once the record is written.
+     * open, so the calls are reported at all, and its events go into the
+     * generation that follows (see within()), in that generation's trace, as
+     * core reported them on 0.26.7 when it resolved inside the generation. If
+     * no generation follows, it starts one itself (see settle()). The
+     * step-by-step paths (subagents, a cost cap, every stream) open none, as on
+     * 0.26.7, and dispatch what a host context of their own produced once the
+     * record is written.
      *
      * @param  Closure(list<Message>):void  $record
      * @return list<StreamEvent>
@@ -160,6 +168,8 @@ final class ApprovedTools
     public function resolve(TextPending|StructuredPending $generation, Closure $record): array
     {
         $request = $this->request = $generation->toRequest();
+        $dispatcher = DeferredEvents::dispatcher();
+        $this->hostStart = DeferredEvents::state($dispatcher)['deferring'] ? count(DeferredEvents::list($dispatcher)) : null;
         $context = null;
         if ($this->inGeneration !== null && Telemetry::enabled() && Telemetry::current() === null) {
             $context = new TelemetryContext(
@@ -179,9 +189,9 @@ final class ApprovedTools
             // replay a side effect if the consumer abandons the generator at
             // that yield.
             $resolver = $this->resolveToolApprovalsAndYieldEvents($request, EventID::generate());
-            while ($this->step(static fn (): bool => $resolver->valid())) {
+            while ($this->step($dispatcher, static fn (): bool => $resolver->valid())) {
                 $events[] = $resolver->current();
-                $this->step(static function () use ($resolver): bool {
+                $this->step($dispatcher, static function () use ($resolver): bool {
                     $resolver->next();
 
                     return true;
@@ -235,11 +245,11 @@ final class ApprovedTools
     }
 
     /**
-     * Run the generation that follows the resolution, dispatching the held
-     * events when it starts, in its trace: as GenerationStarted reaches its
+     * Run the generation that follows the resolution, sending the held
+     * events into it when it starts: as its GenerationStarted reaches its
      * listeners, after the ones the application registered at boot (a tracing
-     * bridge opens the trace there). Whatever no generation took is flushed
-     * once the run ends.
+     * bridge opens the trace there). Whatever no generation took is settled
+     * once the run ends (see leftOver()).
      *
      * @template TResult
      *
@@ -248,12 +258,12 @@ final class ApprovedTools
      */
     public function within(Closure $run): mixed
     {
-        if ($this->held === []) {
+        if (! $this->pending()) {
             return $run();
         }
         self::hook();
         self::$waiting[] = $this;
-        $from = $this->deferredCount();
+        $from = count(DeferredEvents::list(DeferredEvents::dispatcher()));
         $failure = null;
         try {
             return $run();
@@ -276,14 +286,14 @@ final class ApprovedTools
      */
     public function streamWithin(Closure $open): Generator
     {
-        if ($this->held === []) {
+        if (! $this->pending()) {
             yield from $open();
 
             return;
         }
         self::hook();
         self::$waiting[] = $this;
-        $from = $this->deferredCount();
+        $from = count(DeferredEvents::list(DeferredEvents::dispatcher()));
         $failure = null;
         try {
             yield from $open();
@@ -308,53 +318,82 @@ final class ApprovedTools
         $this->settle(ResolutionAbandoned::before());
     }
 
+    private function pending(): bool
+    {
+        return $this->held !== [] || $this->inHost !== [];
+    }
+
     /**
-     * What is still held once the generation's run is over: when the host
+     * Whether a GenerationStarted is the generation this resolution stands in
+     * for: the same operation and the same telemetry session. A generation an
+     * approved or ordinary tool starts of its own (its own session, usually
+     * none) is never it.
+     */
+    private function standsInFor(GenerationStarted $started): bool
+    {
+        return $this->inGeneration !== null
+            && $started->context->operation === $this->inGeneration
+            && $started->context->sessionId === $this->sessionId;
+    }
+
+    /** The generation has started: send everything into its trace. */
+    private function arrived(TelemetryContext $generation, int $step): void
+    {
+        $this->retargetInHost($generation, $step);
+        $held = $this->held;
+        $this->held = [];
+        self::dispatchEach(self::retargeted($held, $generation, $step));
+    }
+
+    /**
+     * What is still held once the generation's run is over. When the host
      * deferred the generation's own GenerationStarted (an Event::defer() of
-     * its own around the turn), the hook never ran, so the events go into the
-     * host's deferred list right after that GenerationStarted, in its trace,
-     * where core put them on 0.26.7; otherwise the generation never started,
-     * and they are settled in a stand-in closed as abandoned.
+     * its own around the turn), the hook never saw it: the events go into
+     * that generation's trace from the host's deferred list, and its
+     * GenerationStarted is moved back to where the resolution began, the
+     * order 0.26.7 flushed in (the generation started before the resolution
+     * ran). Otherwise the generation never started, and they are settled in a
+     * stand-in closed as abandoned.
      */
     private function leftOver(int $from, ?Throwable $failure): void
     {
         self::$waiting = array_values(array_filter(self::$waiting, fn (self $waiting): bool => $waiting !== $this));
-        if ($this->held === [] || $this->intoDeferredGeneration($from)) {
+        if (! $this->pending() || $this->intoDeferredGeneration($from)) {
             return;
         }
         $this->settle(ResolutionAbandoned::before($failure));
     }
 
-    /** The length of the host's deferred list, when it is deferring. */
-    private function deferredCount(): int
-    {
-        $dispatcher = DeferredEvents::dispatcher();
-
-        return $dispatcher === null ? 0 : DeferredEvents::count($dispatcher);
-    }
-
     private function intoDeferredGeneration(int $from): bool
     {
         $dispatcher = DeferredEvents::dispatcher();
-        if ($dispatcher === null) {
+        if (! DeferredEvents::defers(DeferredEvents::state($dispatcher), GenerationStarted::class)) {
             return false;
         }
-        $state = DeferredEvents::state($dispatcher);
-        if (! DeferredEvents::defers($state, GenerationStarted::class)) {
+        $list = DeferredEvents::list($dispatcher);
+        $at = null;
+        foreach ($list as $index => $args) {
+            $event = $args[0] ?? null;
+            if ($index >= $from && $event instanceof GenerationStarted && $this->standsInFor($event)) {
+                $at = $index;
+
+                break;
+            }
+        }
+        if ($at === null) {
             return false;
         }
-        $held = $this->held;
-        $deferTools = DeferredEvents::defers($state, ToolInvoked::class);
-        $started = DeferredEvents::insertAfter($dispatcher, $from,
-            static fn (mixed $event): bool => $event instanceof GenerationStarted,
-            static fn (object $event): array => $deferTools && $event instanceof GenerationStarted ? self::retargeted($held, $event->context, 0) : []);
+        $started = $list[$at][0];
         if (! $started instanceof GenerationStarted) {
             return false;
         }
-        $this->held = [];
-        if (! $deferTools) {
-            self::dispatchEach(self::retargeted($held, $started->context, 0));
+        if ($this->hostStart !== null && $this->hostStart < $at) {
+            $entry = $list[$at];
+            array_splice($list, $at, 1);
+            array_splice($list, $this->hostStart, 0, [$entry]);
+            DeferredEvents::replace($dispatcher, $list);
         }
+        $this->arrived($started->context, 0);
 
         return true;
     }
@@ -370,6 +409,11 @@ final class ApprovedTools
      */
     private function settle(?Throwable $closeWith): void
     {
+        if ($this->inGeneration !== null) {
+            // Taken back out of the host's list, so they follow the stand-in's
+            // GenerationStarted there instead of preceding it.
+            $this->held = [...$this->reclaimFromHost(), ...$this->held];
+        }
         if ($this->held === []) {
             return;
         }
@@ -406,6 +450,59 @@ final class ApprovedTools
         $held = $this->held;
         $this->held = [];
         self::dispatchEach($generation === null ? $held : self::retargeted($held, $generation, Telemetry::stack()->stepFor($generation->traceId)));
+    }
+
+    /** Move the events left in the host's deferred list into the generation, in place. */
+    private function retargetInHost(TelemetryContext $generation, int $step): void
+    {
+        if ($this->inHost === []) {
+            return;
+        }
+        $dispatcher = DeferredEvents::dispatcher();
+        $mine = [];
+        foreach ($this->inHost as $event) {
+            $mine[spl_object_id($event)] = true;
+        }
+        $this->inHost = [];
+        $list = DeferredEvents::list($dispatcher);
+        foreach ($list as $index => $args) {
+            $event = $args[0] ?? null;
+            if ($event instanceof ToolInvoked && isset($mine[spl_object_id($event)])) {
+                $list[$index] = self::retargeted([$args], $generation, $step)[0];
+            }
+        }
+        DeferredEvents::replace($dispatcher, $list);
+    }
+
+    /**
+     * Take the events left in the host's deferred list back out of it.
+     *
+     * @return list<array<int, mixed>>
+     */
+    private function reclaimFromHost(): array
+    {
+        if ($this->inHost === []) {
+            return [];
+        }
+        $dispatcher = DeferredEvents::dispatcher();
+        $mine = [];
+        foreach ($this->inHost as $event) {
+            $mine[spl_object_id($event)] = true;
+        }
+        $this->inHost = [];
+        $kept = [];
+        $taken = [];
+        foreach (DeferredEvents::list($dispatcher) as $args) {
+            $event = $args[0] ?? null;
+            if ($event instanceof ToolInvoked && isset($mine[spl_object_id($event)])) {
+                $taken[] = $args;
+            } else {
+                $kept[] = $args;
+            }
+        }
+        DeferredEvents::replace($dispatcher, $kept);
+
+        return $taken;
     }
 
     /**
@@ -461,8 +558,8 @@ final class ApprovedTools
         self::$hooked[$events] = true;
         Event::listen(GenerationStarted::class, static function (GenerationStarted $started): void {
             $waiting = end(self::$waiting);
-            if ($waiting instanceof self) {
-                $waiting->announce($started->context);
+            if ($waiting instanceof self && $waiting->standsInFor($started)) {
+                $waiting->arrived($started->context, Telemetry::stack()->stepFor($started->context->traceId));
             }
         });
     }
@@ -513,37 +610,32 @@ final class ApprovedTools
     }
 
     /**
-     * One step of the resolver, with the resolver's own ToolInvoked events
-     * taken into the held list as it returns (the tool body runs with the hold
-     * lifted; see invokeToolCall). A listener failure is reported, never
-     * thrown.
-     *
-     * Laravel's Event::defer holds the step's events, but dispatches them all
-     * in one loop as the step returns (before the record, and one throwing
-     * listener stops the rest), so they are taken out of its deferred list
-     * first. Where that list cannot be read (a dispatcher that is not
-     * Laravel's), the deferral dispatches them as the step returns.
+     * One step of the resolver. The approved tool's body runs under the
+     * host's own deferral (see invokeToolCall); the resolver's own
+     * ToolInvoked, dispatched as the step runs, is taken out of the step's
+     * deferral as it returns: into the held list, or, when the host defers
+     * ToolInvoked itself, back into the host's deferred list right after
+     * what the tool body deferred there. Either way no listener sees it
+     * before the record. A listener failure is reported, never thrown.
      *
      * @param  Closure(): bool  $step
      */
-    private function step(Closure $step): bool
+    private function step(Dispatcher $dispatcher, Closure $step): bool
     {
-        $dispatcher = DeferredEvents::dispatcher();
         $previousHost = self::$host;
         $previousForHost = self::$forHost;
-        self::$host = $dispatcher === null ? ['deferring' => false, 'events' => []] : DeferredEvents::state($dispatcher);
+        $host = self::$host = DeferredEvents::state($dispatcher);
         self::$forHost = [];
+        $own = [];
         $done = false;
         $result = false;
         try {
-            Event::defer(function () use ($step, $dispatcher, &$done, &$result): void {
+            Event::defer(function () use ($step, $dispatcher, &$own, &$done, &$result): void {
                 try {
                     $result = $step();
                     $done = true;
                 } finally {
-                    if ($dispatcher !== null) {
-                        $this->held = [...$this->held, ...DeferredEvents::take($dispatcher)];
-                    }
+                    $own = DeferredEvents::take($dispatcher);
                 }
             }, [ToolInvoked::class]);
         } catch (Throwable $failure) {
@@ -553,11 +645,23 @@ final class ApprovedTools
             report($failure);
         } finally {
             // What the approved tool deferred under the host's own deferral
-            // goes back to the host, now that its deferral is the live one.
+            // goes back to the host, now that its deferral is the live one;
+            // then the resolver's own events, to the host too when it defers
+            // them (it flushes after the record), else to the held list.
             $forHost = self::$forHost;
             self::$host = $previousHost;
             self::$forHost = $previousForHost;
             self::dispatchEach($forHost);
+            if (DeferredEvents::defers($host, ToolInvoked::class)) {
+                foreach ($own as $args) {
+                    if (($args[0] ?? null) instanceof ToolInvoked) {
+                        $this->inHost[] = $args[0];
+                    }
+                }
+                self::dispatchEach($own);
+            } else {
+                $this->held = [...$this->held, ...$own];
+            }
         }
 
         return $result;

@@ -13,7 +13,8 @@ use Throwable;
  * consumer abandoned, or a generation that failed before it began), so the
  * resolution's events had to be sent in a generation of their own.
  *
- * It carries no content: at most the class of the failure that ended the turn.
+ * It carries no content: at most the class of the failure that ended the
+ * turn, and a trace without frame arguments (see ContentFree).
  *
  * @internal
  */
@@ -21,7 +22,8 @@ final class ResolutionAbandoned extends RuntimeException
 {
     public static function before(?Throwable $failure = null): self
     {
-        return new self('resolution_abandoned: the turn ended before the generation after the approval resolution started'
-            .($failure === null ? '.' : sprintf(' (%s).', $failure::class)));
+        $suffix = $failure === null ? '.' : sprintf(' (%s).', get_debug_type($failure));
+
+        return ContentFree::make(static fn (): self => new self('resolution_abandoned: the turn ended before the generation after the approval resolution started'.$suffix));
     }
 }

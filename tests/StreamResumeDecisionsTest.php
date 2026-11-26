@@ -2,7 +2,9 @@
 
 declare(strict_types=1);
 
+use Closure;
 use Illuminate\Database\QueryException;
+use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\Exceptions\SessionLocked;
@@ -14,6 +16,7 @@ use Prism\Prism\Events\Telemetry\GenerationErrored;
 use Prism\Prism\Events\Telemetry\GenerationFailed;
 use Prism\Prism\Events\Telemetry\GenerationStarted;
 use Prism\Prism\Events\Telemetry\ToolInvoked;
+use Prism\Prism\Facades\Prism;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
@@ -252,16 +255,14 @@ it('keeps a failed record write\'s content out of every telemetry event', functi
             return;
         }
         $seen[spl_object_id($value)] = true;
-        if ($value instanceof Throwable) {
-            for ($failure = $value; $failure !== null; $failure = $failure->getPrevious()) {
-                $scan($failure->getMessage(), $where.'.message', $seen);
-                $scan($failure->getTraceAsString(), $where.'.trace', $seen);
-            }
-
+        if ($value instanceof Closure) {
             return;
         }
-        foreach (get_object_vars($value) as $field => $item) {
-            $scan($item, $where.'->'.$field, $seen);
+        // Every property, private and protected included: an exception's
+        // message, its whole trace with each frame's arguments untruncated,
+        // and its previous exception; an event's every field.
+        foreach ((array) $value as $field => $item) {
+            $scan($item, $where.'->'.str_replace(chr(0), '', (string) $field), $seen);
         }
     };
     $telemetry = [];
@@ -286,6 +287,15 @@ it('keeps a failed record write\'s content out of every telemetry event', functi
         $threw = $failure;
     }
 
+    // The scan does reach into an exception's private trace and chain: it
+    // finds the marker in the caller's own exception.
+    $control = [];
+    $leaksBefore = $leaks;
+    $scan($threw, 'caller', $control);
+    $found = array_values(array_diff($leaks, $leaksBefore));
+    $leaks = $leaksBefore;
+    expect($found)->not->toBe([]);
+
     // The caller still gets the database's own failure; telemetry hears of it
     // only by class.
     expect($threw)->toBeInstanceOf(QueryException::class)
@@ -294,3 +304,52 @@ it('keeps a failed record write\'s content out of every telemetry event', functi
         ->and($telemetry)->toContain('ToolInvoked', 'GenerationFailed')
         ->and($leaks)->toBe([]);
 })->with(['approve', 'stream']);
+
+// The generation the held events wait for is the one the resolution stands in
+// for: the same operation and the same telemetry session. Under a host
+// deferral of GenerationStarted, an ordinary tool of the outer generation that
+// runs a generation of its own inside an Event::defer() of its own gets that
+// nested GenerationStarted dispatched live while the outer one waits in the
+// host's list. The approved call must not be reported in the nested trace.
+it('never reports the approved call in a nested generation\'s trace', function (string $innerDefer): void {
+    config()->set('prism-harness.agent.modes.chat.tools', ['transfer', 'helper']);
+    app(ToolRegistry::class)->register((new Tool)->as('helper')->for('Helper.')->withStringParameter('h', 'H')
+        ->using(fn (string $h): string => Event::defer(fn (): string => Prism::text()->using('openai', 'gpt-4o')->withPrompt('Inner.')->asText()->text, $innerDefer === 'all' ? null : ['app.none'])));
+    $call = fn (string $id, string $tool, string $args): array => ['id' => 'c-'.$id, 'object' => 'chat.completion', 'model' => 'gpt-4o',
+        'choices' => [['index' => 0, 'message' => ['role' => 'assistant', 'content' => null, 'tool_calls' => [
+            ['id' => $id, 'type' => 'function', 'function' => ['name' => $tool, 'arguments' => $args]],
+        ]], 'finish_reason' => 'tool_calls']],
+        'usage' => ['prompt_tokens' => 1, 'completion_tokens' => 1, 'total_tokens' => 2]];
+    // Its own HTTP fake: this file's shared sequence is for streams.
+    Http::swap(new HttpFactory(app('events')));
+    Http::preventStrayRequests();
+    Http::fakeSequence()
+        ->push($call('call_transfer', 'transfer', '{"amount":"5"}'))
+        // The resume: the outer generation calls the helper, whose agent answers; then the outer answers.
+        ->push($call('call_helper', 'helper', '{"h":"y"}'))
+        ->push(streamResumeChat('inner done'))
+        ->push(streamResumeChat('done'));
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('Send five.')->pendingApprovals();
+    expect($pending)->toHaveCount(1);
+
+    $sessions = [];
+    $approved = [];
+    Event::listen(GenerationStarted::class, function (GenerationStarted $event) use (&$sessions): void {
+        $sessions[$event->context->traceId] = $event->context->sessionId;
+    });
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use (&$approved): void {
+        if ($event->toolName === 'transfer') {
+            $approved[] = $event->context->traceId;
+        }
+    });
+
+    Event::defer(fn () => $session->decide([new ToolApprovalResponse($pending[0]->approvalId, true)]), [GenerationStarted::class]);
+
+    // Reported once, in the session's own generation; never the nested one,
+    // which has no session. Read once the host has flushed every start.
+    expect($this->runs)->toBe(1)
+        ->and(count($sessions))->toBe(2)
+        ->and(array_map(fn (string $trace): ?string => array_key_exists($trace, $sessions) ? $sessions[$trace] : 'unknown trace', $approved))
+        ->toBe([$session->key()]);
+})->with(['inner list' => 'list', 'inner all' => 'all']);
