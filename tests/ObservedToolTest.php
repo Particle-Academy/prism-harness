@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Prism\Harness\Subagents\ObservedTool;
 use Prism\Harness\Subagents\ResolutionRecorder;
+use Prism\Harness\Tools\DelegatingTool;
 use Prism\Prism\Schema\ObjectSchema;
 use Prism\Prism\Schema\StringSchema;
 use Prism\Prism\Tool;
@@ -41,6 +42,35 @@ final class RenamingSearch extends Tool
     }
 }
 
+// The shape of a tool class that takes its handler's parameters from
+// __invoke, so core's namesParameter() reflects on that method.
+final class InvokableRaw extends Tool
+{
+    public function __construct()
+    {
+        // No using(): core falls back to __invoke for the handler.
+        $this->as('search')->for('Search.');
+    }
+
+    public function __invoke(string $input): string
+    {
+        return 'invoked '.$input;
+    }
+}
+
+final class ExtraApiSearch extends Tool
+{
+    public function extraApi(): string
+    {
+        return 'extra';
+    }
+}
+
+final class PublicStateSearch extends Tool
+{
+    public string $label = 'labelled';
+}
+
 /** @param list<array{0: string, 1: string, 2: array<string, mixed>}> $calls */
 function watchedRecorder(array $calls): ResolutionRecorder
 {
@@ -58,7 +88,9 @@ function watchedRecorder(array $calls): ResolutionRecorder
 function toolShape(Tool $tool): array
 {
     return [$tool->name(), $tool->description(), $tool->parametersAsArray(), $tool->requiredParameters(),
-        $tool->hasApprovalConfigured(), $tool->isConcurrent(), $tool->failedHandler() === false, $tool->providerOptions()];
+        $tool->hasApprovalConfigured(), $tool->isConcurrent(), $tool->failedHandler() === false, $tool->providerOptions(),
+        $tool->namesParameter('input'), $tool->namesParameter('raw'), $tool->namesParameter('query'),
+        $tool->isClientExecuted(), $tool->withholdsOtherCalls(), $tool->hasParameters()];
 }
 
 it('returns, fails and describes itself exactly as the tool it watches', function (Closure $make, array $args): void {
@@ -95,12 +127,55 @@ it('returns, fails and describes itself exactly as the tool it watches', functio
     'approval and concurrency settings' => [fn () => (new Tool)->as('search')->for('S')->withStringParameter('query', 'Q')
         ->requiresApproval(true)->concurrent()->using(fn (string $query): string => 'r'), ['query' => 'a']],
     'an invokable Tool subclass' => [fn () => new InvokableSearch, ['query' => 'a']],
+    'an invokable Tool subclass whose handler names input' => [fn () => new InvokableRaw, ['input' => 'a']],
+    'a Tool subclass that overrides a Tool method' => [fn () => (new RenamingSearch)->as('other')->for('S')->withStringParameter('query', 'Q')
+        ->using(fn (string $query): string => 'r '.$query), ['query' => 'a']],
 ]);
 
-it('does not wrap a Tool subclass that overrides public behaviour', function (): void {
-    $tool = (new RenamingSearch)->as('search')->for('S')->using(fn (): string => 'r');
+it('does not wrap a tool whose class adds public methods of its own', function (): void {
+    $tool = (new ExtraApiSearch)->as('search')->for('S')->using(fn (): string => 'r');
 
-    expect(ObservedTool::of($tool, watchedRecorder([['call_1', 'search', []]])))->toBe($tool);
+    expect(ObservedTool::of($tool, watchedRecorder([['call_1', 'search', []]])))->toBeNull();
+});
+
+it('wraps a tool with public state of its own without a deprecation', function (): void {
+    $tool = (new PublicStateSearch)->as('search')->for('S')->withStringParameter('query', 'Q')->using(fn (string $query): string => 'r');
+    set_error_handler(function (int $level, string $message): never {
+        throw new ErrorException($message, 0, $level);
+    });
+    try {
+        $watched = ObservedTool::of($tool, watchedRecorder([['call_1', 'search', ['query' => 'a']]]));
+    } finally {
+        restore_error_handler();
+    }
+
+    expect($watched)->toBeInstanceOf(ObservedTool::class)
+        ->and($watched?->handle(query: 'a'))->toBe('r');
+});
+
+it('changes the wrapped tool when a setter is called on the wrapper', function (): void {
+    $tool = (new Tool)->as('search')->for('S')->withStringParameter('query', 'Q')->using(fn (string $query): string => 'r');
+    $watched = ObservedTool::of($tool, watchedRecorder([['call_1', 'search', ['query' => 'a']]]));
+
+    expect($watched?->withoutErrorHandling())->toBe($watched)
+        ->and($tool->failedHandler())->toBeFalse()
+        ->and($watched?->copyWithProviderOptions(['k' => 'v'])->providerOptions('k'))->toBe('v')
+        ->and($tool->providerOptions('k'))->toBeNull();
+});
+
+// When core adds a public Tool method, this fails, and until the method is
+// delegated no tool is wrapped (each turn falls back to resolving first).
+it('delegates every public method of Tool', function (): void {
+    $missing = [];
+    foreach ((new ReflectionClass(Tool::class))->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+        if (! $method->isStatic() && $method->getName() !== '__construct'
+            && (new ReflectionMethod(DelegatingTool::class, $method->getName()))->getDeclaringClass()->getName() !== DelegatingTool::class) {
+            $missing[] = $method->getName();
+        }
+    }
+
+    expect($missing)->toBe([])
+        ->and(DelegatingTool::canWrap(new Tool))->toBeTrue();
 });
 
 it('records what each approved call returned, in order, and ends at a call it does not know', function (): void {

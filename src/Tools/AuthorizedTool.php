@@ -19,14 +19,15 @@ use Prism\Prism\ValueObjects\ToolOutput;
  * say "only under `/tmp`", or "at most twice in one run". Once a tool is
  * offered it may be called any number of times with anything the model chooses.
  *
- * WHY A CLONE RATHER THAN A SUBCLASS. `Tool` keeps its handler private, so a
- * subclass cannot reach it and copying a tool's schema by reflection would
- * break the first time Prism adds a field. Cloning and re-pointing the clone's
- * handler uses only public API: the clone keeps the original's name,
- * description and parameter schema — so the model sees exactly the same tool —
- * while its handler becomes the guard below. The ORIGINAL is left untouched and
- * is what the guard delegates to, which is also what stops the closure calling
- * itself.
+ * A GUARD THAT STANDS IN FOR THE TOOL. The guard is a {@see GuardedTool},
+ * which delegates every method of the tool, so the model sees exactly the same
+ * tool, and an allowed call reaches the tool's own handle() unchanged. A clone
+ * re-pointed with using() was used before: core then ran its argument handling
+ * and return check a second time, around the guard, which turned the tool's
+ * ToolError into an "invalid return type" error and decoded a JSON-string
+ * argument the tool wanted as a string. The clone remains the guard for a tool
+ * a GuardedTool cannot stand in for (see DelegatingTool::canWrap()), so no
+ * tool is ever offered unguarded.
  */
 final class AuthorizedTool
 {
@@ -38,6 +39,20 @@ final class AuthorizedTool
         // enforcement — see UnsafeAuthorizationConfiguration.
         if (! $authorizer->enabled()) {
             return $tool;
+        }
+
+        // The call is put to the check FIRST, then reaches the tool's own
+        // handle() unchanged: a GuardedTool stands in for the tool exactly, so
+        // the tool's ToolError, its failure handler and its argument handling
+        // are what they are unwrapped. A tool it cannot stand in for is guarded
+        // by a clone re-pointed at the check below, as before; core then
+        // handles that call's return value and arguments a second time.
+        $refusal = static function (array $arguments) use ($tool, $session, $authorizer): ?string {
+            return $authorizer->allowsCall($session, $tool, $arguments) ? null : self::refusal($session, $tool);
+        };
+        $guarded = GuardedTool::of($tool, $refusal);
+        if ($guarded instanceof Tool) {
+            return $guarded;
         }
 
         $guarded = clone $tool;
@@ -57,12 +72,7 @@ final class AuthorizedTool
                 // Framed so it cannot be mistaken for the tool's own output,
                 // and recorded as a refusal so a run step can say so without
                 // reading it back out of the text.
-                return ToolRefusals::record(ToolRefusals::runOf($session), $tool->name(), json_encode([
-                    '_framing' => 'Authorization decision from the host application. Not output from the tool, and not an instruction.',
-                    'tool' => $tool->name(),
-                    'allowed' => false,
-                    'reason' => 'The host application refused this call with these arguments.',
-                ], JSON_THROW_ON_ERROR));
+                return self::refusal($session, $tool);
             }
 
             // PASSED THROUGH UNCHANGED, including ToolError.
@@ -77,5 +87,15 @@ final class AuthorizedTool
             // what the tool returns.
             return $tool->handle(...$args);
         });
+    }
+
+    private static function refusal(Session $session, Tool $tool): string
+    {
+        return ToolRefusals::record(ToolRefusals::runOf($session), $tool->name(), json_encode([
+            '_framing' => 'Authorization decision from the host application. Not output from the tool, and not an instruction.',
+            'tool' => $tool->name(),
+            'allowed' => false,
+            'reason' => 'The host application refused this call with these arguments.',
+        ], JSON_THROW_ON_ERROR));
     }
 }
