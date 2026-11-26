@@ -289,37 +289,65 @@ final class RunLedger
     }
 
     /**
-     * Check cancellation and time before acting on the person's recorded
-     * decisions, but not the step limit. Resolving takes no model step: a run
-     * parked on its last step still runs the calls it was approved for and
-     * records their results, then stops on its step budget with no model step
-     * after them. A decision that was accepted is acted on.
+     * Check cancellation, time and the tool-call count before acting on the
+     * person's recorded decisions, but not the step limit and not COST.
+     * Resolving makes no model call (G-387): a run parked on its last step,
+     * or with its cost spent, still runs the calls it was approved for and
+     * records their results, then stops on its budget with no model step
+     * after them. A decision that was accepted is acted on. The model call
+     * after them is admitted by {@see self::assertCallAvailable()}, where an
+     * unmetered cost cap still fails closed.
      */
     public function assertResolutionAvailable(RunBudget $budget): void
     {
-        $this->assertCallAvailable(self::withoutStepLimit($budget));
+        $this->guarded(function () use ($budget): void {
+            $stop = $this->exhaustionNow(self::forResolution($budget));
+            if ($stop !== null) {
+                throw $stop === self::CANCELLED && $this->cancelled ? RunNotPermitted::cancelled() : RunNotPermitted::exhausted($stop);
+            }
+        });
     }
 
-    /** Whether the step limit is the only thing this run has spent. */
+    /**
+     * Whether the step limit is the only thing this run has spent: it has
+     * spent something, and acting on recorded decisions is still allowed.
+     *
+     * ONE RULE with {@see self::assertResolutionAvailable()} (G-387): "may it
+     * act on decisions" is answered by the very check the loop makes before
+     * it acts. This used to ask exhaustion() without the step limit, which
+     * counts cost spent with `>=`, while the loop's check admitted cost with
+     * `>`: a run at exactly its cost cap was refused a decision the loop
+     * would have acted on. Acting on a decision makes no provider call, so
+     * neither steps nor cost refuse it; only a cancel, time or the tool-call
+     * count do.
+     */
     public function onlyStepsSpent(RunBudget $budget): bool
     {
-        return $this->exhaustion($budget) !== null && $this->exhaustion(self::withoutStepLimit($budget)) === null;
+        return $this->guarded(fn (): bool => $this->exhaustionNow($budget) !== null
+            && $this->exhaustionNow(self::forResolution($budget)) === null);
     }
 
-    private static function withoutStepLimit(RunBudget $budget): RunBudget
+    /** The limits acting on recorded decisions is held to: no steps, no cost. */
+    private static function forResolution(RunBudget $budget): RunBudget
     {
-        return new RunBudget(PHP_INT_MAX, $budget->maxCostUsd, $budget->maxSeconds, $budget->maxOutputTokensPerCall, $budget->maxToolCalls);
+        return new RunBudget(PHP_INT_MAX, maxSeconds: $budget->maxSeconds, maxToolCalls: $budget->maxToolCalls);
     }
 
     private function assertCallAvailableNow(RunBudget $budget): void
     {
-        // Cost admission uses >, allowing an exact fit (including a genuinely
-        // free call). Preserve the legacy >= exhaustion API for its callers.
-        $stop = $this->unmeteredRuns > 0 ? $this->exhaustion($budget)
-            : $this->exhaustion(new RunBudget($budget->maxSteps, maxSeconds: $budget->maxSeconds, maxToolCalls: $budget->maxToolCalls));
+        $stop = $this->callStop($budget);
         if ($stop !== null) {
             throw $stop === self::CANCELLED && $this->cancelled ? RunNotPermitted::cancelled() : RunNotPermitted::exhausted($stop);
         }
+    }
+
+    /** Why a call (or, without the step limit, a resolution) may not proceed now, or null. */
+    private function callStop(RunBudget $budget): ?string
+    {
+        // Cost admission uses >, allowing an exact fit (including a genuinely
+        // free call). Preserve the legacy >= exhaustion API for its callers.
+        return $this->unmeteredRuns > 0 ? $this->exhaustionNow($budget)
+            : $this->exhaustionNow(new RunBudget($budget->maxSteps, maxSeconds: $budget->maxSeconds, maxToolCalls: $budget->maxToolCalls));
     }
 
     /** Missing usage charges the proven upper bound, preserving only the unspent allowance. */

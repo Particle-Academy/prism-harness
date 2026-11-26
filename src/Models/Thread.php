@@ -22,6 +22,7 @@ use Prism\Harness\Contracts\EvictionSink;
 use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\Sessions\DatabaseAddressIndex;
 use Prism\Harness\Sessions\SessionAddress;
+use Prism\Harness\Subagents\RunBudgets;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Harness\Tools\CanonicalJson;
@@ -440,8 +441,9 @@ class Thread extends Model implements ThreadContract
      *
      * @param  iterable<Message>  $messages
      * @param  list<string>|null  $toolNames  the actual offer, stored only beside pending approvals
+     * @param  array{harness_steps_used: int, harness_steps_left: int}|null  $parked  stored on the row a run parks on (G-387)
      */
-    public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null): self
+    public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null, ?array $parked = null): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
@@ -460,7 +462,7 @@ class Thread extends Model implements ThreadContract
         // A turn that half-writes leaves a tool call with no result, which
         // replays to the model as an unanswered question rather than as an
         // error anyone can see.
-        return DB::transaction(function () use ($messages, $runId, $toolNames): self {
+        return DB::transaction(function () use ($messages, $runId, $toolNames, $parked): self {
             // Locks the thread ROW so a concurrent recorder waits instead of
             // reading the same max. A no-op on SQLite, which is why the suite
             // cannot exercise this and why the guarantee lives in the database.
@@ -474,6 +476,12 @@ class Thread extends Model implements ThreadContract
                     // Harness metadata on the same durable approval record.
                     // MessageMapper does not send it back to the provider.
                     $payload['harness_tool_names'] = array_values(array_unique($toolNames));
+                }
+                if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $parked !== null) {
+                    // The steps the parked run used, its children included, and
+                    // what it had left: the count its resume continues (G-387).
+                    $payload['harness_steps_used'] = $parked['harness_steps_used'];
+                    $payload['harness_steps_left'] = $parked['harness_steps_left'];
                 }
                 $this->storedMessages()->create([
                     'position' => ++$position,
@@ -557,6 +565,11 @@ class Thread extends Model implements ThreadContract
      * stored rows (one assistant row per model step since the turn's user
      * row), so the count survives a reload, another worker and a deploy, and
      * compaction cannot erase it.
+     *
+     * Not the count a resume continues (G-387): that is `harness_steps_used`
+     * on the row the run parked on ({@see self::pausedStepsUsed()}), which
+     * includes the steps of its subagents, which these rows never hold. This
+     * is its floor, and the count for a row written before it was kept.
      */
     public function approvalRunSteps(): ?int
     {
@@ -580,6 +593,42 @@ class Thread extends Model implements ThreadContract
         }
 
         return $paused === true ? $steps : null;
+    }
+
+    /**
+     * What the run paused at the transcript tail wrote it had used, on the
+     * row it parked on (G-387): `none` when nothing at the tail is waiting on
+     * an approval, `absent` for a row written before the count was kept,
+     * `invalid` for a value this runtime could not have written, `valid`
+     * with the count otherwise.
+     *
+     * @internal Read by the runtime once, when a run that resumes it begins.
+     *
+     * @return array{0: 'none'|'absent'|'invalid'|'valid', 1: ?int}
+     */
+    public function pausedStepsUsed(): array
+    {
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            if ($stored->type === MessageMapper::TYPE_USER) {
+                return ['none', null];
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                continue;
+            }
+            $payload = is_array($stored->payload) ? $stored->payload : [];
+            $requests = $payload['tool_approval_requests'] ?? [];
+            if (! is_array($requests) || $requests === []) {
+                return ['none', null];
+            }
+            if (! array_key_exists('harness_steps_used', $payload)) {
+                return ['absent', null];
+            }
+            $used = $payload['harness_steps_used'];
+
+            return RunBudgets::validUsed($used) ? ['valid', $used] : ['invalid', null];
+        }
+
+        return ['none', null];
     }
 
     /**

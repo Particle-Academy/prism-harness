@@ -656,16 +656,23 @@ with `RunNotPermitted` (`child_binding_missing`) rather than run on the root rul
 run continues the run tree the child was started in rather than getting a fresh root budget. The
 first time a root run starts a child, the tree's step and cost allowance is kept in the durable
 store, and the root run settles what the whole tree spent when it ends. The resumed run holds
-what the tree has left before it calls a provider, settles what it spent when it ends, and is
-refused with `RunNotPermitted` once the tree's allowance is spent; a decision on the child's
-approval is then refused the same way with nothing recorded, so the approval is never consumed
-by a resume that cannot run. A hold whose run never settled is charged in full once the run
+what the tree has left before it calls a provider and settles what it spent when it ends. The
+runner also saves the child's step ceiling (the smaller of its declared `max_steps`, what the
+parent had left and `max_steps_ceiling`), and every turn the runner did not start is held to it,
+counted from what the child had used when it parked: a child declared at 2 steps that parked
+after 1 has 1 left however it is resumed. A tree with no steps left never refuses the person's
+decision on the child's approval: acting on a decision takes no model step, so the approved call
+runs, its result is recorded and the run then stops on its step budget with no further model
+step. A spent cost allowance never refuses it either: acting on an approved call makes no
+provider call. Only a cancelled tree refuses the decision, with nothing recorded. A new message
+to a child whose ceiling or tree is spent is refused before anything is recorded. A hold whose run never settled is charged in full once the run
 lock's TTL has passed. When the child was started by a turn that spent from a shared plan
 budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). The same holds
 for every turn on the child session the runner did not start: a new message sent with `send()`
 instead of an answer continues the tree and the plan budget exactly as an answer does, and a run
 context the host passes in can only narrow them. The host context's limits are lowered to what
-the tree and the plan budget have left, and the turn is refused only when they are spent. A host
+the tree and the plan budget have left; it can lower the child's saved step ceiling and never
+raise it. A turn with nothing left and no decision to act on is refused. A host
 context never replaces what the runner saved: if it carries a child binding of its own, the saved
 binding, depth, run tree and plan budget still win, and the turn runs no shallower than the saved
 depth. Only the runner's own context rewrites them. A host context cannot stand in for a binding
@@ -1023,6 +1030,28 @@ answer. A parent bounded at 8 steps that may spawn children each entitled to a f
 no bound at all — it has a bound per node in a tree whose width it also controls. A child
 receives the *smaller* of what it declares and what the tree has left, and its spend lands
 in the parent's account.
+
+**How many steps a run may take is decided once, when it begins.** The run's ceiling (its
+mode's or session's `max_steps` for a root, the ceiling the runner saved for a child, or a
+host context's remainder) is capped by `max_steps_ceiling` on the run's whole count, less
+what the run had already used when it parked; then the run tree's record and a shared plan
+budget each grant at most that, in one locked write each. The least of the three is the
+run's allowance, and the step gate, the subagent runner's check, the tree and plan holds
+and the row the run parks on all read it. A run that parks writes `harness_steps_used` (the
+steps it had used, its subagents' steps included) and `harness_steps_left` on the row it
+parks on, and its resume continues from `harness_steps_used`, so a root that spent 5 of its
+8 steps through a child before parking has 3 left, however many times it is approved. A
+value there that this runtime could not have written fails closed, with no steps left; a
+row written by an earlier release is counted from the transcript (a count missing beside a
+saved child ceiling fails closed: the two are written together). A new message starts a new run (it resumes
+no parked count) on the child's saved ceiling; what a child spends across runs is bounded by
+its run tree's record. A spent allowance, of steps
+or of cost, never refuses a decision, on any route: the approved calls run, their results are recorded, and
+the run then stops on its budget (`RunNotPermitted`) with no model step, identically on
+`send()`, `sendStructured()`, `stream()` and the decision routes. A new message, which
+resumes no decision, with nothing left is refused before anything is recorded
+(`plan_budget_exhausted` when the plan is what is spent). The same rule is
+pinned across the three languages by the parity op `step_allowance`.
 
 `send()`, `sendStructured()` and `stream()` charge a shared tree's step before
 the provider call, so a tool that starts a child sees the parent's current step
@@ -1523,9 +1552,9 @@ run context the host passes in, which is narrowed to what the plan has left
 rather than refused. Any other turn on the session,
 such as the person chatting while a step waits on their approval, spends
 nothing from the plan's budget and is never refused for it. A decision on an
-approval the step asked for is refused with `plan_budget_exhausted`, recording
-nothing, when the shared budget is already spent, and the next `advance()`
-blocks the plan, so an approval is never consumed by a resume that cannot run.
+approval the step asked for is accepted and acted on even when the shared
+budget is spent, its steps or its cost, live holds counted: the approved call
+runs with no further model step, and the next `advance()` blocks the plan.
 
 ## What it is for
 

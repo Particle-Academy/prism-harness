@@ -131,9 +131,11 @@ it('acts on a decision a resumed root parked on at its last step after delegatin
         ->and($after['steps'])->toBeLessThanOrEqual($after['max_steps']);
 })->with(['approve', 'decide', 'streamDecision']);
 
-// A child continuing a spent tree must still hold a turn of it: its decision
-// is refused before it is recorded, as before.
-it('still refuses a parked child decision when its tree is spent', function (): void {
+// A child continuing a spent tree acts on its decision too (G-387): acting
+// takes no model step, so the spent tree grants it 0 steps, not a refusal.
+// The approved call runs once, nothing asks the model, and the tree stays
+// within its allowance. (Before G-387 the child's decision was refused here.)
+it('acts on a parked child decision with no model step when its tree is spent', function (): void {
     config()->set('prism-harness.agent.modes.helper.tools', ['search']);
     config()->set('prism-harness.agent.modes.helper.requires_approval', ['search']);
     G360::calls([['run_op', ['task' => 'Run the Op']]]);
@@ -146,7 +148,11 @@ it('still refuses a parked child decision when its tree is spent', function (): 
     $pending = $child->thread()->pendingApprovalIds();
     expect($pending)->toHaveCount(1)->and($record['steps'])->toBe($record['max_steps']);
 
-    expect(fn () => $child->approve($pending[0]))->toThrow(RunNotPermitted::class)
-        ->and($child->thread()->pendingApprovalIds())->toBe($pending)
-        ->and($this->searches)->toBe([]);
+    $requests = count(Http::recorded());
+
+    expect(fn () => $child->approve($pending[0]))->toThrow(RunNotPermitted::class, 'step budget exhausted')
+        ->and($child->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->searches)->toBe(['child'])
+        ->and(count(Http::recorded()))->toBe($requests)
+        ->and(spentTreeRecord($runId)['steps'])->toBe($record['max_steps']);
 });

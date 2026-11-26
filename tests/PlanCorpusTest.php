@@ -12,6 +12,7 @@ use Prism\Harness\Plans\PlanText;
 use Prism\Harness\Plans\PlanView;
 use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunBudgets;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Tools\ToolPolicy;
@@ -57,6 +58,8 @@ function runPlansCase(array $case): array
                 $op['op'] === 'binding_route' => plansBindingOp($op, $savedBinding),
                 $op['op'] === 'binding_context' => plansBindingContextOp($op, $savedBinding),
                 in_array($op['op'], ['tree_membership', 'kept_refs'], true) => plansTreeOp($op),
+                // How many model steps a run may take (G-387): the pure RunBudgets::allowance.
+                $op['op'] === 'step_allowance' => RunBudgets::allowance($op),
                 str_starts_with($op['op'], 'budget_') => plansBudgetOp($op, $ledger, $now),
                 default => plansOp($op, $plan, $ids, $limits, $now, $marked, $ledger),
             };
