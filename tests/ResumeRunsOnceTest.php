@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\PrismHarness;
+use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Events\Telemetry\GenerationCompleted;
 use Prism\Prism\Events\Telemetry\GenerationErrored;
@@ -92,8 +94,13 @@ function resumeSseCall(string $id, string $name, string $arguments): string
  *
  * @return array{runs: array<string, int>, events: list<array{tool: string, at_dispatch: string, op: string|null}>, failures: list<string>, resolvedRows: list<array{results: list<string>, decisions: list<string>}>}
  */
-function resumeScenario(string $route, string $path, string $listener, string $provider = 'openai', bool $unwatchable = false): array
+function resumeScenario(string $route, string $path, string $listener, string $provider = 'openai', bool $unwatchable = false, bool $authorize = false): array
 {
+    if ($authorize) {
+        config()->set('prism-harness.agent.authorize_tools', true);
+        Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+        Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => true);
+    }
     $anthropic = $provider === 'anthropic';
     config()->set('prism.providers.openai.api_key', 'sk-test');
     config()->set('prism.providers.openai.api_format', 'chat_completions');
@@ -332,10 +339,25 @@ it('runs an approved call once across a structured resume', function (string $pa
     expect(resumeScenario('structured', $path, $listener, 'anthropic')['runs'])->toBe(['search' => 0, 'weather' => 1]);
 })->with(['plain', 'subagents', 'capped'])->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw', 'telemetry off' => 'off']);
 
+// With call-time authorization on, each tool is guarded, and the guarded tool
+// is watched like any other: no second run, and the telemetry where it was.
+it('runs every call resolved before a tool\'s own exception once with call-time authorization on', function (string $route, string $provider, string $path): void {
+    $result = resumeScenario($route, $path, 'quiet', $provider, authorize: true);
+    $retried = ! str_starts_with($route, 'raw later') && ! ($route === 'raw structured' && $provider === 'openai' && $path === 'plain');
+
+    expect($result['runs'])->toBe(['search' => 1, 'weather' => $retried ? 2 : 1]);
+})->with([
+    'decide, OpenAI' => ['raw', 'openai'],
+    'decide, Anthropic' => ['raw', 'anthropic'],
+    'structured, Anthropic' => ['raw structured', 'anthropic'],
+    'later step, OpenAI' => ['raw later', 'openai'],
+    'stream, OpenAI' => ['raw stream', 'openai'],
+])->with(['plain', 'subagents', 'capped']);
+
 // Where 0.26.7 put the telemetry: inside the generation that resolved the call,
-// while its trace is open.
-it('reports a resumed approved call inside the generation that resolves it', function (string $route, string $provider, string $listener): void {
-    $result = resumeScenario($route, 'plain', $listener, $provider);
+// while its trace is open, with call-time authorization off and on.
+it('reports a resumed approved call inside the generation that resolves it', function (string $route, string $provider, string $listener, bool $authorize): void {
+    $result = resumeScenario($route, 'plain', $listener, $provider, authorize: $authorize);
 
     expect($result['events'])->not->toBe([]);
     foreach ($result['events'] as $event) {
@@ -347,4 +369,5 @@ it('reports a resumed approved call inside the generation that resolves it', fun
     'decide, two approvals' => ['decide2', 'openai'],
     'plain stream' => ['stream', 'openai'],
     'structured' => ['structured', 'anthropic'],
-])->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw']);
+])->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw'])
+    ->with(['authorization off' => false, 'authorization on' => true]);

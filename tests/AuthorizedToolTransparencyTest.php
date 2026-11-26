@@ -26,6 +26,25 @@ final class ExtraMethodTool extends Tool
     }
 }
 
+// Its own handle() and a public method of its own: neither guard can be put
+// in front of its calls.
+final class OwnHandleTool extends Tool
+{
+    public static int $ran = 0;
+
+    public function extra(): string
+    {
+        return 'extra';
+    }
+
+    public function handle(...$args): string
+    {
+        self::$ran++;
+
+        return 'ran';
+    }
+}
+
 function guardOutcome(Tool $tool, array $args): mixed
 {
     try {
@@ -68,6 +87,23 @@ it('returns, fails and reads its arguments as the tool does when the call is all
         ->withParameter(new ObjectSchema('filter', 'F', [new StringSchema('k', 'K')]))
         ->using(fn (string $filter): string => 'got '.$filter), ['filter' => '{"k":"v"}']],
 ]);
+
+it('does not offer a tool no guard can be put in front of', function (): void {
+    OwnHandleTool::$ran = 0;
+    $tool = (new OwnHandleTool)->as('own')->for('Own.')->withStringParameter('query', 'Q');
+    config()->set('prism-harness.agent.authorize_tools', true);
+    Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => false);
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $authorizer = new ToolAuthorizer(app(GateContract::class), true);
+    $plain = (new Tool)->as('plain')->for('Plain.')->using(fn (): string => 'p');
+
+    $offered = $authorizer->allowed($session, [$tool, $plain]);
+
+    expect(AuthorizedTool::wrap($tool, $session, $authorizer))->toBeNull()
+        ->and(array_map(fn (Tool $t): string => $t->name(), $offered))->toBe(['plain'])
+        ->and(OwnHandleTool::$ran)->toBe(0);
+});
 
 it('never lets a refused call reach the tool', function (Closure $make): void {
     $ran = 0;
