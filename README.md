@@ -1102,6 +1102,22 @@ passed). Nothing is written to the child in any of these cases. Any exception
 in the runner's own checks comes back as the framed `failed` result naming only the
 exception's class; its message goes to the application log, never to the model.
 
+**A runner start is decided once, before anything is written.** The runner reads every fact
+the start depends on, then asks one gate (`RunStarts::gate`), in this order: the task, the
+nesting depth, a cancel, the time limit, the steps the child would have, a spent cost limit
+(the context's cap or the agent's `spend_ceiling`), a cost cap that cannot be metered, a spent
+tool-call limit, a turn running on the child, an approval a person can still answer, then what
+the run tree and the shared plan budget would grant. The first that holds is the refusal, and
+the parent model gets a fixed, harness-written reason (a host's cancel text is never passed
+on). A refused start writes nothing: no session mode, no thread link or row, no count, binding
+or hold, no run state. A start the gate allows commits in one order: the run tree hold, then
+the child's records in one locked write that checks again that no turn holds the child, then
+the run. A hold or claim that lands between the read and the write refuses the start with the
+child's records unchanged, and the tree hold is returned. Once a start has committed, a stop
+that lands later (a cancel, say) stops its model steps but not the start: the task is recorded
+on the child and the run ends with that stop. The gate is pinned across the three languages
+by the parity op `start_gate`; the tool-call limit exists only here.
+
 **A host run context belongs to one session's turn.** Its ledger is the account every step
 under it is counted on. Share one context across sessions and each child resumed under it is
 charged the steps the others took on that ledger too, which can refuse a follow-up the child

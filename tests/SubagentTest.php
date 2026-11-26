@@ -169,8 +169,10 @@ it('reports cancellation as its own outcome, distinct from exhaustion', function
 
     $result = runner()->run(subagentFixture(), $parent, $context, 'run_parent', 'go');
 
+    // The reason is harness-written (G-387): the host's cancel text never
+    // reaches the parent model.
     expect($result->outcome)->toBe(SubagentOutcome::Cancelled)
-        ->and($result->reason)->toContain('operator stopped');
+        ->and($result->reason)->toBe('the run was cancelled');
 });
 
 it('fails closed when a cost cap is set but the provider reports no cost', function (): void {

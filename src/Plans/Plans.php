@@ -558,6 +558,29 @@ final class Plans
         return $this->grants[$runId] ?? null;
     }
 
+    /**
+     * What the plan budget WOULD grant a runner start now, read without a
+     * write (G-387): a fact of the start gate. Null when no plan budget
+     * applies to the start; 0 when the start may not spend from one (the
+     * plan's own turn handed a run tree of its own, or a spent plan).
+     *
+     * @internal Read by the runtime for the start gate.
+     */
+    public function startGrant(Session $session, string $prompt, ?RunContext $context): ?int
+    {
+        $target = $this->ledgerFor($session, $prompt, $context);
+        if ($target === null) {
+            return null;
+        }
+        if ($target['refused']) {
+            return 0;
+        }
+        $state = $this->budgetRecordAt($session->planStore(), $target['session'], $target['plan'])
+            ?? PlanBudget::open($target['plan'], $this->budgetSettings());
+
+        return PlanBudget::grantSteps($state, 'start_gate', PHP_INT_MAX, null, $this->now(), $this->holdTtl())[1]['steps'];
+    }
+
     /** @internal Whether this run spends from a shared plan budget. */
     public function isPlanTurn(string $runId): bool
     {

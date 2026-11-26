@@ -48,6 +48,7 @@ use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunBudgets;
 use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\RunStarts;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
@@ -193,10 +194,11 @@ final readonly class AgentRuntime
     /**
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $attachments
+     * @param  array{mode: string, parent: Session, root: string, tree_left: ?int}|null  $start  a runner start the start gate let through (G-387)
      */
-    private function sendLocked(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, ?string &$runId, ?Closure $beforeRun = null): AgentResponse
+    private function sendLocked(Session $session, string $prompt, ?array $toolNames, ?RunContext $context, array $attachments, ?string &$runId, ?Closure $beforeRun = null, ?array $start = null): AgentResponse
     {
-        return $session->fencedLock(function (Session $session) use ($prompt, $toolNames, $context, $attachments, &$runId, $beforeRun): AgentResponse {
+        return $session->fencedLock(function (Session $session) use ($prompt, $toolNames, $context, $attachments, &$runId, $beforeRun, $start): AgentResponse {
             // Inside the lock and before a run exists: decisions are checked
             // and written here, so a refusal leaves no run behind it.
             if ($beforeRun !== null) {
@@ -212,14 +214,25 @@ final readonly class AgentRuntime
             // error is the most likely failure here and was the one least
             // visible.
             $runId = 'run_'.bin2hex(random_bytes(12));
+            $release = null;
 
             try {
-                $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+                // A runner start runs in the mode its declaration names; the
+                // session's mode slot is written only once the start commits.
+                $mode = $this->modes->forAgent($session->agent())->resolve($start['mode'] ?? $session->mode());
                 // Which run tree this run belongs to: decided once, here (G-381).
                 $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
                 // And how many steps it may take, from facts this runtime holds (G-387).
                 [$facts, $paused] = $this->ownFacts($session, $mode, $context, $prompt);
-                [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership, $facts);
+                [$provider, $model, $child, $save] = $this->resolveBinding($session, $mode, $context);
+                if ($save) {
+                    // A runner start the start gate let through (G-387): its
+                    // tree hold, then the child's records in one locked write.
+                    if ($start === null || $child === null) {
+                        throw new \LogicException('A runner start begins only through the start gate.');
+                    }
+                    $release = $this->commitRunnerStart($session, $membership, $facts, $child, $start);
+                }
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
                 // run the session never started trips its own state guard —
@@ -240,13 +253,28 @@ final readonly class AgentRuntime
                 throw $failure;
             }
 
-            // A cancelled run never resumes (G-285): refused before it begins.
-            if ($session->resumesCancelledRun($prompt)) {
-                throw RunNotPermitted::cancelled();
-            }
             $resumedFrom = $this->resumedFrom($session, $prompt);
-            $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
-                tree: $membership);
+            try {
+                // A cancelled run never resumes (G-285): refused before it begins.
+                if ($session->resumesCancelledRun($prompt)) {
+                    throw RunNotPermitted::cancelled();
+                }
+                if ($start !== null) {
+                    // Commit step (c) of a runner start: the session's mode and
+                    // the thread link, then the run itself.
+                    $session->usingMode($start['mode']);
+                    $session->thread()->linkBeneath($start['parent']->thread(), $start['root']);
+                }
+                $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
+                    tree: $membership);
+            } catch (Throwable $failure) {
+                // The run never began: the tree hold the start took is returned.
+                if ($release !== null) {
+                    $release();
+                }
+
+                throw $failure;
+            }
 
             // A root run opens the tree's account; a child inherits it. Either
             // way there is exactly one ledger per tree from here down.
@@ -262,7 +290,7 @@ final readonly class AgentRuntime
             $budget = $run->budget;
             $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
             try {
-                return $this->sendRun($session, $prompt, $toolNames, $attachments, $runId, $mode, $provider, $model, $run, $budget);
+                return $this->sendRun($session, $prompt, $toolNames, $attachments, $runId, $mode, $provider, $model, $run, $budget, $start !== null);
             } finally {
                 $unwatch();
             }
@@ -350,7 +378,7 @@ final readonly class AgentRuntime
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $attachments
      */
-    private function sendRun(Session $session, string $prompt, ?array $toolNames, array $attachments, string $runId, AgentMode $mode, string $provider, string $model, RunContext $run, RunBudget $budget): AgentResponse
+    private function sendRun(Session $session, string $prompt, ?array $toolNames, array $attachments, string $runId, AgentMode $mode, string $provider, string $model, RunContext $run, RunBudget $budget, bool $committedStart = false): AgentResponse
     {
         event(new RunStarted(
             sessionKey: $session->key(),
@@ -363,7 +391,12 @@ final readonly class AgentRuntime
             harnessAgent: $session->agent(),
         ));
 
-        $this->refuseSpentRun($session, $runId, $run, $budget, $prompt);
+        // A runner start was decided by the start gate and is committed: a
+        // stop that landed since only stops its model steps (the loop's
+        // gate), it never refuses the start (G-387).
+        if (! $committedStart) {
+            $this->refuseSpentRun($session, $runId, $run, $budget, $prompt);
+        }
 
         try {
             $run = $this->observedRun($run);
@@ -454,6 +487,12 @@ final readonly class AgentRuntime
         } catch (Throwable $failure) {
             if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
                 throw $failure;
+            }
+            // A committed start that a stop kept from its first model step
+            // still records the task it was given: the delegation happened.
+            if ($committedStart && $prompt !== '' && $failure instanceof RunNotPermitted
+                && ! $session->thread()->storedMessages()->where('run_id', $runId)->exists()) {
+                $this->recordTurn($session, [new UserMessage($prompt, $attachments)], $runId, []);
             }
             $this->failRunOn($session, $runId, $run, $failure);
 
@@ -2485,11 +2524,9 @@ final readonly class AgentRuntime
     }
 
     /**
-     * The provider and model this run requests, per field (G-321 E).
-     *
-     * A root run: session override, then the mode, then the agent default,
-     * then the global default. A subagent's child: see {@see ChildBinding} —
-     * the child session's own override slot is not read.
+     * The provider and model this run requests, per field (G-321 E), for a
+     * turn that is not a runner start: a runner start begins only through
+     * {@see self::startChild()}, after the start gate.
      *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
      * @param  array<string, mixed>  $facts  the run's own step facts (G-387)
@@ -2497,37 +2534,62 @@ final readonly class AgentRuntime
      */
     private function bindingFor(Session $session, AgentMode $mode, ?RunContext $context, array $membership, array $facts): array
     {
-        // A child's binding is SAVED with its session, inside the lock, so a
-        // run on that session the runner did not start (the host answering an
-        // approval the child stopped on, say) keeps the provider and model the
-        // runner gave it, and still never reads the child's own override slot.
-        //
-        // Saved in the session's DURABLE half, with the child's depth: a person
-        // may answer the approval after the ephemeral half has expired. A
-        // session whose thread is linked beneath a parent but has no saved
-        // binding is refused rather than run on the root rules, which would
-        // send the child's conversation to a provider nobody chose for it.
-        //
-        // Which binding, and whether it is saved: {@see ChildBinding::route()},
-        // the rule every language shares. Only the runner's own context writes
-        // the saved binding. A binding on a context the host built never
-        // replaces a saved one (it may narrow what the tree has left, never
-        // move the child to another provider or model, reset its depth, or
-        // erase the run tree and plan budget it continues), cannot stand in
-        // for one a linked child lost, and on a session that was never a child
-        // is used for that turn only.
-        //
-        // A session is a linked child when the runner linked its thread
-        // beneath a parent, or saved run tree references with it. The ports
-        // keep no thread link and identify one by those references; here they
-        // are saved in the same record as the binding, so in practice it is
-        // the thread link that marks a child whose binding is gone.
+        [$provider, $model, , $save] = $this->resolveBinding($session, $mode, $context);
+        if ($save) {
+            throw new \LogicException('A runner start begins only through the start gate.');
+        }
+
+        return [$provider, $model];
+    }
+
+    /**
+     * The provider and model this run requests, per field (G-321 E), the
+     * child binding it runs on and whether that binding is saved. Reads only.
+     *
+     * A root run: session override, then the mode, then the agent default,
+     * then the global default. A subagent's child: see {@see ChildBinding} —
+     * the child session's own override slot is not read.
+     *
+     * A child's binding is SAVED with its session, inside the lock, so a run
+     * on that session the runner did not start (the host answering an
+     * approval the child stopped on, say) keeps the provider and model the
+     * runner gave it, and still never reads the child's own override slot.
+     *
+     * Saved in the session's DURABLE half, with the child's depth: a person
+     * may answer the approval after the ephemeral half has expired. A
+     * session whose thread is linked beneath a parent but has no saved
+     * binding is refused rather than run on the root rules, which would
+     * send the child's conversation to a provider nobody chose for it.
+     *
+     * Which binding, and whether it is saved: {@see ChildBinding::route()},
+     * the rule every language shares. Only the runner's own context saves a
+     * binding, and only once the start gate let it start
+     * ({@see self::commitRunnerStart()}). A binding on a context the host
+     * built never replaces a saved one (it may narrow what the tree has left,
+     * never move the child to another provider or model, reset its depth, or
+     * erase the run tree and plan budget it continues), cannot stand in for
+     * one a linked child lost, and on a session that was never a child is
+     * used for that turn only.
+     *
+     * A session is a linked child when the runner linked its thread beneath
+     * a parent, or saved run tree references with it. The ports keep no
+     * thread link and identify one by those references; here they are saved
+     * in the same record as the binding, so in practice it is the thread
+     * link that marks a child whose binding is gone. A runner start does not
+     * read it (its binding is the runner's), so it never creates the thread.
+     *
+     * @return array{string, string, ?ChildBinding, bool}
+     */
+    private function resolveBinding(Session $session, AgentMode $mode, ?RunContext $context): array
+    {
         $saved = $session->childBinding();
+        $kind = app(RunTrees::class)->bindingContextKind($context);
+        $runner = $kind === 'runner' && $context?->binding !== null;
         $route = ChildBinding::route(
-            app(RunTrees::class)->bindingContextKind($context),
+            $kind,
             $context?->binding !== null,
             $saved !== null,
-            $session->thread()->parent_thread_id !== null || $session->childTree() !== null || $session->childPlanLedger() !== null,
+            ! $runner && ($session->thread()->parent_thread_id !== null || $session->childTree() !== null || $session->childPlanLedger() !== null),
         );
         $child = match ($route['binding']) {
             'runner', 'host' => $context?->binding,
@@ -2535,23 +2597,47 @@ final readonly class AgentRuntime
             'refused' => throw RunNotPermitted::unboundChild(),
             'root' => null,
         };
-        if ($route['save'] && $context !== null && $child !== null) {
-            // The run tree the child is in, with the shared plan budget of the
-            // run it spends from (G-366), so a child resumed outside the
+
+        return [
+            ($child === null ? $session->provider() : $child->provider)
+                ?? $mode->provider ?? $child->parentModeProvider ?? $this->stringConfig('provider', $session),
+            ($child === null ? $session->model() : $child->model)
+                ?? $mode->model ?? $child->parentModeModel ?? $this->stringConfig('model', $session),
+            $child,
+            $route['save'] && $context !== null && $child !== null,
+        ];
+    }
+
+    /**
+     * Commit steps (a) and (b) of a runner start the start gate let through
+     * (G-387): (a) the run tree hold the gate read, in one conditional locked
+     * write (refused when a race shrank it, with nothing else written); (b)
+     * the child's records (a new delegation count under the new ceiling, the
+     * binding, depth, refs, ceiling and delegation id) in ONE locked write
+     * that checks again that no turn holds the child, refused on a race. When
+     * (b) fails or refuses, the hold from (a) is released. Returns that
+     * release, for a failure of step (c) (the run itself beginning).
+     *
+     * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
+     * @param  array<string, mixed>  $facts
+     * @param  array{mode: string, parent: Session, root: string, tree_left: ?int}  $start
+     * @return Closure(): void
+     */
+    private function commitRunnerStart(Session $session, array $membership, array $facts, ChildBinding $child, array $start): Closure
+    {
+        $trees = app(RunTrees::class);
+        $release = $trees->holdForStart($session, $membership, $start['tree_left']);
+        try {
+            // The step ceiling the runner gives it: the ceiling of this
+            // runner start's allowance, re-applied on every turn the runner
+            // does not start. A runner start overwrites it.
+            $ceiling = $this->allowanceOf($facts)['ceiling'];
+            $delegation = 'dlg_'.bin2hex(random_bytes(12));
+            // The run tree the child is in, with the shared plan budget of
+            // the run it spends from (G-366), so a child resumed outside the
             // runner continues both; under a tree the host built, what it
             // saved before unless a person cancelled that tree. All from the
             // membership the run began with (G-381).
-            $trees = app(RunTrees::class);
-            // Every runner start is a new delegation: its count of the steps
-            // the child uses starts at 0 under the new ceiling. Reset FIRST,
-            // in one locked write that refuses while a turn on the child
-            // holds the count, so a refused start writes nothing else.
-            $ceiling = $this->allowanceOf($facts)['ceiling'];
-            $delegation = 'dlg_'.bin2hex(random_bytes(12));
-            if (! $trees->startDelegation($session, $delegation, $ceiling)) {
-                throw RunNotPermitted::childBusy();
-            }
-            $trees->childStarted($session, $membership);
             $savedTree = $session->childTree();
             $refs = RunTrees::keptRefs(
                 $membership,
@@ -2560,17 +2646,140 @@ final readonly class AgentRuntime
                 $session->childPlanLedger(),
                 $trees->treeCancelled($session, $savedTree),
             );
-            // The step ceiling the runner gave it (G-387): the ceiling of this
-            // runner start's allowance, re-applied on every turn the runner
-            // does not start. A runner start overwrites it.
-            $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation);
+            $committed = $trees->commitChild($session, $delegation, $ceiling,
+                static function () use ($session, $child, $membership, $refs, $ceiling, $delegation): void {
+                    $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation);
+                });
+            if (! $committed) {
+                throw RunNotPermitted::childBusy();
+            }
+        } catch (Throwable $failure) {
+            $release();
+
+            throw $failure;
         }
 
+        return $release;
+    }
+
+    /**
+     * Every fact a runner start depends on, READ without a write (G-387):
+     * the start gate's inputs ({@see RunStarts::gate()}) that this runtime
+     * holds. The subagent runner adds the child's busy and pending state.
+     *
+     *  - steps_left is what this start's own allowance would give
+     *    ({@see RunBudgets::allowance()} for a runner start: the context's
+     *    remainder, capped by max_steps_ceiling);
+     *  - cancelled and time are read on the context the child would run
+     *    under AND on the context the subagent tool was wired with;
+     *  - cost is `spent` when any cost limit that would stop the child is
+     *    spent (the context's cap, the agent's spend ceiling), and
+     *    `unenforceable` when one cannot be metered (a run that reported no
+     *    cost, or a capped child whose provider and model have no price);
+     *  - tool_calls_spent is PHP's own limit, which the ports do not have;
+     *  - tree_left and plan_left are what the tree's and the plan's records
+     *    would grant now, null when none applies.
+     *
+     * Any read that throws fails the start CLOSED: the runner frames it as
+     * `failed`, with nothing written.
+     *
+     * @internal Called by the subagent runner.
+     *
+     * @return array<string, mixed>
+     */
+    public function runnerStartFacts(Session $child, RunContext $childContext, RunContext $wired, mixed $task, string $modeName): array
+    {
+        $mode = $this->modes->forAgent($child->agent())->resolve($modeName);
+        $trees = app(RunTrees::class);
+        $text = is_string($task) && ! RunStarts::blank($task);
+        $membership = $trees->begin($child, 'run_start_gate', $childContext, $text ? $task : 'task');
+        [$facts] = $this->ownFacts($child, $mode, $childContext, $text ? $task : 'task');
+        $ledger = $childContext->ledger;
+        // Read the durable cancel flags the ledgers watch, then the result.
+        $ledger->cancelRequested();
+        $wired->ledger->cancelRequested();
+        $spentTime = static fn (RunContext $context): bool => $context->budget->maxSeconds !== null
+            && $context->ledger->elapsedSeconds() >= $context->budget->maxSeconds;
+        $spentCalls = static fn (RunContext $context): bool => $context->budget->maxToolCalls !== null
+            && $context->ledger->toolCalls() >= $context->budget->maxToolCalls;
+        $run = $this->boundedAgentRun($child, $childContext);
+
         return [
-            ($child === null ? $session->provider() : $child->provider)
-                ?? $mode->provider ?? $child->parentModeProvider ?? $this->stringConfig('provider', $session),
-            ($child === null ? $session->model() : $child->model)
-                ?? $mode->model ?? $child->parentModeModel ?? $this->stringConfig('model', $session),
+            'task' => $task,
+            'too_deep' => $childContext->tooDeep(),
+            'cancelled' => $ledger->cancelled() || $wired->ledger->cancelled(),
+            'time_spent' => $spentTime($childContext) || $spentTime($wired),
+            'steps_left' => $this->allowanceOf($facts)['own_left'],
+            'cost' => $this->startCost($child, $mode, $childContext, $run, $wired),
+            'tool_calls_spent' => $spentCalls($childContext) || $spentCalls($wired),
+            'tree_left' => $trees->startGrant($child, $membership),
+            'plan_left' => $text ? app(Plans::class)->startGrant($child, $task, $childContext) : null,
         ];
+    }
+
+    /**
+     * Whether a cost limit would stop a runner start's child (G-387).
+     *
+     * @return 'ok'|'spent'|'unenforceable'
+     */
+    private function startCost(Session $child, AgentMode $mode, RunContext $childContext, RunContext $run, RunContext $wired): string
+    {
+        $spent = false;
+        $unmetered = false;
+        foreach ([$run, $wired] as $context) {
+            $cap = $context->budget->maxCostUsd;
+            if ($cap !== null) {
+                $unmetered = $unmetered || $context->ledger->unmeteredRuns() > 0;
+                $spent = $spent || ! is_finite($cap) || $context->ledger->costUsd() >= $cap;
+            }
+        }
+        $ceiling = $run->agentCeilingUsd;
+        if ($ceiling !== null && ($run->agent === null || ! is_finite($ceiling) || $ceiling <= 0
+            || $run->ledger->agentCostUsd($run->agent) >= $ceiling)) {
+            $spent = true;
+        }
+        if ($spent) {
+            return 'spent';
+        }
+        if ($unmetered) {
+            return 'unenforceable';
+        }
+        if ($run->capped()) {
+            // A capped child is priced on every call: with no trusted price
+            // for its provider and model, every call would be refused.
+            [$provider, $model] = $this->resolveBinding($child, $mode, $childContext);
+            try {
+                CallBudget::forRun($run, $provider, $model, $this->pricing);
+            } catch (RunNotPermitted) {
+                return 'unenforceable';
+            }
+        }
+
+        return 'ok';
+    }
+
+    /**
+     * Start a subagent child the start gate let through (G-387): commit in
+     * ONE order, under the child's session lock. (a) the run tree hold, a
+     * conditional locked write, refused when a race shrank it; (b) the
+     * child's records in one locked write that checks again that no turn
+     * holds it, the hold released when it refuses or fails; (c) only then
+     * the session's mode, the thread link, the run and its task row. Once
+     * committed, a later stop only stops model steps.
+     *
+     * @internal Called by the subagent runner after the start gate.
+     */
+    public function startChild(Session $child, string $task, RunContext $childContext, string $mode, Session $parent, string $rootRunId, ?int $treeLeft): AgentResponse
+    {
+        $runId = null;
+
+        try {
+            return $this->sendLocked($child, $task, null, $childContext, [], $runId, null,
+                ['mode' => $mode, 'parent' => $parent, 'root' => $rootRunId, 'tree_left' => $treeLeft]);
+        } finally {
+            if ($runId !== null) {
+                ToolRefusals::forget($runId);
+            }
+        }
     }
 }

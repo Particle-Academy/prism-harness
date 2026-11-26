@@ -1529,9 +1529,12 @@ it('refuses a runner start when a resume claims between the busy check and the r
     // runner may start the child again; a resume then claims mid-start.
     $pending = $child->thread()->pendingApprovalIds();
     (fn () => $this->recordDecisions([new ToolApprovalResponse($pending[0], true)]))->call($child);
-    $retrievals = 0;
-    Thread::retrieved(function (Thread $thread) use (&$retrievals): void {
-        if (str_contains((string) $thread->scope, '::sub::') && ++$retrievals === 2) {
+    // Right after the start gate read the count (G-387 round 7: the busy
+    // check is a gate fact, re-checked in the commit's locked write).
+    $claimed = false;
+    DB::listen(function ($query) use (&$claimed): void {
+        if (! $claimed && str_contains(implode('|', array_map('strval', $query->bindings)), '::sub::worker:delegation-steps')) {
+            $claimed = true;
             app(RunTrees::class)->claimDelegation(g387Child('worker'), 'run_sneak', RunLedger::start('sneak'), fn (int $used): int => 1);
         }
     });
