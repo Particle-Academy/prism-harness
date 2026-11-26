@@ -8,42 +8,60 @@ use Closure;
 use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Testing\Fakes\EventFake;
+use Prism\Harness\Exceptions\UnsupportedEventDispatcher;
 
 /**
- * The one place the harness reads Laravel's event deferral state.
+ * The one place the harness reads and writes Laravel's event deferral state.
  *
  * Event::defer() holds events by class only, for the whole callback, and
  * dispatches them all in one loop when it returns. Resolving a resumed run's
- * approvals needs finer control: hold only the resolver's own ToolInvoked,
- * let the approved tool's body run under whatever deferral the host had
- * before, and send held events where core would have sent them. That needs
- * the dispatcher's protected deferral fields, read and written here through a
- * scope-bound closure. When the dispatcher is not Laravel's, or a framework
- * release renames the fields, dispatcher() returns null and every caller
- * falls back to plain Event::defer() behaviour. A test fails if the fields go
- * away (ResolutionTraceTest).
+ * approvals needs finer control: hold only the resolver's own ToolInvoked
+ * until the result is recorded, let the approved tool's body run under
+ * whatever deferral the host had before, and put held events where core
+ * would have put them on 0.26.7. That needs the dispatcher's protected
+ * deferral fields, read and written here through scope-bound closures.
+ *
+ * There is no fallback. If the dispatcher is not Laravel's (or an EventFake
+ * over Laravel's), or a framework release renames the fields, dispatcher()
+ * throws UnsupportedEventDispatcher: carrying on without them would give up
+ * the guarantee that no listener runs between an approved call and its
+ * record. ResolutionTraceTest pins the fields on every framework version CI
+ * installs.
  *
  * @internal
  */
 final class DeferredEvents
 {
-    /** The Laravel dispatcher whose deferral state can be read, or null. */
-    public static function dispatcher(): ?Dispatcher
+    /** The fields this class reads and writes, on Illuminate\Events\Dispatcher. */
+    public const FIELDS = ['deferredEvents', 'deferringEvents', 'eventsToDefer'];
+
+    /** The Laravel dispatcher whose deferral state can be read and written. */
+    public static function dispatcher(): Dispatcher
     {
         $events = Event::getFacadeRoot();
         if ($events instanceof EventFake) {
             $events = $events->dispatcher;
         }
         if (! $events instanceof Dispatcher) {
-            return null;
+            throw UnsupportedEventDispatcher::notLaravel(get_debug_type($events));
         }
-        foreach (['deferredEvents', 'deferringEvents', 'eventsToDefer'] as $field) {
-            if (! property_exists(Dispatcher::class, $field)) {
-                return null;
-            }
-        }
+        self::assertSupports($events::class);
 
         return $events;
+    }
+
+    /**
+     * Refuse a dispatcher class that lacks any of the fields.
+     *
+     * @param  class-string  $class
+     */
+    public static function assertSupports(string $class): void
+    {
+        foreach (self::FIELDS as $field) {
+            if (! property_exists($class, $field)) {
+                throw UnsupportedEventDispatcher::missingField($class, $field);
+            }
+        }
     }
 
     /**
@@ -74,28 +92,47 @@ final class DeferredEvents
     }
 
     /**
-     * Empty the deferred list and return what it held (dispatch arguments).
+     * The deferred list (dispatch arguments), in order.
+     *
+     * @return list<array<int, mixed>>
+     */
+    public static function list(Dispatcher $events): array
+    {
+        $read = Closure::bind(static fn (Dispatcher $events): array => array_values($events->deferredEvents), null, Dispatcher::class);
+        $list = [];
+        foreach ($read($events) as $args) {
+            if (is_array($args)) {
+                $list[] = array_values($args);
+            }
+        }
+
+        return $list;
+    }
+
+    /**
+     * Replace the deferred list.
+     *
+     * @param  list<array<int, mixed>>  $list
+     */
+    public static function replace(Dispatcher $events, array $list): void
+    {
+        $write = Closure::bind(static function (Dispatcher $events, array $list): void {
+            $events->deferredEvents = $list;
+        }, null, Dispatcher::class);
+        $write($events, $list);
+    }
+
+    /**
+     * Empty the deferred list and return what it held.
      *
      * @return list<array<int, mixed>>
      */
     public static function take(Dispatcher $events): array
     {
-        $take = Closure::bind(static function (Dispatcher $events): array {
-            $deferred = array_values($events->deferredEvents);
-            $events->deferredEvents = [];
+        $list = self::list($events);
+        self::replace($events, []);
 
-            return $deferred;
-        }, null, Dispatcher::class);
-
-        return $take($events);
-    }
-
-    /** How many events the deferred list holds. */
-    public static function count(Dispatcher $events): int
-    {
-        $count = Closure::bind(static fn (Dispatcher $events): int => count($events->deferredEvents), null, Dispatcher::class);
-
-        return $count($events);
+        return $list;
     }
 
     /**
@@ -115,59 +152,22 @@ final class DeferredEvents
      */
     public static function under(Dispatcher $events, array $state, Closure $run, array &$deferred): mixed
     {
-        $swap = Closure::bind(
-            /**
-             * @param  list<string>|null  $only
-             * @param  list<array<int, mixed>>  $list
-             * @return array{0: bool, 1: list<string>|null, 2: list<array<int, mixed>>}
-             */
-            static function (Dispatcher $events, bool $deferring, ?array $only, array $list): array {
-                $before = [(bool) $events->deferringEvents, $events->eventsToDefer, array_values($events->deferredEvents)];
-                $events->deferringEvents = $deferring;
-                $events->eventsToDefer = $only;
-                $events->deferredEvents = $list;
+        $swap = Closure::bind(static function (Dispatcher $events, bool $deferring, ?array $only): array {
+            $before = [(bool) $events->deferringEvents, $events->eventsToDefer];
+            $events->deferringEvents = $deferring;
+            $events->eventsToDefer = $only;
 
-                return $before;
-            }, null, Dispatcher::class);
-        $before = $swap($events, $state['deferring'], $state['events'], []);
+            return $before;
+        }, null, Dispatcher::class);
+        $list = self::list($events);
+        self::replace($events, []);
+        $before = $swap($events, $state['deferring'], $state['events']);
         try {
             return $run();
         } finally {
-            $after = $swap($events, $before[0], $before[1], $before[2]);
-            $deferred = [];
-            foreach ($after[2] as $args) {
-                if (is_array($args)) {
-                    $deferred[] = array_values($args);
-                }
-            }
+            $swap($events, $before[0], is_array($before[1]) ? array_values(array_map('strval', $before[1])) : null);
+            $deferred = self::list($events);
+            self::replace($events, $list);
         }
-    }
-
-    /**
-     * Insert $entries into the deferred list right after the first entry at
-     * or after $from whose event satisfies $anchor; the anchor event, or null
-     * when there is none.
-     *
-     * @param  Closure(mixed): bool  $anchor
-     * @param  Closure(object): list<array<int, mixed>>  $entries  given the anchor event
-     */
-    public static function insertAfter(Dispatcher $events, int $from, Closure $anchor, Closure $entries): ?object
-    {
-        $insert = Closure::bind(static function (Dispatcher $events) use ($from, $anchor, $entries): ?object {
-            $list = array_values($events->deferredEvents);
-            foreach ($list as $index => $args) {
-                $event = $args[0] ?? null;
-                if ($index >= $from && is_object($event) && $anchor($event)) {
-                    array_splice($list, $index + 1, 0, $entries($event));
-                    $events->deferredEvents = $list;
-
-                    return $event;
-                }
-            }
-
-            return null;
-        }, null, Dispatcher::class);
-
-        return $insert($events);
     }
 }
