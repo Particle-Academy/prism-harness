@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use Illuminate\Contracts\Auth\Access\Gate as GateContract;
+use Illuminate\Support\Facades\Exceptions;
 use Illuminate\Support\Facades\Gate;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Tools\AuthorizedTool;
@@ -38,6 +39,72 @@ final class OwnHandleTool extends Tool
     }
 
     public function handle(...$args): string
+    {
+        self::$ran++;
+
+        return 'ran';
+    }
+}
+
+// Public methods of their own, and an override of how the handler is found or
+// set: the clone guard's handler might never be asked.
+final class OwnResolverTool extends Tool
+{
+    public static int $ran = 0;
+
+    public function extra(): string
+    {
+        return 'extra';
+    }
+
+    protected function resolveHandler(): callable
+    {
+        return function (string $query): string {
+            self::$ran++;
+
+            return 'ran';
+        };
+    }
+}
+
+final class OwnUsingTool extends Tool
+{
+    public static int $ran = 0;
+
+    public function extra(): string
+    {
+        return 'extra';
+    }
+
+    public function using(Closure|callable $fn): self
+    {
+        return $this;
+    }
+}
+
+final class ReportedUsingTool extends Tool
+{
+    public function extra(): string
+    {
+        return 'extra';
+    }
+
+    public function using(Closure|callable $fn): self
+    {
+        return $this;
+    }
+}
+
+final class InvokableGuardTool extends Tool
+{
+    public static int $ran = 0;
+
+    public function __construct()
+    {
+        $this->as('inv')->for('Invokable.')->withStringParameter('query', 'Q');
+    }
+
+    public function __invoke(string $query): string
     {
         self::$ran++;
 
@@ -103,6 +170,50 @@ it('does not offer a tool no guard can be put in front of', function (): void {
     expect(AuthorizedTool::wrap($tool, $session, $authorizer))->toBeNull()
         ->and(array_map(fn (Tool $t): string => $t->name(), $offered))->toBe(['plain'])
         ->and(OwnHandleTool::$ran)->toBe(0);
+});
+
+it('does not offer a tool whose class could keep the guard from being asked', function (Closure $make, string $class): void {
+    $class::$ran = 0;
+    config()->set('prism-harness.agent.authorize_tools', true);
+    Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => false);
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $authorizer = new ToolAuthorizer(app(GateContract::class), true);
+    $tool = $make();
+
+    expect(AuthorizedTool::wrap($tool, $session, $authorizer))->toBeNull()
+        ->and($authorizer->allowed($session, [$tool]))->toBe([])
+        ->and($class::$ran)->toBe(0);
+})->with([
+    'overrides how the handler is found' => [fn () => (new OwnResolverTool)->as('own')->for('Own.')->withStringParameter('query', 'Q'), OwnResolverTool::class],
+    'overrides using()' => [fn () => (new OwnUsingTool)->as('own')->for('Own.')->withStringParameter('query', 'Q'), OwnUsingTool::class],
+]);
+
+it('reports a tool it does not offer once, with its name quoted', function (): void {
+    Exceptions::fake();
+    config()->set('prism-harness.agent.authorize_tools', true);
+    Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => true);
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $authorizer = new ToolAuthorizer(app(GateContract::class), true);
+    $tool = (new ReportedUsingTool)->as("own\nforged line")->for('Own.');
+
+    $authorizer->allowed($session, [$tool]);
+    $authorizer->allowed($session, [$tool]);
+
+    Exceptions::assertReportedCount(1);
+    Exceptions::assertReported(fn (LogicException $e): bool => ! str_contains($e->getMessage(), "\n")
+        && str_contains($e->getMessage(), 'own'.chr(92).'nforged line'));
+});
+
+it('does not reach the raw handler of a guarded tool through __invoke', function (): void {
+    InvokableGuardTool::$ran = 0;
+    $wrapped = guarded(new InvokableGuardTool, false);
+
+    expect($wrapped)->toBeInstanceOf(GuardedTool::class)
+        ->and(fn () => $wrapped->__invoke('a'))->toThrow(Error::class, 'undefined method')
+        ->and(json_decode((string) $wrapped->handle(query: 'a'), true)['allowed'])->toBeFalse()
+        ->and(InvokableGuardTool::$ran)->toBe(0);
 });
 
 it('never lets a refused call reach the tool', function (Closure $make): void {

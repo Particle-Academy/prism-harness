@@ -125,7 +125,7 @@ final readonly class ToolAuthorizer
             }
             $wrapped = AuthorizedTool::wrap($tool, $session, $this);
             if ($wrapped === null) {
-                report(new LogicException('Tool ['.$tool->name().'] is not offered: its class ['.$tool::class.'] overrides handle() and adds public methods, so call-time authorization cannot be put in front of its calls.'));
+                AuthorizedTool::reportUnguardable($tool);
 
                 continue;
             }
