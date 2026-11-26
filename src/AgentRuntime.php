@@ -32,9 +32,9 @@ use Prism\Harness\Steps\RunStep;
 use Prism\Harness\Steps\RunStepTagger;
 use Prism\Harness\Structured\SchemaCheck;
 use Prism\Harness\Structured\StructuredTranscript;
-use Prism\Harness\Subagents\ApprovedTools;
 use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Harness\Subagents\CallBudget;
+use Prism\Harness\Subagents\ResolvedApprovals;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\StepCalls;
@@ -46,21 +46,23 @@ use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Enums\FinishReason;
-use Prism\Prism\Enums\TelemetryOperation;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\ErrorEvent;
 use Prism\Prism\Streaming\Events\StreamEndEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
+use Prism\Prism\Streaming\Events\StreamStartEvent;
+use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Streaming\StreamCollector;
-use Prism\Prism\Structured\PendingRequest as StructuredPending;
 use Prism\Prism\Structured\Response as StructuredResponse;
-use Prism\Prism\Text\PendingRequest as TextPending;
+use Prism\Prism\Structured\Step as StructuredStep;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Throwable;
 
 final readonly class AgentRuntime
@@ -114,33 +116,6 @@ final readonly class AgentRuntime
                 }
             }
         }
-    }
-
-    /**
-     * Resolve the approvals a resumed run carries before the generation, and
-     * record them, as the step-by-step paths already do (G-380); then run the
-     * generation.
-     *
-     * Core would otherwise run an approved call inside its generation and
-     * report it with ToolInvoked before the harness records the result. A
-     * telemetry listener that threw there would lose that record, and the
-     * approved call would run again when the run resumed. Here the events are
-     * held until the record is written, then dispatched inside the generation
-     * as it starts, in its trace, as on 0.26.7; a listener failure is
-     * reported, never thrown. See ApprovedTools.
-     *
-     * @template TResult
-     *
-     * @param  Closure(list<Message>):void  $record
-     * @param  Closure(): TResult  $run
-     * @return TResult
-     */
-    private function resolvedFirst(Session $session, TextPending|StructuredPending $generation, Closure $record, Closure $run): mixed
-    {
-        $approved = new ApprovedTools($generation instanceof StructuredPending ? TelemetryOperation::Structured : TelemetryOperation::Text, $session->key());
-        $approved->resolve($generation, $record);
-
-        return $approved->within($run);
     }
 
     /**
@@ -276,10 +251,7 @@ final readonly class AgentRuntime
                         }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }) : $this->resolvedFirst($session, $generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
-                            $history = $messages;
-                        }, fn (): TextResponse => $generation->asText()))
+                        }) : $generation->asText())
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -488,11 +460,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }) : $this->resolvedFirst($session, $generation, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
-                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
-                            $history = $messages;
-                            $userMessage = null;
-                        }, fn (): StructuredResponse => $generation->asStructured()))
+                        }) : $generation->asStructured())
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -503,7 +471,7 @@ final readonly class AgentRuntime
                         });
 
                 if ($budget->maxCostUsd === null && ! $stepOnly) {
-                    $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
+                    $this->recordTurn($session, $this->resolvedFirstInTranscript($response, $userMessage, $history), $runId, $tools);
                 }
 
                 $violation = $this->violationIn($schema, $response);
@@ -813,19 +781,16 @@ final readonly class AgentRuntime
         $collected = null;
         $tools = [];
         $finishReason = FinishReason::Unknown;
-        // Whether the prompt went into the record with an approval resolution.
-        $promptRecorded = false;
-        $approved = null;
+        $streamStarted = false;
+        /** @var list<ToolResult> $resolvedFirst */
+        $resolvedFirst = [];
 
         try {
-            // The thread's messages and the prompt, as withThread() and
-            // withPrompt() would assemble them, so an approval resolution can
-            // write the merged history back (see below).
-            $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()
                 ->using($provider, $model)
-                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
-                ->withTelemetryMetadata(sessionId: $session->key());
+                ->withThread($session->thread())
+                ->withTelemetryMetadata(sessionId: $session->key())
+                ->withPrompt($prompt, $attachments);
 
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);
@@ -878,24 +843,8 @@ final readonly class AgentRuntime
             // back the same Message objects and Response the non-streaming path
             // builds. A streamed turn and a sent turn now record the SAME
             // transcript, because the same code wrote both.
-            //
-            // Approval decisions already in the thread (a decide() that failed
-            // after recording them, for one) are resolved and recorded HERE,
-            // before the stream, as on the send paths (G-380): resolved inside
-            // the stream, an approved call whose result was then lost (a
-            // telemetry listener that threw) ran again on the next resume.
-            $approved = new ApprovedTools(TelemetryOperation::Stream, $session->key());
-            $resolution = $approved->resolve($generation, function (array $messages) use ($session, &$history, &$promptRecorded, $prompt, $runId, &$tools): void {
-                $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
-                $history = $messages;
-                $promptRecorded = $prompt !== '';
-            });
-            foreach ($resolution as $event) {
-                $tagger->observe($event);
-                yield $event;
-            }
             $collector = new StreamCollector(
-                $approved->streamWithin(fn (): Generator => $generation->asStream()),
+                $generation->asStream(),
                 null,
                 function (mixed $pending, Collection $messages, TextResponse $response) use (&$collected): void {
                     $collected = ['messages' => $messages->all(), 'response' => $response];
@@ -903,6 +852,15 @@ final readonly class AgentRuntime
             );
 
             foreach ($collector->collect() as $event) {
+                // Core resolves a resumed run's approvals first, and yields
+                // each resolved call's result before the provider's stream
+                // starts. Kept, in case the turn ends before core's own
+                // record of them arrives (see the finally below).
+                if ($event instanceof StreamStartEvent) {
+                    $streamStarted = true;
+                } elseif (! $streamStarted && $event instanceof ToolResultEvent) {
+                    $resolvedFirst[] = $event->toolResult;
+                }
                 if ($event instanceof ErrorEvent) {
                     $finishReason = FinishReason::Error;
                 } elseif ($event instanceof StreamEndEvent && $finishReason !== FinishReason::Error) {
@@ -925,13 +883,20 @@ final readonly class AgentRuntime
 
             throw $failure;
         } finally {
-            // A resolution whose stream was abandoned (or failed) before its
-            // generation opened still sends the events it holds.
-            $approved?->flush();
             if ($namedRun !== null && $collected !== null) {
                 $namedRun->ledger->recordSteps(count($collected['response']->steps));
                 $namedRun->ledger->recordCost($this->costOf($collected['response']));
             }
+            // A resumed run's approved calls that core ran before the stream
+            // ended without its own record of them (the consumer abandoned
+            // the stream, or a tool threw its own exception): their results
+            // are recorded, merged as core would have merged them, after the
+            // prompt as in the request. Otherwise the next resume would run
+            // those calls again.
+            $resolution = $collected === null && $resolvedFirst !== []
+                ? ResolvedApprovals::merged(iterator_to_array($session->thread()->messages(), false), $resolvedFirst)
+                : null;
+            $resolution = $resolution === null ? [] : [$resolution[count($resolution) - 1]];
             // Reached on completion, on an exception, AND when an abandoned
             // generator is destroyed. Recording whatever arrived beats losing a
             // partial turn: a conversation missing the half the user already
@@ -942,9 +907,10 @@ final readonly class AgentRuntime
                 // callback, so `$collected` is null and only the prompt is
                 // recorded — a partial turn kept rather than a whole one lost,
                 // and honest about how far it got.
-                $messages = [...($promptRecorded ? [] : [new UserMessage($prompt, $attachments)]), ...($collected['messages'] ?? [])];
+                $messages = [new UserMessage($prompt, $attachments), ...$resolution, ...($collected['messages'] ?? [])];
 
                 $this->recordTurn($session, $messages, $runId, $tools);
+                $resolution = [];
                 if (in_array($finishReason, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finishReason->value);
                     event(new RunFailed($session->key(), $runId, $finishReason->value));
@@ -958,6 +924,11 @@ final readonly class AgentRuntime
                         awaitingApproval: false,
                     ));
                 }
+            }
+            if ($resolution !== []) {
+                // The run already failed (a tool's own exception), so no turn
+                // was recorded above; the resolved calls' results still are.
+                $this->recordTurn($session, $resolution, $runId, $tools);
             }
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
@@ -1755,6 +1726,41 @@ final readonly class AgentRuntime
     private function newMessages(TextResponse $response, array $history): array
     {
         return $this->newMessageObjects($response->messages->values()->all(), $history);
+    }
+
+    /**
+     * A structured turn's transcript, with the result of the approvals core
+     * resolved inside the turn.
+     *
+     * When a structured turn resumes approved calls, core runs them inside
+     * its generation and merges their results into the messages it sends (the
+     * first step's messages), not into the steps the transcript is rebuilt
+     * from. Without that message the record lost the results, and the next
+     * resume ran the approved calls again. It goes right after the prompt,
+     * where core put it in the request.
+     *
+     * @param  list<Message>  $history
+     * @return list<Message>
+     */
+    private function resolvedFirstInTranscript(StructuredResponse $response, ?UserMessage $prompt, array $history): array
+    {
+        $transcript = StructuredTranscript::of($response, $prompt);
+        $first = $response->steps->first();
+        if (! $first instanceof StructuredStep) {
+            return $transcript;
+        }
+        // The resolution's merged message is the one core builds with the
+        // approval decisions on it; the step's own tool results carry none.
+        $resolution = array_values(array_filter(
+            $this->newMessageObjects(array_values($first->messages), $prompt instanceof UserMessage ? [...$history, $prompt] : $history),
+            fn (Message $message): bool => $message instanceof ToolResultMessage && $message->toolApprovalResponses !== [],
+        ));
+        if ($resolution === []) {
+            return $transcript;
+        }
+        $at = $prompt instanceof UserMessage ? 1 : 0;
+
+        return [...array_slice($transcript, 0, $at), ...$resolution, ...array_slice($transcript, $at)];
     }
 
     /** @param list<Message> $messages
