@@ -219,6 +219,89 @@ final class PlanBudget
     }
 
     /**
+     * Grant one run its share of a ledger's STEPS, in the one locked write
+     * that holds it (G-387). Steps never refuse: a ledger whose steps are
+     * spent, settled or held by other runs, grants 0 and the run acts on the
+     * decisions it resumes with no model step. Only a COST limit refuses, as
+     * {@see self::reserve()} does. Asked for 0 steps, nothing is held.
+     *
+     * Returns the state and either the grant (`steps`, `cost_micros`) or the
+     * cost refusal (`refused`, `limit`).
+     *
+     * @param  array<string, mixed>  $state
+     * @return array{0: array<string, mixed>, 1: array<string, mixed>}
+     */
+    public static function grantSteps(array $state, string $holdId, int $steps, ?int $costMicros, int $now, int $holdTtl): array
+    {
+        $state = self::expire($state, $now, $holdTtl);
+        if (self::stepsLeft($state) <= 0 || $steps < 1) {
+            return [$state, ['steps' => 0, 'cost_micros' => null]];
+        }
+        $limit = self::costLimit($state);
+        if ($limit !== null) {
+            return [$state, ['refused' => self::EXHAUSTED, 'limit' => $limit]];
+        }
+
+        return self::reserve($state, $holdId, $steps, $costMicros, $now, $holdTtl);
+    }
+
+    /**
+     * Whether a decision on a run that resumes into this ledger must be
+     * refused before it is recorded (G-387): only for a cost limit, and
+     * never once the steps are spent (that run then acts on the decision
+     * with no model step, so no cost can be spent). The same answer
+     * {@see self::grantSteps()} gives the resume, whatever it asks for.
+     *
+     * @param  array<string, mixed>  $state
+     */
+    public static function decisionRefusal(array $state, int $now, int $holdTtl): ?string
+    {
+        $state = self::expire($state, $now, $holdTtl);
+
+        return self::stepsLeft($state) <= 0 ? null : self::costLimit($state);
+    }
+
+    /**
+     * Whether the ledger has no steps left for another run, its live holds
+     * counted (G-387).
+     *
+     * @param  array<string, mixed>  $state
+     */
+    public static function stepsSpent(array $state, int $now, int $holdTtl): bool
+    {
+        return self::stepsLeft(self::expire($state, $now, $holdTtl)) <= 0;
+    }
+
+    /** @param array<string, mixed> $state */
+    private static function stepsLeft(array $state): int
+    {
+        $held = 0;
+        foreach ($state['holds'] as $hold) {
+            $held += $hold['steps'];
+        }
+
+        return (int) $state['max_steps'] - (int) $state['steps'] - $held;
+    }
+
+    /** @param array<string, mixed> $state */
+    private static function costLimit(array $state): ?string
+    {
+        if ($state['mode'] !== 'shared' || $state['max_cost_micros'] === null) {
+            return null;
+        }
+        if ($state['unmetered'] > 0) {
+            return 'cost_unmetered';
+        }
+        $held = 0;
+        foreach ($state['holds'] as $hold) {
+            $held += $hold['cost_micros'];
+        }
+
+        return $state['cost_micros'] >= $state['max_cost_micros'] || $state['max_cost_micros'] - $state['cost_micros'] - $held <= 0
+            ? 'cost' : null;
+    }
+
+    /**
      * Replace a turn's hold with what it spent. `$costMicros` null means the
      * provider reported no cost. A hold already gone (settled, or expired and
      * charged in full) changes nothing.

@@ -246,12 +246,34 @@ class Session
     }
 
     /**
+     * The step ceiling the subagent runner gave this session's child run when
+     * it last started it (G-387): min(its declared max_steps, what the parent
+     * had left, max_steps_ceiling). Re-applied on every turn the runner did
+     * not start, so a child resumed by its host keeps the ceiling it was
+     * given. Null for a session never started as a child, or saved before
+     * the ceiling was kept.
+     *
+     * @internal Read by the runtime for a run the runner did not start.
+     */
+    public function childStepCeiling(): ?int
+    {
+        $saved = $this->savedChild();
+        if ($saved === null || ! array_key_exists('step_ceiling', $saved)) {
+            return null;
+        }
+        $ceiling = $saved['step_ceiling'];
+
+        // A value this runtime could not have written fails closed: no steps.
+        return is_int($ceiling) && $ceiling >= 0 ? $ceiling : 0;
+    }
+
+    /**
      * @internal Written by the runtime when the subagent runner starts a child run.
      *
      * @param  array{session: string, plan: string}|null  $planLedger
      * @param  array{session: string, run: string}|null  $tree
      */
-    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null): self
+    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null, ?int $stepCeiling = null): self
     {
         $this->assertWritableResolution();
         $child = [
@@ -266,6 +288,9 @@ class Session
         }
         if ($tree !== null) {
             $child['tree'] = $tree;
+        }
+        if ($stepCeiling !== null) {
+            $child['step_ceiling'] = max(0, $stepCeiling);
         }
         // Under a key of its own (G-381): the session's durable record holds
         // host state, such as capabilities, that another process may change

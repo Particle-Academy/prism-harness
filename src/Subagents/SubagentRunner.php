@@ -111,8 +111,10 @@ final readonly class SubagentRunner
 
         // A child that has been narrowed to nothing is refused rather than run:
         // a zero-step budget can only produce an empty answer, and an empty
-        // answer reads to the parent like the work was done.
-        if ($childContext->budget->maxSteps < 1) {
+        // answer reads to the parent like the work was done. In the ledger's
+        // unit: the budget is a ceiling on the tree's running count, so what
+        // the child may take is what that ceiling leaves above it (G-387).
+        if ($childContext->budget->maxSteps - $context->ledger->steps() < 1) {
             return SubagentResult::refused(
                 $subagent->name,
                 $childRunId,

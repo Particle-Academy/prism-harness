@@ -349,15 +349,19 @@ it('does not charge a shared plan for a turn while its step is claimed by no run
         ->and(G360::session()->plan()->budget()['steps'])->toBe(0);
 });
 
-it('refuses an approval a spent shared budget cannot run, records nothing, and blocks the plan once', function (): void {
+// A decision on a step whose shared budget was spent on its last step is
+// accepted and acted on (G-387): acting takes no model step, so the spent
+// plan grants 0 steps, not a refusal. Then the plan blocks once.
+it('acts on an approval a spent shared budget holds, with no model step, and blocks the plan once', function (): void {
     Event::fake([PlanBudgetExhausted::class]);
     $held = g366Held(1);
     $before = count(Http::recorded());
 
-    expect(fn () => G360::session()->approve($held))->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
-    expect(G360::session()->thread()->pendingApprovalIds())->toBe([$held])
-        ->and($this->weatherRan)->toBe(0)
-        ->and(count(Http::recorded()))->toBe($before);
+    expect(fn () => G360::session()->approve($held))->toThrow(RunNotPermitted::class, 'step budget exhausted');
+    expect(G360::session()->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->weatherRan)->toBe(1)
+        ->and(count(Http::recorded()))->toBe($before)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(1);
 
     $outcome = G360::session()->plan()->advance();
     expect($outcome->status)->toBe('blocked')
@@ -365,12 +369,7 @@ it('refuses an approval a spent shared budget cannot run, records nothing, and b
     Event::assertDispatchedTimes(PlanBudgetExhausted::class, 1);
     expect(G360::session()->plan()->advance()->status)->toBe('not_active');
     Event::assertDispatchedTimes(PlanBudgetExhausted::class, 1);
-
-    // Still refused once the plan is blocked: the call never runs outside the budget.
-    expect(fn () => G360::session()->decide([new ToolApprovalResponse($held, true)]))
-        ->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
-    expect(G360::session()->thread()->pendingApprovalIds())->toBe([$held])
-        ->and($this->weatherRan)->toBe(0)
+    expect($this->weatherRan)->toBe(1)
         ->and(count(Http::recorded()))->toBe($before);
 });
 
@@ -432,14 +431,15 @@ it('charges a child resumed outside the runner to the shared plan budget it was 
         ->and(G360::session()->plan()->budget()['steps'])->toBe(5);
 });
 
-it('refuses, recording nothing, an approval for a child whose shared plan budget is spent', function (): void {
+it('acts on an approval for a child whose shared plan budget is spent, with no model step', function (): void {
     [$child, $id] = g366PausedChild(4);
     $before = count(Http::recorded());
 
-    expect(fn () => $child->approve($id))->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
-    expect($child->thread()->pendingApprovalIds())->toBe([$id])
-        ->and($this->weatherRan)->toBe(0)
-        ->and(count(Http::recorded()))->toBe($before);
+    expect(fn () => $child->approve($id))->toThrow(RunNotPermitted::class, 'step budget exhausted');
+    expect($child->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->weatherRan)->toBe(1)
+        ->and(count(Http::recorded()))->toBe($before)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(4);
 });
 
 it('charges a host-supplied run context on a resumed child to the shared plan budget, never around it', function (): void {
@@ -452,15 +452,16 @@ it('charges a host-supplied run context on a resumed child to the shared plan bu
         ->and(G360::session()->plan()->budget()['steps'])->toBe(5);
 });
 
-it('refuses, recording nothing, a host-supplied run context on a child whose shared plan budget is spent', function (): void {
+it('acts on a host-supplied run context on a child whose shared plan budget is spent, with no model step', function (): void {
     [$child, $id] = g366PausedChild(4);
     $before = count(Http::recorded());
 
     expect(fn () => $child->approve($id, true, null, RunContext::root('host_root', new RunBudget(100))))
-        ->toThrow(RunNotPermitted::class, 'plan_budget_exhausted');
-    expect($child->thread()->pendingApprovalIds())->toBe([$id])
-        ->and($this->weatherRan)->toBe(0)
-        ->and(count(Http::recorded()))->toBe($before);
+        ->toThrow(RunNotPermitted::class, 'step budget exhausted');
+    expect($child->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->weatherRan)->toBe(1)
+        ->and(count(Http::recorded()))->toBe($before)
+        ->and(G360::session()->plan()->budget()['steps'])->toBe(4);
 });
 
 it('charges a new message to a child session to the shared plan budget it was started under', function (): void {

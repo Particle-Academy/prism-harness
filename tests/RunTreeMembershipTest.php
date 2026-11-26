@@ -338,11 +338,13 @@ it('holds a resumed root to its tree record, so the tree never spends past its a
     $searches = $this->searches;
     $requests = count(Http::recorded());
 
-    // Spent, the tree refuses the parked child before anything is recorded.
-    expect(fn () => $child->approve($pending[0]))->toThrow(RunNotPermitted::class)
-        ->and($child->thread()->pendingApprovalIds())->toBe($pending)
-        ->and($this->searches)->toBe($searches)
-        ->and(count(Http::recorded()))->toBe($requests);
+    // Spent, the tree grants the parked child 0 steps (G-387): it acts on
+    // its decision with no model step, and the tree spends nothing more.
+    expect(fn () => $child->approve($pending[0]))->toThrow(RunNotPermitted::class, 'step budget exhausted')
+        ->and($child->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->searches)->toBe($searches + 1)
+        ->and(count(Http::recorded()))->toBe($requests)
+        ->and(g381TreeRecord(g381Session('Ada'), $firstRun)['steps'])->toBe($record['max_steps']);
 });
 
 // A resume the spent tree refuses still begins a run, and the session keeps

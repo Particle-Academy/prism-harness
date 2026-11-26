@@ -46,6 +46,7 @@ use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Harness\Subagents\CallBudget;
 use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunBudget;
+use Prism\Harness\Subagents\RunBudgets;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\StepCalls;
@@ -216,7 +217,9 @@ final readonly class AgentRuntime
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
                 // Which run tree this run belongs to: decided once, here (G-381).
                 $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
-                [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
+                // And how many steps it may take, from facts this runtime holds (G-387).
+                [$facts, $paused] = $this->ownFacts($session, $mode, $context, $prompt);
+                [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership, $facts);
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
                 // run the session never started trips its own state guard —
@@ -254,8 +257,8 @@ final readonly class AgentRuntime
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             )));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
-            $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-            $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true);
+            $this->continuePausedSteps($session, $prompt, $context, $run, $runId, $facts, $paused);
+            $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true, facts: $facts);
             $budget = $run->budget;
             $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
             try {
@@ -280,6 +283,25 @@ final readonly class AgentRuntime
     }
 
     /**
+     * Refuse, before any provider call, a run with nothing it may spend and
+     * nothing to act on: the tree's allowance, not this node's wish. The
+     * same check, and the same ending (failed on its budget, or cancelled),
+     * on send, structured and the step stream (G-387), which used to end a
+     * spent run three different ways. A capped run is checked by its call
+     * reservation instead.
+     */
+    private function refuseSpentRun(Session $session, string $runId, RunContext $run, RunBudget $budget): void
+    {
+        $stop = $run->ledger->exhaustion($budget);
+        if (! $run->capped() && $stop !== null && ! $this->actsOnDecisionsFirst($session, $run, $budget)) {
+            $refusal = $run->ledger->refusal($stop);
+            $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
+
+            throw $refusal;
+        }
+    }
+
+    /**
      * @param  list<string>|null  $toolNames
      * @param  array<array-key, mixed>  $attachments
      */
@@ -296,17 +318,7 @@ final readonly class AgentRuntime
             harnessAgent: $session->agent(),
         ));
 
-        // The tree's allowance, not this node's wish. A child was already
-        // handed a budget narrowed against what the tree had left when it
-        // was spawned; this re-checks at the moment of spending, because a
-        // sibling may have consumed the remainder in between.
-        $stop = $run->ledger->exhaustion($budget);
-        if (! $run->capped() && $stop !== null && ! $this->actsOnDecisionsFirst($session, $run, $budget)) {
-            $refusal = $run->ledger->refusal($stop);
-            $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
-
-            throw $refusal;
-        }
+        $this->refuseSpentRun($session, $runId, $run, $budget);
 
         try {
             $run = $this->observedRun($run);
@@ -467,7 +479,9 @@ final readonly class AgentRuntime
                 $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
                 // Which run tree this run belongs to: decided once, here (G-381).
                 $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
-                [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
+                // And how many steps it may take, from facts this runtime holds (G-387).
+                [$facts, $paused] = $this->ownFacts($session, $mode, $context, $prompt);
+                [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership, $facts);
             } catch (Throwable $failure) {
                 // As in send(): no run exists yet, so there is no run state to
                 // fail — only an event to fire.
@@ -498,8 +512,8 @@ final readonly class AgentRuntime
                 maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
             )));
             $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
-            $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-            $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true);
+            $this->continuePausedSteps($session, $prompt, $context, $run, $runId, $facts, $paused);
+            $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true, facts: $facts);
             $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
             try {
                 return $this->sendStructuredRun($session, $prompt, $schema, $toolNames, $attachments, $runId, $mode, $provider, $model, $run);
@@ -528,13 +542,7 @@ final readonly class AgentRuntime
             harnessAgent: $session->agent(),
         ));
 
-        $stop = $run->ledger->exhaustion($budget);
-        if (! $run->capped() && $stop !== null && ! $this->actsOnDecisionsFirst($session, $run, $budget)) {
-            $refusal = $run->ledger->refusal($stop);
-            $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
-
-            throw $refusal;
-        }
+        $this->refuseSpentRun($session, $runId, $run, $budget);
 
         try {
             $run = $this->observedRun($run);
@@ -906,7 +914,9 @@ final readonly class AgentRuntime
         $runId = $tagger->claimRunId();
         // Which run tree this run belongs to: decided once, here (G-381).
         $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
-        [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
+        // And how many steps it may take, from facts this runtime holds (G-387).
+        [$facts, $paused] = $this->ownFacts($session, $mode, $context, $prompt);
+        [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership, $facts);
         $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxSeconds: $this->nullableIntConfig('max_seconds'),
@@ -917,8 +927,8 @@ final readonly class AgentRuntime
         if ($session->resumesCancelledRun($prompt)) {
             throw RunNotPermitted::cancelled();
         }
-        $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-        $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: false);
+        $this->continuePausedSteps($session, $prompt, $context, $run, $runId, $facts, $paused);
+        $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: false, facts: $facts);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $resumedFrom = $this->resumedFrom($session, $prompt);
@@ -930,6 +940,15 @@ final readonly class AgentRuntime
         event($tagger->resuming()
             ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
             : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+        try {
+            $this->refuseSpentRun($session, $runId, $run, $run->budget);
+        } catch (Throwable $refused) {
+            $unwatch();
+            $this->rememberSeq($session, $runId, $tagger);
+            ToolRefusals::forget($runId);
+
+            throw $refused;
+        }
         $recorded = false;
         $finish = FinishReason::Unknown;
         $steps = 0;
@@ -1017,7 +1036,9 @@ final readonly class AgentRuntime
         $runId = $tagger->claimRunId();
         // Which run tree this run belongs to: decided once, here (G-381).
         $membership = app(RunTrees::class)->begin($session, $runId, $context, $prompt);
-        [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership);
+        // And how many steps it may take, from facts this runtime holds (G-387).
+        [$facts, $paused] = $this->ownFacts($session, $mode, $context, $prompt);
+        [$provider, $model] = $this->bindingFor($session, $mode, $context, $membership, $facts);
         $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
             maxSteps: $this->ceilingFor($session, $mode),
             maxCostUsd: $this->floatConfig('max_cost_usd'),
@@ -1029,8 +1050,8 @@ final readonly class AgentRuntime
         if ($session->resumesCancelledRun($prompt)) {
             throw RunNotPermitted::cancelled();
         }
-        $this->continuePausedSteps($session, $prompt, $context, $run, $runId);
-        $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: false);
+        $this->continuePausedSteps($session, $prompt, $context, $run, $runId, $facts, $paused);
+        $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: false, facts: $facts);
         $tagger->bind($session->key(), $runId, $run->parentRunId, $run->rootRunId(), $session->agent());
         $tagger->history(fn (): iterable => $session->thread()->messages());
         $resumedFrom = $this->resumedFrom($session, $prompt);
@@ -1687,7 +1708,8 @@ final readonly class AgentRuntime
     {
         // Materialised once: the thread and the observers both read it.
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
-        $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools));
+        $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
+            app(RunTrees::class)->parkFacts($runId));
         // AFTER the durable record, so an observer can never lose a turn the
         // thread kept, and its failure (isolated in MemoryHooks) cannot undo one.
         app(MemoryHooks::class)->recorded($session, $runId, $messages);
@@ -1908,28 +1930,78 @@ final readonly class AgentRuntime
     }
 
     /**
-     * Steps the paused run has already taken, when this turn resumes it.
+     * The facts a run's own allowance is computed from (G-387), before its
+     * tree and plan grants, and whether the turn resumes a parked run. Read
+     * once, when the run begins; see {@see RunBudgets::allowance()}.
      *
-     * A resume (an empty prompt with an approval waiting at the tail) is the
-     * same run, so it continues that run's step count and never opens a new
-     * allowance. A new prompt is a new run. A child run is left alone: its
-     * steps are already on the tree ledger its caller passes back in.
+     *  - `used`: what the parked run this turn resumes wrote it had used, on
+     *    the row it parked on, children included, for ANY turn that resumes
+     *    one except a runner start (no context, metadata or host). Never less
+     *    than the run's own transcript rows show it took: a row forged lower
+     *    gains nothing. A row written before the count was kept is counted
+     *    from the transcript; one holding a value this runtime could not
+     *    have written fails closed, with nothing left.
+     *  - `saved_ceiling`: the ceiling the runner saved with a child, for any
+     *    turn the runner did not start.
+     *  - `context_left`: what the runner's or the host's context has left.
+     *  - `steps_ceiling`: `max_steps_ceiling` for a named agent's session, and
+     *    for a workflow node the session's own ceiling too: on the run's whole
+     *    count, so a node resumed after an approval continues it.
+     *
+     * @return array{0: array<string, mixed>, 1: bool}
      */
-    private function pausedSteps(Session $session, string $prompt, ?RunContext $context, string $runId): int
+    private function ownFacts(Session $session, AgentMode $mode, ?RunContext $context, string $prompt): array
     {
-        if ($prompt !== '' || $context !== null) {
-            return 0;
+        $kind = app(RunTrees::class)->contextKind($context);
+        $cap = $session->agent() === null ? null : $this->nullableIntConfig('max_steps_ceiling', $session);
+        if ($context !== null && $context->workflowNode) {
+            $own = $this->ceilingFor($session, $mode);
+            $cap = $cap === null ? $own : min($cap, $own);
         }
-        $steps = $session->thread()->approvalRunSteps();
-        if ($steps !== null) {
-            // A call nobody answered is refused by the resume; record that a
-            // person did not approve it, as for a denial.
-            foreach ($session->thread()->unansweredApprovals() as $call) {
-                $this->emitToolDecision(ToolDenied::class, $session, $runId, $this->declaredTool($session, $call['name']), $call['name'], $call['arguments'], 'person');
-            }
+        $state = 'none';
+        $used = 0;
+        if ($kind !== 'runner' && $prompt === '') {
+            [$state, $written] = $session->thread()->pausedStepsUsed();
+            $recount = $state === 'none' ? 0 : ($session->thread()->approvalRunSteps() ?? 0);
+            $used = match ($state) {
+                'valid' => max((int) $written, $recount),
+                'absent' => $recount,
+                default => 0,
+            };
+        }
+        $facts = [
+            'context' => $kind,
+            'mode_steps' => $this->ceilingFor($session, $mode),
+            'saved_ceiling' => $kind === 'runner' ? null : $session->childStepCeiling(),
+            'context_left' => $context === null ? null : max(0, $context->budget->maxSteps - $context->ledger->steps()),
+            'steps_ceiling' => $cap,
+            'used' => $used,
+            'tree_left' => null,
+            'plan_left' => null,
+            'took' => 0,
+        ];
+        if ($state === 'invalid') {
+            // FAIL CLOSED: the run has used its whole ceiling.
+            $ceiling = $this->allowanceOf($facts)['ceiling'];
+            $facts['saved_ceiling'] = $ceiling;
+            $facts['used'] = $ceiling;
         }
 
-        return $steps ?? 0;
+        return [$facts, $state !== 'none'];
+    }
+
+    /**
+     * @param  array<string, mixed>  $facts
+     * @return array{ceiling: int, used: int, own_left: int, tree_left: ?int, plan_left: ?int, allowance: int, acts_without_step: bool, used_at_park: int, left_at_park: int}
+     */
+    private function allowanceOf(array $facts): array
+    {
+        $result = RunBudgets::allowance($facts);
+        if (! isset($result['allowance'])) {
+            throw new \LogicException('A run began with no step allowance.');
+        }
+
+        return $result['allowance'];
     }
 
     /**
@@ -1938,18 +2010,44 @@ final readonly class AgentRuntime
      * after the run began closes the run first: a refusal as every other
      * budget refusal does, and a store or lock error as a failed run.
      *
+     * Then the run's step allowance (G-387), computed ONCE from its own facts
+     * and the tree's and the plan's grants, each asked for no more than the
+     * run itself has left in one locked write, recorded beside the run's
+     * membership, and the run narrowed to it: every consumer reads that.
+     *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
+     * @param  array<string, mixed>  $facts
      */
-    private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, array $membership, bool $begun): RunContext
+    private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, array $membership, bool $begun, array $facts): RunContext
     {
         try {
+            $trees = app(RunTrees::class);
+            $plans = app(Plans::class);
+            $own = $this->allowanceOf($facts)['own_left'];
             // A root run opens a tree; any turn on a child session the runner
             // did not start continues the run tree it was started in, a host
             // context narrowed to what that tree has left. Read from the
             // membership the run began with.
-            $run = app(RunTrees::class)->rootRun($session, $runId, $run, $membership);
+            $run = $trees->rootRun($session, $runId, $run, $membership, $own);
+            $facts['tree_left'] = $trees->treeGrant($runId);
+            $run = $plans->planTurn($session, $runId, $run, $context, $prompt, min($own, $facts['tree_left'] ?? $own));
+            $facts['plan_left'] = $plans->planGrant($runId);
 
-            return app(Plans::class)->planTurn($session, $runId, $run, $context, $prompt);
+            $allowance = $this->allowanceOf($facts);
+            $base = $run->ledger->steps();
+            $budget = $run->budget;
+            // The same context when the allowance is already its limit: a
+            // host's own context stays the object it handed in.
+            $run = $budget->maxSteps === $base + $allowance['allowance'] ? $run : $run->withBudget(new RunBudget(
+                maxSteps: $base + $allowance['allowance'],
+                maxCostUsd: $budget->maxCostUsd,
+                maxSeconds: $budget->maxSeconds,
+                maxOutputTokensPerCall: $budget->maxOutputTokensPerCall,
+                maxToolCalls: $budget->maxToolCalls,
+            ));
+            $trees->recordAllowance($runId, $run, $allowance, $base);
+
+            return $run;
         } catch (Throwable $failure) {
             if (! $begun || ($failure instanceof SessionLockLost && $failure->isWriteRejected())) {
                 // No run state to close, so nothing else settles what the
@@ -1976,9 +2074,26 @@ final readonly class AgentRuntime
         }
     }
 
-    private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run, string $runId): void
+    /**
+     * A root with no context opens a ledger of its own: it starts at what the
+     * parked run it resumes had used, so the run's count (and the reason it
+     * stops on) continues that run's. A resume with no context also records
+     * that a person did not approve any call nobody answered, as for a
+     * denial: the resume refuses it.
+     *
+     * @param  array<string, mixed>  $facts
+     */
+    private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run, string $runId, array $facts, bool $paused): void
     {
-        $run->ledger->recordSteps($this->pausedSteps($session, $prompt, $context, $runId));
+        if ($context !== null || $prompt !== '') {
+            return;
+        }
+        $run->ledger->recordSteps((int) $facts['used']);
+        if ($paused) {
+            foreach ($session->thread()->unansweredApprovals() as $call) {
+                $this->emitToolDecision(ToolDenied::class, $session, $runId, $this->declaredTool($session, $call['name']), $call['name'], $call['arguments'], 'person');
+            }
+        }
     }
 
     /**
@@ -2180,7 +2295,7 @@ final readonly class AgentRuntime
      */
     public function flowRun(?Session $session, RunContext $run): RunContext
     {
-        return $this->observedRun($session === null ? $run : $this->boundedAgentRun($session, $run));
+        return $this->observedRun($session === null ? $run : $this->boundedAgentRun($session, $run, steps: true));
     }
 
     /**
@@ -2198,19 +2313,26 @@ final readonly class AgentRuntime
         return max(0, $run->budget->maxSteps - $run->ledger->steps());
     }
 
-    private function boundedAgentRun(Session $session, RunContext $run): RunContext
+    /**
+     * The run labelled with the session's named agent and held to its output
+     * limit. A harness run's steps are its allowance ({@see self::planRun()}),
+     * which applies `max_steps_ceiling` to the run's whole count; only a
+     * workflow model call (`$steps`), which has no allowance of its own, is
+     * held to it here, from the workflow ledger's count.
+     */
+    private function boundedAgentRun(Session $session, RunContext $run, bool $steps = false): RunContext
     {
         // The label comes from the SESSION, so every run — a delegated child
         // included — charges the agent it actually runs as.
         if ($session->agent() === null) {
             return $run->agent === null && $run->agentCeilingUsd === null ? $run : $run->forAgent(null, null);
         }
-        $steps = $this->nullableIntConfig('max_steps_ceiling', $session);
+        $stepCeiling = $steps ? $this->nullableIntConfig('max_steps_ceiling', $session) : null;
         $output = $this->nullableIntConfig('max_output_tokens_per_call', $session);
         $budget = $run->budget;
 
         return $run->withBudget(new RunBudget(
-            maxSteps: $steps === null ? $budget->maxSteps : min($budget->maxSteps, $run->ledger->steps() + $steps),
+            maxSteps: $stepCeiling === null ? $budget->maxSteps : min($budget->maxSteps, $run->ledger->steps() + $stepCeiling),
             maxCostUsd: $budget->maxCostUsd,
             maxSeconds: $budget->maxSeconds,
             maxOutputTokensPerCall: $output === null ? $budget->maxOutputTokensPerCall : min($budget->maxOutputTokensPerCall ?? $output, $output),
@@ -2260,9 +2382,10 @@ final readonly class AgentRuntime
      * the child session's own override slot is not read.
      *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
+     * @param  array<string, mixed>  $facts  the run's own step facts (G-387)
      * @return array{string, string}
      */
-    private function bindingFor(Session $session, AgentMode $mode, ?RunContext $context, array $membership): array
+    private function bindingFor(Session $session, AgentMode $mode, ?RunContext $context, array $membership, array $facts): array
     {
         // A child's binding is SAVED with its session, inside the lock, so a
         // run on that session the runner did not start (the host answering an
@@ -2318,9 +2441,14 @@ final readonly class AgentRuntime
                 $session->childPlanLedger(),
                 $trees->treeCancelled($session, $savedTree),
             );
+            // The step ceiling the runner gave it (G-387): the ceiling of this
+            // runner start's allowance, re-applied on every turn the runner
+            // does not start. A runner start overwrites it.
+            $ceiling = $this->allowanceOf($facts)['ceiling'];
             if ($saved != $child || $session->childDepth() !== $membership['depth']
-                || $session->childPlanLedger() !== $refs['plan_ledger'] || $savedTree !== $refs['tree']) {
-                $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree']);
+                || $session->childPlanLedger() !== $refs['plan_ledger'] || $savedTree !== $refs['tree']
+                || $session->childStepCeiling() !== $ceiling) {
+                $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling);
             }
         }
 

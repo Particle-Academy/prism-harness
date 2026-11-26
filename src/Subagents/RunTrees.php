@@ -49,9 +49,21 @@ final class RunTrees
      * childStarted, the kept references, the depth and the budget route read;
      * a child the runner starts takes its parent's from here.
      *
-     * @var array<string, array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string, session: string, ledger: RunLedger}>
+     * The allowance the run was given when it began (G-387) is kept here
+     * too, beside the ledger count it was given at, once it is known: what
+     * the run writes on the row it parks on, and what childStarted holds.
+     *
+     * @var array<string, array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string, session: string, ledger: RunLedger, allowance?: array{ceiling: int, used: int, own_left: int, tree_left: ?int, plan_left: ?int, allowance: int, acts_without_step: bool, used_at_park: int, left_at_park: int}, base?: int}>
      */
     private array $members = [];
+
+    /**
+     * The steps each run's tree record granted it when it began, by run id;
+     * null when no durable tree record bounds the run.
+     *
+     * @var array<string, ?int>
+     */
+    private array $grants = [];
 
     /**
      * Which run tree a run that is beginning belongs to (G-381), from facts
@@ -93,13 +105,19 @@ final class RunTrees
      *
      * @internal Called by the runtime once a run's budget is known.
      *
+     * `$steps` is what the run itself has left (its own allowance): the hold
+     * asks for that and no more, in one locked write. A tree with no steps
+     * left grants 0, not a refusal: the run acts on the decisions it resumes
+     * with no model step (G-387). Only a spent COST limit refuses.
+     *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
      *
-     * @throws RunNotPermitted when the tree the child belongs to is spent or cancelled
+     * @throws RunNotPermitted when the tree the child belongs to is cancelled, or its cost is spent
      */
-    public function rootRun(Session $session, string $runId, RunContext $run, array $membership): RunContext
+    public function rootRun(Session $session, string $runId, RunContext $run, array $membership, ?int $steps = null): RunContext
     {
         $this->members[$runId] = [...$membership, 'session' => $session->key(), 'ledger' => $run->ledger];
+        $this->grants[$runId] = null;
         $route = $membership['route'];
         if ($route !== 'open' && $route !== 'continue') {
             return $run;
@@ -141,21 +159,22 @@ final class RunTrees
         $turnCost = $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost']));
         $now = time();
         $ttl = self::holdTtl();
-        $steps = max(0, $budget->maxSteps - $entry['steps']);
+        $steps = max(0, $steps ?? ($budget->maxSteps - $entry['steps']));
         $grant = $this->write($session->planStore(), $tree, static function (?array $state) use ($runId, $steps, $turnCost, $now, $ttl): array {
             if ($state === null) {
                 // The tree's record is gone: closed, never a fresh budget.
-                return [null, ['refused' => PlanBudget::EXHAUSTED, 'limit' => 'steps']];
+                return [null, ['steps' => 0, 'cost_micros' => null]];
             }
 
-            return PlanBudget::reserve($state, $runId, $steps, $turnCost, $now, $ttl);
+            return PlanBudget::grantSteps($state, $runId, $steps, $turnCost, $now, $ttl);
         });
         if (isset($grant['refused'])) {
-            // A resumed root whose tree is spent still acts on the decisions
-            // the person gave it: resolving them takes no model step, so it
-            // cannot overspend. It holds nothing and is narrowed to no further
-            // step, and the step check after the resolution stops it.
+            // A spent COST limit (steps never refuse, G-387). A resumed root
+            // still acts on the decisions the person gave it: resolving them
+            // takes no model step, so it cannot overspend. It holds nothing
+            // and is narrowed to no further step.
             if ($resumedRoot && $session->thread()->decidedCallsAwaitingResult()) {
+                $this->grants[$runId] = 0;
                 $spent = $run->withBudget(new RunBudget(
                     maxSteps: $entry['steps'],
                     maxCostUsd: $budget->maxCostUsd,
@@ -171,6 +190,7 @@ final class RunTrees
             throw RunNotPermitted::exhausted((string) $grant['limit']);
         }
 
+        $this->grants[$runId] = (int) $grant['steps'];
         $narrowed = $run->withBudget(new RunBudget(
             maxSteps: $entry['steps'] + (int) $grant['steps'],
             maxCostUsd: $grant['cost_micros'] === null ? $budget->maxCostUsd : $entry['cost'] + $grant['cost_micros'] / 1_000_000,
@@ -178,9 +198,69 @@ final class RunTrees
             maxOutputTokensPerCall: $budget->maxOutputTokensPerCall,
             maxToolCalls: $budget->maxToolCalls,
         ));
-        $this->runs[$runId] = [...$entry, 'budget' => $narrowed->budget, 'ledger' => $narrowed->ledger, 'held' => true];
+        // A grant of 0 holds nothing, so there is nothing to settle.
+        $this->runs[$runId] = [...$entry, 'budget' => $narrowed->budget, 'ledger' => $narrowed->ledger, 'held' => (int) $grant['steps'] > 0];
 
         return $narrowed;
+    }
+
+    /**
+     * What the run's tree record granted it when it began; null when no
+     * durable tree record bounds it (an open root with no record yet, the
+     * host's tree, none).
+     *
+     * @internal Read by the runtime once, to compute the run's allowance.
+     */
+    public function treeGrant(string $runId): ?int
+    {
+        return $this->grants[$runId] ?? null;
+    }
+
+    /**
+     * The run's allowance, computed once when it began (G-387), recorded
+     * beside its membership with the ledger count it was given at. The run
+     * was narrowed to exactly it; an open root's in-memory entry takes the
+     * narrowed budget, so the hold it opens its tree's record with is it.
+     *
+     * @internal Called by the runtime once per run.
+     *
+     * @param  array{ceiling: int, used: int, own_left: int, tree_left: ?int, plan_left: ?int, allowance: int, acts_without_step: bool, used_at_park: int, left_at_park: int}  $allowance
+     */
+    public function recordAllowance(string $runId, RunContext $run, array $allowance, int $base): void
+    {
+        if (isset($this->members[$runId])) {
+            $this->members[$runId]['allowance'] = $allowance;
+            $this->members[$runId]['base'] = $base;
+        }
+        if (isset($this->runs[$runId])) {
+            $this->runs[$runId]['budget'] = $run->budget;
+            $this->runs[$runId]['ledger'] = $run->ledger;
+        }
+    }
+
+    /**
+     * What a run writes on the row it parks on (G-387): the steps it has
+     * used, its children included (what its ledger gained since it began,
+     * added to what its parked predecessor used), and what its allowance
+     * has left. Null for a run with no recorded allowance.
+     *
+     * @internal
+     *
+     * @return array{harness_steps_used: int, harness_steps_left: int}|null
+     */
+    public function parkFacts(string $runId): ?array
+    {
+        $member = $this->members[$runId] ?? null;
+        if ($member === null || ! isset($member['allowance'], $member['base'])) {
+            return null;
+        }
+        $took = max(0, $member['ledger']->steps() - $member['base']);
+        $taken = min($took, $member['allowance']['allowance']);
+
+        return [
+            'harness_steps_used' => $member['allowance']['used'] + $took,
+            'harness_steps_left' => $member['allowance']['allowance'] - $taken,
+        ];
     }
 
     /**
@@ -215,9 +295,11 @@ final class RunTrees
         $entry = $key === null ? null : ($this->runs[$key] ?? null);
         if ($entry !== null && ! $entry['held']) {
             $budget = $entry['budget'];
+            // The spending run's allowance, recorded when it began (G-387).
+            $allowance = $this->members[$key]['allowance']['allowance'] ?? max(0, $budget->maxSteps - $entry['steps']);
             $settings = [
                 'mode' => 'shared',
-                'max_steps' => max(0, $budget->maxSteps - $entry['steps']),
+                'max_steps' => $allowance,
                 'max_cost_micros' => $budget->maxCostUsd === null ? null : PlanBudget::micros(max(0.0, $budget->maxCostUsd - $entry['cost'])),
             ];
             $now = time();
@@ -242,9 +324,15 @@ final class RunTrees
     }
 
     /**
-     * Refuse, before anything is recorded, a decision on a child session
-     * whose run tree has nothing left: recorded, it would be consumed by a
-     * resume the tree then refuses, and the approved call would never run.
+     * Refuse, before anything is recorded, a decision the run it resumes
+     * could not act on at all: recorded, it would be consumed by a resume
+     * the tree then refuses, and the approved call would never run.
+     *
+     * A tree with no STEPS left never refuses a decision (G-387): acting on
+     * it takes no model step, and the resume acts on it with an allowance of
+     * 0. Only a cancelled tree refuses, and, for a child continuing a tree,
+     * a spent cost limit, which the resume also refuses: the same answer
+     * {@see PlanBudget::grantSteps()} gives it.
      *
      * @internal Called by the session before it records decisions.
      *
@@ -276,12 +364,13 @@ final class RunTrees
         } elseif ($membership['route'] !== 'continue') {
             return;
         }
-        if ($state === null) {
-            throw RunNotPermitted::exhausted('steps');
+        if ($this->treeCancelled($session, $tree)) {
+            throw RunNotPermitted::cancelled();
         }
-        [, $grant] = PlanBudget::reserve($state, 'decision', 1, null, time(), self::holdTtl());
-        if (isset($grant['refused'])) {
-            throw RunNotPermitted::exhausted((string) $grant['limit']);
+        // A record that is gone grants 0 steps: the resume acts on the decision.
+        $refused = $state === null ? null : PlanBudget::decisionRefusal($state, time(), self::holdTtl());
+        if ($refused !== null) {
+            throw RunNotPermitted::exhausted($refused);
         }
     }
 
@@ -293,7 +382,7 @@ final class RunTrees
      */
     public function finished(Session $session, string $runId): void
     {
-        unset($this->members[$runId]);
+        unset($this->members[$runId], $this->grants[$runId]);
         $entry = $this->runs[$runId] ?? null;
         if ($entry === null || $entry['session'] !== $session->key()) {
             return;

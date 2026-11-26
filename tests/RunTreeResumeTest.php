@@ -89,13 +89,16 @@ it('resumes a child outside the runner on what its run tree has left, not a fres
         ->and(count(Http::recorded()) - $before)->toBe(1);
 });
 
-it('refuses, recording nothing, an approval for a child whose run tree is spent', function (): void {
+// A spent tree grants 0 steps, never a refusal of the decision (G-387):
+// the approved call runs, nothing asks the model, and the run ends on its
+// spent budget.
+it('acts on an approval for a child whose run tree is spent, with no model step', function (): void {
     [$child, $id] = treePausedChild(3);
     $before = count(Http::recorded());
 
-    expect(fn () => $child->approve($id))->toThrow(RunNotPermitted::class);
-    expect($child->thread()->pendingApprovalIds())->toBe([$id])
-        ->and($this->weatherRan)->toBe(0)
+    expect(fn () => $child->approve($id))->toThrow(RunNotPermitted::class, 'step budget exhausted');
+    expect($child->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->weatherRan)->toBe(1)
         ->and(count(Http::recorded()))->toBe($before);
 });
 
@@ -153,14 +156,14 @@ it('narrows a host-supplied run context on a resumed child to what its run tree 
         ->and(count(Http::recorded()) - $before)->toBe(1);
 });
 
-it('refuses, recording nothing, a host-supplied run context on a child whose run tree is spent', function (): void {
+it('acts on a host-supplied run context on a child whose run tree is spent, with no model step', function (): void {
     [$child, $id] = treePausedChild(3);
     $before = count(Http::recorded());
 
     expect(fn () => $child->approve($id, true, null, RunContext::root('host_root', new RunBudget(100))))
-        ->toThrow(RunNotPermitted::class);
-    expect($child->thread()->pendingApprovalIds())->toBe([$id])
-        ->and($this->weatherRan)->toBe(0)
+        ->toThrow(RunNotPermitted::class, 'step budget exhausted');
+    expect($child->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->weatherRan)->toBe(1)
         ->and(count(Http::recorded()))->toBe($before);
 });
 
