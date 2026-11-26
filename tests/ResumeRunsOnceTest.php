@@ -25,8 +25,8 @@ use Tests\Fixtures\Participant;
 // no longer cause a second run (core 0.155 reports a listener's failure instead
 // of letting it escape), and the harness records what the resolution produced
 // on the routes where core's own record lost it: a structured turn, a plain
-// stream that is abandoned, or that stops on a tool's own exception, and the
-// step-by-step paths when a tool's own exception stops the resolution.
+// stream that is abandoned, and any turn, on any path, that a tool's own
+// exception stops during the resolution or on a later step.
 //
 // Telemetry stays where 0.26.7 put it: on the plain paths core resolves the
 // approvals inside its own generation, so each approved call's ToolInvoked
@@ -62,11 +62,25 @@ function resumeSse(string $text): string
         .$line(['index' => 0, 'delta' => (object) [], 'finish_reason' => 'stop'])."data: [DONE]\n\n";
 }
 
+function resumeSseCall(string $id, string $name, string $arguments): string
+{
+    $line = fn (array $choice): string => 'data: '.json_encode(['id' => 's', 'model' => 'gpt-4o', 'choices' => [$choice]])."\n\n";
+
+    return $line(['index' => 0, 'delta' => ['role' => 'assistant', 'content' => null, 'tool_calls' => [['index' => 0, 'id' => $id, 'type' => 'function', 'function' => ['name' => $name, 'arguments' => $arguments]]]], 'finish_reason' => null])
+        .$line(['index' => 0, 'delta' => (object) [], 'finish_reason' => 'tool_calls'])."data: [DONE]\n\n";
+}
+
 /**
  * Park a run on approvals, resume it by $route, then send(''): what ran, and
  * where each approved call's ToolInvoked landed.
  *
- * @return array{runs: array<string, int>, events: list<array{tool: string, at_dispatch: string, op: string|null}>, failures: list<string>}
+ * $route 'raw …': the weather tool is built withoutErrorHandling() and
+ * throws once. 'raw', 'raw stream' and 'raw structured' resolve two approved
+ * calls (search, then weather) and weather throws inside the resolution; 'raw
+ * later' and 'raw later stream' resolve one (search) and weather, which needs
+ * no approval, throws on the next step of the same turn.
+ *
+ * @return array{runs: array<string, int>, events: list<array{tool: string, at_dispatch: string, op: string|null}>, failures: list<string>, resolvedRows: list<array{results: list<string>, decisions: list<string>}>}
  */
 function resumeScenario(string $route, string $path, string $listener, string $provider = 'openai'): array
 {
@@ -79,9 +93,10 @@ function resumeScenario(string $route, string $path, string $listener, string $p
     config()->set('prism-harness.agent.provider', $provider);
     config()->set('prism-harness.agent.model', $anthropic ? 'm' : 'gpt-4o');
     config()->set('prism-harness.agent.max_cost_usd', null);
-    $two = in_array($route, ['decide2', 'raw', 'raw stream'], true);
+    $two = in_array($route, ['decide2', 'raw', 'raw stream', 'raw structured'], true);
+    $later = str_starts_with($route, 'raw later');
     config()->set('prism-harness.agent.modes.chat.tools', ['search', 'weather']);
-    config()->set('prism-harness.agent.modes.chat.requires_approval', $two ? ['search', 'weather'] : ['weather']);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', $later ? ['search'] : ($two ? ['search', 'weather'] : ['weather']));
     if ($path === 'subagents') {
         config()->set('prism-harness.agent.modes.child', ['system_prompt' => 'A child.', 'tools' => [], 'skills' => [], 'max_steps' => 1]);
         config()->set('prism-harness.agent.modes.chat.subagents', ['run_child' => ['description' => 'Run a child.', 'mode' => 'child', 'max_steps' => 1]]);
@@ -113,14 +128,21 @@ function resumeScenario(string $route, string $path, string $listener, string $p
             return 'sunny';
         }),
     ]);
-    $calls = $two ? [['call_s', 'search', '{"query":"a"}'], ['call_w', 'weather', '{"city":"b"}']] : [['call_w', 'weather', '{"city":"b"}']];
+    $calls = $later ? [['call_s', 'search', '{"query":"a"}']] : ($two ? [['call_s', 'search', '{"query":"a"}'], ['call_w', 'weather', '{"city":"b"}']] : [['call_w', 'weather', '{"city":"b"}']]);
     $queue = [$anthropic ? resumeAnthropic(null, $calls) : resumeChat(null, $calls)];
+    $streams = [];
+    if ($route === 'raw later') {
+        $queue[] = $anthropic ? resumeAnthropic(null, [['call_l', 'weather', '{"city":"c"}']]) : resumeChat(null, [['call_l', 'weather', '{"city":"c"}']]);
+    }
+    if ($route === 'raw later stream') {
+        $streams[] = resumeSseCall('call_l', 'weather', '{"city":"c"}');
+    }
     Http::preventStrayRequests();
-    Http::fake(function (HttpRequest $request) use (&$queue, $anthropic) {
-        $next = array_shift($queue);
+    Http::fake(function (HttpRequest $request) use (&$queue, &$streams, $anthropic) {
         if (($request->data()['stream'] ?? false) === true) {
-            return Http::response(resumeSse('streamed'), 200, ['Content-Type' => 'text/event-stream']);
+            return Http::response(array_shift($streams) ?? resumeSse('streamed'), 200, ['Content-Type' => 'text/event-stream']);
         }
+        $next = array_shift($queue);
         if ($anthropic) {
             return Http::response($next ?? resumeAnthropic('{"ok":true}'));
         }
@@ -155,14 +177,14 @@ function resumeScenario(string $route, string $path, string $listener, string $p
     $record = fn () => $session->thread()->record([new ToolResultMessage(toolApprovalResponses: $decisions)], $session->run()['id'] ?? null);
     try {
         match ($route) {
-            'approve' => $session->approve($pending[0]->approvalId),
+            'approve', 'raw later' => $session->approve($pending[0]->approvalId),
             'decide2', 'raw' => $session->decide($decisions),
             'streamDecision' => iterator_to_array($session->streamDecision($decisions), false),
-            'structured' => (function () use ($record, $session): void {
+            'structured', 'raw structured' => (function () use ($record, $session): void {
                 $record();
                 $session->sendStructured('', new ObjectSchema('answer', 'Answer', [new BooleanSchema('ok', 'Done')], ['ok']));
             })(),
-            'stream', 'raw stream' => (function () use ($record, $session): void {
+            'stream', 'raw stream', 'raw later stream' => (function () use ($record, $session): void {
                 $record();
                 iterator_to_array($session->stream(''), false);
             })(),
@@ -181,13 +203,24 @@ function resumeScenario(string $route, string $path, string $listener, string $p
     } catch (Throwable $e) {
         $failures[] = class_basename($e);
     }
+    // The tool result rows the resolving turn left, before the next turn.
+    $resolvedRows = [];
+    foreach ($session->thread()->storedMessages()->orderBy('id')->get() as $row) {
+        $message = $row->toPrismMessage();
+        if ($message instanceof ToolResultMessage) {
+            $resolvedRows[] = [
+                'results' => array_map(fn ($r) => $r->toolCallId, $message->toolResults),
+                'decisions' => array_map(fn ($d) => $d->approvalId, $message->toolApprovalResponses),
+            ];
+        }
+    }
     try {
         $session->send('');
     } catch (Throwable $e) {
         $failures[] = 'resume '.class_basename($e);
     }
 
-    return ['runs' => $runs, 'events' => $events, 'failures' => $failures];
+    return ['runs' => $runs, 'events' => $events, 'failures' => $failures, 'resolvedRows' => $resolvedRows];
 }
 
 it('runs each approved call once across the resolving turn and the next', function (string $route, string $path, string $listener): void {
@@ -201,9 +234,58 @@ it('runs each approved call once across the resolving turn and the next', functi
     ->with(['plain', 'subagents', 'capped'])
     ->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw', 'telemetry off' => 'off']);
 
-it('runs the earlier call once when a tool throws during a step-path resolution', function (string $path, string $listener): void {
-    expect(resumeScenario('raw', $path, $listener)['runs'])->toBe(['search' => 1, 'weather' => 2]);
-})->with(['subagents', 'capped'])->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw', 'telemetry off' => 'off']);
+// A tool's own exception, during the resolution or on a later step of the
+// same turn, costs no other call a second run, on any path. The call that
+// threw has no result, so it alone is resolved again on the next turn.
+it('runs every call resolved before a tool\'s own exception once', function (string $route, string $provider, string $path, string $listener): void {
+    $result = resumeScenario($route, $path, $listener, $provider);
+    // The call that threw runs again only when a later turn resolves it. On
+    // a later step it is no resolved call, and on a plain structured turn
+    // with OpenAI chat completions (which resolves approvals on the next
+    // turn, not inside the structured one) it throws in the last turn here.
+    $retried = ! str_starts_with($route, 'raw later') && ! ($route === 'raw structured' && $provider === 'openai' && $path === 'plain');
+
+    expect($result['runs'])->toBe(['search' => 1, 'weather' => $retried ? 2 : 1]);
+})->with([
+    'decide, OpenAI' => ['raw', 'openai'],
+    'decide, Anthropic' => ['raw', 'anthropic'],
+    'structured, OpenAI' => ['raw structured', 'openai'],
+    'structured, Anthropic' => ['raw structured', 'anthropic'],
+    'stream, OpenAI' => ['raw stream', 'openai'],
+    'later step, OpenAI' => ['raw later', 'openai'],
+    'later step, Anthropic' => ['raw later', 'anthropic'],
+    'later step, stream' => ['raw later stream', 'openai'],
+])->with(['plain', 'subagents', 'capped'])
+    ->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw', 'telemetry off' => 'off']);
+
+// What a cut-short resolution records is only what is new: no stored row
+// repeats a result or a decision another row already holds. The thread folds
+// consecutive tool result rows into one message, so every call is still
+// answered when the conversation is replayed.
+it('records a cut-short resolution without repeating earlier results or decisions', function (string $route, string $provider, string $path): void {
+    // On the step paths a later step's failure comes after the resolution was
+    // recorded whole, so only the plain path cuts that one short.
+    $rows = resumeScenario($route, $path, 'quiet', $provider)['resolvedRows'];
+    $results = array_merge(...array_column($rows, 'results'));
+    $decisions = array_merge(...array_column($rows, 'decisions'));
+
+    expect($results)->toContain('call_s')
+        ->and(array_count_values($results))->each->toBe(1)
+        ->and(array_count_values($decisions))->each->toBe(1);
+})->with([
+    'decide, OpenAI' => ['raw', 'openai'],
+    'decide, Anthropic' => ['raw', 'anthropic'],
+    'stream, OpenAI' => ['raw stream', 'openai'],
+])->with(['plain', 'subagents', 'capped']);
+
+it('records a later step\'s cut-short resolution on the plain path without repeating anything', function (string $provider): void {
+    $rows = resumeScenario('raw later', 'plain', 'quiet', $provider)['resolvedRows'];
+    $results = array_merge(...array_column($rows, 'results'));
+    $decisions = array_merge(...array_column($rows, 'decisions'));
+
+    expect($results)->toBe(['call_s'])
+        ->and(array_count_values($decisions))->each->toBe(1);
+})->with(['openai', 'anthropic']);
 
 // The structured turn on a provider that resolves approvals inside it.
 it('runs an approved call once across a structured resume', function (string $path, string $listener): void {

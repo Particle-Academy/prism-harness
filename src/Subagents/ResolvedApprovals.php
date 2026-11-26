@@ -20,16 +20,21 @@ use Prism\Prism\ValueObjects\ToolResult;
  * resume runs them again. merged() builds the message core would have built
  * for the results resolved so far, so the harness can record it.
  *
+ * Only what is new is added: a tool result message holding the results that
+ * were missing, and no decision. The messages already there are left as they
+ * are, so nothing stored is repeated. Core reads every tool result message
+ * after an assistant step as one, and the thread replays consecutive tool
+ * result rows as one message, so every call is still answered.
+ *
  * @internal
  */
 final class ResolvedApprovals
 {
     /**
-     * The messages with $resolved merged into the tool results after the last
-     * assistant tool call, as core merges them: every tool result message
-     * after that call is folded into one, at the end. Only results for that
-     * call's own tool calls that have no result yet count, and only when
-     * decisions were recorded after it; null when there is nothing to merge.
+     * The messages with one tool result message added at the end, holding
+     * the results in $resolved for the last assistant step's own tool calls
+     * that have no result yet, and only when decisions were recorded after
+     * it; null when there is nothing to add.
      *
      * @param  list<Message>  $messages
      * @param  list<ToolResult>  $resolved
@@ -48,17 +53,13 @@ final class ResolvedApprovals
         if ($resolved === [] || $assistant === null) {
             return null;
         }
-        $kept = [];
         $results = [];
         $responses = [];
         foreach ($messages as $index => $message) {
             if ($index > $assistant && $message instanceof ToolResultMessage) {
                 $results = [...$results, ...$message->toolResults];
                 $responses = [...$responses, ...$message->toolApprovalResponses];
-
-                continue;
             }
-            $kept[] = $message;
         }
         // Only what core's resolution produces: results for this assistant
         // step's own calls that had no result yet, after decisions were made
@@ -82,8 +83,7 @@ final class ResolvedApprovals
         if ($new === []) {
             return null;
         }
-        $kept[] = new ToolResultMessage([...$results, ...$new], $responses);
 
-        return $kept;
+        return [...$messages, new ToolResultMessage($new)];
     }
 }
