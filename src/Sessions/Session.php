@@ -335,6 +335,72 @@ class Session
         return $this;
     }
 
+    /**
+     * The child record exactly as stored (binding, depth, refs, ceiling and
+     * delegation id), or null when there is none: what a runner start's
+     * commit restores when the start fails before its task row (G-387).
+     *
+     * @internal
+     *
+     * @return array<string, mixed>|null
+     */
+    public function childRecord(): ?array
+    {
+        return $this->durable->get($this->childKey());
+    }
+
+    /**
+     * Put the child record back as {@see self::childRecord()} read it.
+     *
+     * @internal
+     *
+     * @param  array<string, mixed>|null  $record
+     */
+    public function restoreChildRecord(?array $record): void
+    {
+        $this->assertWritableResolution();
+        if ($record === null) {
+            $this->durable->forget($this->childKey());
+        } else {
+            $this->durable->put($this->childKey(), $record);
+        }
+    }
+
+    /**
+     * The session's mode slot as stored: whether it is set, and its value.
+     *
+     * @internal
+     *
+     * @return array{0: bool, 1: mixed}
+     */
+    public function modeSlot(): array
+    {
+        $state = $this->state();
+
+        return [array_key_exists('mode', $state), $state['mode'] ?? null];
+    }
+
+    /**
+     * Put the mode slot back as {@see self::modeSlot()} read it, absent
+     * included, in one write.
+     *
+     * @internal
+     *
+     * @param  array{0: bool, 1: mixed}  $slot
+     */
+    public function restoreModeSlot(array $slot): void
+    {
+        if ($slot[0]) {
+            $this->writeAll(['mode' => $slot[1]]);
+
+            return;
+        }
+        $this->assertWritableResolution();
+        $state = $this->state();
+        unset($state['mode']);
+        $this->putState($state);
+    }
+
     /** @return array<string, mixed>|null */
     private function savedChild(): ?array
     {
@@ -1497,6 +1563,12 @@ class Session
             $state[$key] = $value;
         }
 
+        return $this->putState($state);
+    }
+
+    /** @param array<string, mixed> $state the whole ephemeral state, written in one store write */
+    private function putState(array $state): self
+    {
         if ($this->writeFence !== null) {
             if (! ($this->writeFence)($state)) {
                 $this->cachedState = null;

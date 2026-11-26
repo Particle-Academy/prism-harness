@@ -35,6 +35,14 @@ final class RunLedger
 
     private ?string $cancelReason = null;
 
+    /**
+     * Whether the cancel reason is the host's own text, passed to cancel()
+     * (G-387). The host reads it back through cancelReason() and
+     * exhaustion(); it never becomes an exception message and is never
+     * stored with the totals, because a refusal can reach a model.
+     */
+    private bool $hostReason = false;
+
     /** @var array<int, float> */
     private array $reservations = [];
 
@@ -65,6 +73,9 @@ final class RunLedger
      * cancel is never confused with a spent budget.
      */
     public const CANCELLED = 'run cancelled';
+
+    /** What a refusal says for a stop the host asked for with a reason of its own. */
+    public const STOPPED = 'run stopped by the host';
 
     /**
      * Durable cancel flags this tree watches, one per run executing on it in
@@ -104,7 +115,7 @@ final class RunLedger
             'cost_usd' => $this->costUsd,
             'unmetered' => $this->unmeteredRuns,
             'cancelled' => $this->cancelled,
-            'cancel_reason' => $this->cancelReason,
+            'cancel_reason' => $this->hostReason ? self::STOPPED : $this->cancelReason,
             'reservations' => $this->reservations,
             'reservation_agents' => $this->reservationAgents,
             'reservation_sequence' => $this->reservationSequence,
@@ -126,6 +137,7 @@ final class RunLedger
         $this->unmeteredRuns = self::int($state['unmetered'] ?? 0);
         $this->cancelled = ($state['cancelled'] ?? false) === true;
         $this->cancelReason = isset($state['cancel_reason']) && is_string($state['cancel_reason']) ? $state['cancel_reason'] : null;
+        $this->hostReason = false;
         $this->reservations = [];
         $this->reservationAgents = [];
         $this->agentCosts = [];
@@ -160,6 +172,7 @@ final class RunLedger
      */
     public function refusal(string $reason): RunNotPermitted
     {
+        $reason = $this->stopText($reason);
         if ($reason === self::CANCELLED) {
             return RunNotPermitted::cancelled();
         }
@@ -303,7 +316,7 @@ final class RunLedger
         $this->guarded(function () use ($budget): void {
             $stop = $this->exhaustionNow(self::forResolution($budget));
             if ($stop !== null) {
-                throw $stop === self::CANCELLED && $this->cancelled ? RunNotPermitted::cancelled() : RunNotPermitted::exhausted($stop);
+                throw $stop === self::CANCELLED && $this->cancelled ? RunNotPermitted::cancelled() : RunNotPermitted::exhausted($this->stopText($stop));
             }
         });
     }
@@ -347,7 +360,7 @@ final class RunLedger
     {
         $stop = $this->callStop($budget);
         if ($stop !== null) {
-            throw $stop === self::CANCELLED && $this->cancelled ? RunNotPermitted::cancelled() : RunNotPermitted::exhausted($stop);
+            throw $stop === self::CANCELLED && $this->cancelled ? RunNotPermitted::cancelled() : RunNotPermitted::exhausted($this->stopText($stop));
         }
     }
 
@@ -487,7 +500,14 @@ final class RunLedger
         $this->guarded(function () use ($reason): void {
             $this->cancelled = true;
             $this->cancelReason = $reason;
+            $this->hostReason = $reason !== self::CANCELLED;
         });
+    }
+
+    /** A stop as an exception may say it: never the host's own cancel text. */
+    private function stopText(string $stop): string
+    {
+        return $this->hostReason && $this->cancelled && $stop === $this->cancelReason ? self::STOPPED : $stop;
     }
 
     /**

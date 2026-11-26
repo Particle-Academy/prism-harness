@@ -117,6 +117,9 @@ final readonly class SubagentRunner
         'child_waiting' => 'the subagent is waiting on a person\'s approval',
         'tree' => 'the run tree has nothing left for this subagent',
         'plan' => 'the plan budget has nothing left for this subagent',
+        // Fixed reasons for a stop after the gate (G-387).
+        'stopped' => 'the subagent stopped: its run budget is spent',
+        'spend_ceiling' => 'the next model call would exceed this agent\'s spend ceiling',
     ];
 
     /**
@@ -164,7 +167,7 @@ final readonly class SubagentRunner
             'child_busy' => app(RunTrees::class)->delegationBusy($child),
             // A child waiting on a person's approval is the person's to
             // answer: a delegation into it would dismiss that approval.
-            'child_pending' => $this->pendingOn($child),
+            'child_pending' => $this->runtime->childPending($child),
         ];
         $verdict = RunStarts::gate($facts);
         $refused = $verdict['gate']['refused'] ?? (isset($verdict['gate']['start']) ? null : 'task_invalid');
@@ -177,7 +180,7 @@ final readonly class SubagentRunner
         }
 
         try {
-            $response = $this->runtime->startChild($child, $task, $childContext, $subagent->mode, $parent, $context->rootRunId(), $facts['tree_left']);
+            $response = $this->runtime->startChild($child, $task, $childContext, $subagent->mode, $parent, $context->rootRunId(), $facts['tree_left'], $facts['read']);
 
             return new SubagentResult(
                 subagent: $subagent->name,
@@ -191,22 +194,23 @@ final readonly class SubagentRunner
                 ],
             );
         } catch (RunNotPermitted $e) {
-            if ($e->code() === 'child_busy') {
-                return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
-                    self::REASONS['child_busy']);
+            // Not a failure of the child's work: a commit step lost a race
+            // with the gate's read, or a stop landed after the start
+            // committed. Reported as its own outcome so the parent does not
+            // retry. NEVER the exception's text (G-387): a refusal can carry
+            // a host's words (a cancel reason, say), and what goes here is
+            // read by the parent model and stored in its thread. The outcome
+            // and the reason are chosen by code, from the refusal's code,
+            // read once; anything not in the fixed set is a failure.
+            $refusal = $this->refusalOf($e->code(), $e->reason(), $context->ledger->cancelled());
+            if ($refusal === null) {
+                report($e);
+
+                return SubagentResult::failed($subagent->name, $childRunId, $parentRunId,
+                    sprintf('The subagent failed with %s. The details are in the application log.', $e::class));
             }
 
-            // Not a failure of the child's work: the tree refused a hold that
-            // raced the gate, or a stop landed after the start committed.
-            // Reported as its own outcome so the parent does not retry. Every
-            // RunNotPermitted message is harness-written.
-            return SubagentResult::refused(
-                $subagent->name,
-                $childRunId,
-                $parentRunId,
-                $context->ledger->cancelled() ? SubagentOutcome::Cancelled : SubagentOutcome::Exhausted,
-                $e->getMessage(),
-            );
+            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, $refusal[0], $refusal[1]);
         }
         // Any other exception is caught by run(), deliberately: here it would
         // abort the PARENT's run, losing everything it had done before
@@ -215,34 +219,33 @@ final readonly class SubagentRunner
     }
 
     /**
-     * Whether the child has an approval a person could still answer
-     * (`answerable`: one whose run was not cancelled, on a child whose
-     * decision would be accepted, its binding saved and its run tree not
-     * cancelled), one nobody can answer (`unanswerable`, which does not hold
-     * the child for ever), or none. Reads only.
+     * The outcome and the harness-written reason for a refusal that ended a
+     * start after the gate, chosen from its code; null for a code outside
+     * the fixed set, which the runner reports as a failure.
      *
-     * @return 'none'|'answerable'|'unanswerable'
+     * @return array{0: SubagentOutcome, 1: string}|null
      */
-    private function pendingOn(Session $child): string
+    private function refusalOf(string $code, ?string $reason, bool $cancelled): ?array
     {
-        $thread = Thread::existingAt($child->address());
-        if ($thread === null) {
-            return 'none';
+        if ($code === 'child_busy' || $code === 'child_waiting') {
+            return [SubagentOutcome::Denied, self::REASONS[$code]];
         }
-        $pending = array_filter($thread->pendingApprovalIds(),
-            static fn (string $id): bool => $child->approvalStatus($id) === 'pending');
-        if ($pending === []) {
-            return 'none';
-        }
-        try {
-            // The checks a decision on it would be refused by.
-            $this->runtime->assertDecisionsActionable($child, null);
-            app(RunTrees::class)->assertDecisionsFunded($child, null);
-        } catch (RunNotPermitted) {
-            return 'unanswerable';
+        if ($code === 'run_cancelled' || ($cancelled && $code === 'run_not_permitted')) {
+            return [SubagentOutcome::Cancelled, self::REASONS['cancelled']];
         }
 
-        return 'answerable';
+        return match ($code) {
+            // The tree hold refused a race with the gate's read: its limit name.
+            'run_not_permitted' => [SubagentOutcome::Exhausted, in_array($reason, ['steps', 'cost', 'cost_unmetered'], true)
+                ? self::REASONS['tree'] : self::REASONS['stopped']],
+            'plan_budget_exhausted' => [SubagentOutcome::Exhausted, self::REASONS['plan']],
+            'workflow_budget_exhausted' => [SubagentOutcome::Exhausted, self::REASONS['stopped']],
+            'call_budget_exceeded' => [SubagentOutcome::Exhausted, self::REASONS['cost']],
+            'agent_spend_ceiling_exceeded' => [SubagentOutcome::Exhausted, self::REASONS['spend_ceiling']],
+            'budget_unpriced', 'budget_unbounded_output', 'budget_input_unbounded', 'budget_compaction_unmetered',
+            'budget_observer_uncapped' => [SubagentOutcome::Exhausted, self::REASONS['cost_unenforceable']],
+            default => null,
+        };
     }
 
     /**

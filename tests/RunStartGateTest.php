@@ -651,10 +651,16 @@ it('settles the tree once after a refused start and a committed one in the same 
 // cannot bound anything refused; exception text kept out of run records.
 // ---------------------------------------------------------------------------
 
-/** The child's durable records only: binding, count, thread and its rows (not the ephemeral run state). */
+/**
+ * The child's records a start commits: its binding record, its count, its
+ * thread and its rows. Not its run state and run history (the ephemeral
+ * state and the per-run tree record), which name the run that was tried;
+ * the mode slot in the ephemeral state is compared on its own.
+ */
 function sgDurable(): array
 {
-    return array_filter(sgChildRecords(), fn (string $key): bool => ! str_ends_with($key, ':ephemeral'), ARRAY_FILTER_USE_KEY);
+    return array_filter(sgChildRecords(), fn (string $key): bool => ! str_ends_with($key, ':ephemeral') && ! str_ends_with($key, ':run-trees'),
+        ARRAY_FILTER_USE_KEY);
 }
 
 /** The child's mode slot, raw: absent, or the value written. */
@@ -1014,3 +1020,51 @@ it('keeps exception text out of RunFailed and the run records, whatever the capt
         ->and(implode("\n", $events))->not->toContain('SECRET')
         ->and(implode("\n", sgSnapshot()))->not->toContain('SECRET');
 })->with(['capture off' => [false], 'capture on' => [true]]);
+
+// New channel: the undo is compare-and-restore. A record a later writer
+// changed after (b) is left as that writer left it.
+it('never clobbers a later writer when it undoes commit (b)', function (): void {
+    sgDeadChild();
+    $key = sgChild()->key().':child';
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use ($key): array {
+        if (str_contains($session->key(), '::sub::worker')) {
+            $row = DB::table('harness_session_state')->where('key', $key)->first();
+            $payload = json_decode((string) $row->payload, true);
+            $payload['child_binding']['delegation'] = 'dlg_later';
+            DB::table('harness_session_state')->where('key', $key)->update(['payload' => json_encode($payload)]);
+
+            throw new RuntimeException('boom');
+        }
+
+        return [];
+    }, name: 'later-writer');
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::text('Handled.');
+
+    sgRoot()->send('Go');
+
+    expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+        ->and(sgChild()->childDelegation())->toBe('dlg_later');
+});
+
+// New channel: once the task row is recorded the delegation happened, and
+// a later failure does not undo it.
+it('keeps a start whose run failed after its task row was recorded', function (): void {
+    G360::calls([['worker', ['task' => 'Go']]]);
+    G360::calls([['echo', ['text' => 'hi']]]);
+    G360::text('Handled.');
+    $n = 0;
+    G360::$onRequest = function () use (&$n): void {
+        if (++$n === 3) {
+            throw new RuntimeException('provider down');
+        }
+    };
+    sgRoot()->send('Go');
+    G360::$onRequest = null;
+
+    expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+        ->and(sgChild()->childBinding())->not->toBeNull()
+        ->and(sgChild()->childDelegation())->not->toBeNull()
+        ->and(sgChild()->thread()->storedMessages()->where('type', 'user')->count())->toBe(1);
+});

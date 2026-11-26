@@ -116,7 +116,7 @@ final readonly class SubagentResult
                 'outcome' => SubagentOutcome::Failed->value,
                 'succeeded' => false,
                 'retryable' => false,
-                'reason' => 'The subagent produced output that could not be encoded: '.$e->getMessage(),
+                'reason' => 'The subagent produced output that could not be encoded ('.$e::class.').',
             ], JSON_UNESCAPED_SLASHES) ?: '{"outcome":"failed"}';
         }
     }

@@ -134,6 +134,20 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
         return $failure;
     }
 
+    /**
+     * The subagent runner may not start a child that is waiting on an
+     * approval a person can still answer (G-387): the start would dismiss
+     * it. Re-checked under the child's lock, after the start gate read it.
+     */
+    public static function childWaiting(): self
+    {
+        $failure = new self('This subagent child is waiting on a person\'s approval, so it may not be started again until that is answered.');
+        $failure->errorCode = 'child_waiting';
+        $failure->reason = 'child_waiting';
+
+        return $failure;
+    }
+
     public static function unboundChild(): self
     {
         $failure = new self('This subagent child session has no saved provider and model binding, so it may not run outside the subagent runner.');
