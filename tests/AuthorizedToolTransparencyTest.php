@@ -95,6 +95,87 @@ final class ReportedUsingTool extends Tool
     }
 }
 
+// Public methods of its own and no override of a Tool method, but a clone
+// keeps its handler where using() cannot reach it: the property is unset, so
+// Tool's own assignment goes to __set() and its own read to __get().
+final class MagicHandlerTool extends Tool
+{
+    public static int $ran = 0;
+
+    /** @var callable|null */
+    private $keep;
+
+    public function __construct()
+    {
+        $this->using(function (string $query): string {
+            self::$ran++;
+
+            return 'ran';
+        });
+    }
+
+    public function extra(): string
+    {
+        return 'extra';
+    }
+
+    public function __clone()
+    {
+        $this->keep = $this->fn;
+        unset($this->fn);
+    }
+
+    public function __set(string $name, mixed $value): void {}
+
+    public function __get(string $name): mixed
+    {
+        return $name === 'fn' ? $this->keep : null;
+    }
+}
+
+// The same shape, but finding its handler throws.
+final class ThrowingHandlerTool extends Tool
+{
+    public static int $ran = 0;
+
+    public function extra(): string
+    {
+        return 'extra';
+    }
+
+    public function __clone()
+    {
+        unset($this->fn);
+    }
+
+    public function __set(string $name, mixed $value): void {}
+
+    public function __get(string $name): mixed
+    {
+        throw new RuntimeException('handler lookup detail');
+    }
+}
+
+final class ReportedThrowingTool extends Tool
+{
+    public function extra(): string
+    {
+        return 'extra';
+    }
+
+    public function __clone()
+    {
+        unset($this->fn);
+    }
+
+    public function __set(string $name, mixed $value): void {}
+
+    public function __get(string $name): mixed
+    {
+        throw new RuntimeException('handler lookup detail');
+    }
+}
+
 final class InvokableGuardTool extends Tool
 {
     public static int $ran = 0;
@@ -187,7 +268,23 @@ it('does not offer a tool whose class could keep the guard from being asked', fu
 })->with([
     'overrides how the handler is found' => [fn () => (new OwnResolverTool)->as('own')->for('Own.')->withStringParameter('query', 'Q'), OwnResolverTool::class],
     'overrides using()' => [fn () => (new OwnUsingTool)->as('own')->for('Own.')->withStringParameter('query', 'Q'), OwnUsingTool::class],
+    'keeps its handler out of using()\'s reach' => [fn () => (new MagicHandlerTool)->as('own')->for('Own.')->withStringParameter('query', 'Q'), MagicHandlerTool::class],
+    'throws while its handler is found' => [fn () => (new ThrowingHandlerTool)->as('own')->for('Own.')->withStringParameter('query', 'Q'), ThrowingHandlerTool::class],
 ]);
+
+it('reports a tool whose handler could not be checked without the exception it threw', function (): void {
+    Exceptions::fake();
+    config()->set('prism-harness.agent.authorize_tools', true);
+    Gate::define(ToolAuthorizer::ABILITY, fn (): bool => true);
+    Gate::define(ToolAuthorizer::CALL_ABILITY, fn (): bool => true);
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $authorizer = new ToolAuthorizer(app(GateContract::class), true);
+
+    expect($authorizer->allowed($session, [(new ReportedThrowingTool)->as('own')->for('Own.')]))->toBe([]);
+    Exceptions::assertReportedCount(1);
+    Exceptions::assertReported(fn (LogicException $e): bool => ! str_contains($e->getMessage(), 'handler lookup detail')
+        && $e->getPrevious() === null);
+});
 
 it('reports a tool it does not offer once, with its name quoted', function (): void {
     Exceptions::fake();

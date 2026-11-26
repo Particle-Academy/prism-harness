@@ -10,6 +10,8 @@ use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolError;
 use Prism\Prism\ValueObjects\ToolOutput;
 use ReflectionClass;
+use ReflectionMethod;
+use Throwable;
 
 /**
  * Wraps a tool so authorization is asked at the moment it is CALLED, with the
@@ -31,8 +33,9 @@ use ReflectionClass;
  * a GuardedTool cannot stand in for (see DelegatingTool::canWrap()), but only
  * one whose class overrides none of Tool's methods: an override of handle(),
  * of how the handler is found, or of using() itself can keep the re-pointed
- * guard from ever being asked. Any other tool is not offered at all: wrap()
- * returns null.
+ * guard from ever being asked, and then only when the clone's handler, found
+ * as handle() finds it, is the guard. Any other tool is not offered at all:
+ * wrap() returns null.
  */
 final class AuthorizedTool
 {
@@ -68,9 +71,7 @@ final class AuthorizedTool
             return null;
         }
 
-        $guarded = clone $tool;
-
-        return $guarded->using(function (...$args) use ($tool, $session, $authorizer): string|ToolOutput|ToolError {
+        $guard = function (...$args) use ($tool, $session, $authorizer): string|ToolOutput|ToolError {
             /** @var array<string, mixed> $arguments */
             $arguments = $args;
 
@@ -99,7 +100,22 @@ final class AuthorizedTool
             // would have lost the distinction. Wrapping a tool must not change
             // what the tool returns.
             return $tool->handle(...$args);
-        });
+        };
+        $guarded = (clone $tool)->using($guard);
+
+        // The capability, not the shape: Tool's own handle() calls whatever
+        // Tool's own resolveHandler() returns, so the clone is a guard only if
+        // that is the guard. A class can keep its handler out of using()'s
+        // reach without overriding a method (magic __get()/__set() over an
+        // unset property, a property hook). Anything else, including an
+        // exception while finding the handler, and the tool is not offered.
+        try {
+            $resolved = (new ReflectionMethod(Tool::class, 'resolveHandler'))->invoke($guarded);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $resolved === $guard ? $guarded : null;
     }
 
     /** @var array<string, true> the tool classes already reported, once per process */
@@ -112,7 +128,7 @@ final class AuthorizedTool
             return;
         }
         self::$unguardable[$tool::class] = true;
-        report(new LogicException('A tool is not offered: call-time authorization cannot be put in front of its calls. Its class adds public methods of its own and overrides Tool methods. Tool '
+        report(new LogicException('A tool is not offered: call-time authorization cannot be put in front of its calls. Its class adds public methods of its own and overrides Tool methods or keeps its handler out of reach. Tool '
             .json_encode($tool->name(), JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).', class '.json_encode($tool::class, JSON_UNESCAPED_SLASHES).'.'));
     }
 
