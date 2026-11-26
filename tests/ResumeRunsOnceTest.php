@@ -32,6 +32,16 @@ use Tests\Fixtures\Participant;
 // approvals inside its own generation, so each approved call's ToolInvoked
 // arrives inside that generation's open trace.
 
+// A tool class with a public method of its own, which the harness cannot
+// stand in for, so a plain turn resolves its approvals first.
+final class ResumeExtraApiTool extends Tool
+{
+    public function extraApi(): string
+    {
+        return 'extra';
+    }
+}
+
 function resumeChat(?string $text, array $calls = []): array
 {
     $message = ['role' => 'assistant', 'content' => $text];
@@ -82,7 +92,7 @@ function resumeSseCall(string $id, string $name, string $arguments): string
  *
  * @return array{runs: array<string, int>, events: list<array{tool: string, at_dispatch: string, op: string|null}>, failures: list<string>, resolvedRows: list<array{results: list<string>, decisions: list<string>}>}
  */
-function resumeScenario(string $route, string $path, string $listener, string $provider = 'openai'): array
+function resumeScenario(string $route, string $path, string $listener, string $provider = 'openai', bool $unwatchable = false): array
 {
     $anthropic = $provider === 'anthropic';
     config()->set('prism.providers.openai.api_key', 'sk-test');
@@ -93,8 +103,8 @@ function resumeScenario(string $route, string $path, string $listener, string $p
     config()->set('prism-harness.agent.provider', $provider);
     config()->set('prism-harness.agent.model', $anthropic ? 'm' : 'gpt-4o');
     config()->set('prism-harness.agent.max_cost_usd', null);
-    $two = in_array($route, ['decide2', 'raw', 'raw stream', 'raw structured'], true);
-    $later = str_starts_with($route, 'raw later');
+    $two = in_array($route, ['decide2', 'raw', 'raw stream', 'raw structured', 'raw decision stream'], true);
+    $later = str_starts_with($route, 'raw later') || $route === 'provider failure';
     config()->set('prism-harness.agent.modes.chat.tools', ['search', 'weather']);
     config()->set('prism-harness.agent.modes.chat.requires_approval', $later ? ['search'] : ($two ? ['search', 'weather'] : ['weather']));
     if ($path === 'subagents') {
@@ -113,7 +123,7 @@ function resumeScenario(string $route, string $path, string $listener, string $p
         $weather = $weather->withoutErrorHandling();
     }
     app(ToolRegistry::class)->registerMany([
-        (new Tool)->as('search')->for('Search.')->withStringParameter('query', 'Query')->using(function (string $query) use (&$runs): string {
+        ($unwatchable ? new ResumeExtraApiTool : new Tool)->as('search')->for('Search.')->withStringParameter('query', 'Query')->using(function (string $query) use (&$runs): string {
             $runs['search']++;
 
             return 'found';
@@ -134,6 +144,9 @@ function resumeScenario(string $route, string $path, string $listener, string $p
     if ($route === 'raw later') {
         $queue[] = $anthropic ? resumeAnthropic(null, [['call_l', 'weather', '{"city":"c"}']]) : resumeChat(null, [['call_l', 'weather', '{"city":"c"}']]);
     }
+    if ($route === 'provider failure') {
+        $queue[] = 'fail';
+    }
     if ($route === 'raw later stream') {
         $streams[] = resumeSseCall('call_l', 'weather', '{"city":"c"}');
     }
@@ -143,6 +156,9 @@ function resumeScenario(string $route, string $path, string $listener, string $p
             return Http::response(array_shift($streams) ?? resumeSse('streamed'), 200, ['Content-Type' => 'text/event-stream']);
         }
         $next = array_shift($queue);
+        if ($next === 'fail') {
+            return Http::response($anthropic ? ['type' => 'error', 'error' => ['type' => 'api_error', 'message' => 'down']] : ['error' => ['message' => 'down', 'type' => 'server_error']], 500);
+        }
         if ($anthropic) {
             return Http::response($next ?? resumeAnthropic('{"ok":true}'));
         }
@@ -177,9 +193,9 @@ function resumeScenario(string $route, string $path, string $listener, string $p
     $record = fn () => $session->thread()->record([new ToolResultMessage(toolApprovalResponses: $decisions)], $session->run()['id'] ?? null);
     try {
         match ($route) {
-            'approve', 'raw later' => $session->approve($pending[0]->approvalId),
+            'approve', 'raw later', 'provider failure' => $session->approve($pending[0]->approvalId),
             'decide2', 'raw' => $session->decide($decisions),
-            'streamDecision' => iterator_to_array($session->streamDecision($decisions), false),
+            'streamDecision', 'raw decision stream' => iterator_to_array($session->streamDecision($decisions), false),
             'structured', 'raw structured' => (function () use ($record, $session): void {
                 $record();
                 $session->sendStructured('', new ObjectSchema('answer', 'Answer', [new BooleanSchema('ok', 'Done')], ['ok']));
@@ -255,8 +271,32 @@ it('runs every call resolved before a tool\'s own exception once', function (str
     'later step, OpenAI' => ['raw later', 'openai'],
     'later step, Anthropic' => ['raw later', 'anthropic'],
     'later step, stream' => ['raw later stream', 'openai'],
+    'streamDecision, OpenAI' => ['raw decision stream', 'openai'],
 ])->with(['plain', 'subagents', 'capped'])
     ->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw', 'telemetry off' => 'off']);
+
+// A provider failure after the approved calls ran keeps their results.
+it('runs an approved call once when the provider fails after it ran', function (string $provider, string $path): void {
+    $result = resumeScenario('provider failure', $path, 'quiet', $provider);
+
+    expect($result['runs'])->toBe(['search' => 1, 'weather' => 0])
+        ->and($result['failures'])->not->toBe([]);
+})->with(['openai', 'anthropic'])->with(['plain', 'subagents', 'capped']);
+
+// A tool the harness cannot stand in for: on a plain turn the approvals are
+// resolved first, before the turn, so a later failure costs no second run.
+it('runs every call resolved before a tool\'s own exception once when a tool cannot be watched', function (string $route, string $provider): void {
+    $result = resumeScenario($route, 'plain', 'quiet', $provider, unwatchable: true);
+    $retried = ! str_starts_with($route, 'raw later');
+
+    expect($result['runs'])->toBe(['search' => 1, 'weather' => $retried ? 2 : 1]);
+})->with([
+    'decide, OpenAI' => ['raw', 'openai'],
+    'decide, Anthropic' => ['raw', 'anthropic'],
+    'structured, Anthropic' => ['raw structured', 'anthropic'],
+    'later step, OpenAI' => ['raw later', 'openai'],
+    'later step, Anthropic' => ['raw later', 'anthropic'],
+]);
 
 // What a cut-short resolution records is only what is new: no stored row
 // repeats a result or a decision another row already holds. The thread folds

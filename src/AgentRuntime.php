@@ -32,6 +32,7 @@ use Prism\Harness\Steps\RunStep;
 use Prism\Harness\Steps\RunStepTagger;
 use Prism\Harness\Structured\SchemaCheck;
 use Prism\Harness\Structured\StructuredTranscript;
+use Prism\Harness\Subagents\ApprovedTools;
 use Prism\Harness\Subagents\BudgetedCalls;
 use Prism\Harness\Subagents\CallBudget;
 use Prism\Harness\Subagents\ResolutionRecorder;
@@ -54,8 +55,10 @@ use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\StreamStartEvent;
 use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Streaming\StreamCollector;
+use Prism\Prism\Structured\PendingRequest as StructuredPendingRequest;
 use Prism\Prism\Structured\Response as StructuredResponse;
 use Prism\Prism\Structured\Step as StructuredStep;
+use Prism\Prism\Text\PendingRequest as TextPendingRequest;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
@@ -240,8 +243,9 @@ final readonly class AgentRuntime
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 $stepOnly = $context !== null || $mode->subagents !== [];
                 $recorder = $budget->maxCostUsd === null && ! $stepOnly ? ResolutionRecorder::for($history) : null;
+                $watched = $recorder?->watch($tools);
                 if ($tools !== []) {
-                    $generation->withTools($recorder?->watch($tools) ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
+                    $generation->withTools($watched ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
@@ -253,7 +257,10 @@ final readonly class AgentRuntime
                         }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }) : $this->recordingResolution($recorder, $session, $history, $runId, $tools, fn (): TextResponse => $generation->asText()))
+                        }) : $this->recordingResolution($recorder, $watched !== null, $generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                            $history = $messages;
+                        }, $session, $history, $runId, $tools, fn (): TextResponse => $generation->asText()))
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -449,8 +456,9 @@ final readonly class AgentRuntime
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 $stepOnly = $context !== null || $mode->subagents !== [];
                 $recorder = $budget->maxCostUsd === null && ! $stepOnly ? ResolutionRecorder::for($history) : null;
+                $watched = $recorder?->watch($tools);
                 if ($tools !== []) {
-                    $generation->withTools($recorder?->watch($tools) ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
+                    $generation->withTools($watched ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
                 if ($budget->maxOutputTokensPerCall !== null) {
                     $generation->withMaxTokens($budget->maxOutputTokensPerCall);
@@ -463,7 +471,11 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }) : $this->recordingResolution($recorder, $session, $history, $runId, $tools, fn (): StructuredResponse => $generation->asStructured()))
+                        }) : $this->recordingResolution($recorder, $watched !== null, $generation, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                            $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
+                            $history = $messages;
+                            $userMessage = null;
+                        }, $session, $history, $runId, $tools, fn (): StructuredResponse => $generation->asStructured()))
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -1777,15 +1789,26 @@ final readonly class AgentRuntime
      * row with only what is new; a failure to record is reported, never put
      * in place of the turn's own failure.
      *
+     * When an approved call's tool cannot be watched (see ObservedTool), the
+     * approvals are resolved here first, before the turn, and recorded at
+     * once, as on the step-by-step paths; their telemetry then follows those
+     * paths too (no ToolInvoked unless the application has a telemetry
+     * context open).
+     *
      * @template T
      *
+     * @param  Closure(list<Message>): void  $resolved  records the messages a resolution here produced
      * @param  list<Message>  $history
      * @param  list<Tool>  $tools
      * @param  Closure(): T  $generate
      * @return T
      */
-    private function recordingResolution(?ResolutionRecorder $recorder, Session $session, array $history, string $runId, array $tools, Closure $generate): mixed
+    private function recordingResolution(?ResolutionRecorder $recorder, bool $watching, TextPendingRequest|StructuredPendingRequest $generation, Closure $resolved, Session $session, array $history, string $runId, array $tools, Closure $generate): mixed
     {
+        if ($recorder !== null && ! $watching) {
+            (new ApprovedTools)->resolve($generation, $resolved);
+            $recorder = null;
+        }
         try {
             return $generate();
         } catch (Throwable $failure) {

@@ -82,16 +82,31 @@ final class ResolutionRecorder
     }
 
     /**
-     * $tools, with each tool a queued call names watched.
+     * $tools, with each tool a queued call names watched; null when one of
+     * them cannot be watched (see ObservedTool), and the caller must resolve
+     * the approvals itself before the turn.
      *
      * @param  list<Tool>  $tools
-     * @return list<Tool>
+     * @return list<Tool>|null
      */
-    public function watch(array $tools): array
+    public function watch(array $tools): ?array
     {
         $names = array_map(fn (ToolCall $call): string => $call->name, $this->queue);
+        $watched = [];
+        foreach ($tools as $tool) {
+            if (! in_array($tool->name(), $names, true)) {
+                $watched[] = $tool;
 
-        return array_map(fn (Tool $tool): Tool => in_array($tool->name(), $names, true) ? ObservedTool::of($tool, $this) : $tool, $tools);
+                continue;
+            }
+            $observed = ObservedTool::of($tool, $this);
+            if ($observed === null) {
+                return null;
+            }
+            $watched[] = $observed;
+        }
+
+        return $watched;
     }
 
     /** @param array<int|string, mixed> $args */
