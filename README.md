@@ -664,19 +664,25 @@ answers an approval, sends a new message or sends an empty one, spends from one 
 of the steps the child has used since the runner last started it, claimed in one locked write
 when the turn begins and settled with what it took. A child declared at 2 steps that took 1
 has 1 left, however it is resumed and however many turns are sent to it. The next time the
-runner starts the child, the count starts again at 0 under the new grant. A linked child with
-no saved ceiling, or with one that is not a whole number, gets no model steps: it still acts on
-the decisions it is answered with, and a new message to it is refused before anything is
-recorded. Only a session that was never a child runs on its own mode.
+runner starts the child, the count starts again at 0 under the new grant. A count this
+runtime could not have written (a field that is not a whole, non-negative number, or a record
+that is gone) gives the child no model steps, and is never rewritten into a permissive one.
+A session is a subagent child when its scope has a `::sub::` segment, its thread is linked
+beneath a parent, or it saved a child record. Such a session with no saved ceiling (one
+parked by an earlier release, say), or with a ceiling that is not a whole number, gets no
+model steps: it still acts on the decisions it is answered with, and a new message to it is
+refused before anything is recorded. Any other session runs on its own mode.
 
 A spent budget, of steps or of cost, in the child, its tree or a plan, never refuses the
 person's decision: acting on an approved call makes no model call, so the call runs, its result
 is recorded, and the run then stops on its budget with no further model step. A decision the
 turn could not act on at all is refused before anything is recorded: a cancelled run tree, a
 linked child that lost its binding (`child_binding_missing`), or a run context whose run was
-cancelled or whose time or tool-call limit is spent. A new message to a child with nothing left
-is refused before anything is recorded. A hold whose run never settled is charged in full once
-the run lock's TTL has passed. When the child was started by a turn that spent from a shared plan
+cancelled or whose time or tool-call limit is spent. A denial runs nothing, so a spent time or
+tool-call limit does not refuse it; a cancelled run still does. A new message to a child with
+nothing left is refused before anything is recorded. A hold whose run never settled is charged
+in full once the run lock's TTL has passed; a run that was still live and settles later has
+that charge replaced with what it took, so it is counted once. When the child was started by a turn that spent from a shared plan
 budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). The same holds
 for every turn on the child session the runner did not start: a new message sent with `send()`
 instead of an answer continues the tree and the plan budget exactly as an answer does, and a run
@@ -1071,11 +1077,22 @@ resumes no decision, with nothing left is refused before anything is recorded
 (`plan_budget_exhausted` when the plan is what is spent). The rule is pinned across the
 three languages by the parity op `step_allowance`.
 
-**The runner does not delegate over a person.** A subagent call with an empty or blank
-`task` is refused (`denied`) before the child is built. So is a delegation into a child that
-is waiting on a person's approval: a model must not be able to dismiss that approval by
-delegating again. Nothing is written to the child. An approval whose run was cancelled is
-not waiting on anyone, and does not hold the child.
+**The runner does not delegate over a person.** A subagent call whose `task` is not a string,
+or is blank, is refused (`denied`, "the task is empty") before the child is built. Blank is one
+explicit set of codepoints, the same in every language: U+0009 to U+000D, U+0020, U+0085,
+U+00A0, U+1680, U+2000 to U+200D, U+2028, U+2029, U+202F, U+205F, U+2060, U+3000 and U+FEFF.
+A delegation into a child that is waiting on a person's approval is refused too: a model must
+not be able to dismiss that approval by delegating again. An approval blocks the child only
+while a person could still answer it; one in a cancelled run or tree, or on a child that lost
+its binding, does not hold the child. Neither does the runner start a child again while a
+turn on it is running. Nothing is written to the child in any of these cases. Any exception
+in the runner's own checks comes back as the framed `failed` result naming only the
+exception's class; its message goes to the application log, never to the model.
+
+**A host run context belongs to one session's turn.** Its ledger is the account every step
+under it is counted on. Share one context across sessions and each child resumed under it is
+charged the steps the others took on that ledger too, which can refuse a follow-up the child
+itself never spent. Build a fresh context for each turn.
 
 `send()`, `sendStructured()` and `stream()` charge a shared tree's step before
 the provider call, so a tool that starts a child sees the parent's current step

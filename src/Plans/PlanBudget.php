@@ -314,6 +314,40 @@ final class PlanBudget
     }
 
     /**
+     * Settle a run the runtime knows was LIVE (G-387): its own charge is
+     * replaced with what it took, whether its hold is still held or was
+     * already charged in full on expiry while it ran (remembered by
+     * {@see self::expire()} under its id). Counted once, never the actual
+     * steps on top of an expired full charge. {@see self::settle()} is the
+     * pure ledger rule the corpus pins (a dead run's expired hold stays
+     * charged in full); this is the runtime's for a run that did end.
+     *
+     * @param  array<string, mixed>  $state
+     * @return array<string, mixed>
+     */
+    public static function settleRun(array $state, string $holdId, int $steps, ?int $costMicros): array
+    {
+        if (isset($state['holds'][$holdId])) {
+            unset($state['expired'][$holdId]);
+
+            return self::settle($state, $holdId, $steps, $costMicros);
+        }
+        $charged = $state['expired'][$holdId] ?? null;
+        if (! is_array($charged)) {
+            return $state;
+        }
+        unset($state['expired'][$holdId]);
+        $state['steps'] = max(0, (int) $state['steps'] - (int) ($charged['steps'] ?? 0) + max(0, $steps));
+        if ($costMicros === null) {
+            $state['unmetered']++;
+        } else {
+            $state['cost_micros'] = max(0, (int) $state['cost_micros'] - (int) ($charged['cost_micros'] ?? 0) + max(0, $costMicros));
+        }
+
+        return $state;
+    }
+
+    /**
      * Charge every hold older than the TTL in full.
      *
      * @param  array<string, mixed>  $state
@@ -326,6 +360,9 @@ final class PlanBudget
                 unset($state['holds'][$id]);
                 $state['steps'] += $hold['steps'];
                 $state['cost_micros'] += $hold['cost_micros'];
+                // Remembered under the run's id, so a run that was still live
+                // and settles later replaces this charge instead of adding to it.
+                $state['expired'][$id] = ['steps' => $hold['steps'], 'cost_micros' => $hold['cost_micros']];
             }
         }
 

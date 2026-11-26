@@ -750,7 +750,7 @@ final class Plans
         $cost = $ledger->unmeteredRuns() > $turn['unmetered'] ? null : PlanBudget::micros(max(0.0, $ledger->costUsd() - $turn['cost']));
         try {
             $this->budgetWriteAt($session->planStore(), $turn['ledger'], $turn['plan'], $this->budgetSettings(),
-                static fn (array $state): array => [PlanBudget::settle($state, $runId, $steps, $cost), null]);
+                static fn (array $state): array => [PlanBudget::settleRun($state, $runId, $steps, $cost), null]);
         } catch (Throwable $failure) {
             // The hold stays and is charged in full once it expires.
             self::reportQuietly($failure);

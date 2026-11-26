@@ -296,7 +296,7 @@ final readonly class AgentRuntime
      *
      * @throws RunNotPermitted
      */
-    public function assertDecisionsActionable(Session $session, ?RunContext $context): void
+    public function assertDecisionsActionable(Session $session, ?RunContext $context, bool $onlyDenials = false): void
     {
         $context = $this->executionContext($context);
         $route = ChildBinding::route(
@@ -309,6 +309,15 @@ final readonly class AgentRuntime
             throw RunNotPermitted::unboundChild();
         }
         if ($context !== null) {
+            // A denial runs nothing, so a spent tool-call or time limit does
+            // not refuse it; a cancelled run still does.
+            if ($onlyDenials) {
+                if ($context->ledger->cancelRequested()) {
+                    throw RunNotPermitted::cancelled();
+                }
+
+                return;
+            }
             $stop = $context->ledger->resolutionStop($context->budget);
             if ($stop !== null) {
                 throw $context->ledger->refusal($stop);

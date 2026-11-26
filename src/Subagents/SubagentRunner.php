@@ -41,7 +41,9 @@ final readonly class SubagentRunner
             ->as($subagent->name)
             ->for($subagent->description)
             ->withStringParameter('task', 'What the subagent should do, stated as a complete instruction. It does not see this conversation.')
-            ->using(function (string $task) use ($subagent, $parent, $context, $parentRunId, $parentMode): string {
+            // `mixed`: a model may send any JSON value. A task that is not a
+            // string is the runner's to refuse, framed, never a raw error.
+            ->using(function (mixed $task = null) use ($subagent, $parent, $context, $parentRunId, $parentMode): string {
                 if ($context === null) {
                     throw new \LogicException('Tool inspection cannot invoke a subagent.');
                 }
@@ -61,19 +63,62 @@ final readonly class SubagentRunner
         Session $parent,
         RunContext $context,
         string $parentRunId,
-        string $task,
+        mixed $task,
         ?AgentMode $parentMode = null,
     ): SubagentResult {
         $childRunId = 'run_'.bin2hex(random_bytes(12));
 
         // A task with nothing in it is no instruction: refused before the
         // child is built or touched. Run, an empty task would read as a
-        // resume of whatever the child is parked on.
-        if (trim($task) === '') {
+        // resume of whatever the child is parked on. Blank is one explicit
+        // codepoint set, spelled the same in every language (never the
+        // language's own trim, which differs between them).
+        if (! is_string($task) || self::blank($task)) {
             return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
-                'the subagent task is empty');
+                'the task is empty');
         }
 
+        // EVERYTHING below runs inside the framing: any failure, in a check
+        // before the child starts as much as in the child, comes back as a
+        // framed `failed` result carrying only the exception's class.
+        try {
+            return $this->delegate($subagent, $parent, $context, $parentRunId, $task, $parentMode, $childRunId);
+        } catch (Throwable $e) {
+            // ONLY THE CLASS NAME TRAVELS. A provider, store or database
+            // exception's message can carry a URL, a host, SQL, headers or a
+            // key, and whatever goes in `reason` is read by a model and may be
+            // shown to a user. The full message goes to the log.
+            report($e);
+
+            return SubagentResult::failed(
+                $subagent->name,
+                $childRunId,
+                $parentRunId,
+                sprintf('The subagent failed with %s. The details are in the application log.', $e::class),
+            );
+        }
+    }
+
+    /**
+     * Whether a task holds only blank codepoints (G-387): U+0009-U+000D,
+     * U+0020, U+0085, U+00A0, U+1680, U+2000-U+200D, U+2028, U+2029,
+     * U+202F, U+205F, U+2060, U+3000 and U+FEFF. The same set in all three
+     * languages. Text that is not valid UTF-8 is not blank.
+     */
+    public static function blank(string $task): bool
+    {
+        return preg_match('/\A[\x{0009}-\x{000D}\x{0020}\x{0085}\x{00A0}\x{1680}\x{2000}-\x{200D}\x{2028}\x{2029}\x{202F}\x{205F}\x{2060}\x{3000}\x{FEFF}]*\z/u', $task) === 1;
+    }
+
+    private function delegate(
+        Subagent $subagent,
+        Session $parent,
+        RunContext $context,
+        string $parentRunId,
+        string $task,
+        ?AgentMode $parentMode,
+        string $childRunId,
+    ): SubagentResult {
         // Checked BEFORE spawning, so an exhausted tree does not pay for a
         // session, a thread row and a provider call to discover it is exhausted.
         $stop = $context->ledger->exhaustion($context->budget);
@@ -139,13 +184,15 @@ final readonly class SubagentRunner
         $child = $this->harness->forAgent($childAgent)->session(
             $parent->participant(), $subagent->scopeUnder($parent->scope()), $parent->actor(),
         );
-        // Only an approval a person can still answer: one in a cancelled run
-        // can never be, and must not hold the child for ever.
-        $waiting = array_filter(Thread::existingAt($child->address())?->pendingApprovalIds() ?? [],
-            static fn (string $id): bool => $child->approvalStatus($id) === 'pending');
-        if ($waiting !== []) {
+        if ($this->awaitsAPerson($child)) {
             return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
                 'the subagent is waiting on a person\'s approval');
+        }
+        // A turn on the child is running and holds its count: starting it
+        // again would reset that count under the running turn.
+        if (app(RunTrees::class)->delegationBusy($child)) {
+            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
+                'the subagent is already running');
         }
 
         try {
@@ -175,25 +222,35 @@ final readonly class SubagentRunner
                 $context->ledger->cancelled() ? SubagentOutcome::Cancelled : SubagentOutcome::Exhausted,
                 $e->getMessage(),
             );
-        } catch (Throwable $e) {
-            // Caught deliberately. An exception here would abort the PARENT's
-            // run, losing everything it had done before calling out — and the
-            // parent can reasonably decide what to do about a child that broke.
-            //
-            // ONLY THE CLASS NAME TRAVELS. A provider exception's message can
-            // carry the request URL, headers, or a key embedded in either, and
-            // whatever goes in `reason` is read by a model and may be shown to
-            // a user. The full message goes to the log, where it is useful to
-            // an operator and reaches nobody else.
-            report($e);
-
-            return SubagentResult::failed(
-                $subagent->name,
-                $childRunId,
-                $parentRunId,
-                sprintf('The subagent failed with %s. The details are in the application log.', $e::class),
-            );
         }
+        // Any other exception is caught by run(), deliberately: here it would
+        // abort the PARENT's run, losing everything it had done before
+        // calling out, and the parent can decide what to do about a child
+        // that broke.
+    }
+
+    /**
+     * Whether the child has an approval a person could still answer: one
+     * whose run was not cancelled, on a child whose decision would be
+     * accepted (its binding saved, its run tree not cancelled). An approval
+     * nobody can answer does not hold the child for ever.
+     */
+    private function awaitsAPerson(Session $child): bool
+    {
+        $pending = array_filter(Thread::existingAt($child->address())?->pendingApprovalIds() ?? [],
+            static fn (string $id): bool => $child->approvalStatus($id) === 'pending');
+        if ($pending === []) {
+            return false;
+        }
+        try {
+            // The checks a decision on it would be refused by.
+            $this->runtime->assertDecisionsActionable($child, null);
+            app(RunTrees::class)->assertDecisionsFunded($child, null);
+        } catch (RunNotPermitted) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
