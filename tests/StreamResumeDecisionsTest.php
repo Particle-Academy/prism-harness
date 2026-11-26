@@ -143,11 +143,16 @@ it('sends the held events when the turn ends before announcing them', function (
 
     $started = [];
     $seen = [];
+    $failed = [];
     Event::listen(GenerationStarted::class, function (GenerationStarted $event) use (&$started): void {
         $started[$event->context->traceId] = true;
     });
-    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use (&$started, &$seen): void {
+    Event::listen(GenerationFailed::class, function (GenerationFailed $event) use (&$failed): void {
+        $failed[] = $event->context->traceId;
+    });
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use (&$started, &$seen, &$failed): void {
         $seen[] = [$event->toolName, isset($started[$event->context->traceId])];
+        $failed[] = 'event:'.$event->context->traceId;
     });
 
     if ($exit === 'abandoned stream') {
@@ -164,6 +169,10 @@ it('sends the held events when the turn ends before announcing them', function (
     }
 
     expect($this->runs)->toBe(1)->and($seen)->toBe([['transfer', true]]);
+    if ($exit === 'failed record') {
+        // The stand-in generation is closed with the failure, not left open.
+        expect($failed)->toHaveCount(2)->and($failed[0])->toBe('event:'.$failed[1]);
+    }
 })->with(['abandoned stream', 'failed record']);
 
 // On 0.26.7 core resolved a plain stream's recorded decisions inside asStream(),

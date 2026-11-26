@@ -183,7 +183,7 @@ final class ApprovedTools
             } catch (Throwable $unrecorded) {
                 // The calls ran; their events describe what happened even
                 // though the record did not land.
-                $this->flush($unrecorded);
+                $this->flush($unrecorded, failGeneration: true);
 
                 throw $unrecorded;
             }
@@ -267,9 +267,13 @@ final class ApprovedTools
      * resolution ran inside it: a stream generation is failed first when
      * there is a failure (core's asStream does), a text or structured one is
      * not (core's does not, for anything but a provider request failure).
+     * After a failed record ($failGeneration) it is failed whatever the
+     * operation: on 0.26.7 the record came after a completed generation, and
+     * a stand-in that produced no response cannot be completed honestly, so
+     * it is closed with the failure instead of being left open.
      * Elsewhere they are dispatched in their own context.
      */
-    public function flush(?Throwable $failure = null): void
+    public function flush(?Throwable $failure = null, bool $failGeneration = false): void
     {
         if ($this->held === []) {
             return;
@@ -286,7 +290,7 @@ final class ApprovedTools
         }
         try {
             $this->announce($generation);
-            if ($failure !== null && $this->inGeneration === TelemetryOperation::Stream) {
+            if ($failure !== null && ($failGeneration || $this->inGeneration === TelemetryOperation::Stream)) {
                 try {
                     Telemetry::failed($generation, $failure);
                 } catch (Throwable $listener) {
