@@ -50,12 +50,12 @@ it('keeps participants apart within the same scope', function (): void {
 it('carries mode and model independently', function (): void {
     $ada = Participant::create(['name' => 'Ada']);
 
-    harness()->for($ada)->session()->usingMode('plan')->usingModel('claude-sonnet-4-5');
+    harness()->for($ada)->session()->usingMode('plan')->usingModel('claude-sonnet-5-5');
 
     $session = harness()->for($ada)->session();
 
     expect($session->mode())->toBe('plan')
-        ->and($session->model())->toBe('claude-sonnet-4-5');
+        ->and($session->model())->toBe('claude-sonnet-5-5');
 });
 
 it('persists the selected provider independently from the model', function (): void {

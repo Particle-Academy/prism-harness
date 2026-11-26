@@ -332,7 +332,7 @@ it('defaults to RetryOnce when nothing is bound', function (): void {
 });
 
 it('uses a SummaryBudget bound in the container', function (): void {
-    config()->set('prism-harness.context.summarise_with', 'claude-haiku-4-5-20251001');
+    config()->set('prism-harness.context.summarise_with', 'claude-haiku-5-5');
     config()->set('prism-harness.context.summary_words', 3);
     app()->bind(SummaryBudget::class, fn (): SummaryBudget => new AskOnly);
 

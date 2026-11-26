@@ -93,7 +93,7 @@ final class SummarisingCompaction implements CompactionStrategy
     private readonly SummaryBudget $budget;
 
     public function __construct(
-        private readonly string $model = 'claude-haiku-4-5-20251001',
+        private readonly string $model = 'claude-haiku-5-5',
         private readonly int $keep = 20,
         private readonly int $summaryWords = 200,
         private readonly Provider $provider = Provider::Anthropic,
