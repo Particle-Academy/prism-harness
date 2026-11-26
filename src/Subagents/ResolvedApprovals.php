@@ -27,8 +27,9 @@ final class ResolvedApprovals
     /**
      * The messages with $resolved merged into the tool results after the last
      * assistant tool call, as core merges them: every tool result message
-     * after that call is folded into one, at the end; null when there is
-     * nothing to merge.
+     * after that call is folded into one, at the end. Only results for that
+     * call's own tool calls that have no result yet count, and only when
+     * decisions were recorded after it; null when there is nothing to merge.
      *
      * @param  list<Message>  $messages
      * @param  list<ToolResult>  $resolved
@@ -59,11 +60,25 @@ final class ResolvedApprovals
             }
             $kept[] = $message;
         }
+        // Only what core's resolution produces: results for this assistant
+        // step's own calls that had no result yet, after decisions were made
+        // on it. Anything else (a tool result of a later step that arrived
+        // early, a call of another turn) is not a resolution.
+        if ($responses === []) {
+            return null;
+        }
         $known = [];
         foreach ($results as $result) {
             $known[$result->toolCallId] = true;
         }
-        $new = array_values(array_filter($resolved, fn (ToolResult $result): bool => ! isset($known[$result->toolCallId])));
+        $own = [];
+        $last = $messages[$assistant];
+        if ($last instanceof AssistantMessage) {
+            foreach ($last->toolCalls as $call) {
+                $own[$call->id] = true;
+            }
+        }
+        $new = array_values(array_filter($resolved, fn (ToolResult $result): bool => isset($own[$result->toolCallId]) && ! isset($known[$result->toolCallId])));
         if ($new === []) {
             return null;
         }
