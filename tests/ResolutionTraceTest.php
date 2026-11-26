@@ -6,6 +6,7 @@ use Illuminate\Events\Dispatcher;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\PrismHarness;
+use Prism\Harness\Subagents\DeferredEvents;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Enums\TelemetryOperation;
 use Prism\Prism\Events\Telemetry\GenerationCompleted;
@@ -126,5 +127,8 @@ it('reports a resumed approved call inside the generation trace, after its recor
 // renames them, this fails rather than the buffer silently falling back.
 it('can read the events the dispatcher defers', function (): void {
     expect(app('events'))->toBeInstanceOf(Dispatcher::class)
-        ->and(property_exists(Dispatcher::class, 'deferredEvents'))->toBeTrue();
+        ->and(property_exists(Dispatcher::class, 'deferredEvents'))->toBeTrue()
+        ->and(property_exists(Dispatcher::class, 'deferringEvents'))->toBeTrue()
+        ->and(property_exists(Dispatcher::class, 'eventsToDefer'))->toBeTrue()
+        ->and(DeferredEvents::dispatcher())->toBe(app('events'));
 });
