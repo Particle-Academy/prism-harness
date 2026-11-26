@@ -89,13 +89,15 @@ abstract class DelegatingTool extends Tool
     /**
      * A public method the wrapped tool's class adds (see canWrap()). Only a
      * public instance method: from inside this class, Tool's protected methods
-     * would be reachable on the wrapped tool, and they are not its API.
+     * would be reachable on the wrapped tool, and they are not its API. Never
+     * a magic method: __invoke() is the tool's raw handler, which a guard
+     * must stand in front of.
      *
      * @param  array<int|string, mixed>  $arguments
      */
     public function __call(string $method, array $arguments): mixed
     {
-        if (! method_exists($this->inner, $method) || ! (new ReflectionMethod($this->inner, $method))->isPublic()
+        if (str_starts_with($method, '__') || ! method_exists($this->inner, $method) || ! (new ReflectionMethod($this->inner, $method))->isPublic()
             || (new ReflectionMethod($this->inner, $method))->isStatic()) {
             throw new Error('Call to undefined method '.static::class.'::'.$method.'()');
         }

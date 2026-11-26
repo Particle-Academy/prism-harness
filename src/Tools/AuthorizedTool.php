@@ -4,11 +4,12 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Tools;
 
+use LogicException;
 use Prism\Harness\Sessions\Session;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolError;
 use Prism\Prism\ValueObjects\ToolOutput;
-use ReflectionMethod;
+use ReflectionClass;
 
 /**
  * Wraps a tool so authorization is asked at the moment it is CALLED, with the
@@ -27,9 +28,11 @@ use ReflectionMethod;
  * and return check a second time, around the guard, which turned the tool's
  * ToolError into an "invalid return type" error and decoded a JSON-string
  * argument the tool wanted as a string. The clone remains the guard for a tool
- * a GuardedTool cannot stand in for (see DelegatingTool::canWrap()). A tool
- * neither can guard (its class overrides handle(), so a re-pointed handler is
- * never called) is not offered at all: wrap() returns null.
+ * a GuardedTool cannot stand in for (see DelegatingTool::canWrap()), but only
+ * one whose class overrides none of Tool's methods: an override of handle(),
+ * of how the handler is found, or of using() itself can keep the re-pointed
+ * guard from ever being asked. Any other tool is not offered at all: wrap()
+ * returns null.
  */
 final class AuthorizedTool
 {
@@ -57,9 +60,11 @@ final class AuthorizedTool
         if ($guarded instanceof Tool) {
             return $guarded;
         }
-        // The clone's guard is its handler, which only Tool's own handle()
-        // calls. A class with its own handle() would never ask it.
-        if ((new ReflectionMethod($tool, 'handle'))->getDeclaringClass()->getName() !== Tool::class) {
+        // The clone's guard is its handler, and only Tool's own methods are
+        // sure to set it and call it. A class overriding any of them (handle(),
+        // resolveHandler(), using(), the argument handling) could leave it
+        // unasked.
+        if (! self::clonable($tool)) {
             return null;
         }
 
@@ -95,6 +100,34 @@ final class AuthorizedTool
             // what the tool returns.
             return $tool->handle(...$args);
         });
+    }
+
+    /** @var array<string, true> the tool classes already reported, once per process */
+    private static array $unguardable = [];
+
+    /** Reports, once per tool class and process, that a tool was not offered. */
+    public static function reportUnguardable(Tool $tool): void
+    {
+        if (isset(self::$unguardable[$tool::class])) {
+            return;
+        }
+        self::$unguardable[$tool::class] = true;
+        report(new LogicException('A tool is not offered: call-time authorization cannot be put in front of its calls. Its class adds public methods of its own and overrides Tool methods. Tool '
+            .json_encode($tool->name(), JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).', class '.json_encode($tool::class, JSON_UNESCAPED_SLASHES).'.'));
+    }
+
+    /** Whether $tool's class overrides none of Tool's methods besides its constructor and __invoke. */
+    private static function clonable(Tool $tool): bool
+    {
+        foreach ((new ReflectionClass($tool))->getMethods() as $method) {
+            $declared = $method->getDeclaringClass()->getName();
+            if ($declared !== Tool::class && ! in_array($method->getName(), ['__construct', '__invoke'], true)
+                && method_exists(Tool::class, $method->getName())) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static function refusal(Session $session, Tool $tool): string
