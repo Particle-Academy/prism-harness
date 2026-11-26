@@ -6,6 +6,7 @@ namespace Prism\Harness\Subagents;
 
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Models\Thread;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
@@ -64,6 +65,14 @@ final readonly class SubagentRunner
         ?AgentMode $parentMode = null,
     ): SubagentResult {
         $childRunId = 'run_'.bin2hex(random_bytes(12));
+
+        // A task with nothing in it is no instruction: refused before the
+        // child is built or touched. Run, an empty task would read as a
+        // resume of whatever the child is parked on.
+        if (trim($task) === '') {
+            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
+                'the subagent task is empty');
+        }
 
         // Checked BEFORE spawning, so an exhausted tree does not pay for a
         // session, a thread row and a provider call to discover it is exhausted.
@@ -124,10 +133,22 @@ final readonly class SubagentRunner
             );
         }
 
+        // A child waiting on a person's approval is the person's to answer:
+        // a delegation into it would dismiss that approval. Refused before
+        // anything is written to the child.
+        $child = $this->harness->forAgent($childAgent)->session(
+            $parent->participant(), $subagent->scopeUnder($parent->scope()), $parent->actor(),
+        );
+        // Only an approval a person can still answer: one in a cancelled run
+        // can never be, and must not hold the child for ever.
+        $waiting = array_filter(Thread::existingAt($child->address())?->pendingApprovalIds() ?? [],
+            static fn (string $id): bool => $child->approvalStatus($id) === 'pending');
+        if ($waiting !== []) {
+            return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, SubagentOutcome::Denied,
+                'the subagent is waiting on a person\'s approval');
+        }
+
         try {
-            $child = $this->harness->forAgent($childAgent)->session(
-                $parent->participant(), $subagent->scopeUnder($parent->scope()), $parent->actor(),
-            );
             $child->usingMode($subagent->mode);
             $child->thread()->linkBeneath($parent->thread(), $context->rootRunId());
 

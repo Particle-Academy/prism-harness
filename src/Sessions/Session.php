@@ -250,8 +250,11 @@ class Session
      * it last started it (G-387): min(its declared max_steps, what the parent
      * had left, max_steps_ceiling). Re-applied on every turn the runner did
      * not start, so a child resumed by its host keeps the ceiling it was
-     * given. Null for a session never started as a child, or saved before
-     * the ceiling was kept.
+     * given. It is the delegation's LIFETIME budget: every turn the runner
+     * did not start, resumes and new messages alike, spends from it until
+     * the runner starts the child again (see {@see self::childDelegation()}).
+     * Null for a session never started as a child, or saved before the
+     * ceiling was kept (a linked child with none fails closed).
      *
      * @internal Read by the runtime for a run the runner did not start.
      */
@@ -264,7 +267,33 @@ class Session
         $ceiling = $saved['step_ceiling'];
 
         // A value this runtime could not have written fails closed: no steps.
-        return is_int($ceiling) && $ceiling >= 0 ? $ceiling : 0;
+        return is_int($ceiling) && $ceiling >= 0 && $ceiling <= 9007199254740991 ? $ceiling : 0;
+    }
+
+    /**
+     * The delegation the runner last started this child under (G-387): the
+     * id of the durable count of the steps the child has used since, kept
+     * beside the ceiling. Null for a session never started as a child.
+     *
+     * @internal
+     */
+    public function childDelegation(): ?string
+    {
+        $delegation = $this->savedChild()['delegation'] ?? null;
+
+        return is_string($delegation) && $delegation !== '' ? $delegation : null;
+    }
+
+    /**
+     * Whether this session is, or was, a subagent child: its thread is linked
+     * beneath a parent, or it saved a child record (a binding, a run tree or
+     * a plan ledger). Only a session that never was runs on its own mode.
+     *
+     * @internal
+     */
+    public function isLinkedChild(): bool
+    {
+        return $this->savedChild() !== null || $this->thread()->parent_thread_id !== null;
     }
 
     /**
@@ -273,7 +302,7 @@ class Session
      * @param  array{session: string, plan: string}|null  $planLedger
      * @param  array{session: string, run: string}|null  $tree
      */
-    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null, ?int $stepCeiling = null): self
+    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null, ?int $stepCeiling = null, ?string $delegation = null): self
     {
         $this->assertWritableResolution();
         $child = [
@@ -291,6 +320,9 @@ class Session
         }
         if ($stepCeiling !== null) {
             $child['step_ceiling'] = max(0, $stepCeiling);
+        }
+        if ($delegation !== null) {
+            $child['delegation'] = $delegation;
         }
         // Under a key of its own (G-381): the session's durable record holds
         // host state, such as capabilities, that another process may change
@@ -789,6 +821,10 @@ class Session
         // BEFORE anything is written or emitted, and so before any provider
         // call: a decision answers a question the run asked (G-354).
         $this->assertDecisionsPending($decisions);
+        // A decision the resuming turn could not act on at all (a lost child
+        // binding, a cancelled or spent context) is refused here, with
+        // nothing recorded, rather than consumed by a resume that refuses.
+        $this->runtime?->assertDecisionsActionable($this, $context);
         // A decision a spent shared plan budget could not run is refused
         // here, with nothing recorded, rather than consumed by a resume that
         // is then refused (G-366).

@@ -31,19 +31,25 @@ final readonly class RunBudget
          * already bounded by its steps.
          */
         public ?int $maxToolCalls = null,
-    ) {}
+    ) {
+        // A budget that cannot bound anything is refused, never read as no
+        // limit (G-387).
+        if ($maxSteps < 0) {
+            throw new \InvalidArgumentException('A run budget\'s max_steps must be a non-negative whole number.');
+        }
+    }
 
     /**
      * @param  array<string, mixed>  $config
      */
     public static function fromArray(array $config, int $defaultSteps = 8): self
     {
-        $steps = $config['max_steps'] ?? $defaultSteps;
+        $steps = self::wholeSteps($config['max_steps'] ?? $defaultSteps);
         $cost = $config['max_cost_usd'] ?? null;
         $seconds = $config['max_seconds'] ?? null;
 
         return new self(
-            maxSteps: is_numeric($steps) ? (int) $steps : $defaultSteps,
+            maxSteps: $steps,
             maxCostUsd: is_numeric($cost) ? (float) $cost : null,
             maxSeconds: is_numeric($seconds) ? (int) $seconds : null,
             maxOutputTokensPerCall: isset($config['max_output_tokens_per_call']) && is_int($config['max_output_tokens_per_call'])
@@ -104,6 +110,26 @@ final readonly class RunBudget
                 $this->maxToolCalls === null ? null : $ledger->toolCalls() + $this->maxToolCalls,
             ),
         );
+    }
+
+    /**
+     * A max_steps as a whole count. A non-finite, fractional, negative or
+     * out-of-range number, or anything that is not a number, is refused:
+     * cast, INF and NAN become 0 and 1e30 becomes an arbitrary count.
+     */
+    private static function wholeSteps(mixed $steps): int
+    {
+        if (is_int($steps) && $steps >= 0) {
+            return $steps;
+        }
+        if (is_string($steps) && preg_match('/\A[0-9]{1,15}\z/', $steps) === 1) {
+            return (int) $steps;
+        }
+        if (is_float($steps) && is_finite($steps) && floor($steps) === $steps && $steps >= 0 && $steps <= 9007199254740991) {
+            return (int) $steps;
+        }
+
+        throw new \InvalidArgumentException('A run budget\'s max_steps must be a non-negative whole number.');
     }
 
     private static function lesserCount(?int $a, ?int $b): ?int

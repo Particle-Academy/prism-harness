@@ -226,6 +226,19 @@ class Thread extends Model implements ThreadContract
         return $query;
     }
 
+    /**
+     * The live thread at this address, or null, creating nothing.
+     *
+     * @internal Read by the subagent runner before it touches a child.
+     */
+    public static function existingAt(SessionAddress $address): ?self
+    {
+        /** @var self|null $live */
+        $live = static::lookupAddress($address)->first();
+
+        return $live;
+    }
+
     public static function forAddress(SessionAddress $address): self
     {
         $lookup = static::lookupAddress($address);

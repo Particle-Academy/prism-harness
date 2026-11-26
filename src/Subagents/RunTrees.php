@@ -66,6 +66,15 @@ final class RunTrees
     private array $grants = [];
 
     /**
+     * Holds on a child's delegation count, by run id, until the run ends
+     * (G-387): the child session, the delegation, and the ledger with its
+     * count when the hold was taken.
+     *
+     * @var array<string, array{session: string, delegation: string, ledger: RunLedger, steps: int}>
+     */
+    private array $delegationHolds = [];
+
+    /**
      * Which run tree a run that is beginning belongs to (G-381), from facts
      * this runtime holds and nothing a host states: for the runner's own
      * context, the recorded membership of the live parent run the runner
@@ -355,6 +364,7 @@ final class RunTrees
     public function finished(Session $session, string $runId): void
     {
         unset($this->members[$runId], $this->grants[$runId]);
+        $this->settleDelegation($session, $runId);
         $entry = $this->runs[$runId] ?? null;
         if ($entry === null || $entry['session'] !== $session->key()) {
             return;
@@ -373,6 +383,107 @@ final class RunTrees
             // The hold stays and is charged in full once it expires.
             report(new RuntimeException('A run tree budget update failed: '.$failure::class.'.'));
         }
+    }
+
+    /**
+     * The runner is starting a child (G-387): a new delegation, whose count
+     * of the steps the child uses starts at 0 under the ceiling the runner
+     * gave it. Every turn on the child the runner does not start spends
+     * from it, so the ceiling is the delegation's lifetime budget.
+     *
+     * @internal Called by the runtime when it saves a runner start's binding.
+     */
+    public function startDelegation(Session $child, string $delegation, int $ceiling): void
+    {
+        $key = self::delegationKey($child);
+        $child->planStore()->withLock($key, function () use ($child, $key, $delegation, $ceiling): void {
+            $child->planStore()->put($key, PlanBudget::open($delegation, ['mode' => 'shared', 'max_steps' => max(0, $ceiling), 'max_cost_micros' => null]));
+        }, 10, 5);
+    }
+
+    /**
+     * Claim this run's steps from its child's delegation count, in ONE locked
+     * write (G-387). `$allow` is given the count the delegation has already
+     * used, live holds of other runs included, and returns the steps this run
+     * may take; that many are held under the run id, and settled with what
+     * the run took when it ends. A hold whose run never settles is charged
+     * in full once the run lock's TTL has passed. Returns the count used;
+     * null when the session was started before delegations were counted;
+     * -1 when it names a delegation whose record is gone or is another's,
+     * which the caller fails closed on.
+     *
+     * @internal
+     *
+     * @param  Closure(int): int  $allow
+     */
+    public function claimDelegation(Session $child, string $runId, RunLedger $ledger, Closure $allow): ?int
+    {
+        $delegation = $child->childDelegation();
+        if ($delegation === null) {
+            return null;
+        }
+        $key = self::delegationKey($child);
+        $store = $child->planStore();
+        $now = time();
+        $ttl = self::holdTtl();
+        $used = $store->withLock($key, function () use ($store, $key, $delegation, $runId, $allow, $now, $ttl): int {
+            $state = $store->get($key);
+            if (! is_array($state) || ($state['planId'] ?? null) !== $delegation || ! is_array($state['holds'] ?? null)) {
+                return -1;
+            }
+            $state = PlanBudget::expire($state, $now, $ttl);
+            $used = (int) $state['steps'];
+            foreach ($state['holds'] as $hold) {
+                $used += (int) $hold['steps'];
+            }
+            $steps = max(0, $allow($used));
+            if ($steps > 0) {
+                $state['holds'][$runId] = ['steps' => $steps, 'cost_micros' => 0, 'at' => $now];
+                ksort($state['holds'], SORT_STRING);
+            }
+            $store->put($key, $state);
+
+            return $used;
+        }, 10, 5);
+        if ($used >= 0) {
+            $this->delegationHolds[$runId] = ['session' => $child->key(), 'delegation' => $delegation, 'ledger' => $ledger, 'steps' => $ledger->steps()];
+        }
+
+        return $used;
+    }
+
+    /** Replace a run's hold on its child's delegation count with what it took. */
+    private function settleDelegation(Session $session, string $runId): void
+    {
+        $hold = $this->delegationHolds[$runId] ?? null;
+        if ($hold === null || $hold['session'] !== $session->key()) {
+            return;
+        }
+        unset($this->delegationHolds[$runId]);
+        $steps = max(0, $hold['ledger']->steps() - $hold['steps']);
+        $key = self::delegationKey($session);
+        $store = $session->planStore();
+        try {
+            $store->withLock($key, function () use ($store, $key, $hold, $runId, $steps): void {
+                $state = $store->get($key);
+                if (! is_array($state) || ($state['planId'] ?? null) !== $hold['delegation']) {
+                    return;
+                }
+                // Counted whether or not a hold was taken: a run with no
+                // grant that still took a step (it cannot) is never free.
+                unset($state['holds'][$runId]);
+                $state['steps'] = (int) $state['steps'] + $steps;
+                $store->put($key, $state);
+            }, 10, 5);
+        } catch (Throwable $failure) {
+            // The hold stays and is charged in full once it expires.
+            report(new RuntimeException('A delegation count update failed: '.$failure::class.'.'));
+        }
+    }
+
+    private static function delegationKey(Session $child): string
+    {
+        return $child->key().':delegation-steps';
     }
 
     /**

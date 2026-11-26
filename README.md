@@ -657,16 +657,26 @@ run continues the run tree the child was started in rather than getting a fresh 
 first time a root run starts a child, the tree's step and cost allowance is kept in the durable
 store, and the root run settles what the whole tree spent when it ends. The resumed run holds
 what the tree has left before it calls a provider and settles what it spent when it ends. The
-runner also saves the child's step ceiling (the smaller of its declared `max_steps`, what the
-parent had left and `max_steps_ceiling`), and every turn the runner did not start is held to it,
-counted from what the child had used when it parked: a child declared at 2 steps that parked
-after 1 has 1 left however it is resumed. A tree with no steps left never refuses the person's
-decision on the child's approval: acting on a decision takes no model step, so the approved call
-runs, its result is recorded and the run then stops on its step budget with no further model
-step. A spent cost allowance never refuses it either: acting on an approved call makes no
-provider call. Only a cancelled tree refuses the decision, with nothing recorded. A new message
-to a child whose ceiling or tree is spent is refused before anything is recorded. A hold whose run never settled is charged in full once the run
-lock's TTL has passed. When the child was started by a turn that spent from a shared plan
+runner also saves the child's step ceiling: its grant, the smaller of the child's declared
+`max_steps`, what the parent had left and `max_steps_ceiling`. That ceiling is the
+delegation's lifetime budget. Every turn on the child the runner did not start, whether it
+answers an approval, sends a new message or sends an empty one, spends from one durable count
+of the steps the child has used since the runner last started it, claimed in one locked write
+when the turn begins and settled with what it took. A child declared at 2 steps that took 1
+has 1 left, however it is resumed and however many turns are sent to it. The next time the
+runner starts the child, the count starts again at 0 under the new grant. A linked child with
+no saved ceiling, or with one that is not a whole number, gets no model steps: it still acts on
+the decisions it is answered with, and a new message to it is refused before anything is
+recorded. Only a session that was never a child runs on its own mode.
+
+A spent budget, of steps or of cost, in the child, its tree or a plan, never refuses the
+person's decision: acting on an approved call makes no model call, so the call runs, its result
+is recorded, and the run then stops on its budget with no further model step. A decision the
+turn could not act on at all is refused before anything is recorded: a cancelled run tree, a
+linked child that lost its binding (`child_binding_missing`), or a run context whose run was
+cancelled or whose time or tool-call limit is spent. A new message to a child with nothing left
+is refused before anything is recorded. A hold whose run never settled is charged in full once
+the run lock's TTL has passed. When the child was started by a turn that spent from a shared plan
 budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). The same holds
 for every turn on the child session the runner did not start: a new message sent with `send()`
 instead of an answer continues the tree and the plan budget exactly as an answer does, and a run
@@ -1031,27 +1041,41 @@ no bound at all — it has a bound per node in a tree whose width it also contro
 receives the *smaller* of what it declares and what the tree has left, and its spend lands
 in the parent's account.
 
-**How many steps a run may take is decided once, when it begins.** The run's ceiling (its
-mode's or session's `max_steps` for a root, the ceiling the runner saved for a child, or a
-host context's remainder) is capped by `max_steps_ceiling` on the run's whole count, less
-what the run had already used when it parked; then the run tree's record and a shared plan
-budget each grant at most that, in one locked write each. The least of the three is the
-run's allowance, and the step gate, the subagent runner's check, the tree and plan holds
-and the row the run parks on all read it. A run that parks writes `harness_steps_used` (the
-steps it had used, its subagents' steps included) and `harness_steps_left` on the row it
-parks on, and its resume continues from `harness_steps_used`, so a root that spent 5 of its
-8 steps through a child before parking has 3 left, however many times it is approved. A
-value there that this runtime could not have written fails closed, with no steps left; a
-row written by an earlier release is counted from the transcript (a count missing beside a
-saved child ceiling fails closed: the two are written together). A new message starts a new run (it resumes
-no parked count) on the child's saved ceiling; what a child spends across runs is bounded by
-its run tree's record. A spent allowance, of steps
-or of cost, never refuses a decision, on any route: the approved calls run, their results are recorded, and
-the run then stops on its budget (`RunNotPermitted`) with no model step, identically on
-`send()`, `sendStructured()`, `stream()` and the decision routes. A new message, which
+**How many steps a run may take is decided once, when it begins.** The run's ceiling is
+its mode's or session's `max_steps` for a root with no context; a host's run context's
+remainder for a root under a host context (it runs on the host's budget, not the mode's);
+and for a child, the ceiling the runner granted and saved with it. `max_steps_ceiling` caps
+it on the run's whole count. From the ceiling the run's count is taken away: for a resume,
+what the parked run had used, its subagents' steps included; for a child, what its
+delegation has used. Then the run tree's record and a shared plan budget each grant at most
+what is left, in one locked write each, and the least of the three is the run's allowance.
+The step gate, the subagent runner's check, the holds and the row the run parks on all
+read that one allowance. A run that parks writes `harness_steps_used` and
+`harness_steps_left` on the row it parks on, so a root that spent 5 of its 8 steps through a
+child before parking has 3 left however many times it is approved. A stored value this
+runtime could not have written fails closed with no steps left. So does a count that is
+missing beside a saved child ceiling, because the two are always written together.
+
+A run budget is a whole number of steps: `RunBudget` refuses a negative `max_steps`, and
+`RunBudget::fromArray()` refuses one that is not a whole number (`INF`, `NAN`, `2.5`).
+A `max_steps_ceiling` setting that cannot be read as a whole number allows no steps rather
+than lifting the limit.
+
+A spent allowance, of steps or of cost, never refuses a decision, on any route. The approved
+calls run, their results are recorded, and the run then stops on its budget
+(`RunNotPermitted`) with no model step, identically on `send()`, `sendStructured()`,
+`stream()`, `streamSteps()` and the decision routes, capped or not. When the approved call
+is itself a subagent call on a spent run, it is acted on: the subagent runner returns its
+framed "did not run" result (`exhausted`) as that call's result. A new message, which
 resumes no decision, with nothing left is refused before anything is recorded
-(`plan_budget_exhausted` when the plan is what is spent). The same rule is
-pinned across the three languages by the parity op `step_allowance`.
+(`plan_budget_exhausted` when the plan is what is spent). The rule is pinned across the
+three languages by the parity op `step_allowance`.
+
+**The runner does not delegate over a person.** A subagent call with an empty or blank
+`task` is refused (`denied`) before the child is built. So is a delegation into a child that
+is waiting on a person's approval: a model must not be able to dismiss that approval by
+delegating again. Nothing is written to the child. An approval whose run was cancelled is
+not waiting on anyone, and does not hold the child.
 
 `send()`, `sendStructured()` and `stream()` charge a shared tree's step before
 the provider call, so a tool that starts a child sees the parent's current step

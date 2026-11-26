@@ -111,12 +111,23 @@ final class RunBudgets
         return is_int($value) && $value >= 0 && $value <= 9007199254740991;
     }
 
+    /**
+     * A count, clamped to >= 0. Null stays null. A non-finite number, one
+     * beyond the JSON-safe range, or anything that is not a number counts as
+     * 0: an input that cannot be read never removes a bound.
+     */
     private static function count(mixed $value): ?int
     {
         if ($value === null) {
             return null;
         }
+        if (is_int($value)) {
+            return max(0, $value);
+        }
+        if (is_float($value) && is_finite($value) && abs($value) <= 9007199254740991) {
+            return max(0, (int) $value);
+        }
 
-        return max(0, is_int($value) ? $value : (int) $value);
+        return 0;
     }
 }
