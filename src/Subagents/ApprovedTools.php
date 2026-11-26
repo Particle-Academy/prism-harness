@@ -16,6 +16,7 @@ use Prism\Prism\Enums\TelemetryOperation;
 use Prism\Prism\Events\Telemetry\GenerationStarted;
 use Prism\Prism\Events\Telemetry\ToolInvoked;
 use Prism\Prism\Streaming\EventID;
+use Prism\Prism\Streaming\Events\ArtifactEvent;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Structured\PendingRequest as StructuredPending;
@@ -24,8 +25,11 @@ use Prism\Prism\Telemetry\Telemetry;
 use Prism\Prism\Telemetry\TelemetryContext;
 use Prism\Prism\Text\PendingRequest as TextPending;
 use Prism\Prism\Text\Request as TextRequest;
+use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Throwable;
 use WeakMap;
 
@@ -36,7 +40,26 @@ use WeakMap;
  */
 final class ApprovedTools
 {
-    use CallsTools;
+    use CallsTools {
+        invokeToolCall as private coreInvokeToolCall;
+    }
+
+    /**
+     * Run one approved tool with the hold lifted.
+     *
+     * The resolver's own ToolInvoked for a call is dispatched after the tool
+     * returns, and only that one is held. A tool that runs a generation of its
+     * own (an agent built as a tool, a subagent) reports that generation's
+     * calls while it runs, in that generation's trace; they pass through live,
+     * as on 0.26.7. Core's only per-call execution path goes through here.
+     *
+     * @param  Tool[]  $tools
+     * @return array{toolResult: ToolResult, events: array<int, ToolResultEvent|ArtifactEvent>, durationMs: float, failed: bool, failure: ?string}
+     */
+    private static function invokeToolCall(array $tools, ToolCall $toolCall, string $messageId): array
+    {
+        return Event::defer(static fn (): array => self::coreInvokeToolCall($tools, $toolCall, $messageId), []);
+    }
 
     /**
      * The resolution's ToolInvoked events (dispatch arguments), held until
@@ -45,6 +68,9 @@ final class ApprovedTools
      * @var list<array<int, mixed>>
      */
     private array $held = [];
+
+    /** The resolved request, for a generation the held events may need. */
+    private TextRequest|StructuredRequest|null $request = null;
 
     /** @var list<self> resolutions whose events wait for their generation */
     private static array $waiting = [];
@@ -73,8 +99,10 @@ final class ApprovedTools
      *
      * Core reports each call it runs with a ToolInvoked telemetry event, and
      * only under a telemetry context. The resolver is stepped one result at a
-     * time and each step's ToolInvoked events are held, not dispatched, until
-     * the resolution's result is recorded. No listener runs between an
+     * time and the resolver's own ToolInvoked events are held, not dispatched,
+     * until the resolution's result is recorded (a generation the approved
+     * tool runs itself reports live; see invokeToolCall). No listener runs
+     * between an
      * approved call and its record, so not even a listener that ends the
      * process in a way PHP cannot catch can lose the record (an approved call
      * whose result was lost would run again on the next resume). Each held
@@ -99,7 +127,7 @@ final class ApprovedTools
      */
     public function resolve(TextPending|StructuredPending $generation, Closure $record): array
     {
-        $request = $generation->toRequest();
+        $request = $this->request = $generation->toRequest();
         $context = null;
         if ($this->inGeneration !== null && Telemetry::enabled() && Telemetry::current() === null) {
             $context = new TelemetryContext(
@@ -142,7 +170,7 @@ final class ApprovedTools
                     report($unrecorded);
                 }
             }
-            $this->announceFailed($request);
+            $this->flush($failure);
 
             throw $failure;
         } finally {
@@ -150,7 +178,15 @@ final class ApprovedTools
         }
         if ($events !== []) {
             $messages = $request->messages();
-            $record($messages);
+            try {
+                $record($messages);
+            } catch (Throwable $unrecorded) {
+                // The calls ran; their events describe what happened even
+                // though the record did not land.
+                $this->flush($unrecorded, failGeneration: true);
+
+                throw $unrecorded;
+            }
             $generation->withMessages($messages);
         }
         if ($this->inGeneration === null) {
@@ -164,8 +200,8 @@ final class ApprovedTools
      * Run the generation that follows the resolution, dispatching the held
      * events when it starts, in its trace: as GenerationStarted reaches its
      * listeners, after the ones the application registered at boot (a tracing
-     * bridge opens the trace there). Whatever no generation took is
-     * dispatched in its own context once the run ends.
+     * bridge opens the trace there). Whatever no generation took is flushed
+     * once the run ends.
      *
      * @template TResult
      *
@@ -179,11 +215,16 @@ final class ApprovedTools
         }
         self::hook();
         self::$waiting[] = $this;
+        $failure = null;
         try {
             return $run();
+        } catch (Throwable $thrown) {
+            $failure = $thrown;
+
+            throw $thrown;
         } finally {
             self::$waiting = array_values(array_filter(self::$waiting, fn (self $waiting): bool => $waiting !== $this));
-            $this->announce(null);
+            $this->flush($failure);
         }
     }
 
@@ -204,36 +245,60 @@ final class ApprovedTools
         }
         self::hook();
         self::$waiting[] = $this;
+        $failure = null;
         try {
             yield from $open();
+        } catch (Throwable $thrown) {
+            $failure = $thrown;
+
+            throw $thrown;
         } finally {
             self::$waiting = array_values(array_filter(self::$waiting, fn (self $waiting): bool => $waiting !== $this));
-            $this->announce(null);
+            $this->flush($failure);
         }
     }
 
     /**
-     * After a failed resolution: on the plain paths, start the generation the
-     * resolution stood in for, dispatch the held events in it and end it, as
-     * core's generation did when a tool threw out of it (started, no
-     * GenerationFailed for a tool's own exception, ended); elsewhere dispatch
-     * them in their own context.
+     * Dispatch whatever is still held because no generation took it: the
+     * resolution failed, its record did not land, or the turn ended (a
+     * stream abandoned, a generation that failed) before its generation
+     * started. On the plain paths the generation the resolution stood in for
+     * is started for them and ended, as core's was on 0.26.7 when the
+     * resolution ran inside it: a stream generation is failed first when
+     * there is a failure (core's asStream does), a text or structured one is
+     * not (core's does not, for anything but a provider request failure).
+     * After a failed record ($failGeneration) it is failed whatever the
+     * operation: on 0.26.7 the record came after a completed generation, and
+     * a stand-in that produced no response cannot be completed honestly, so
+     * it is closed with the failure instead of being left open.
+     * Elsewhere they are dispatched in their own context.
      */
-    private function announceFailed(TextRequest|StructuredRequest $request): void
+    public function flush(?Throwable $failure = null, bool $failGeneration = false): void
     {
-        $failed = null;
-        if ($this->inGeneration !== null && $this->held !== []) {
+        if ($this->held === []) {
+            return;
+        }
+        $generation = null;
+        if ($this->inGeneration !== null && $this->request !== null) {
+            $request = $this->request;
             try {
-                $failed = Telemetry::start($this->inGeneration, (string) $request->provider(), $request->model(), $request, null, $this->sessionId);
+                $generation = Telemetry::start($this->inGeneration, (string) $request->provider(), $request->model(), $request, null, $this->sessionId);
             } catch (Throwable $listener) {
                 report($listener);
-                $failed = Telemetry::current();
+                $generation = Telemetry::current();
             }
         }
         try {
-            $this->announce($failed);
+            $this->announce($generation);
+            if ($failure !== null && ($failGeneration || $this->inGeneration === TelemetryOperation::Stream)) {
+                try {
+                    Telemetry::failed($generation, $failure);
+                } catch (Throwable $listener) {
+                    report($listener);
+                }
+            }
         } finally {
-            Telemetry::end($failed);
+            Telemetry::end($generation);
         }
     }
 
@@ -332,8 +397,10 @@ final class ApprovedTools
     }
 
     /**
-     * One step of the resolver, with core's ToolInvoked events taken into the
-     * held list as it returns. A listener failure is reported, never thrown.
+     * One step of the resolver, with the resolver's own ToolInvoked events
+     * taken into the held list as it returns (the tool body runs with the hold
+     * lifted; see invokeToolCall). A listener failure is reported, never
+     * thrown.
      *
      * Laravel's Event::defer holds the step's events, but dispatches them all
      * in one loop as the step returns (before the record, and one throwing

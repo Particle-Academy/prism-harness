@@ -815,6 +815,7 @@ final readonly class AgentRuntime
         $finishReason = FinishReason::Unknown;
         // Whether the prompt went into the record with an approval resolution.
         $promptRecorded = false;
+        $approved = null;
 
         try {
             // The thread's messages and the prompt, as withThread() and
@@ -924,6 +925,9 @@ final readonly class AgentRuntime
 
             throw $failure;
         } finally {
+            // A resolution whose stream was abandoned (or failed) before its
+            // generation opened still sends the events it holds.
+            $approved?->flush();
             if ($namedRun !== null && $collected !== null) {
                 $namedRun->ledger->recordSteps(count($collected['response']->steps));
                 $namedRun->ledger->recordCost($this->costOf($collected['response']));
