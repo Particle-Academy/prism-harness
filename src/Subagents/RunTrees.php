@@ -38,7 +38,7 @@ final class RunTrees
     /**
      * Root runs of this process, by run id, until they end.
      *
-     * @var array<string, array{session: string, tree: array{session: string, run: string}, budget: RunBudget, ledger: RunLedger, steps: int, cost: float, unmetered: int, held: bool}>
+     * @var array<string, array{session: string, tree: array{session: string, run: string}, budget: RunBudget, ledger: RunLedger, steps: int, cost: float, unmetered: int, held: bool, held_by?: string}>
      */
     private array $runs = [];
 
@@ -330,7 +330,9 @@ final class RunTrees
      * spent the tree since the read, so it would now grant less than the
      * gate saw), nothing is written and the start is refused. Returns the
      * release, called when a later commit step fails: it returns the hold
-     * (and the record, when this hold opened it) exactly once.
+     * (and the record, when this hold opened it) exactly once, and only
+     * while the hold is still the one this start took: a release by any
+     * other start (a re-entrant one, say) is a no-op.
      *
      * @internal Called by the runtime once the start gate let a start through.
      *
@@ -339,7 +341,7 @@ final class RunTrees
      *
      * @throws RunNotPermitted when the tree no longer grants what the gate read
      */
-    public function holdForStart(Session $child, array $membership, ?int $expected): Closure
+    public function holdForStart(Session $child, array $membership, ?int $expected, string $by): Closure
     {
         $hold = $this->startHold($membership);
         if ($hold === null) {
@@ -369,14 +371,17 @@ final class RunTrees
         }
         $key = $hold['key'];
         $this->runs[$key]['held'] = true;
+        // Which start took it: only that start may release it.
+        $this->runs[$key]['held_by'] = $by;
         $released = false;
 
-        return function () use ($child, $hold, $key, $opened, &$released): void {
-            if ($released) {
+        return function () use ($child, $hold, $key, $opened, $by, &$released): void {
+            if ($released || ($this->runs[$key]['held_by'] ?? null) !== $by) {
                 return;
             }
             $released = true;
             $this->runs[$key]['held'] = false;
+            unset($this->runs[$key]['held_by']);
             $store = $child->planStore();
             $recordKey = self::key($hold['tree']);
             try {
@@ -484,30 +489,45 @@ final class RunTrees
      *
      * The busy check is made again under the lock: a turn on the child that
      * claimed its count since the gate read it (live, not past the lock TTL)
-     * keeps it, and the start is refused with nothing written. When `$save`
-     * fails, the count is put back as it was, so the binding and the count
-     * never name two delegations. Returns false when refused.
+     * keeps it, and the start is refused with nothing written. So is the
+     * pending check (`$recheck`, which throws to refuse): an approval a
+     * person can answer that was parked since the gate read it is never
+     * dismissed by the start. When `$save` fails, the count is put back as it
+     * was, so the binding and the count never name two delegations.
+     *
+     * `$save` writes the child's records and returns their restore. Returns
+     * null when refused as busy; otherwise the undo, for a start that fails
+     * before its task row is recorded: in one locked write, the child's
+     * records and its count go back to what they were before this commit,
+     * each only while it is still what this commit wrote (a later writer is
+     * never clobbered). Called once; a failure to undo is logged by class.
      *
      * @internal Called by the runtime once the tree hold is taken.
      *
-     * @param  Closure(): void  $save
+     * @param  Closure(): (Closure(): void)  $save
+     * @param  (Closure(): void)|null  $recheck
+     * @return (Closure(): void)|null
      */
-    public function commitChild(Session $child, string $delegation, int $ceiling, Closure $save): bool
+    public function commitChild(Session $child, string $delegation, int $ceiling, Closure $save, ?Closure $recheck = null): ?Closure
     {
         $key = self::delegationKey($child);
         $store = $child->planStore();
 
-        return $store->withLock($key, function () use ($child, $store, $key, $delegation, $ceiling, $save): bool {
+        $state = null;
+        $restore = $store->withLock($key, function () use ($child, $store, $key, $delegation, $ceiling, $save, $recheck, &$state): ?Closure {
             // A record this runtime could not have written is replaced.
             $state = $store->get($key);
             $current = $child->childDelegation();
             if ($current !== null && self::validCount($state, $current)
                 && PlanBudget::expire($state, time(), self::holdTtl())['holds'] !== []) {
-                return false;
+                return null;
+            }
+            if ($recheck !== null) {
+                $recheck();
             }
             $store->put($key, PlanBudget::open($delegation, ['mode' => 'shared', 'max_steps' => max(0, $ceiling), 'max_cost_micros' => null]));
             try {
-                $save();
+                return $save();
             } catch (Throwable $failure) {
                 if ($state === null) {
                     $store->forget($key);
@@ -517,9 +537,36 @@ final class RunTrees
 
                 throw $failure;
             }
-
-            return true;
         }, 10, 5);
+        if ($restore === null) {
+            return null;
+        }
+        $prior = $state;
+        $undone = false;
+
+        return static function () use ($child, $store, $key, $delegation, $restore, $prior, &$undone): void {
+            if ($undone) {
+                return;
+            }
+            $undone = true;
+            try {
+                $store->withLock($key, static function () use ($child, $store, $key, $delegation, $restore, $prior): void {
+                    if ($child->childDelegation() === $delegation) {
+                        $restore();
+                    }
+                    $count = $store->get($key);
+                    if (is_array($count) && ($count['planId'] ?? null) === $delegation) {
+                        if ($prior === null) {
+                            $store->forget($key);
+                        } else {
+                            $store->put($key, $prior);
+                        }
+                    }
+                }, 10, 5);
+            } catch (Throwable $failure) {
+                report(new RuntimeException('A subagent start could not be undone: '.$failure::class.'.'));
+            }
+        };
     }
 
     /**

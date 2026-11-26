@@ -1108,15 +1108,36 @@ nesting depth, a cancel, the time limit, the steps the child would have, a spent
 (the context's cap or the agent's `spend_ceiling`), a cost cap that cannot be metered, a spent
 tool-call limit, a turn running on the child, an approval a person can still answer, then what
 the run tree and the shared plan budget would grant. The first that holds is the refusal, and
-the parent model gets a fixed, harness-written reason (a host's cancel text is never passed
-on). A refused start writes nothing: no session mode, no thread link or row, no count, binding
-or hold, no run state. A start the gate allows commits in one order: the run tree hold, then
-the child's records in one locked write that checks again that no turn holds the child, then
-the run. A hold or claim that lands between the read and the write refuses the start with the
-child's records unchanged, and the tree hold is returned. Once a start has committed, a stop
-that lands later (a cancel, say) stops its model steps but not the start: the task is recorded
-on the child and the run ends with that stop. The gate is pinned across the three languages
-by the parity op `start_gate`; the tool-call limit exists only here.
+the parent model gets a fixed, harness-written reason. A refused start writes nothing: no
+session mode, no thread link or row, no count, binding or hold, no run state. A start the gate
+allows commits in one order: the run tree hold, then the child's records (its binding, count
+and mode) in one locked write that checks again that no turn holds the child and that no
+approval a person can answer was parked on it since the read, then the run. A hold, a claim or
+an approval that lands between the read and the write refuses the start with the child's
+records unchanged, and the tree hold is returned. The start is held to the step count the gate
+read: steps the context spends after the read count against it. Until the child's task row is
+recorded the start can still be undone: if anything fails before it (the tool offer, the
+provider, the run beginning), the child's binding, count, mode and thread link go back to what
+they were (each only if no later writer changed it) and the tree hold is returned, so an
+approval nobody could answer stays that way. Once a start has committed, a stop that lands
+later (a cancel, say) stops its model steps but not the start: the task is recorded on the
+child and the run ends with that stop. The gate is pinned across the three languages by the
+parity op `start_gate`; the tool-call limit exists only here.
+
+**What the parent model reads about a child is harness-written.** The runner chooses the
+outcome (`denied`, `cancelled`, `exhausted`, else `failed`) and the reason from the refusal's
+code, from a fixed set; a failure names only the exception's class. An exception's message is
+never passed on, and a host's cancel reason (`RunLedger::cancel($reason)`) never becomes an
+exception message or a stored total: the host reads it back from `cancelReason()` and
+`exhaustion()`, and refusals say "run stopped by the host". The same holds for `RunFailed`
+and every run record (the run state's `failure`, the run history): they carry the exception's
+class, a fixed harness description or a harness code, never exception text, whatever
+`prism.telemetry.capture_content` is set to.
+
+**A budget that cannot bound anything is refused.** `RunBudget` refuses a negative, fractional
+or non-finite `max_steps`, a `max_cost_usd` that is negative, NaN or infinite, and a negative
+or non-whole `max_seconds` (from a host's constructor call and from config alike), rather than
+reading any of them as no limit.
 
 **A host run context belongs to one session's turn.** Its ledger is the account every step
 under it is counted on. Share one context across sessions and each child resumed under it is

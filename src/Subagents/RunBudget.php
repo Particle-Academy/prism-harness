@@ -37,6 +37,14 @@ final readonly class RunBudget
         if ($maxSteps < 0) {
             throw new \InvalidArgumentException('A run budget\'s max_steps must be a non-negative whole number.');
         }
+        // NaN compares false with every limit and INF never runs out: either
+        // would read as no cap. A negative one is not a budget either.
+        if ($maxCostUsd !== null && (! is_finite($maxCostUsd) || $maxCostUsd < 0)) {
+            throw new \InvalidArgumentException('A run budget\'s max_cost_usd must be a finite, non-negative number.');
+        }
+        if ($maxSeconds !== null && $maxSeconds < 0) {
+            throw new \InvalidArgumentException('A run budget\'s max_seconds must be a non-negative whole number.');
+        }
     }
 
     /**
@@ -51,7 +59,8 @@ final readonly class RunBudget
         return new self(
             maxSteps: $steps,
             maxCostUsd: is_numeric($cost) ? (float) $cost : null,
-            maxSeconds: is_numeric($seconds) ? (int) $seconds : null,
+            // Cast, 1e999 and 1.5 would become an arbitrary count: refused.
+            maxSeconds: is_numeric($seconds) ? self::wholeSeconds($seconds) : null,
             maxOutputTokensPerCall: isset($config['max_output_tokens_per_call']) && is_int($config['max_output_tokens_per_call'])
                 ? $config['max_output_tokens_per_call'] : null,
         );
@@ -130,6 +139,22 @@ final readonly class RunBudget
         }
 
         throw new \InvalidArgumentException('A run budget\'s max_steps must be a non-negative whole number.');
+    }
+
+    /** A numeric max_seconds as a whole count; a fraction, a negative or a non-finite number is refused. */
+    private static function wholeSeconds(int|float|string $seconds): int
+    {
+        if (is_string($seconds)) {
+            $seconds = preg_match('/\A[0-9]{1,15}\z/', $seconds) === 1 ? (int) $seconds : (float) $seconds;
+        }
+        if (is_int($seconds) && $seconds >= 0) {
+            return $seconds;
+        }
+        if (is_float($seconds) && is_finite($seconds) && floor($seconds) === $seconds && $seconds >= 0 && $seconds <= 9007199254740991) {
+            return (int) $seconds;
+        }
+
+        throw new \InvalidArgumentException('A run budget\'s max_seconds must be a non-negative whole number.');
     }
 
     private static function lesserCount(?int $a, ?int $b): ?int
