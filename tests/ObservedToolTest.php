@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Prism\Harness\Subagents\ObservedTool;
 use Prism\Harness\Subagents\ResolutionRecorder;
 use Prism\Harness\Tools\DelegatingTool;
+use Prism\Harness\Tools\GuardedTool;
 use Prism\Prism\Schema\ObjectSchema;
 use Prism\Prism\Schema\StringSchema;
 use Prism\Prism\Tool;
@@ -161,6 +162,39 @@ it('changes the wrapped tool when a setter is called on the wrapper', function (
         ->and($tool->failedHandler())->toBeFalse()
         ->and($watched?->copyWithProviderOptions(['k' => 'v'])->providerOptions('k'))->toBe('v')
         ->and($tool->providerOptions('k'))->toBeNull();
+});
+
+it('reaches only the public methods and properties of the tool it stands in for', function (): void {
+    $tool = (new PublicStateSearch)->as('search')->for('S')->withStringParameter('query', 'Q')->using(fn (string $query): string => 'r');
+    $watched = ObservedTool::of($tool, watchedRecorder([['call_1', 'search', ['query' => 'a']]]));
+
+    expect(fn () => $watched?->resolveHandler())->toThrow(Error::class, 'undefined method')
+        ->and(fn () => $watched?->coerceArguments(fn () => null, []))->toThrow(Error::class, 'undefined method')
+        ->and($watched?->label)->toBe('labelled');
+    $watched->label = 'changed';
+    expect($tool->label)->toBe('changed');
+});
+
+it('clones apart from the tool it stands in for, as the tool clones unwrapped', function (): void {
+    $tool = (new Tool)->as('search')->for('S')->withStringParameter('query', 'Q')->using(fn (string $query): string => 'r');
+    $watched = ObservedTool::of($tool, watchedRecorder([['call_1', 'search', ['query' => 'a']]]));
+    $copy = clone $watched;
+    $copy?->requiresApproval(true);
+
+    expect($copy?->hasApprovalConfigured())->toBeTrue()
+        ->and($watched?->hasApprovalConfigured())->toBeFalse()
+        ->and($tool->hasApprovalConfigured())->toBeFalse();
+});
+
+it('watches a guarded tool, so call-time authorization keeps the watch', function (): void {
+    $guarded = GuardedTool::of((new Tool)->as('search')->for('S')->withStringParameter('query', 'Q')
+        ->using(fn (string $query): string => 'r '.$query), fn (array $arguments): ?string => null);
+    $recorder = watchedRecorder([['call_1', 'search', ['query' => 'a']]]);
+    $watched = $guarded === null ? null : ObservedTool::of($guarded, $recorder);
+
+    expect($watched)->toBeInstanceOf(ObservedTool::class)
+        ->and($watched?->handle(query: 'a'))->toBe('r a')
+        ->and(array_map(fn ($r) => $r->toolCallId, $recorder->results()))->toBe(['call_1']);
 });
 
 // When core adds a public Tool method, this fails, and until the method is

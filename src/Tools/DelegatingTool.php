@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Tools;
 
 use Closure;
+use Error;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Tool;
 use Prism\Prism\Tools\LaravelMcpTool;
@@ -47,6 +48,8 @@ abstract class DelegatingTool extends Tool
      * code may reach by a type check the wrapper cannot pass. The one such
      * class core checks for, LaravelMcpTool, is wrapped when core would offer
      * it: core's only check of it is the eligibility filter at withTools().
+     * Another DelegatingTool (a guarded tool, say) is wrapped: it stands in
+     * for its own tool exactly.
      */
     public static function canWrap(Tool $tool): bool
     {
@@ -57,6 +60,9 @@ abstract class DelegatingTool extends Tool
             if (! is_a((new ReflectionMethod(static::class, $method->getName()))->getDeclaringClass()->getName(), self::class, true)) {
                 return false;
             }
+        }
+        if ($tool instanceof self) {
+            return true;
         }
         if ($tool instanceof LaravelMcpTool) {
             return $tool::class === LaravelMcpTool::class && $tool->eligibleForRegistration();
@@ -81,13 +87,57 @@ abstract class DelegatingTool extends Tool
     }
 
     /**
-     * A public method the wrapped tool's class adds (see canWrap()).
+     * A public method the wrapped tool's class adds (see canWrap()). Only a
+     * public instance method: from inside this class, Tool's protected methods
+     * would be reachable on the wrapped tool, and they are not its API.
      *
      * @param  array<int|string, mixed>  $arguments
      */
     public function __call(string $method, array $arguments): mixed
     {
+        if (! method_exists($this->inner, $method) || ! (new ReflectionMethod($this->inner, $method))->isPublic()
+            || (new ReflectionMethod($this->inner, $method))->isStatic()) {
+            throw new Error('Call to undefined method '.static::class.'::'.$method.'()');
+        }
+
         return $this->inner->{$method}(...$arguments);
+    }
+
+    /** A public property the wrapped tool's class declares. */
+    public function __get(string $property): mixed
+    {
+        if (! $this->exposes($property)) {
+            trigger_error('Undefined property: '.static::class.'::$'.$property, E_USER_WARNING);
+
+            return null;
+        }
+
+        return $this->inner->{$property};
+    }
+
+    public function __set(string $property, mixed $value): void
+    {
+        if (! $this->exposes($property)) {
+            throw new Error('Cannot create dynamic property '.static::class.'::$'.$property);
+        }
+        $this->inner->{$property} = $value;
+    }
+
+    public function __isset(string $property): bool
+    {
+        return $this->exposes($property) && isset($this->inner->{$property});
+    }
+
+    /** A clone stands in for a clone of the tool, as cloning it unwrapped would give. */
+    public function __clone()
+    {
+        $this->inner = clone $this->inner;
+    }
+
+    private function exposes(string $property): bool
+    {
+        return property_exists($this->inner, $property) && (new ReflectionProperty($this->inner, $property))->isPublic()
+            && ! (new ReflectionProperty($this->inner, $property))->isStatic();
     }
 
     public function handle(...$args): string|ToolOutput|ToolError
@@ -317,8 +367,7 @@ abstract class DelegatingTool extends Tool
     public function copyWithProviderOptions(array $options): static
     {
         $copy = clone $this;
-        $copy->inner = $this->inner->copyWithProviderOptions($options);
-        $copy->adopt($copy->inner);
+        $copy->adopt($this->inner->copyWithProviderOptions($options));
 
         return $copy;
     }

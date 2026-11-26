@@ -8,6 +8,7 @@ use Prism\Harness\Sessions\Session;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolError;
 use Prism\Prism\ValueObjects\ToolOutput;
+use ReflectionMethod;
 
 /**
  * Wraps a tool so authorization is asked at the moment it is CALLED, with the
@@ -26,12 +27,14 @@ use Prism\Prism\ValueObjects\ToolOutput;
  * and return check a second time, around the guard, which turned the tool's
  * ToolError into an "invalid return type" error and decoded a JSON-string
  * argument the tool wanted as a string. The clone remains the guard for a tool
- * a GuardedTool cannot stand in for (see DelegatingTool::canWrap()), so no
- * tool is ever offered unguarded.
+ * a GuardedTool cannot stand in for (see DelegatingTool::canWrap()). A tool
+ * neither can guard (its class overrides handle(), so a re-pointed handler is
+ * never called) is not offered at all: wrap() returns null.
  */
 final class AuthorizedTool
 {
-    public static function wrap(Tool $tool, Session $session, ToolAuthorizer $authorizer): Tool
+    /** The tool, guarded; null when no guard can be put in front of its calls. */
+    public static function wrap(Tool $tool, Session $session, ToolAuthorizer $authorizer): ?Tool
     {
         // Nothing to enforce, so hand back the tool itself rather than a clone
         // that only adds a call. The authorizer's constructor has already
@@ -53,6 +56,11 @@ final class AuthorizedTool
         $guarded = GuardedTool::of($tool, $refusal);
         if ($guarded instanceof Tool) {
             return $guarded;
+        }
+        // The clone's guard is its handler, which only Tool's own handle()
+        // calls. A class with its own handle() would never ask it.
+        if ((new ReflectionMethod($tool, 'handle'))->getDeclaringClass()->getName() !== Tool::class) {
+            return null;
         }
 
         $guarded = clone $tool;

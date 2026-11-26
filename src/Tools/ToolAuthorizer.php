@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Tools;
 
 use Illuminate\Contracts\Auth\Access\Gate;
+use LogicException;
 use Prism\Harness\Exceptions\UnsafeAuthorizationConfiguration;
 use Prism\Harness\Sessions\Session;
 use Prism\Prism\Tool;
@@ -54,7 +55,7 @@ final readonly class ToolAuthorizer
             return $this;
         }
         if ($this->agent !== null) {
-            throw new \LogicException('Harness authorizer/session agent mismatch.');
+            throw new LogicException('Harness authorizer/session agent mismatch.');
         }
         $agent = $session->agent();
         $options = $this->agents[$agent] ?? [];
@@ -113,16 +114,25 @@ final readonly class ToolAuthorizer
             return array_values($tools);
         }
 
-        return array_values(array_map(
-            // Each survivor is wrapped so the SAME policy is asked again when
-            // the tool is actually called, with arguments. Offer-time filtering
-            // alone cannot bound how a tool is used, only whether it is present.
-            fn (Tool $tool): Tool => AuthorizedTool::wrap($tool, $session, $this),
-            array_filter(
-                $tools,
-                fn (Tool $tool): bool => $this->gate->forUser($session->actor())->allows($this->offerAbility, [$session, $tool]),
-            ),
-        ));
+        // Each survivor is wrapped so the SAME policy is asked again when the
+        // tool is actually called, with arguments. Offer-time filtering alone
+        // cannot bound how a tool is used, only whether it is present. A tool
+        // no guard can be put in front of is not offered (see AuthorizedTool).
+        $guarded = [];
+        foreach ($tools as $tool) {
+            if (! $this->gate->forUser($session->actor())->allows($this->offerAbility, [$session, $tool])) {
+                continue;
+            }
+            $wrapped = AuthorizedTool::wrap($tool, $session, $this);
+            if ($wrapped === null) {
+                report(new LogicException('Tool ['.$tool->name().'] is not offered: its class ['.$tool::class.'] overrides handle() and adds public methods, so call-time authorization cannot be put in front of its calls.'));
+
+                continue;
+            }
+            $guarded[] = $wrapped;
+        }
+
+        return $guarded;
     }
 
     /**
