@@ -17,6 +17,7 @@ use Prism\Prism\Events\Telemetry\GenerationFailed;
 use Prism\Prism\Events\Telemetry\GenerationStarted;
 use Prism\Prism\Events\Telemetry\ToolInvoked;
 use Prism\Prism\Facades\Prism;
+use Prism\Prism\Streaming\Events\ToolResultEvent;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
@@ -353,3 +354,54 @@ it('never reports the approved call in a nested generation\'s trace', function (
         ->and(array_map(fn (string $trace): ?string => array_key_exists($trace, $sessions) ? $sessions[$trace] : 'unknown trace', $approved))
         ->toBe([$session->key()]);
 })->with(['inner list' => 'list', 'inner all' => 'all']);
+
+// A host whose Event::defer() over ToolInvoked ends while a plain stream is
+// still mid-way (it consumed the resolution's events, then returned) must not
+// get the approved call's event in a trace that never starts: it belongs to
+// the stream's generation, as on 0.26.7, or, if the stream is abandoned, to a
+// stand-in that is opened and closed. Never before the record.
+it('reports a host-deferred stream resolution in the stream generation, or a closed stand-in', function (string $end): void {
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('Send five.')->pendingApprovals();
+    $session->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($pending[0]->approvalId, true)])], $session->run()['id'] ?? null);
+
+    $traces = [];
+    $seen = [];
+    Event::listen(GenerationStarted::class, function (GenerationStarted $event) use (&$traces): void {
+        $traces[$event->context->traceId] = [$event->context->operation->value, 'open'];
+    });
+    Event::listen(GenerationFailed::class, function (GenerationFailed $event) use (&$traces): void {
+        $traces[$event->context->traceId][1] = 'failed:'.strtok($event->exception->getMessage(), ':');
+    });
+    Event::listen(GenerationCompleted::class, function (GenerationCompleted $event) use (&$traces): void {
+        $traces[$event->context->traceId][1] = 'completed';
+    });
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use ($session, &$traces, &$seen): void {
+        $seen[] = [$event->toolName, $event->context->traceId, $session->thread()->storedMessages()->where('type', 'tool_result')->get()
+            ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])
+            ->where('tool_call_id', $event->toolCallId)->count()];
+    });
+
+    $stream = $session->stream('');
+    Event::defer(function () use ($stream): void {
+        // Consume up to the resolution's own event, then return.
+        foreach ($stream as $event) {
+            if ($event instanceof ToolResultEvent) {
+                break;
+            }
+        }
+    }, [ToolInvoked::class]);
+    if ($end === 'finished outside') {
+        while ($stream->valid()) {
+            $stream->next();
+        }
+    }
+    unset($stream);
+    gc_collect_cycles();
+
+    expect($this->runs)->toBe(1)->and($seen)->toHaveCount(1);
+    [$tool, $trace, $recorded] = $seen[0];
+    expect($tool)->toBe('transfer')
+        ->and($recorded)->toBe(1)
+        ->and($traces[$trace] ?? 'a trace that never started')->toBe($end === 'finished outside' ? ['stream', 'completed'] : ['stream', 'failed:resolution_abandoned']);
+})->with(['finished outside', 'abandoned']);

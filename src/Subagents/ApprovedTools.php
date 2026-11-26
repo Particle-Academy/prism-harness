@@ -168,8 +168,11 @@ final class ApprovedTools
     public function resolve(TextPending|StructuredPending $generation, Closure $record): array
     {
         $request = $this->request = $generation->toRequest();
-        $dispatcher = DeferredEvents::dispatcher();
-        $this->hostStart = DeferredEvents::state($dispatcher)['deferring'] ? count(DeferredEvents::list($dispatcher)) : null;
+        // Laravel's deferral internals are needed only when the resolution
+        // could report a call (see holdNeeded()); otherwise it runs as on
+        // 0.26.7, on any dispatcher.
+        $dispatcher = $this->holdNeeded($request) ? DeferredEvents::dispatcher() : null;
+        $this->hostStart = $dispatcher !== null && DeferredEvents::state($dispatcher)['deferring'] ? count(DeferredEvents::list($dispatcher)) : null;
         $context = null;
         if ($this->inGeneration !== null && Telemetry::enabled() && Telemetry::current() === null) {
             $context = new TelemetryContext(
@@ -316,6 +319,40 @@ final class ApprovedTools
     public function flush(): void
     {
         $this->settle(ResolutionAbandoned::before());
+    }
+
+    /**
+     * Whether the resolution could dispatch a ToolInvoked at all, and so has
+     * to be held: telemetry is on, a context is open for core to report under
+     * (the one this resolution opens on the plain paths, or the host's own),
+     * and the last assistant step calls a tool with an approval configured.
+     * The last is core's own first check: without such a call its resolver
+     * returns before running anything.
+     */
+    private function holdNeeded(TextRequest|StructuredRequest $request): bool
+    {
+        if (! Telemetry::enabled() || ($this->inGeneration === null && Telemetry::current() === null)) {
+            return false;
+        }
+        $messages = $request->messages();
+        for ($i = count($messages) - 1; $i >= 0; $i--) {
+            $message = $messages[$i];
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                $byName = [];
+                foreach ($request->tools() as $tool) {
+                    $byName[$tool->name()] = $tool;
+                }
+                foreach ($message->toolCalls as $call) {
+                    if (($byName[$call->name] ?? null)?->hasApprovalConfigured() === true) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        return false;
     }
 
     private function pending(): bool
@@ -614,14 +651,20 @@ final class ApprovedTools
      * host's own deferral (see invokeToolCall); the resolver's own
      * ToolInvoked, dispatched as the step runs, is taken out of the step's
      * deferral as it returns: into the held list, or, when the host defers
-     * ToolInvoked itself, back into the host's deferred list right after
-     * what the tool body deferred there. Either way no listener sees it
-     * before the record. A listener failure is reported, never thrown.
+     * ToolInvoked itself (and the generation runs inside that deferral),
+     * back into the host's deferred list right after what the tool body
+     * deferred there. Either way no listener sees it before the record. A
+     * listener failure is reported, never thrown. With no dispatcher there
+     * is nothing to hold and the step just runs.
      *
      * @param  Closure(): bool  $step
      */
-    private function step(Dispatcher $dispatcher, Closure $step): bool
+    private function step(?Dispatcher $dispatcher, Closure $step): bool
     {
+        if ($dispatcher === null) {
+            // Nothing to hold (see holdNeeded()).
+            return $step();
+        }
         $previousHost = self::$host;
         $previousForHost = self::$forHost;
         $host = self::$host = DeferredEvents::state($dispatcher);
@@ -652,7 +695,11 @@ final class ApprovedTools
             self::$host = $previousHost;
             self::$forHost = $previousForHost;
             self::dispatchEach($forHost);
-            if (DeferredEvents::defers($host, ToolInvoked::class)) {
+            // Left in the host's list only where the generation they wait for
+            // runs inside the host's deferral: not for the plain stream, which
+            // opens after the resolution's events are yielded, possibly after
+            // the host's deferral has flushed; there they stay held.
+            if (DeferredEvents::defers($host, ToolInvoked::class) && $this->inGeneration !== TelemetryOperation::Stream) {
                 foreach ($own as $args) {
                     if (($args[0] ?? null) instanceof ToolInvoked) {
                         $this->inHost[] = $args[0];

@@ -222,20 +222,62 @@ it('keeps each approved call\'s event right after its tool\'s own in a host flus
     expect(array_slice($order, 0, 4))->toBe(['audit:search', 'invoked:search', 'audit:weather', 'invoked:weather']);
 })->with(['plain', 'subagents']);
 
-// The deferral internals the harness relies on: if a framework release (or an
-// application's own dispatcher) does not have them, the harness refuses,
-// loudly, rather than run without the record-first guarantee.
-it('refuses a dispatcher without the deferral internals, loudly', function (): void {
+// The deferral internals the harness relies on are needed only where a call
+// could be reported before its record: a resume that resolves approvals with
+// telemetry on. There, a framework release (or an application's own
+// dispatcher) without them is refused, loudly, before the approved call runs.
+// Everywhere else (a plain send, a resume with telemetry off) the turn runs as
+// on 0.26.7, on any dispatcher.
+it('refuses a dispatcher without the deferral internals only where it holds', function (string $turn): void {
     expect(fn () => DeferredEvents::assertSupports(NullDispatcher::class))
         ->toThrow(UnsupportedEventDispatcher::class, 'has no [deferredEvents] property');
+    $ran = 0;
+    app(ToolRegistry::class)->register((new Tool)->as('weather')->for('Weather.')->withStringParameter('city', 'City')
+        ->using(function (string $city) use (&$ran): string {
+            $ran++;
 
-    $fixture = fn (string $name): string => (string) file_get_contents(__DIR__.'/Fixtures/openai/'.$name.'.json');
+            return 'sunny';
+        }));
     $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
     $real = app('events');
+    if ($turn !== 'plain send') {
+        $pending = $session->send('What time is the game, and do I need a coat?')->pendingApprovals();
+        expect($pending)->toHaveCount(1);
+    }
+    if ($turn === 'resume, telemetry off') {
+        config()->set('prism.telemetry.enabled', false);
+    }
     Event::swap(new NullDispatcher($real));
     try {
-        expect(fn () => $session->send('Hello.'))->toThrow(UnsupportedEventDispatcher::class, 'unsupported_event_dispatcher');
+        $act = fn () => $turn === 'plain send'
+            ? $session->send('What time is the game, and do I need a coat?')
+            : $session->decide([new ToolApprovalResponse($pending[0]->approvalId, true)]);
+        if ($turn === 'resume, telemetry on') {
+            expect($act)->toThrow(UnsupportedEventDispatcher::class, 'unsupported_event_dispatcher');
+            // Refused before the approved call ran.
+            expect($ran)->toBe(0);
+        } else {
+            $act();
+            expect($ran)->toBe($turn === 'plain send' ? 0 : 1);
+        }
     } finally {
         Event::swap($real);
     }
+})->with(['plain send', 'resume, telemetry off', 'resume, telemetry on']);
+
+// Skipping the hold opens no window: on Laravel's dispatcher, a resume with
+// telemetry off reports nothing at all, before or after the record.
+it('reports nothing from a resume with telemetry off', function (): void {
+    app(ToolRegistry::class)->register((new Tool)->as('weather')->for('Weather.')->withStringParameter('city', 'City')->using(fn (string $city): string => 'sunny'));
+    $session = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+    $pending = $session->send('What time is the game, and do I need a coat?')->pendingApprovals();
+    config()->set('prism.telemetry.enabled', false);
+    $seen = [];
+    Event::listen(ToolInvoked::class, function (ToolInvoked $event) use (&$seen): void {
+        $seen[] = $event->toolName;
+    });
+
+    $session->decide([new ToolApprovalResponse($pending[0]->approvalId, true)]);
+
+    expect($seen)->toBe([]);
 });
