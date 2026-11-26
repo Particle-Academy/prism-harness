@@ -113,11 +113,9 @@ resume of an approval that step asked for, and a subagent child those turns
 started, on any turn the runner did not start (an answer, a new message, or a
 host run context, which is narrowed to what is left). Other turns on the session spend nothing
 from the plan's budget and are never refused for it. A decision on the step's
-approval is accepted and acted on even when the shared budget's steps are spent
-(its live holds counted): the approved call runs with no further model step,
-because acting on a decision takes none. It is refused with
-`plan_budget_exhausted`, recording nothing, only once the shared budget's cost
-is spent. A step held on an approval when the budget is spent blocks the plan on
+approval is accepted and acted on even when the shared budget is spent, its
+steps or its cost (live holds counted): the approved call runs with no further
+model step, because acting on a decision makes no provider call. A step held on an approval when the budget is spent blocks the plan on
 the next `advance()`.
 
 ## Hosts with queues

@@ -505,21 +505,18 @@ final class Plans
         $now = $this->now();
         $ttl = $this->holdTtl();
         $wanted = max(0, $steps ?? ($budget->maxSteps - $baseSteps));
-        $spent = false;
+        $spent = null;
         [, $grant] = $this->budgetWriteAt($session->planStore(), $target['session'], $target['plan'], $this->budgetSettings(),
             static function (array $state) use ($runId, $wanted, $turnCost, $now, $ttl, &$spent): array {
-                $spent = PlanBudget::stepsSpent($state, $now, $ttl);
+                $spent = PlanBudget::spentLimit($state, $now, $ttl);
 
                 return PlanBudget::grantSteps($state, $runId, $wanted, $turnCost, $now, $ttl);
             });
-        if (isset($grant['refused'])) {
-            throw RunNotPermitted::planBudget((string) $grant['limit']);
-        }
-        // The plan's own steps are spent and the turn has no decision to act
-        // on: refused, as a turn on a spent plan always was. With decisions
-        // to act on it runs with no model step instead.
-        if ($spent && ! $session->thread()->decidedCallsAwaitingResult()) {
-            throw RunNotPermitted::planBudget('steps');
+        // The plan itself is spent (its steps or its cost) and the turn
+        // resumes no recorded decision: refused, as a turn on a spent plan
+        // always was. A resume acts on its decisions with no model step.
+        if ($spent !== null && ! ($prompt === '' && $session->thread()->decidedCallsAwaitingResult())) {
+            throw RunNotPermitted::planBudget($spent);
         }
         $this->grants[$runId] = (int) $grant['steps'];
 
@@ -610,13 +607,13 @@ final class Plans
 
     /**
      * Refuse, before anything is recorded, a decision on an approval whose
-     * resume would spend from a shared plan budget whose COST is spent, or
-     * that is handed a run tree of its own. Recorded, it would be consumed by
-     * a resume the budget then refuses, and the approved call would never run.
+     * resume is handed a run tree of its own. Recorded, it would be consumed
+     * by a resume the budget then refuses, and the approved call would never
+     * run.
      *
-     * A plan with no STEPS left never refuses a decision (G-387): its resume
-     * acts on it with no model step. Holds count, as they count for the
-     * resume: both read {@see PlanBudget::grantSteps()}'s rule.
+     * A spent shared budget, its steps or its cost, never refuses a decision
+     * (G-387): acting on it makes no provider call, and its resume acts on
+     * it with no model step.
      *
      * @internal Called by the session before it records decisions.
      *
@@ -633,11 +630,6 @@ final class Plans
         }
         if ($ledger['refused']) {
             throw PlanRefused::because('plan.budget_context');
-        }
-        $record = $this->budgetRecordAt($session->planStore(), $ledger['session'], $ledger['plan']);
-        $spent = $record === null ? null : PlanBudget::decisionRefusal($record, $this->now(), $this->holdTtl());
-        if ($spent !== null) {
-            throw RunNotPermitted::planBudget($spent);
         }
     }
 

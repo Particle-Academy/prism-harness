@@ -277,23 +277,26 @@ final readonly class AgentRuntime
      * decision was accepted, so it is acted on; refused here, it would be
      * consumed with nothing done, and every later resume refused the same way.
      */
-    private function actsOnDecisionsFirst(Session $session, RunContext $run, RunBudget $budget): bool
+    private function actsOnDecisionsFirst(Session $session, RunContext $run, RunBudget $budget, string $prompt): bool
     {
-        return $run->ledger->onlyStepsSpent($budget) && $session->thread()->decidedCallsAwaitingResult();
+        // Only a resume acts on recorded decisions; a new message resumes none.
+        return $prompt === '' && $run->ledger->onlyStepsSpent($budget) && $session->thread()->decidedCallsAwaitingResult();
     }
 
     /**
-     * Refuse, before any provider call, a run with nothing it may spend and
-     * nothing to act on: the tree's allowance, not this node's wish. The
-     * same check, and the same ending (failed on its budget, or cancelled),
-     * on send, structured and the step stream (G-387), which used to end a
-     * spent run three different ways. A capped run is checked by its call
-     * reservation instead.
+     * Refuse, before any provider call and before anything is recorded, a
+     * run with nothing it may spend and no recorded decision to act on: the
+     * tree's allowance, not this node's wish. The same check, and the same
+     * ending (failed on its budget, or cancelled), on send, structured and
+     * the step stream (G-387), which used to end a spent run three different
+     * ways. A capped run's own cost is admitted by its call reservation; its
+     * step allowance is checked here like any other run's.
      */
-    private function refuseSpentRun(Session $session, string $runId, RunContext $run, RunBudget $budget): void
+    private function refuseSpentRun(Session $session, string $runId, RunContext $run, RunBudget $budget, string $prompt): void
     {
-        $stop = $run->ledger->exhaustion($budget);
-        if (! $run->capped() && $stop !== null && ! $this->actsOnDecisionsFirst($session, $run, $budget)) {
+        $stop = $run->ledger->exhaustion($run->capped()
+            ? new RunBudget($budget->maxSteps, maxSeconds: $budget->maxSeconds, maxToolCalls: $budget->maxToolCalls) : $budget);
+        if ($stop !== null && ! $this->actsOnDecisionsFirst($session, $run, $budget, $prompt)) {
             $refusal = $run->ledger->refusal($stop);
             $this->endRun($session, $runId, $run, $refusal->code() === 'run_cancelled' ? 'cancelled' : 'budget');
 
@@ -318,7 +321,7 @@ final readonly class AgentRuntime
             harnessAgent: $session->agent(),
         ));
 
-        $this->refuseSpentRun($session, $runId, $run, $budget);
+        $this->refuseSpentRun($session, $runId, $run, $budget, $prompt);
 
         try {
             $run = $this->observedRun($run);
@@ -542,7 +545,7 @@ final readonly class AgentRuntime
             harnessAgent: $session->agent(),
         ));
 
-        $this->refuseSpentRun($session, $runId, $run, $budget);
+        $this->refuseSpentRun($session, $runId, $run, $budget, $prompt);
 
         try {
             $run = $this->observedRun($run);
@@ -941,7 +944,7 @@ final readonly class AgentRuntime
             ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
             : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
         try {
-            $this->refuseSpentRun($session, $runId, $run, $run->budget);
+            $this->refuseSpentRun($session, $runId, $run, $run->budget, $prompt);
         } catch (Throwable $refused) {
             $unwatch();
             $this->rememberSeq($session, $runId, $tagger);
@@ -1936,11 +1939,13 @@ final readonly class AgentRuntime
      *
      *  - `used`: what the parked run this turn resumes wrote it had used, on
      *    the row it parked on, children included, for ANY turn that resumes
-     *    one except a runner start (no context, metadata or host). Never less
-     *    than the run's own transcript rows show it took: a row forged lower
-     *    gains nothing. A row written before the count was kept is counted
-     *    from the transcript; one holding a value this runtime could not
-     *    have written fails closed, with nothing left.
+     *    one except a runner start (no context, metadata or host), and for
+     *    any turn on a child with a saved ceiling, a new message included.
+     *    Never less than the run's own transcript rows show it took: a row
+     *    forged lower gains nothing. A value this runtime could not have
+     *    written fails closed, with nothing left, and so does a count absent
+     *    beside a saved ceiling (the two are written together). A row with
+     *    neither, from an earlier release, is counted from the transcript.
      *  - `saved_ceiling`: the ceiling the runner saved with a child, for any
      *    turn the runner did not start.
      *  - `context_left`: what the runner's or the host's context has left.
@@ -1960,8 +1965,16 @@ final readonly class AgentRuntime
         }
         $state = 'none';
         $used = 0;
-        if ($kind !== 'runner' && $prompt === '') {
+        $savedCeiling = $kind === 'runner' ? null : $session->childStepCeiling();
+        // A child's saved ceiling bounds every turn the runner did not start,
+        // a new message included: its count continues the parked run's.
+        if ($kind !== 'runner' && ($prompt === '' || $savedCeiling !== null)) {
             [$state, $written] = $session->thread()->pausedStepsUsed();
+            // Written together with the saved ceiling: absent beside one, the
+            // row is not this runtime's, and it fails closed.
+            if ($state === 'absent' && $savedCeiling !== null) {
+                $state = 'invalid';
+            }
             $recount = $state === 'none' ? 0 : ($session->thread()->approvalRunSteps() ?? 0);
             $used = match ($state) {
                 'valid' => max((int) $written, $recount),
@@ -1972,7 +1985,7 @@ final readonly class AgentRuntime
         $facts = [
             'context' => $kind,
             'mode_steps' => $this->ceilingFor($session, $mode),
-            'saved_ceiling' => $kind === 'runner' ? null : $session->childStepCeiling(),
+            'saved_ceiling' => $savedCeiling,
             'context_left' => $context === null ? null : max(0, $context->budget->maxSteps - $context->ledger->steps()),
             'steps_ceiling' => $cap,
             'used' => $used,
@@ -1987,7 +2000,7 @@ final readonly class AgentRuntime
             $facts['used'] = $ceiling;
         }
 
-        return [$facts, $state !== 'none'];
+        return [$facts, $prompt === '' && $state !== 'none'];
     }
 
     /**
@@ -2085,7 +2098,7 @@ final readonly class AgentRuntime
      */
     private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run, string $runId, array $facts, bool $paused): void
     {
-        if ($context !== null || $prompt !== '') {
+        if ($context !== null) {
             return;
         }
         $run->ledger->recordSteps((int) $facts['used']);

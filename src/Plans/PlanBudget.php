@@ -219,57 +219,45 @@ final class PlanBudget
     }
 
     /**
-     * Grant one run its share of a ledger's STEPS, in the one locked write
-     * that holds it (G-387). Steps never refuse: a ledger whose steps are
-     * spent, settled or held by other runs, grants 0 and the run acts on the
-     * decisions it resumes with no model step. Only a COST limit refuses, as
-     * {@see self::reserve()} does. Asked for 0 steps, nothing is held.
+     * Grant one run its share of a ledger's steps, in the one locked write
+     * that holds it (G-387). A grant never refuses: a ledger whose steps are
+     * spent (settled or held by other runs) or whose COST is spent grants 0,
+     * and the run acts on the decisions it resumes with no model step, since
+     * acting on an approved call makes no provider call. Whether a turn with
+     * nothing to act on is then refused is the caller's: see
+     * {@see self::spentLimit()}. Asked for 0 steps, nothing is held.
      *
-     * Returns the state and either the grant (`steps`, `cost_micros`) or the
-     * cost refusal (`refused`, `limit`).
+     * Returns the state and the grant (`steps`, `cost_micros`).
      *
      * @param  array<string, mixed>  $state
-     * @return array{0: array<string, mixed>, 1: array<string, mixed>}
+     * @return array{0: array<string, mixed>, 1: array{steps: int, cost_micros: ?int}}
      */
     public static function grantSteps(array $state, string $holdId, int $steps, ?int $costMicros, int $now, int $holdTtl): array
     {
         $state = self::expire($state, $now, $holdTtl);
-        if (self::stepsLeft($state) <= 0 || $steps < 1) {
+        if ($steps < 1 || self::spentOf($state) !== null) {
             return [$state, ['steps' => 0, 'cost_micros' => null]];
         }
-        $limit = self::costLimit($state);
-        if ($limit !== null) {
-            return [$state, ['refused' => self::EXHAUSTED, 'limit' => $limit]];
-        }
+        [$state, $grant] = self::reserve($state, $holdId, $steps, $costMicros, $now, $holdTtl);
 
-        return self::reserve($state, $holdId, $steps, $costMicros, $now, $holdTtl);
+        return [$state, ['steps' => (int) $grant['steps'], 'cost_micros' => $grant['cost_micros']]];
     }
 
     /**
-     * Whether a decision on a run that resumes into this ledger must be
-     * refused before it is recorded (G-387): only for a cost limit, and
-     * never once the steps are spent (that run then acts on the decision
-     * with no model step, so no cost can be spent). The same answer
-     * {@see self::grantSteps()} gives the resume, whatever it asks for.
+     * Which limit leaves another run nothing, live holds counted (G-387):
+     * `steps`, `cost` or `cost_unmetered`; null while it has some of both.
      *
      * @param  array<string, mixed>  $state
      */
-    public static function decisionRefusal(array $state, int $now, int $holdTtl): ?string
+    public static function spentLimit(array $state, int $now, int $holdTtl): ?string
     {
-        $state = self::expire($state, $now, $holdTtl);
-
-        return self::stepsLeft($state) <= 0 ? null : self::costLimit($state);
+        return self::spentOf(self::expire($state, $now, $holdTtl));
     }
 
-    /**
-     * Whether the ledger has no steps left for another run, its live holds
-     * counted (G-387).
-     *
-     * @param  array<string, mixed>  $state
-     */
-    public static function stepsSpent(array $state, int $now, int $holdTtl): bool
+    /** @param array<string, mixed> $state */
+    private static function spentOf(array $state): ?string
     {
-        return self::stepsLeft(self::expire($state, $now, $holdTtl)) <= 0;
+        return self::stepsLeft($state) <= 0 ? 'steps' : self::costLimit($state);
     }
 
     /** @param array<string, mixed> $state */

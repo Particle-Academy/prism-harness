@@ -108,11 +108,12 @@ final class RunTrees
      * `$steps` is what the run itself has left (its own allowance): the hold
      * asks for that and no more, in one locked write. A tree with no steps
      * left grants 0, not a refusal: the run acts on the decisions it resumes
-     * with no model step (G-387). Only a spent COST limit refuses.
+     * with no model step (G-387), and so does a tree whose cost is spent:
+     * acting on an approved call makes no provider call. Never a refusal.
      *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
      *
-     * @throws RunNotPermitted when the tree the child belongs to is cancelled, or its cost is spent
+     * @throws RunNotPermitted when the tree the child belongs to is cancelled
      */
     public function rootRun(Session $session, string $runId, RunContext $run, array $membership, ?int $steps = null): RunContext
     {
@@ -168,28 +169,6 @@ final class RunTrees
 
             return PlanBudget::grantSteps($state, $runId, $steps, $turnCost, $now, $ttl);
         });
-        if (isset($grant['refused'])) {
-            // A spent COST limit (steps never refuse, G-387). A resumed root
-            // still acts on the decisions the person gave it: resolving them
-            // takes no model step, so it cannot overspend. It holds nothing
-            // and is narrowed to no further step.
-            if ($resumedRoot && $session->thread()->decidedCallsAwaitingResult()) {
-                $this->grants[$runId] = 0;
-                $spent = $run->withBudget(new RunBudget(
-                    maxSteps: $entry['steps'],
-                    maxCostUsd: $budget->maxCostUsd,
-                    maxSeconds: $budget->maxSeconds,
-                    maxOutputTokensPerCall: $budget->maxOutputTokensPerCall,
-                    maxToolCalls: $budget->maxToolCalls,
-                ));
-                $this->runs[$runId] = [...$entry, 'budget' => $spent->budget, 'ledger' => $spent->ledger];
-
-                return $spent;
-            }
-
-            throw RunNotPermitted::exhausted((string) $grant['limit']);
-        }
-
         $this->grants[$runId] = (int) $grant['steps'];
         $narrowed = $run->withBudget(new RunBudget(
             maxSteps: $entry['steps'] + (int) $grant['steps'],
@@ -328,11 +307,9 @@ final class RunTrees
      * could not act on at all: recorded, it would be consumed by a resume
      * the tree then refuses, and the approved call would never run.
      *
-     * A tree with no STEPS left never refuses a decision (G-387): acting on
-     * it takes no model step, and the resume acts on it with an allowance of
-     * 0. Only a cancelled tree refuses, and, for a child continuing a tree,
-     * a spent cost limit, which the resume also refuses: the same answer
-     * {@see PlanBudget::grantSteps()} gives it.
+     * A spent tree, its steps or its cost, never refuses a decision
+     * (G-387): acting on it makes no provider call, and the resume acts on
+     * it with an allowance of 0. Only a cancelled tree refuses.
      *
      * @internal Called by the session before it records decisions.
      *
@@ -366,11 +343,6 @@ final class RunTrees
         }
         if ($this->treeCancelled($session, $tree)) {
             throw RunNotPermitted::cancelled();
-        }
-        // A record that is gone grants 0 steps: the resume acts on the decision.
-        $refused = $state === null ? null : PlanBudget::decisionRefusal($state, time(), self::holdTtl());
-        if ($refused !== null) {
-            throw RunNotPermitted::exhausted($refused);
         }
     }
 

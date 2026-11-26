@@ -663,8 +663,9 @@ counted from what the child had used when it parked: a child declared at 2 steps
 after 1 has 1 left however it is resumed. A tree with no steps left never refuses the person's
 decision on the child's approval: acting on a decision takes no model step, so the approved call
 runs, its result is recorded and the run then stops on its step budget with no further model
-step. Only a cancelled tree, or a tree whose cost allowance is spent, refuses the decision, with
-nothing recorded. A hold whose run never settled is charged in full once the run
+step. A spent cost allowance never refuses it either: acting on an approved call makes no
+provider call. Only a cancelled tree refuses the decision, with nothing recorded. A new message
+to a child whose ceiling or tree is spent is refused before anything is recorded. A hold whose run never settled is charged in full once the run
 lock's TTL has passed. When the child was started by a turn that spent from a shared plan
 budget, the resumed run spends from that plan budget too (`plan_budget_exhausted`). The same holds
 for every turn on the child session the runner did not start: a new message sent with `send()`
@@ -1041,10 +1042,13 @@ steps it had used, its subagents' steps included) and `harness_steps_left` on th
 parks on, and its resume continues from `harness_steps_used`, so a root that spent 5 of its
 8 steps through a child before parking has 3 left, however many times it is approved. A
 value there that this runtime could not have written fails closed, with no steps left; a
-row written by an earlier release is counted from the transcript. A spent allowance never
-refuses a decision, on any route: the approved calls run, their results are recorded, and
-the run then stops on its step budget (`RunNotPermitted`) with no model step, identically
-on `send()`, `sendStructured()`, `stream()` and the decision routes. The same rule is
+row written by an earlier release is counted from the transcript (a count missing beside a
+saved child ceiling fails closed: the two are written together). A spent allowance, of steps
+or of cost, never refuses a decision, on any route: the approved calls run, their results are recorded, and
+the run then stops on its budget (`RunNotPermitted`) with no model step, identically on
+`send()`, `sendStructured()`, `stream()` and the decision routes. A new message, which
+resumes no decision, with nothing left is refused before anything is recorded
+(`plan_budget_exhausted` when the plan is what is spent). The same rule is
 pinned across the three languages by the parity op `step_allowance`.
 
 `send()`, `sendStructured()` and `stream()` charge a shared tree's step before
@@ -1547,11 +1551,8 @@ rather than refused. Any other turn on the session,
 such as the person chatting while a step waits on their approval, spends
 nothing from the plan's budget and is never refused for it. A decision on an
 approval the step asked for is accepted and acted on even when the shared
-budget's steps are spent, its live holds counted: the approved call runs with no
-further model step, and the next `advance()` blocks the plan. A decision is
-refused with `plan_budget_exhausted`, recording nothing, only when the shared
-budget's cost is spent, so an approval is never consumed by a resume that
-cannot run.
+budget is spent, its steps or its cost, live holds counted: the approved call
+runs with no further model step, and the next `advance()` blocks the plan.
 
 ## What it is for
 

@@ -497,7 +497,11 @@ it('never lets a paused row forged down to 0 grant more than the transcript show
     expect(g387Requests())->toBeLessThanOrEqual(3);
 });
 
-it('counts a legacy paused row with no harness_steps_used from the transcript, never as 0', function (): void {
+// A count absent from a child's paused row, on a session that saved a step
+// ceiling, was not written by this runtime (the two are written together):
+// it fails closed. Absent on a session with no saved ceiling (an earlier
+// release's child), it is counted from the transcript, never read as 0.
+it('fails closed on a paused child row with no harness_steps_used beside a saved ceiling', function (): void {
     g387ParkedChild('worker', 2);
     $row = g387ParkedRow(g387Child('worker'));
     $payload = $row->payload;
@@ -508,7 +512,28 @@ it('counts a legacy paused row with no harness_steps_used from the transcript, n
 
     g387ApproveAll(fn (): Session => g387Child('worker'));
 
-    expect(g387Requests() - $before)->toBeLessThanOrEqual(1);
+    expect(g387Requests())->toBe($before)
+        ->and($this->ran['weather'])->toBe(1);
+});
+
+it('counts a legacy paused row with no harness_steps_used and no saved ceiling from the transcript', function (): void {
+    config()->set('prism-harness.agent.modes.work.max_steps', 2);
+    g387ParkedChild('worker', 8);
+    $child = g387Child('worker');
+    // As an earlier release saved it: no step ceiling, no count on the row.
+    $child->rememberChildBinding($child->childBinding(), $child->childDepth(), $child->childPlanLedger(), $child->childTree());
+    expect(g387Child('worker')->childStepCeiling())->toBeNull();
+    $row = g387ParkedRow(g387Child('worker'));
+    $payload = $row->payload;
+    unset($payload['harness_steps_used'], $payload['harness_steps_left']);
+    $row->payload = $payload;
+    $row->save();
+    $before = g387Requests();
+
+    g387ApproveAll(fn (): Session => g387Child('worker'));
+
+    // The mode's 2, less the 1 the transcript shows: never a fresh 2.
+    expect(g387Requests() - $before)->toBe(1);
 });
 
 it('gives a child the runner starts again a fresh allowance, never the parked count', function (): void {
@@ -539,4 +564,82 @@ it('still refuses a child decision on a cancelled tree, recording nothing', func
         ->and(g387Child('worker')->thread()->pendingApprovalIds())->toBe($pending)
         ->and($this->ran['weather'])->toBe(0)
         ->and(g387Requests())->toBe($before);
+});
+
+// COST never refuses a decision either: acting on an approved call makes no
+// provider call. A spent cost allowance on a resume acts, with no model step.
+it('acts on a child decision when its tree cost is spent, with no model step', function (): void {
+    g387ParkedChild('worker', 2);
+    $child = g387Child('worker');
+    $tree = $child->childTree();
+    $key = $tree['session'].':run-tree:'.$tree['run'];
+    $record = $child->planStore()->get($key);
+    $child->planStore()->put($key, [...$record, 'max_cost_micros' => 1000, 'cost_micros' => 1000]);
+    $pending = $child->thread()->pendingApprovalIds();
+    $before = g387Requests();
+
+    try {
+        g387Child('worker')->approve($pending[0]);
+    } catch (RunNotPermitted $failure) {
+        expect($failure->getMessage())->toContain('budget exhausted');
+    }
+
+    expect($this->ran['weather'])->toBe(1)
+        ->and(g387Child('worker')->thread()->pendingApprovalIds())->toBe([])
+        ->and(g387Requests())->toBe($before);
+});
+
+it('acts on a plan step decision when the shared budget cost is spent, with no model step', function (): void {
+    g387PlanSetup(10);
+    $approval = g387HeldStep();
+    $session = G360::session();
+    $record = $session->planStore()->get($session->key().':plan-budget');
+    $session->planStore()->put($session->key().':plan-budget', [...$record, 'max_cost_micros' => 1000, 'cost_micros' => 1000]);
+    g387Pad();
+
+    expect(g387ApprovePlanStep($approval, $this))->toBe(['ran' => 1, 'requests' => 0, 'pending' => []]);
+});
+
+// A NEW message (it resumes no recorded decision) with nothing left is
+// refused before anything is recorded: run_not_permitted for the run's own
+// ceiling or its tree.
+function g387Rows(Session $session): int
+{
+    return $session->thread()->storedMessages()->count();
+}
+
+it('refuses a new message to a child whose saved ceiling is spent, recording nothing', function (): void {
+    g387ParkedChild('worker', 1);
+    $rows = g387Rows(g387Child('worker'));
+    $before = g387Requests();
+    g387Fresh();
+
+    expect(fn () => g387Child('worker')->send('A new question'))->toThrow(RunNotPermitted::class, 'step budget exhausted');
+    expect(g387Rows(g387Child('worker')))->toBe($rows)
+        ->and(g387Requests())->toBe($before);
+});
+
+it('refuses a new message to a child whose tree a sibling spent, recording nothing', function (): void {
+    config()->set('prism-harness.agent.modes.chat.tools', []);
+    config()->set('prism-harness.agent.modes.chat.max_steps', 6);
+    config()->set('prism-harness.agent.modes.chat.subagents', [
+        'worker_a' => ['description' => 'Work.', 'mode' => 'work', 'max_steps' => 8],
+        'worker_b' => ['description' => 'Work.', 'mode' => 'work', 'max_steps' => 8],
+    ]);
+    G360::calls([['worker_a', ['task' => 'Go']]]);
+    G360::calls([['weather', ['city' => 'Oslo']]]);
+    G360::calls([['worker_b', ['task' => 'Go']]]);
+    G360::calls([['weather', ['city' => 'Rome']]]);
+    G360::text('Both asked.');
+    g387Pad();
+    g387Root()->send('Go');
+    g387ApproveAll(fn (): Session => g387Child('worker_a'));
+    $rows = g387Rows(g387Child('worker_b'));
+    $before = g387Requests();
+    g387Fresh();
+
+    expect(fn () => g387Child('worker_b')->send('A new question'))->toThrow(RunNotPermitted::class, 'step budget exhausted');
+    expect(g387Rows(g387Child('worker_b')))->toBe($rows)
+        ->and(g387Requests())->toBe($before)
+        ->and($this->ran['weather'])->toBe(2);
 });
