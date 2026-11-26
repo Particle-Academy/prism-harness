@@ -1749,9 +1749,11 @@ final readonly class AgentRuntime
         if (! $first instanceof StructuredStep) {
             return $transcript;
         }
+        // The resolution's merged message is the one core builds with the
+        // approval decisions on it; the step's own tool results carry none.
         $resolution = array_values(array_filter(
             $this->newMessageObjects(array_values($first->messages), $prompt instanceof UserMessage ? [...$history, $prompt] : $history),
-            fn (Message $message): bool => $message instanceof ToolResultMessage,
+            fn (Message $message): bool => $message instanceof ToolResultMessage && $message->toolApprovalResponses !== [],
         ));
         if ($resolution === []) {
             return $transcript;
