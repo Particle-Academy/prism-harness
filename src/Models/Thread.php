@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Models;
 
+use Closure;
 use Generator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
@@ -19,9 +20,11 @@ use Prism\Harness\Context\NoCompaction;
 use Prism\Harness\Context\ToolPairGuard;
 use Prism\Harness\Contracts\CompactionStrategy;
 use Prism\Harness\Contracts\EvictionSink;
+use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\Sessions\DatabaseAddressIndex;
 use Prism\Harness\Sessions\SessionAddress;
+use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
@@ -475,6 +478,62 @@ class Thread extends Model implements ThreadContract
      * @param  list<string>|null  $toolNames
      */
     private function recordRows(iterable $messages, ?string $runId, ?array $toolNames, bool $outside): self
+    {
+        $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
+        if ($outside && $this->wouldSupersedeOpenStep($messages)) {
+            // A write that would end a parked step's calls is SERIALISED with
+            // the run that may be acting on them (G-404): it takes the
+            // session's own lock, so it never lands while an approved call
+            // runs. Held, it waits as a turn does, or throws SessionLocked
+            // having written nothing.
+            $store = app(SessionStoreManager::class)->ephemeral();
+            if ($store instanceof FencedSessionStore) {
+                return $store->withFencedLock($this->sessionAddress()->sessionKey(), function (Closure $owned) use ($messages, $runId, $toolNames): self {
+                    $owned();
+
+                    return $this->writeRows($messages, $runId, $toolNames, true);
+                }, max(1, (int) config('prism-harness.agent.lock_ttl', 300)), max(0, (int) config('prism-harness.agent.lock_wait', 0)));
+            }
+        }
+
+        return $this->writeRows($messages, $runId, $toolNames, $outside);
+    }
+
+    /**
+     * Whether recording `$messages` outside a run would supersede the
+     * paused step while it still has a call with no result.
+     *
+     * @param  list<Message>  $messages
+     */
+    private function wouldSupersedeOpenStep(array $messages): bool
+    {
+        $supersedes = array_filter($messages, static fn (Message $message): bool => $message instanceof AssistantMessage || $message instanceof UserMessage);
+        if ($supersedes === []) {
+            return false;
+        }
+        $step = $this->resolvableStep();
+
+        return $step !== null && $step['assistant']->toolApprovalRequests !== []
+            && self::callsWithoutResult($step['assistant']->toolCalls, $step['results']) !== [];
+    }
+
+    /** The session address this thread belongs to, as its saving hook builds it. */
+    private function sessionAddress(): SessionAddress
+    {
+        return new SessionAddress(
+            $this->participant_ref_type ?? $this->getAttribute('participant_type'),
+            $this->participant_ref_id ?? ($this->getAttribute('participant_id') === null ? null : (string) $this->getAttribute('participant_id')),
+            $this->scope,
+            $this->agent_id,
+            $this->participant_ref_type !== null,
+        );
+    }
+
+    /**
+     * @param  list<Message>  $messages
+     * @param  list<string>|null  $toolNames
+     */
+    private function writeRows(array $messages, ?string $runId, ?array $toolNames, bool $outside): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
