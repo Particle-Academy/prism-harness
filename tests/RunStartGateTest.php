@@ -11,6 +11,7 @@ use Prism\Harness\Contracts\HasErrorCode;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Events\ToolDenied;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\Modes\ModeRegistry;
@@ -1988,4 +1989,308 @@ it('never clobbers a mode a host chose after commit (b) when it undoes a failed 
     expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
         ->and(sgMode())->toBe('chat')
         ->and(sgFreshChild()->mode())->toBe('chat');
+});
+
+// ---------------------------------------------------------------------------
+// Round 11: the round-10 review findings.
+// ---------------------------------------------------------------------------
+
+/** The scripted model's last id: the next call or message takes the one after it. */
+function sgCallId(): int
+{
+    return Closure::bind(static fn (): int => self::$call, null, G360::class)();
+}
+
+/** Make the next scripted call reuse an earlier id, as a provider that names ids by function does. */
+function sgRewindIds(int $to): void
+{
+    Closure::bind(static function () use ($to): void {
+        self::$call = $to;
+    }, null, G360::class)();
+}
+
+/**
+ * The work mode lists `danger` and `probe`; a legacy host provider offers
+ * `danger` only to a session whose mode is NOT `work`, and a `probe` whose
+ * body records what the session it was resolved for reads.
+ *
+ * @param  list<array<string, mixed>>  $seen
+ */
+function sgModeGated(array &$seen, int &$danger): void
+{
+    config()->set('prism-harness.agent.modes.work.tools', ['weather', 'echo', 'danger', 'probe']);
+    config()->set('prism-harness.agent.modes.work.plans', true);
+    config()->set('prism-harness.agent.modes.chat.plans', false);
+    config()->set('prism-harness.plans.enabled', true);
+    app()->forgetInstance(ModeRegistry::class);
+    sgFresh();
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use (&$seen, &$danger): array {
+        if (! str_contains($session->key(), '::sub::worker')) {
+            return [];
+        }
+        $mode = $session->mode();
+        $seen[] = ['where' => 'provider', 'mode' => $mode];
+        $tools = [(new Tool)->as('probe')->for('Probe.')->withStringParameter('text', 'Text')
+            ->using(function (string $text) use ($session, &$seen): string {
+                $outside = sgChild();
+                $seen[] = ['where' => 'tool', 'mode' => $session->mode(), 'plans' => app(Plans::class)->enabledFor($session),
+                    'binding' => $session->childBinding() !== null, 'ceiling' => $session->childStepCeiling(),
+                    'depth' => $session->childDepth(), 'tree' => $session->childTree() !== null,
+                    'outside mode' => $outside->mode(), 'outside binding' => $outside->childBinding() !== null];
+
+                return 'ok';
+            })];
+        if ($mode !== 'work') {
+            $tools[] = (new Tool)->as('danger')->for('Danger.')->withStringParameter('text', 'Text')
+                ->using(function (string $text) use (&$danger): string {
+                    $danger++;
+
+                    return 'done';
+                });
+        }
+
+        return $tools;
+    }, name: 'mode-gated');
+}
+
+/** Every tool name offered in any model request so far. */
+function sgEverOffered(): array
+{
+    $names = [];
+    foreach (Http::recorded() as $pair) {
+        foreach (json_decode((string) $pair[0]->body(), true)['tools'] ?? [] as $tool) {
+            $names[] = $tool['name'] ?? null;
+        }
+    }
+
+    return array_values(array_unique(array_filter($names, 'is_string')));
+}
+
+// Item 5 (PHP run13 finding 1, Medium): the run a start begins reads its OWN
+// mode, binding, refs, depth and ceiling on its own Session. A host provider
+// that gates a tool on Session::mode() never offers it in the start's run;
+// a reader OUTSIDE the run keeps the provisional rule.
+it('reads the start\'s own state inside its run, so a mode-gated host tool is never offered', function (string $prior, string $entry): void {
+    $seen = [];
+    $danger = 0;
+    sgModeGated($seen, $danger);
+    if ($prior === 'chat') {
+        sgChild()->usingMode('chat');
+    }
+    $childScript = function (): void {
+        G360::calls([['probe', ['text' => 'look']], ['danger', ['text' => 'now']]]);
+        G360::text('Child done.');
+    };
+    if ($entry === 'tool') {
+        G360::calls([['worker', ['task' => 'Go']]]);
+        $childScript();
+        G360::text('Handled.');
+        sgRoot()->send('Go');
+    } else {
+        $childScript();
+        $root = 'run_'.str_repeat('c', 24);
+        sgRunner()->run(sgWorker(3), sgRoot(), RunContext::root($root, new RunBudget(8)), $root, 'Go');
+    }
+
+    $tool = array_values(array_filter($seen, fn (array $row): bool => $row['where'] === 'tool'));
+    expect($danger)->toBe(0)
+        ->and(sgEverOffered())->not->toContain('danger')
+        ->and(array_column(array_filter($seen, fn (array $row): bool => $row['where'] === 'provider'), 'mode'))->each->toBe('work')
+        ->and($tool)->toHaveCount(1)
+        ->and($tool[0]['mode'])->toBe('work')
+        ->and($tool[0]['plans'])->toBeTrue()
+        ->and($tool[0]['binding'])->toBeTrue()
+        ->and($tool[0]['ceiling'])->toBe(3)
+        ->and($tool[0]['depth'])->toBe(1)
+        ->and($tool[0]['tree'])->toBeTrue()
+        // Outside the start's run, its records are still provisional.
+        ->and($tool[0]['outside mode'])->toBe($prior === 'chat' ? 'chat' : null)
+        ->and($tool[0]['outside binding'])->toBeFalse()
+        // And once its task row exists, everyone reads them.
+        ->and(sgFreshChild()->mode())->toBe('work')
+        ->and(sgFreshChild()->childBinding())->not->toBeNull();
+})->with(['a fresh child' => ['none'], 'a child the host had set to chat' => ['chat']])->with(['tool', 'runner']);
+
+// The start's own view ends with its run: the session object (or a view of
+// it a host kept) read after a failed start reads the provisional rule.
+it('ends the start\'s own view when its run ends, for the session and any view a host kept', function (): void {
+    $kept = [];
+    $on = true;
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use (&$kept, &$on): array {
+        if ($on && str_contains($session->key(), '::sub::worker')) {
+            $kept[] = $session;
+            $kept[] = [$session->mode(), $session->childBinding() !== null];
+            sgFailChildUndo();
+
+            throw new RuntimeException('provider down');
+        }
+
+        return [];
+    }, name: 'keeper');
+    sgChild()->usingMode('chat');
+    G360::calls([['worker', ['task' => 'Go']]]);
+    G360::text('Handled.');
+    sgPad(3);
+    sgRoot()->send('Go');
+    $on = false;
+    sgUnfailChildUndo();
+
+    expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+        ->and($kept[1])->toBe(['work', true])
+        ->and($kept[0]->mode())->toBe('chat')
+        ->and($kept[0]->childBinding())->toBeNull()
+        ->and(sgFreshChild()->mode())->toBe('chat')
+        ->and(sgFreshChild()->childBinding())->toBeNull();
+});
+
+// Item 6 (PHP run13 finding 2) and items 1 and 3: "ended by a start" is the
+// harness's own mark, scoped to the approval's own request row. A call id
+// that repeats (Gemini names ids by function) decides nothing.
+it('reads an approved call that ran as approved when its call id repeats one a start ended', function (): void {
+    G360::calls([['worker', ['task' => 'Go']]]);
+    $reuse = sgCallId();
+    G360::calls([['weather', ['city' => 'Paris']]]);
+    G360::text('Asked.');
+    sgRoot()->send('Go');
+    $first = sgChild()->thread()->pendingApprovalIds()[0];
+    // The binding is lost: nobody can act on the call, and a start ends it.
+    DB::table('harness_session_state')->where('key', sgChild()->key().':child')->delete();
+    expect(sgRedelegate())->toContain('"outcome":"completed"')
+        ->and(sgFreshChild()->approvalStatus($first))->toBe('superseded');
+
+    // A later delegation: the child asks for weather under the SAME call id.
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Weather again']]]);
+    $next = sgCallId();
+    sgRewindIds($reuse);
+    G360::calls([['weather', ['city' => 'Rome']]]);
+    sgRewindIds($next + 10);
+    G360::text('Asked.');
+    sgRoot()->send('Go');
+    $second = sgChild()->thread()->pendingApprovalIds()[0] ?? null;
+    expect($second)->toBeString()->not->toBe($first)
+        ->and(sgFreshChild()->approvalStatus($second))->toBe('pending');
+
+    G360::$queue = [];
+    G360::text('Child done.');
+    sgFreshChild()->approve($second);
+    expect($this->ran['weather'])->toBe(1)
+        ->and(sgFreshChild()->approvalStatus($second))->toBe('approved')
+        ->and(sgFreshChild()->approvalStatus($first))->toBe('superseded')
+        ->and(sgFreshChild()->thread()->pendingApprovalIds())->toBe([]);
+});
+
+it('reads a decided call a start ended as superseded when an earlier call shares its id', function (): void {
+    G360::calls([['worker', ['task' => 'Go']]]);
+    $reuse = sgCallId();
+    G360::calls([['echo', ['text' => 'hi']]]);
+    $next = sgCallId();
+    sgRewindIds($reuse);
+    G360::calls([['weather', ['city' => 'Paris']]]);
+    sgRewindIds($next + 10);
+    G360::text('Asked.');
+    sgRoot()->send('Go');
+    expect($this->ran['echo'])->toBe(1);
+    $approval = sgChild()->thread()->pendingApprovalIds()[0];
+    sgAnswered();
+    DB::table('harness_session_state')->where('key', sgChild()->key().':child')->delete();
+
+    expect(sgRedelegate())->toContain('"outcome":"completed"')
+        ->and(sgFreshChild()->approvalStatus($approval))->toBe('superseded')
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// Item 3 (Py F1, Q10): a plan approval a person gives later, under a call id
+// a start once ended, stands: the plan is active, never voided.
+it('keeps a later plan approval under a reused call id standing', function (): void {
+    config()->set('prism-harness.agent.modes.work.plans', true);
+    config()->set('prism-harness.plans.enabled', true);
+    app()->forgetInstance(ModeRegistry::class);
+    sgFresh();
+    G360::calls([['worker', ['task' => 'Go']]]);
+    $reuse = sgCallId();
+    G360::calls([['weather', ['city' => 'Paris']]]);
+    G360::text('Asked.');
+    sgRoot()->send('Go');
+    DB::table('harness_session_state')->where('key', sgChild()->key().':child')->delete();
+    expect(sgRedelegate())->toContain('"outcome":"completed"');
+
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Plan it']]]);
+    $next = sgCallId();
+    sgRewindIds($reuse);
+    G360::calls([['plan_draft', ['goal' => 'Plan the trip', 'steps' => G360::steps(2)]]]);
+    sgRewindIds($next + 10);
+    G360::text('Asked.');
+    sgRoot()->send('Go');
+    $draft = sgChild()->thread()->pendingApprovalIds()[0] ?? null;
+    expect($draft)->toBeString();
+
+    G360::$queue = [];
+    G360::text('Plan approved.');
+    sgFreshChild()->approve($draft);
+    expect(sgFreshChild()->approvalStatus($draft))->toBe('approved')
+        ->and(sgFreshChild()->plan()->current()?->toArray()['status'] ?? null)->toBe('active');
+});
+
+// Item 1 (TS R14-1): a tool's RESULT never marks its call ended, nor do its
+// arguments: a gated call that ran and returned the ended text (or a JSON
+// shape naming the mark) reads approved, after a resume and after a runner
+// start, also on the path where its result is the last row before the task row.
+it('never reads an approved call that ran as ended, whatever its result or arguments say', function (string $text, int $steps): void {
+    config()->set('prism-harness.agent.modes.work.requires_approval', ['weather', 'echo']);
+    config()->set('prism-harness.agent.modes.chat.subagents.worker.max_steps', $steps);
+    app()->forgetInstance(ModeRegistry::class);
+    sgFresh();
+    G360::calls([['worker', ['task' => 'Go']]]);
+    G360::calls([['echo', ['text' => $text]]]);
+    G360::text('Asked.');
+    sgRoot()->send('Go');
+    $approval = sgChild()->thread()->pendingApprovalIds()[0];
+
+    // (a) approved and run in a normal resume.
+    G360::$queue = [];
+    G360::text('Child done.');
+    try {
+        sgFreshChild()->approve($approval);
+    } catch (RunNotPermitted) {
+        // A resume with no step left acts on the decision and stops.
+    }
+    expect($this->ran['echo'])->toBe(1)
+        ->and(sgFreshChild()->approvalStatus($approval))->toBe('approved')
+        ->and(sgFreshChild()->thread()->pendingApprovalIds())->toBe([]);
+
+    // (b) then a runner start: still approved, never offered again.
+    expect(sgRedelegate())->toContain('"outcome":"completed"')
+        ->and(sgFreshChild()->approvalStatus($approval))->toBe('approved')
+        ->and(sgFreshChild()->thread()->pendingApprovalIds())->toBe([])
+        ->and($this->ran['echo'])->toBe(1)
+        ->and(fn () => sgChild()->approve($approval))->toThrow(ApprovalNotPending::class);
+    $marked = DB::table('harness_thread_messages')->where('thread_id', sgChild()->thread()->getKey())->get()
+        ->filter(fn ($row): bool => array_key_exists(Thread::ENDED_BY_START, json_decode((string) $row->payload, true) ?? []));
+    expect($marked)->toHaveCount(0);
+})->with([
+    'the ended text' => ['Not run: the delegation this call was proposed under ended.'],
+    'a JSON object carrying the mark' => ['{"harness_ended_by_start":true}'],
+    'a nested metadata shape' => ['{"payload":{"harness_ended_by_start":{"approval_ids":["apr_x"]}},"metadata":{"harness_ended_by_start":true}}'],
+])->with(['steps left' => [3], 'no step left' => [1]]);
+
+// Item 2 (TS Info): the task row is the record, read from the store, never an
+// in-memory flag an event can race: a denial listener that throws after the
+// task row cannot make the start read as not having happened.
+it('keeps a start whose task row is recorded when a denial listener throws', function (): void {
+    $dead = sgDeadChild();
+    Event::listen(ToolDenied::class, function (ToolDenied $event): void {
+        if (str_contains($event->sessionKey, '::sub::worker')) {
+            throw new RuntimeException('SECRET listener failure');
+        }
+    });
+    $out = sgRedelegate('Start over');
+
+    expect($out)->not->toContain('SECRET')
+        ->and(sgFreshChild()->childBinding())->not->toBeNull()
+        ->and(sgFreshChild()->mode())->toBe('work')
+        ->and(sgFreshChild()->approvalStatus($dead))->toBe('superseded')
+        ->and(sgFreshChild()->thread()->storedMessages()->where('type', 'user')->where('payload', 'like', '%Start over%')->exists())->toBeTrue()
+        ->and($this->ran['weather'])->toBe(0);
 });
