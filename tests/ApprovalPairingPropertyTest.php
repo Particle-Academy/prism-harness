@@ -6,6 +6,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
+use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Plans\Plans;
 use Prism\Harness\PrismHarness;
@@ -19,6 +20,7 @@ use Prism\Prism\Schema\BooleanSchema;
 use Prism\Prism\Schema\ObjectSchema;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\SystemMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
@@ -232,7 +234,7 @@ function ppGenerate(int $seed): array
         $again[] = ['approveAll' => $rng->chance(0.7), 'path' => $rng->pick(PP_PATHS)];
     }
 
-    return [
+    $case = [
         'seed' => $seed,
         'source' => $source,
         'calls' => $calls,
@@ -244,13 +246,20 @@ function ppGenerate(int $seed): array
         'resume' => $rng->pick(PP_PATHS),
         'again' => $again,
     ];
+    // G-397 (round 13): a row written between the park and the decision.
+    // Drawn after every TS field, so the rest of the case is the TS case.
+    $case['between'] = $rng->chance(0.4) ? $rng->pick(['assistant', 'user', 'system', 'tool']) : 'none';
+    // G-399: where it lands, before the decisions or after them (before the resume).
+    $case['betweenAt'] = $rng->pick(['decision', 'resume']);
+
+    return $case;
 }
 
 // ---------------------------------------------------------------------------
 // The oracle: an independent model of the rule.
 // ---------------------------------------------------------------------------
 
-/** @return array{repeated: bool, runs: list<int>, outcome: array<int, string>} */
+/** @return array{repeated: bool, runs: list<int>, outcome: array<int, string|null>} null: no run, at most one non-run outcome */
 function ppExpected(array $c): array
 {
     $dup = fn (array $ids): bool => count(array_unique($ids)) !== count($ids);
@@ -291,6 +300,18 @@ function ppExpected(array $c): array
             $outcome[$token] = $own['reason'] ?? PP_DENIED;
         } else {
             $outcome[$token] = PP_NO_RESPONSE;
+        }
+    }
+
+    if (in_array($c['between'] ?? 'none', ['assistant', 'user', 'system'], true)) {
+        // The conversation moved on past the parked step (G-397): no decision
+        // applies to it, so no gated call runs, and a gated call with no result
+        // gets at most the default refusal, never a run.
+        $runs = [];
+        foreach ($c['calls'] as $index => $call) {
+            if ($call['tool'] === 'echo' && ! in_array($index, $c['prior'], true)) {
+                $outcome[$call['token']] = null;
+            }
         }
     }
 
@@ -405,6 +426,9 @@ function ppOutcomes(array $c): array
             continue;
         }
         foreach ($row['tool_results'] ?? [] as $entry) {
+            if (($entry['tool_call_id'] ?? null) === 'inserted') {
+                continue;
+            }
             $out[] = [(int) ($entry['args']['n'] ?? -1), (string) $entry['result']];
         }
     }
@@ -500,6 +524,22 @@ function ppRunCase(array $c): void
         ppSession($c)->thread()->record($messages, toolNames: ['echo', 'free']);
     }
 
+    // G-397: a row written between the park and the decision.
+    $inserted = match ($c['between'] ?? 'none') {
+        'assistant' => new AssistantMessage('An answer written after the park.'),
+        'user' => new UserMessage('A message written after the park.'),
+        'system' => new SystemMessage('A system row written after the park.'),
+        'tool' => new ToolResultMessage([new ToolResult('inserted', 'free', [], 'unrelated')]),
+        default => null,
+    };
+    $insertBeforeResume = ($c['betweenAt'] ?? 'decision') === 'resume';
+    if ($inserted !== null && ! $insertBeforeResume) {
+        ppSession($c)->thread()->record([$inserted]);
+    }
+    $movedOn = in_array($c['between'] ?? 'none', ['assistant', 'user', 'system'], true);
+    // Decisions are refused only when the row came before them.
+    $refusedDecisions = $movedOn && ! $insertBeforeResume;
+
     // The decisions, in a shuffled order.
     $decisions = [];
     foreach ($c['order'] as $index) {
@@ -508,19 +548,36 @@ function ppRunCase(array $c): void
             $decisions[] = new ToolApprovalResponse($approvalIds[$index], $request['verdict'] === 'approve', $request['reason']);
         }
     }
-    if ($c['recorder'] === 'streamDecision' && $decisions !== []) {
+    if ($refusedDecisions && $decisions !== []) {
+        // Nothing is pending once the conversation moved on: every path
+        // refuses the decisions, and the run is resumed once anyway.
+        try {
+            $c['recorder'] === 'streamDecision' ? ppDrain(ppSession($c)->streamDecision($decisions)) : ppRecord($c, $decisions);
+            ppCheck(false, 'G-397: a decision on a step the conversation moved past is refused');
+        } catch (ApprovalNotPending) {
+        }
+        $first = ppTurn($c, $c['resume'], '');
+    } elseif ($c['recorder'] === 'streamDecision' && $decisions !== [] && ! ($inserted !== null && $insertBeforeResume)) {
         $first = ppDrain(ppSession($c)->streamDecision($decisions));
         $recorded = array_values(array_filter($first['steps'], fn (RunStep $step): bool => $step->type === RunStep::DECISION_RECORDED));
         ppCheck(array_map(fn (RunStep $step): array => [$step->data['approvalId'], $step->data['verdict']], $recorded)
             === array_map(fn (ToolApprovalResponse $d): array => [$d->approvalId, ! $oracle['repeated'] && $d->approved ? 'approved' : 'denied'], $decisions),
             '6: one decision_recorded step per decision, as recorded');
     } else {
-        if ($c['recorder'] === 'recordDecisions' && $decisions !== []) {
+        if ($c['recorder'] === 'streamDecision' && $decisions !== []) {
+            // The row lands between streamDecision's record and its resume:
+            // recorded through the same path, then resumed on a stream.
+            ppRecord($c, $decisions);
+            $c['resume'] = 'streamSteps';
+        } elseif ($c['recorder'] === 'recordDecisions' && $decisions !== []) {
             ppRecord($c, $decisions);
         } else {
             foreach ($decisions as $decision) {
                 ppRecord($c, [$decision]);
             }
+        }
+        if ($inserted !== null && $insertBeforeResume) {
+            ppSession($c)->thread()->record([$inserted]);
         }
         $first = ppTurn($c, $c['resume'], '');
     }
@@ -551,7 +608,13 @@ function ppRunCase(array $c): void
         }
         ppCheck(ppSameSet($ok, $ran) && count($ok) === count($ran), '6: the ok tool_result steps are the calls that ran', $ok);
         $open = array_filter($gated, fn (array $call): bool => ! in_array(array_search($call, $c['calls'], true), $c['prior'], true));
-        ppCheck(count($results) === count($open), '6: one tool_result step per open gated call', ['steps' => count($results), 'open' => count($open)]);
+        if ($movedOn) {
+            // A step the conversation moved past: core closes its open calls
+            // with the default refusal so the replay is valid, and runs none.
+            ppCheck(count($results) <= count($open) && $ok === [], '6: a step the conversation moved past is only refused', ['steps' => count($results), 'open' => count($open)]);
+        } else {
+            ppCheck(count($results) === count($open), '6: one tool_result step per open gated call', ['steps' => count($results), 'open' => count($open)]);
+        }
     }
 
     ppSettledOutcomes($c, $oracle, '5');
@@ -570,7 +633,9 @@ function ppRunCase(array $c): void
             }
         }
         $next = ppTurn($c, $again['path'], '');
-        if ($next['steps'] !== null) {
+        if ($next['steps'] !== null && ! $movedOn) {
+            // (On a step the conversation moved past, the one default refusal
+            // may land on any later turn; the outcome check bounds it to one.)
             ppCheck(array_filter($next['steps'], fn (RunStep $step): bool => $step->type === RunStep::TOOL_RESULT) === [],
                 '3: a repeat resume answers no call again');
         }
@@ -593,6 +658,11 @@ function ppSettledOutcomes(array $c, array $oracle, string $label): void
     }
     foreach ($oracle['outcome'] as $token => $want) {
         $got = array_keys($seen[$token] ?? []);
+        if ($want === null) {
+            ppCheck(count($got) <= 1 && ! in_array('ran:'.$token, $got, true), "{$label}: a call on a step the conversation moved past never runs", ['token' => $token, 'got' => $got]);
+
+            continue;
+        }
         ppCheck(count($got) === 1, "{$label}: every call gets exactly one recorded outcome", ['token' => $token, 'got' => $got]);
         ppCheck($got[0] === $want, '6: the recorded outcome matches what ran', ['token' => $token, 'got' => $got[0], 'want' => $want]);
     }
@@ -767,7 +837,9 @@ it('reproduces the TS generator bit for bit', function (): void {
     ];
     foreach ($ts as $json) {
         $case = json_decode($json, true);
-        expect(json_encode(ppGenerate($case['seed'])))->toBe($json);
+        $php = ppGenerate($case['seed']);
+        unset($php['between'], $php['betweenAt']);
+        expect(json_encode($php))->toBe($json);
     }
     expect(array_map(fn (int $index): int => ppCaseSeed(0x6392, $index), [0, 1, 2, 149]))->toBe([2483776628, 2972160347, 2366528728, 3841045332]);
 });
