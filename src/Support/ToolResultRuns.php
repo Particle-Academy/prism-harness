@@ -46,8 +46,101 @@ class ToolResultRuns
 
         yield from self::oncePerSegment(array_map(
             static fn (Message $message): Message => $message instanceof ToolResultMessage ? self::withFinalDecisions($message, $final) : $message,
-            iterator_to_array(self::foldRuns(self::withAnswersInPlace($messages, $answers)), false),
+            self::earlierStepsAnswered(iterator_to_array(self::foldRuns(self::resultsAfterTheirStep(self::withAnswersInPlace($messages, $answers))), false)),
         ));
+    }
+
+    /** What a call of an earlier step with no result of its own is replayed with (G-412). */
+    public const REPLACED_RESULT = 'Tool call was not run because a later step replaced it';
+
+    /**
+     * `$messages` with every call of a step that is not the last tool-call
+     * step, and that no result answers, given ONE result in the replay:
+     * {@see self::REPLACED_RESULT} (G-412). No later turn resolves such a
+     * call (core resolves only the newest step), and a provider rejects a
+     * request with a tool call that is not answered in the very next
+     * message. Nothing is stored. Results pair with calls by id and tool
+     * name, in order.
+     *
+     * @param  list<Message>  $messages
+     * @return list<Message>
+     */
+    private static function earlierStepsAnswered(array $messages): array
+    {
+        $last = null;
+        foreach ($messages as $index => $message) {
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                $last = $index;
+            }
+        }
+        $out = [];
+        foreach ($messages as $index => $message) {
+            $out[] = $message;
+            if (! $message instanceof AssistantMessage || $message->toolCalls === [] || $index === $last) {
+                continue;
+            }
+            $next = $messages[$index + 1] ?? null;
+            $held = [];
+            foreach ($next instanceof ToolResultMessage ? $next->toolResults : [] as $result) {
+                $key = self::ownerKey($result->toolCallId, $result->toolName);
+                $held[$key] = ($held[$key] ?? 0) + 1;
+            }
+            $missing = [];
+            foreach ($message->toolCalls as $call) {
+                $key = self::ownerKey($call->id, $call->name);
+                if (($held[$key] ?? 0) > 0) {
+                    $held[$key]--;
+
+                    continue;
+                }
+                $missing[] = new ToolResult($call->id, $call->name, $call->argumentsForResult(), self::REPLACED_RESULT, $call->resultId);
+            }
+            if ($missing === []) {
+                continue;
+            }
+            if ($next instanceof ToolResultMessage) {
+                $messages[$index + 1] = new ToolResultMessage([...$next->toolResults, ...$missing], $next->toolApprovalResponses);
+            } else {
+                $out[] = new ToolResultMessage($missing);
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * `$messages` with each step's tool result rows moved directly after the
+     * step, ahead of every other row of its segment (G-412). A provider
+     * requires a tool call to be answered in the very next message, so a
+     * user, assistant text or system row recorded between a step and its
+     * results (a host's row while the call ran, or a new message before the
+     * resolution) would otherwise leave the call unanswered in every later
+     * request. Within each group the order is kept.
+     *
+     * @param  list<Message>  $messages
+     * @return list<Message>
+     */
+    public static function resultsAfterTheirStep(array $messages): array
+    {
+        $out = [];
+        $others = null;
+        foreach ($messages as $message) {
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                array_push($out, ...($others ?? []));
+                $out[] = $message;
+                $others = [];
+
+                continue;
+            }
+            if ($others !== null && ! $message instanceof ToolResultMessage) {
+                $others[] = $message;
+
+                continue;
+            }
+            $out[] = $message;
+        }
+
+        return [...$out, ...($others ?? [])];
     }
 
     /**

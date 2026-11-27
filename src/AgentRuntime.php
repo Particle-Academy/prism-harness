@@ -246,7 +246,10 @@ final readonly class AgentRuntime
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 $stepOnly = $context !== null || $mode->subagents !== [];
                 $recorder = $budget->maxCostUsd === null && ! $stepOnly ? ResolutionRecorder::for($history) : null;
-                $watched = $recorder?->watch($tools);
+                // Core would put the resolution after a later row: it is
+                // resolved here first, its results after their step (G-412).
+                $trailing = $budget->maxCostUsd === null && ! $stepOnly && $session->thread()->resolutionWouldTrail($prompt !== '');
+                $watched = $trailing ? null : $recorder?->watch($tools);
                 if ($tools !== []) {
                     $generation->withTools($watched ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
@@ -263,7 +266,7 @@ final readonly class AgentRuntime
                         }, $this->starter($session, $runId)) : $this->recordingResolution($recorder, $watched !== null, $generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }, $session, $history, $runId, $tools, fn (): TextResponse => $generation->asText(), $this->starter($session, $runId)))
+                        }, $session, $history, $runId, $tools, fn (): TextResponse => $generation->asText(), $this->starter($session, $runId), $trailing))
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
@@ -460,7 +463,10 @@ final readonly class AgentRuntime
                 $tools = $this->authorizedTools($mode, $session, $toolNames, $run, $runId);
                 $stepOnly = $context !== null || $mode->subagents !== [];
                 $recorder = $budget->maxCostUsd === null && ! $stepOnly ? ResolutionRecorder::for($history) : null;
-                $watched = $recorder?->watch($tools);
+                // Core would put the resolution after a later row: it is
+                // resolved here first, its results after their step (G-412).
+                $trailing = $budget->maxCostUsd === null && ! $stepOnly && $session->thread()->resolutionWouldTrail($prompt !== '');
+                $watched = $trailing ? null : $recorder?->watch($tools);
                 if ($tools !== []) {
                     $generation->withTools($watched ?? $tools)->withMaxSteps($budget->maxCostUsd === null ? $this->requestSteps($session, $run) : 1);
                 }
@@ -479,7 +485,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }, $session, $history, $runId, $tools, fn (): StructuredResponse => $generation->asStructured(), $this->starter($session, $runId)))
+                        }, $session, $history, $runId, $tools, fn (): StructuredResponse => $generation->asStructured(), $this->starter($session, $runId), $trailing))
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -765,7 +771,7 @@ final readonly class AgentRuntime
         }
 
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        if ($context !== null || $mode->subagents !== [] || $this->resumesUnwatchedTool($session, $mode, $toolNames)) {
+        if ($context !== null || $mode->subagents !== [] || $this->resumesUnwatchedTool($session, $mode, $toolNames) || $session->thread()->resolutionWouldTrail($prompt !== '')) {
             yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
             return;
@@ -1827,9 +1833,9 @@ final readonly class AgentRuntime
      * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (G-410)
      * @return T
      */
-    private function recordingResolution(?ResolutionRecorder $recorder, bool $watching, TextPendingRequest|StructuredPendingRequest $generation, Closure $resolved, Session $session, array $history, string $runId, array $tools, Closure $generate, ?Closure $started = null): mixed
+    private function recordingResolution(?ResolutionRecorder $recorder, bool $watching, TextPendingRequest|StructuredPendingRequest $generation, Closure $resolved, Session $session, array $history, string $runId, array $tools, Closure $generate, ?Closure $started = null, bool $trailing = false): mixed
     {
-        if ($recorder !== null && ! $watching) {
+        if (($recorder !== null || $trailing) && ! $watching) {
             (new ApprovedTools)->resolve($generation, $resolved, $started);
             $recorder = null;
         }
@@ -1969,6 +1975,9 @@ final readonly class AgentRuntime
         // host row written from inside this run leaves it to the run.
         Session::rememberAnswering($session->key(), $session->thread()->pausedStepPosition());
         $session->thread()->endRepeatedIdStep(Session::REPEATED_CALL_ID_REASON, $runId);
+        // A call of the paused step no request names and no result answers:
+        // no resolution answers it, so it gets its one outcome now (G-412).
+        $session->thread()->endUnrequestedOpenCalls(Thread::INTERRUPTED_RESULT, $runId);
         // What the run reads: a denial recorded after this refuses a call it
         // has not started (G-410).
         Session::rememberReadUpTo($session->key(), (int) $session->thread()->storedMessages()->max('position'), $runId);

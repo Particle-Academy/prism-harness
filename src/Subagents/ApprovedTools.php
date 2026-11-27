@@ -6,6 +6,7 @@ namespace Prism\Harness\Subagents;
 
 use Closure;
 use Generator;
+use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Concerns\CallsTools;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Streaming\EventID;
@@ -84,8 +85,11 @@ final class ApprovedTools
             self::$starter = $outer;
         }
         if ($request->messages() !== $before) {
-            $record($request->messages());
-            $generation->withMessages($request->messages());
+            // Core appends the merged results at the end of the request: each
+            // step's results go directly after the step (G-412).
+            $merged = ToolResultRuns::resultsAfterTheirStep($request->messages());
+            $record($merged);
+            $generation->withMessages($merged);
         }
 
         return $events;

@@ -65,11 +65,12 @@ it('records nothing more on later turns after a streamed call whose arguments co
     $fresh()->send('two');
     $fresh()->send('three');
 
-    // The rows v0.26.7 records for the same turns: one per message, and no
-    // resolution recorded on a turn that resolved nothing.
-    $expected = $gate === 'gated'
-        ? ['user', 'assistant', 'tool_result', 'assistant', 'assistant', 'user', 'assistant', 'assistant', 'user', 'tool_result', 'assistant']
-        : ['user', 'assistant', 'tool_result', 'assistant', 'assistant', 'user', 'assistant', 'assistant', 'user', 'assistant'];
+    // One row per message, and no resolution recorded on a turn that
+    // resolved nothing. The copy of the call the streamed turn recorded has
+    // no request and no result, so the next turn gives it its one outcome
+    // before it reads the conversation (G-412): before that, every later
+    // request sent the copy with no tool result after it.
+    $expected = ['user', 'assistant', 'tool_result', 'assistant', 'assistant', 'user', 'assistant', 'tool_result', 'assistant', 'user', 'assistant'];
     expect($runs)->toBe(0)
         ->and($fresh()->thread()->storedMessages()->orderBy('position')->pluck('type')->all())->toBe($expected);
 })->with(['gated', 'ungated']);
