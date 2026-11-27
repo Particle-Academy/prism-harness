@@ -577,10 +577,10 @@ class Session
             array_fill_keys($this->thread()->repeatedIdApprovalIds(), true),
             array_fill_keys($this->thread()->replacedApprovalIds(), true),
         );
-        $decisions = $this->deniedWhenCallIdsRepeat(array_values(array_filter(
+        $decisions = $this->deniedWhenCallIdsRepeat($this->firstDecisions(array_values(array_filter(
             $decisions,
             static fn (ToolApprovalResponse $decision): bool => ! isset($answered[$decision->approvalId]),
-        )));
+        ))));
         if ($decisions === []) {
             return [];
         }
@@ -590,6 +590,30 @@ class Session
         ], $this->run()['id'] ?? null);
 
         return $decisions;
+    }
+
+    /**
+     * The decisions that count (G-401): the first one for each approval.
+     * A decision for an approval that already has one recorded, or a second
+     * one for the same approval in this batch, is recorded as nothing, so a
+     * turn that failed before acting on a decision can never be followed by
+     * a different one that then runs.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @return list<ToolApprovalResponse>
+     */
+    protected function firstDecisions(array $decisions): array
+    {
+        $decided = array_fill_keys($this->thread()->decidedApprovalIds(), true);
+        $first = [];
+        foreach ($decisions as $decision) {
+            if (! isset($decided[$decision->approvalId])) {
+                $decided[$decision->approvalId] = true;
+                $first[] = $decision;
+            }
+        }
+
+        return $first;
     }
 
     /**

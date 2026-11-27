@@ -689,6 +689,28 @@ class Thread extends Model implements ThreadContract
         });
     }
 
+    /**
+     * Every approval id a decision has been recorded for, in any row (G-401).
+     *
+     * @internal Read when decisions are recorded.
+     *
+     * @return list<string>
+     */
+    public function decidedApprovalIds(): array
+    {
+        $ids = [];
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_TOOL_RESULT)->reorder('position')->cursor() as $stored) {
+            $payload = $stored->payload ?? null;
+            foreach (is_array($payload) && is_array($payload['tool_approval_responses'] ?? null) ? $payload['tool_approval_responses'] : [] as $response) {
+                if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                    $ids[$response['approval_id']] = true;
+                }
+            }
+        }
+
+        return array_keys($ids);
+    }
+
     /** The result a call of a step superseded before it was resolved is recorded with (G-392/G-397). */
     public const REPLACED_REASON = 'Tool call was not run because a later step replaced it';
 
