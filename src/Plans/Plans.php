@@ -17,6 +17,7 @@ use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunTrees;
+use Prism\Harness\Support\ClassLabel;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Schema\ArraySchema;
 use Prism\Prism\Schema\EnumSchema;
@@ -358,7 +359,7 @@ final class Plans
      */
     private static function reportQuietly(Throwable $failure): void
     {
-        report(new RuntimeException('A plan update failed: '.$failure::class.'.'));
+        report(new RuntimeException('A plan update failed: '.ClassLabel::of($failure).'.'));
     }
 
     /**

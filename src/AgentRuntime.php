@@ -95,9 +95,10 @@ final readonly class AgentRuntime
     /**
      * The result messages a runner start ended calls with (G-387), until
      * they are recorded: marked as ended in the thread, and announced as
-     * denied only once durable.
+     * denied only once durable. Each names the approval ids of the calls
+     * it ended, which the thread's mark keeps.
      *
-     * @var WeakMap<ToolResultMessage, true>
+     * @var WeakMap<ToolResultMessage, list<string>>
      */
     private WeakMap $endedByStart;
 
@@ -254,6 +255,10 @@ final readonly class AgentRuntime
                         throw new \LogicException('A runner start begins only through the start gate.');
                     }
                     [$undo, $delegation] = $this->commitRunnerStart($session, $membership, $facts, $child, $start, $runId);
+                    // From here until its run ends, the start's own run reads
+                    // what (b) committed on this Session object (G-387); every
+                    // other reader keeps the provisional rule.
+                    $session->enterStart($runId);
                 }
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
@@ -312,9 +317,11 @@ final readonly class AgentRuntime
                 }
             } catch (Throwable $failure) {
                 // Clean up FIRST, each step on its own, reading nothing of
-                // the failure but its class (G-387). A run that began and was
-                // not ended by the path that threw is failed here, with its
-                // RunFailed event.
+                // the failure but its class (G-387). The start's own view
+                // ends first: what follows reads the child as every other
+                // reader does. A run that began and was not ended by the
+                // path that threw is failed here, with its RunFailed event.
+                $session->leaveStart();
                 if ($begun) {
                     $this->closeRun($session, $runId, $context, $failure);
                 }
@@ -334,6 +341,8 @@ final readonly class AgentRuntime
                 }
 
                 throw $failure;
+            } finally {
+                $session->leaveStart();
             }
         }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
     }
@@ -372,11 +381,17 @@ final readonly class AgentRuntime
             }
         }
         $ended = [];
+        $approvals = [];
         /** @var AssistantMessage $assistant */
         $assistant = $history[$index];
         foreach ($assistant->toolCalls as $call) {
             if (isset($answered[$call->id])) {
                 continue;
+            }
+            foreach ($assistant->toolApprovalRequests as $request) {
+                if ($request->toolCallId === $call->id) {
+                    $approvals[] = $request->approvalId;
+                }
             }
             $ended[] = new ToolResult(
                 toolCallId: $call->id,
@@ -390,8 +405,9 @@ final readonly class AgentRuntime
             return null;
         }
         $message = new ToolResultMessage($ended);
-        // Recorded marked as ended, and announced only once it is durable.
-        $this->endedByStart[$message] = true;
+        // Recorded marked as ended, naming the approvals of the calls it
+        // ended, and announced only once it is durable.
+        $this->endedByStart[$message] = array_values(array_unique($approvals));
 
         return $message;
     }
@@ -1968,7 +1984,8 @@ final readonly class AgentRuntime
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
         $ended = array_values(array_filter($messages, fn (Message $message): bool => $message instanceof ToolResultMessage && isset($this->endedByStart[$message])));
         $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
-            app(RunTrees::class)->parkFacts($runId), $ended);
+            app(RunTrees::class)->parkFacts($runId),
+            array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended));
         // The calls a runner start ended are announced as denied only now
         // that the rows ending them are durable (G-387): a store failure on
         // that write announces nothing that was not recorded.

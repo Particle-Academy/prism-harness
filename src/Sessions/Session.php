@@ -68,6 +68,13 @@ class Session
 
     private ?string $resolvedMode = null;
 
+    /**
+     * The runner start this Session object is running, while its run lasts
+     * (G-387): read by {@see self::ownsStart()}. Shared with the read-only
+     * views cloned from it.
+     */
+    private ?StartView $startView = null;
+
     protected readonly SessionAddress $address;
 
     protected readonly SessionStore $ephemeral;
@@ -152,7 +159,7 @@ class Session
             if (! is_string($run) || ! self::isRunId($run)) {
                 return null;
             }
-            if (! $this->taskRowExists($run)) {
+            if (! $this->ownsStart($run) && ! $this->taskRowExists($run)) {
                 $mode = $mark['prior'] ?? null;
             }
         }
@@ -525,7 +532,7 @@ class Session
         }
         if (array_key_exists('provisional', $saved)) {
             $run = $saved['provisional'];
-            if (! is_string($run) || ! self::isRunId($run) || ! $this->taskRowExists($run)) {
+            if (! is_string($run) || ! self::isRunId($run) || (! $this->ownsStart($run) && ! $this->taskRowExists($run))) {
                 return [$saved, false];
             }
         }
@@ -544,6 +551,57 @@ class Session
     {
         return Thread::existingAt($this->address())?->storedMessages()
             ->where('type', MessageMapper::TYPE_USER)->where('run_id', $runId)->exists() ?? false;
+    }
+
+    /**
+     * The start's own run reads its own state (G-387). From commit (b) until
+     * its run ends, the Session object the run uses (and every read-only
+     * view of it) reads the records and the mode that start wrote as
+     * confirmed: a host tool provider, a tool body, a memory hook or the
+     * plan service asking this Session for its mode, binding, refs, depth or
+     * ceiling during the start's run gets the start's values, never the
+     * child's previous ones. Every other Session object, in this process or
+     * another, keeps the provisional rule: absent until the task row exists.
+     * In memory only; nothing is written to set or clear it.
+     *
+     * @internal Set by the runtime once a runner start's commit (b) succeeds.
+     */
+    public function enterStart(string $runId): void
+    {
+        $this->leaveStart();
+        $this->startView = new StartView($runId);
+    }
+
+    /**
+     * End the start's own view (G-387), for this Session object and every
+     * view cloned from it.
+     *
+     * @internal Called by the runtime when the start's run ends, failed or not.
+     */
+    public function leaveStart(): void
+    {
+        if ($this->startView !== null) {
+            $this->startView->run = null;
+            $this->startView = null;
+        }
+    }
+
+    /**
+     * Whether this Session object is running the runner start that wrote
+     * `$runId`'s records (G-387): its view names that run, AND the run slot
+     * holds that run, still running. A view set on a session whose start is
+     * not running (one that failed, or that a host named by hand) confirms
+     * nothing, so it can never make a dead approval answerable.
+     */
+    private function ownsStart(string $runId): bool
+    {
+        $run = $this->startView?->run;
+        if ($run === null || $run !== $runId) {
+            return false;
+        }
+        $stored = $this->storedRun();
+
+        return $stored !== null && ($stored['id'] ?? null) === $runId && ($stored['status'] ?? null) === 'running';
     }
 
     private static function isRunId(string $id): bool
