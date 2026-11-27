@@ -69,12 +69,15 @@ use Tests\Support\G360;
 const PP_REPEATED = 'Tool call was not run because another call in this step has the same id';
 const PP_NO_RESPONSE = 'No approval response provided';
 const PP_DENIED = 'User denied tool execution';
-const PP_SUPERSEDED = 'Not run: a later step replaced it.';
+const PP_SUPERSEDED = 'Tool call was not run because a later step replaced it';
 const PP_ID_POOL = ['a', 'b', 'c', ''];
 const PP_PATHS = ['send', 'structured', 'streamSteps'];
 
 /** The seeds that broke the rule on prism-harness-ts main 63ccf38 (BRIEF-R13). */
 const PP_REGRESSION_SEEDS = [2034523272, 232174035, 2060958372];
+
+/** The fixed-seed set normal CI runs; the coverage check is asserted on exactly these seeds. */
+const PP_DEFAULT_EXAMPLES = 300;
 
 /**
  * A whole number read from the environment, or `$fallback` when the variable
@@ -247,79 +250,215 @@ function ppGenerate(int $seed): array
         'resume' => $rng->pick(PP_PATHS),
         'again' => $again,
     ];
-    // G-397 (round 13): a row written between the park and the decision.
-    // Drawn after every TS field, so the rest of the case is the TS case.
-    $case['between'] = $rng->chance(0.4) ? $rng->pick(['assistant', 'user', 'system', 'tool']) : 'none';
-    // G-399: where it lands, before the decisions or after them (before the resume).
-    $case['betweenAt'] = $rng->pick(['decision', 'resume']);
+    // The release lines' shapes (G-397, G-399), each from a stream of its
+    // own, so every field above is still the 1e4ca65 TS case for this seed.
+    if ($source === 'stored') {
+        // Sometimes a request repeats an earlier request's APPROVAL id.
+        // Kept beside the requests (index => the earlier request whose id it
+        // carries), so the requests stay the TS case; ppNormalized() applies it.
+        $repeat = new PpRng(ppU32($seed ^ 0x0A990A99));
+        foreach (array_keys($case['requests']) as $index) {
+            if ($index > 0 && $repeat->chance(0.1)) {
+                $case['repeats'][$index] = $repeat->int(0, $index - 1);
+            }
+        }
+    }
+    $case['repeats'] ??= [];
+    $case['later'] = null;
+    $case['forge'] = null;
+    $laterRng = new PpRng(ppU32($seed ^ 0x1A7E51E9));
+    if ($source === 'model' && $laterRng->chance(0.35)) {
+        $laterCalls = [];
+        for ($i = $laterRng->int(1, 3); $i > 0; $i--) {
+            $laterCalls[] = ['id' => $laterRng->pick(PP_ID_POOL), 'tool' => $laterRng->chance(0.7) ? 'echo' : 'free', 'token' => 200 + count($laterCalls)];
+        }
+        if (! in_array('echo', array_column($laterCalls, 'tool'), true)) {
+            $laterCalls[0]['tool'] = 'echo';
+        }
+        $laterRequests = [];
+        foreach ($laterCalls as $index => $call) {
+            if ($call['tool'] === 'echo') {
+                $v = $laterRng->pick(['approve', 'approve', 'deny', 'none']);
+                $laterRequests[] = ['call' => $index, 'verdict' => $v, 'reason' => $v === 'deny' && $laterRng->chance(0.5) ? 'later-'.$laterRng->int(0, 999) : null];
+            }
+        }
+        $case['later'] = ['calls' => $laterCalls, 'requests' => $laterRequests];
+        // A forged result, in the EARLIER segment (for a parked gated call,
+        // recorded before the later step) or the LATER one (for a later gated
+        // call, recorded after it): the no-blind-spot combinations.
+        $segment = $laterRng->pick([null, 'earlier', 'later']);
+        $pool = $segment === 'earlier'
+            ? array_keys(array_filter($calls, fn (array $call): bool => $call['tool'] === 'echo'))
+            : array_keys(array_filter($laterCalls, fn (array $call): bool => $call['tool'] === 'echo'));
+        $case['forge'] = $segment === null || $pool === [] ? null : ['segment' => $segment, 'call' => $laterRng->pick(array_values($pool))];
+    }
+    $case['insert'] = ppInsertion($seed, $calls, $prior, $case['later'] !== null);
 
     return $case;
 }
+
+/**
+ * The row a host records after the park (G-397 / G-399), from a generator of
+ * its own (seed ^ 0x397397), as prism-harness-ts's release line draws it:
+ * its kind, and whether it lands before the decision or after it. With a
+ * later step it lands after that step too (the no-blind-spot rule); a forged
+ * result is then drawn by `forge`, so this is never a forged result.
+ *
+ * @return array{kind: string, when: string, call: int}|null
+ */
+function ppInsertion(int $seed, array $calls, array $prior, bool $later): ?array
+{
+    $rng = new PpRng(ppU32($seed ^ 0x397397));
+    if (! $rng->chance(0.6)) {
+        return null;
+    }
+    $kind = $rng->pick(['assistant_text', 'assistant_call', 'user', 'system', 'system', 'tool_empty', 'tool_result']);
+    $open = array_keys(array_filter($calls, fn (array $call, int $index): bool => $call['tool'] === 'echo' && ! in_array($index, $prior, true), ARRAY_FILTER_USE_BOTH));
+    if ($kind === 'tool_result' && ($open === [] || $later)) {
+        $kind = 'system';
+    }
+    $when = $rng->chance(0.5) ? 'before_decision' : 'after_decision';
+
+    return ['kind' => $kind, 'when' => $when, 'call' => $kind === 'tool_result' ? $rng->pick(array_values($open)) : $rng->int(0, count($calls) - 1)];
+}
+
+/**
+ * The case with its repeated approval ids applied to its requests: a request
+ * that repeats an earlier request's APPROVAL id carries `approval` (that
+ * request's index) and records no decision.
+ */
+function ppNormalized(array $c): array
+{
+    foreach ($c['repeats'] ?? [] as $index => $of) {
+        if (isset($c['requests'][$index])) {
+            $c['requests'][$index] = [...$c['requests'][$index], 'approval' => $of, 'verdict' => 'none', 'reason' => null];
+        }
+    }
+    $c['repeats'] = [];
+
+    return $c;
+}
+
+/** Kinds that SUPERSEDE the parked step when a host records them (outside every run). */
+const PP_SUPERSEDES = ['assistant_text', 'assistant_call', 'user'];
+const PP_INSERT_KINDS = ['assistant_text', 'assistant_call', 'user', 'system', 'tool_empty', 'tool_result'];
 
 // ---------------------------------------------------------------------------
 // The oracle: an independent model of the rule.
 // ---------------------------------------------------------------------------
 
-/** @return array{repeated: bool, runs: list<int>, outcome: array<int, string|null>} null: no run, at most one non-run outcome */
+/**
+ * The oracle (the release lines' rule): a step not superseded is decided by
+ * its own requests; a SUPERSEDED step (by a later tool-call step, or by a
+ * host's assistant text, tool-call or user row) gives each gated call with no
+ * result of its own ONE replaced denial and runs nothing; a later step is
+ * decided by ITS OWN approvals; a forged result is its call's only outcome.
+ *
+ * @return array{repeated: bool, runs: list<int>, outcome: array<int, string>}
+ */
 function ppExpected(array $c): array
 {
+    $c = ppNormalized($c);
+    $insert = $c['insert'] ?? null;
+    $later = $c['later'] ?? null;
+    $forge = $c['forge'] ?? null;
+    $supersedingInsert = $insert !== null && in_array($insert['kind'], PP_SUPERSEDES, true);
+    // The forged results, by step.
+    $forgedOld = [];
+    if ($insert !== null && $insert['kind'] === 'tool_result') {
+        $forgedOld[] = $insert['call'];
+    }
+    if (($forge['segment'] ?? null) === 'earlier') {
+        $forgedOld[] = $forge['call'];
+    }
+    $forgedLater = ($forge['segment'] ?? null) === 'later' ? [$forge['call']] : [];
+
+    if ($later === null) {
+        $decided = ppDecideStep($c['calls'], $c['requests'], $c['prior'], $forgedOld);
+        if ($supersedingInsert) {
+            $decided = ppReplaced($c['calls'], $c['prior'], $forgedOld) + ['repeated' => $decided['repeated']];
+        }
+
+        return $decided;
+    }
+    // A later step replaced the parked one; a superseding insert after it
+    // replaces the later step too.
+    $old = ppReplaced($c['calls'], $c['prior'], $forgedOld);
+    $new = $supersedingInsert
+        ? ppReplaced($later['calls'], array_keys(array_filter($later['calls'], fn (array $call): bool => $call['tool'] === 'free')), $forgedLater)
+        : ppDecideStep($later['calls'], $later['requests'], array_keys(array_filter($later['calls'], fn (array $call): bool => $call['tool'] === 'free')), $forgedLater, laterFree: true);
+
+    return ['repeated' => $new['repeated'] ?? false, 'runs' => $new['runs'], 'outcome' => $old['outcome'] + $new['outcome']];
+}
+
+/**
+ * One step decided by its own requests.
+ *
+ * @param  list<int>  $prior  calls with a result before any decision
+ * @param  list<int>  $forged  calls a host forged a result for
+ * @return array{repeated: bool, runs: list<int>, outcome: array<int, string>}
+ */
+function ppDecideStep(array $calls, array $requests, array $prior, array $forged, bool $laterFree = false): array
+{
     $dup = fn (array $ids): bool => count(array_unique($ids)) !== count($ids);
-    $repeated = $dup(array_column($c['calls'], 'id'))
-        || $dup(array_map(fn (array $request): string => $c['calls'][$request['call']]['id'], $c['requests']));
+    $repeated = $dup(array_column($calls, 'id'))
+        || $dup(array_map(fn (array $request): string => $calls[$request['call']]['id'], $requests))
+        || $dup(array_map(fn (array $request, int $index): int => $request['approval'] ?? $index, $requests, array_keys($requests)));
     $runs = [];
     $outcome = [];
-    foreach ($c['calls'] as $index => $call) {
+    foreach ($calls as $index => $call) {
         $token = $call['token'];
         if ($call['tool'] === 'free') {
             $outcome[$token] = 'free:'.$token;
-
-            continue;
-        }
-        if (in_array($index, $c['prior'], true)) {
+        } elseif (in_array($index, $forged, true)) {
+            $outcome[$token] = 'forged:'.$token;
+        } elseif (in_array($index, $prior, true)) {
             $outcome[$token] = 'prior:'.$token;
-
-            continue;
-        }
-        if ($repeated) {
+        } elseif ($repeated) {
             $outcome[$token] = PP_REPEATED;
-
-            continue;
-        }
-        // Distinct ids: this call's own request, if it has one.
-        $own = null;
-        foreach ($c['requests'] as $request) {
-            if ($request['call'] === $index) {
-                $own = $request;
-
-                break;
-            }
-        }
-        if (($own['verdict'] ?? null) === 'approve') {
-            $runs[] = $token;
-            $outcome[$token] = 'ran:'.$token;
-        } elseif (($own['verdict'] ?? null) === 'deny') {
-            $outcome[$token] = $own['reason'] ?? PP_DENIED;
         } else {
-            $outcome[$token] = PP_NO_RESPONSE;
-        }
-    }
+            $own = null;
+            foreach ($requests as $request) {
+                if ($request['call'] === $index) {
+                    $own = $request;
 
-    if (in_array($c['between'] ?? 'none', ['assistant', 'user', 'system'], true)) {
-        // The conversation moved on past the parked step (G-397): no decision
-        // applies to it and no gated call runs. An assistant or a user row
-        // SUPERSEDES it (DECISION B): each gated call with no result gets
-        // exactly one denial. A system row only ends it: at most the default
-        // refusal, never a run.
-        $runs = [];
-        $supersedes = in_array($c['between'], ['assistant', 'user'], true);
-        foreach ($c['calls'] as $index => $call) {
-            if ($call['tool'] === 'echo' && ! in_array($index, $c['prior'], true)) {
-                $outcome[$call['token']] = $supersedes ? PP_SUPERSEDED : null;
+                    break;
+                }
+            }
+            if (($own['verdict'] ?? null) === 'approve') {
+                $runs[] = $token;
+                $outcome[$token] = 'ran:'.$token;
+            } elseif (($own['verdict'] ?? null) === 'deny') {
+                $outcome[$token] = $own['reason'] ?? PP_DENIED;
+            } else {
+                $outcome[$token] = PP_NO_RESPONSE;
             }
         }
     }
 
     return ['repeated' => $repeated, 'runs' => $runs, 'outcome' => $outcome];
+}
+
+/**
+ * A superseded step: nothing runs; each gated call with no result of its own
+ * gets ONE replaced denial.
+ *
+ * @return array{runs: list<int>, outcome: array<int, string>}
+ */
+function ppReplaced(array $calls, array $prior, array $forged): array
+{
+    $outcome = [];
+    foreach ($calls as $index => $call) {
+        $token = $call['token'];
+        $outcome[$token] = match (true) {
+            $call['tool'] === 'free' => 'free:'.$token,
+            in_array($index, $forged, true) => 'forged:'.$token,
+            in_array($index, $prior, true) => 'prior:'.$token,
+            default => PP_SUPERSEDED,
+        };
+    }
+
+    return ['runs' => [], 'outcome' => $outcome];
 }
 
 // ---------------------------------------------------------------------------
@@ -429,11 +568,15 @@ function ppOutcomes(array $c): array
         if (! $after || $row['type'] !== 'tool_result') {
             continue;
         }
+        // EVERY result row after the first step, to the end of the thread
+        // (replaced denials land after later rows); an entry for no call of
+        // a step (the inserted call, token 900) is not an outcome of it.
         foreach ($row['tool_results'] ?? [] as $entry) {
-            if (($entry['tool_call_id'] ?? null) === 'inserted') {
+            $n = $entry['args']['n'] ?? null;
+            if (! is_int($n) || $n === 900) {
                 continue;
             }
-            $out[] = [(int) ($entry['args']['n'] ?? -1), (string) $entry['result']];
+            $out[] = [$n, (string) $entry['result']];
         }
     }
 
@@ -471,6 +614,7 @@ function ppRecord(array $c, array $decisions): void
 
 function ppRunCase(array $c): void
 {
+    $c = ppNormalized($c);
     $oracle = ppExpected($c);
     ppRig($c);
     $gated = array_values(array_filter($c['calls'], fn (array $call): bool => $call['tool'] === 'echo'));
@@ -513,7 +657,7 @@ function ppRunCase(array $c): void
         ppCheck(PpRan::$echo === [], '1: no gated call runs before a decision', PpRan::$echo);
         $approvalIds = $ids;
     } else {
-        $approvalIds = array_map(fn (int $index): string => 'apr_'.$c['seed'].'_'.$index, array_keys($c['requests']));
+        $approvalIds = array_map(fn (array $request, int $index): string => 'apr_'.$c['seed'].'_'.($request['approval'] ?? $index), $c['requests'], array_keys($c['requests']));
         $calls = array_map(fn (array $call): ToolCall => new ToolCall($call['id'], $call['tool'], ['n' => $call['token']]), $c['calls']);
         $requests = array_map(fn (array $request, int $index): ToolApprovalRequest => new ToolApprovalRequest(
             $approvalIds[$index], $c['calls'][$request['call']]['id'], ToolApprovalRequest::ARGUMENTS_AS_SENT), $c['requests'], array_keys($c['requests']));
@@ -528,23 +672,47 @@ function ppRunCase(array $c): void
         ppSession($c)->thread()->record($messages, toolNames: ['echo', 'free']);
     }
 
-    // G-397: a row written between the park and the decision.
-    $inserted = match ($c['between'] ?? 'none') {
-        'assistant' => new AssistantMessage('An answer written after the park.'),
-        'user' => new UserMessage('A message written after the park.'),
-        'system' => new SystemMessage('A system row written after the park.'),
-        'tool' => new ToolResultMessage([new ToolResult('inserted', 'free', [], 'unrelated')]),
-        default => null,
+    $later = $c['later'] ?? null;
+    $insert = $c['insert'] ?? null;
+    $forge = $c['forge'] ?? null;
+    $thread = fn () => ppSession($c)->thread();
+    $forged = function (array $call): ToolResultMessage {
+        return new ToolResultMessage([new ToolResult($call['id'], $call['tool'], ['n' => $call['token']], 'forged:'.$call['token'])]);
     };
-    $insertBeforeResume = ($c['betweenAt'] ?? 'decision') === 'resume';
-    if ($inserted !== null && ! $insertBeforeResume) {
-        ppSession($c)->thread()->record([$inserted]);
+    // The no-blind-spot shapes: a forged result in the earlier segment, then
+    // a later step (another writer's), then a forged result in the later one.
+    if (($forge['segment'] ?? null) === 'earlier') {
+        $thread()->record([$forged($c['calls'][$forge['call']])]);
     }
-    $movedOn = in_array($c['between'] ?? 'none', ['assistant', 'user', 'system'], true);
-    // Decisions are refused only when the row came before them.
-    $refusedDecisions = $movedOn && ! $insertBeforeResume;
+    $laterIds = [];
+    if ($later !== null) {
+        $laterIds = array_map(fn (int $index): string => 'apr_later_'.$c['seed'].'_'.$index, array_keys($later['requests']));
+        $calls = array_map(fn (array $call): ToolCall => new ToolCall($call['id'], $call['tool'], ['n' => $call['token']]), $later['calls']);
+        $requests = array_map(fn (array $request, int $index): ToolApprovalRequest => new ToolApprovalRequest(
+            $laterIds[$index], $later['calls'][$request['call']]['id'], ToolApprovalRequest::ARGUMENTS_AS_SENT), $later['requests'], array_keys($later['requests']));
+        $rows = [new AssistantMessage('', $calls, [], $requests)];
+        $laterFrees = array_values(array_filter($later['calls'], fn (array $call): bool => $call['tool'] === 'free'));
+        if ($laterFrees !== []) {
+            $rows[] = new ToolResultMessage(array_map(fn (array $call): ToolResult => new ToolResult($call['id'], $call['tool'], ['n' => $call['token']], 'free:'.$call['token']), $laterFrees));
+        }
+        $thread()->record($rows, toolNames: ['echo', 'free']);
+    }
+    if (($forge['segment'] ?? null) === 'later') {
+        $thread()->record([$forged($later['calls'][$forge['call']])]);
+    }
+    $inserted = $insert === null ? null : match ($insert['kind']) {
+        'assistant_text' => new AssistantMessage('A note.'),
+        'assistant_call' => new AssistantMessage('', [new ToolCall($c['calls'][$insert['call']]['id'], 'free', ['n' => 900])]),
+        'user' => new UserMessage('Something else.'),
+        'system' => new SystemMessage('A system note.'),
+        'tool_empty' => new ToolResultMessage([]),
+        'tool_result' => $forged($c['calls'][$insert['call']]),
+    };
+    if ($inserted !== null && $insert['when'] === 'before_decision') {
+        $thread()->record([$inserted]);
+    }
 
-    // The decisions, in a shuffled order.
+    // The decisions, in a shuffled order: the parked step's, then a later step's.
     $decisions = [];
     foreach ($c['order'] as $index) {
         $request = $c['requests'][$index];
@@ -552,47 +720,61 @@ function ppRunCase(array $c): void
             $decisions[] = new ToolApprovalResponse($approvalIds[$index], $request['verdict'] === 'approve', $request['reason']);
         }
     }
-    if ($refusedDecisions && $decisions !== []) {
-        // Nothing is pending once the conversation moved on: every path
-        // refuses the decisions, and the run is resumed once anyway.
-        try {
-            $c['recorder'] === 'streamDecision' ? ppDrain(ppSession($c)->streamDecision($decisions)) : ppRecord($c, $decisions);
-            ppCheck(false, 'G-397: a decision on a step the conversation moved past is refused');
-        } catch (ApprovalNotPending) {
+    $laterDecisions = [];
+    foreach ($later['requests'] ?? [] as $index => $request) {
+        if ($request['verdict'] !== 'none') {
+            $laterDecisions[] = new ToolApprovalResponse($laterIds[$index], $request['verdict'] === 'approve', $request['reason']);
         }
-        $first = ppTurn($c, $c['resume'], '');
-    } elseif ($c['recorder'] === 'streamDecision' && $decisions !== [] && ! ($inserted !== null && $insertBeforeResume)) {
-        $first = ppDrain(ppSession($c)->streamDecision($decisions));
-        $recorded = array_values(array_filter($first['steps'], fn (RunStep $step): bool => $step->type === RunStep::DECISION_RECORDED));
-        ppCheck(array_map(fn (RunStep $step): array => [$step->data['approvalId'], $step->data['verdict']], $recorded)
-            === array_map(fn (ToolApprovalResponse $d): array => [$d->approvalId, ! $oracle['repeated'] && $d->approved ? 'approved' : 'denied'], $decisions),
-            '6: one decision_recorded step per decision, as recorded');
-    } else {
-        if ($c['recorder'] === 'streamDecision' && $decisions !== []) {
-            // The row lands between streamDecision's record and its resume:
-            // recorded through the same path, then resumed on a stream.
-            ppRecord($c, $decisions);
-            $c['resume'] = 'streamSteps';
-        } elseif ($c['recorder'] === 'recordDecisions' && $decisions !== []) {
-            ppRecord($c, $decisions);
-        } else {
-            foreach ($decisions as $decision) {
-                ppRecord($c, [$decision]);
-            }
-        }
-        if ($inserted !== null && $insertBeforeResume) {
-            ppSession($c)->thread()->record([$inserted]);
-        }
-        $first = ppTurn($c, $c['resume'], '');
     }
+    $supersedingBefore = $inserted !== null && $insert['when'] === 'before_decision' && in_array($insert['kind'], PP_SUPERSEDES, true);
+    // A decision for a step superseded BEFORE it is refused with
+    // approval_not_pending, all or nothing per batch.
+    $batches = [];
+    if ($decisions !== []) {
+        $batches[] = ['decisions' => $decisions, 'refused' => $later !== null || $supersedingBefore, 'repeated' => $oracle['repeated'] && $later === null];
+    }
+    if ($laterDecisions !== []) {
+        $batches[] = ['decisions' => $laterDecisions, 'refused' => $supersedingBefore, 'repeated' => $oracle['repeated']];
+    }
+    $first = null;
+    foreach ($batches as $batch) {
+        $refused = false;
+        try {
+            if ($c['recorder'] === 'streamDecision' && $first === null && ! $batch['refused'] && ($insert['when'] ?? null) !== 'after_decision') {
+                $first = ppDrain(ppSession($c)->streamDecision($batch['decisions']));
+                $recorded = array_values(array_filter($first['steps'], fn (RunStep $step): bool => $step->type === RunStep::DECISION_RECORDED));
+                ppCheck(array_map(fn (RunStep $step): array => [$step->data['approvalId'], $step->data['verdict']], $recorded)
+                    === array_map(fn (ToolApprovalResponse $d): array => [$d->approvalId, ! $batch['repeated'] && $d->approved ? 'approved' : 'denied'], $batch['decisions']),
+                    '6: one decision_recorded step per decision, as recorded');
+            } elseif ($c['recorder'] === 'recordApproval') {
+                foreach ($batch['decisions'] as $decision) {
+                    ppRecord($c, [$decision]);
+                }
+            } else {
+                ppRecord($c, $batch['decisions']);
+            }
+        } catch (ApprovalNotPending) {
+            $refused = true;
+        }
+        ppCheck($refused === $batch['refused'], 'G-397: a decision is refused exactly when its step was superseded first', ['refused' => $refused, 'expected' => $batch['refused']]);
+    }
+    if ($inserted !== null && $insert['when'] === 'after_decision') {
+        $thread()->record([$inserted]);
+    }
+    $first ??= ppTurn($c, $c['resume'], '');
+    $superseded = $later !== null || ($insert !== null && in_array($insert['kind'], PP_SUPERSEDES, true));
 
     // Invariants 1-4, then full equality with the oracle.
     $ran = PpRan::$echo;
-    $token = fn (array $request): int => $c['calls'][$request['call']]['token'];
+    $all = [...array_map(fn (array $q): array => [$q, $c['calls'][$q['call']]['token']], $c['requests']),
+        ...array_map(fn (array $q): array => [$q, $later['calls'][$q['call']]['token']], $later['requests'] ?? [])];
     ppCheck(count($ran) === count(array_unique($ran)), '3: a call runs at most once', $ran);
-    $denied = array_map($token, array_values(array_filter($c['requests'], fn (array $q): bool => $q['verdict'] === 'deny')));
+    $denied = array_map(fn (array $pair): int => $pair[1], array_values(array_filter($all, fn (array $pair): bool => $pair[0]['verdict'] === 'deny')));
     ppCheck(array_intersect($ran, $denied) === [], '1: a call a person denied never runs', $ran);
-    $approves = array_map($token, array_values(array_filter($c['requests'], fn (array $q): bool => $q['verdict'] === 'approve')));
+    $approves = array_map(fn (array $pair): int => $pair[1], array_values(array_filter($all, fn (array $pair): bool => $pair[0]['verdict'] === 'approve')));
+    if ($later !== null) {
+        ppCheck(array_filter($ran, fn (int $token): bool => $token < 200) === [], "a replaced step's approvals never run anything", $ran);
+    }
     ppCheck(array_diff($ran, $approves) === [], '2: each run call has its own approve', $ran);
     ppCheck(count($ran) <= count($approves), '2: one decision decides at most one call', ['ran' => count($ran), 'approves' => count($approves)]);
     if ($oracle['repeated']) {
@@ -611,14 +793,14 @@ function ppRunCase(array $c): void
             }
         }
         ppCheck(ppSameSet($ok, $ran) && count($ok) === count($ran), '6: the ok tool_result steps are the calls that ran', $ok);
-        $open = array_filter($gated, fn (array $call): bool => ! in_array(array_search($call, $c['calls'], true), $c['prior'], true));
-        if ($movedOn) {
-            // A step the conversation moved past: core closes its open calls
-            // with the default refusal so the replay is valid, and runs none.
-            ppCheck(count($results) <= count($open) && $ok === [], '6: a step the conversation moved past is only refused', ['steps' => count($results), 'open' => count($open)]);
-        } else {
-            ppCheck(count($results) === count($open), '6: one tool_result step per open gated call', ['steps' => count($results), 'open' => count($open)]);
-        }
+        $forgedTokens = array_keys(array_filter(ppExpected($c)['outcome'], fn (string $o): bool => str_starts_with($o, 'forged:')));
+        $resolving = $later === null ? $c['calls'] : $later['calls'];
+        $resolvingPrior = $later === null ? $c['prior'] : [];
+        $open = $superseded && ! ($later !== null && ! ($insert !== null && in_array($insert['kind'], PP_SUPERSEDES, true)))
+            ? []
+            : array_filter($resolving, fn (array $call, int $index): bool => $call['tool'] === 'echo' && ! in_array($index, $resolvingPrior, true)
+                && ! in_array($call['token'], $forgedTokens, true), ARRAY_FILTER_USE_BOTH);
+        ppCheck(count($results) === count($open), '6: one tool_result step per open gated call', ['steps' => count($results), 'open' => count($open)]);
     }
 
     ppSettledOutcomes($c, $oracle, '5');
@@ -628,7 +810,7 @@ function ppRunCase(array $c): void
     $before = PpRan::$echo;
     foreach ($c['again'] as $again) {
         if ($again['approveAll']) {
-            foreach ($approvalIds as $id) {
+            foreach ([...$approvalIds, ...$laterIds] as $id) {
                 try {
                     ppRecord($c, [new ToolApprovalResponse($id, true)]);
                 } catch (Throwable) {
@@ -637,9 +819,7 @@ function ppRunCase(array $c): void
             }
         }
         $next = ppTurn($c, $again['path'], '');
-        if ($next['steps'] !== null && ! $movedOn) {
-            // (On a step the conversation moved past, the one default refusal
-            // may land on any later turn; the outcome check bounds it to one.)
+        if ($next['steps'] !== null) {
             ppCheck(array_filter($next['steps'], fn (RunStep $step): bool => $step->type === RunStep::TOOL_RESULT) === [],
                 '3: a repeat resume answers no call again');
         }
@@ -648,6 +828,8 @@ function ppRunCase(array $c): void
     if ($c['source'] === 'stored') {
         ppCheck(PpRan::$free === [], 'a stored ungated call with a result never runs', PpRan::$free);
     } else {
+        // The parked step's ungated calls ran when it was taken; a later
+        // step another writer recorded already holds its results.
         ppCheck(count(PpRan::$free) === count($frees), '3: an ungated call runs once', PpRan::$free);
     }
     ppSettledOutcomes($c, $oracle, '5 (after repeat resumes)');
@@ -662,11 +844,6 @@ function ppSettledOutcomes(array $c, array $oracle, string $label): void
     }
     foreach ($oracle['outcome'] as $token => $want) {
         $got = array_keys($seen[$token] ?? []);
-        if ($want === null) {
-            ppCheck(count($got) <= 1 && ! in_array('ran:'.$token, $got, true), "{$label}: a call on a step the conversation moved past never runs", ['token' => $token, 'got' => $got]);
-
-            continue;
-        }
         ppCheck(count($got) === 1, "{$label}: every call gets exactly one recorded outcome", ['token' => $token, 'got' => $got]);
         ppCheck($got[0] === $want, '6: the recorded outcome matches what ran', ['token' => $token, 'got' => $got[0], 'want' => $want]);
     }
@@ -694,6 +871,9 @@ function ppWithoutCall(array $c, int $drop): ?array
         ...$c,
         'calls' => $calls,
         'requests' => array_values(array_map(fn (array $request): array => [...$request, 'call' => $remap($request['call'])], $kept)),
+        'repeats' => [],
+        'insert' => ($c['insert'] ?? null) === null || $c['insert']['call'] === $drop ? null : [...$c['insert'], 'call' => $remap($c['insert']['call'])],
+        'forge' => ($c['forge']['segment'] ?? null) === 'earlier' ? ($c['forge']['call'] === $drop ? null : [...$c['forge'], 'call' => $remap($c['forge']['call'])]) : ($c['forge'] ?? null),
         'prior' => array_values(array_map($remap, array_filter($c['prior'], fn (int $index): bool => $index !== $drop))),
         'order' => array_values(array_map(fn (int $index): int => $position[$index], array_filter($c['order'], fn (int $index): bool => isset($position[$index])))),
     ];
@@ -708,6 +888,7 @@ function ppWithoutRequest(array $c, int $drop): ?array
     return [
         ...$c,
         'requests' => array_values(array_filter($c['requests'], fn (array $request, int $index): bool => $index !== $drop, ARRAY_FILTER_USE_BOTH)),
+        'repeats' => [],
         'order' => array_values(array_map(fn (int $index): int => $index > $drop ? $index - 1 : $index,
             array_filter($c['order'], fn (int $index): bool => $index !== $drop))),
     ];
@@ -719,6 +900,11 @@ function ppSmaller(array $c): array
     $out = [];
     if ($c['again'] !== []) {
         $out[] = [...$c, 'again' => array_slice($c['again'], 0, -1)];
+    }
+    foreach (['insert', 'later', 'forge', 'repeats'] as $key) {
+        if (($c[$key] ?? null) !== null && $c[$key] !== []) {
+            $out[] = [...$c, $key => $key === 'repeats' ? [] : null, ...($key === 'later' ? ['forge' => null] : [])];
+        }
     }
     foreach (array_keys($c['calls']) as $i) {
         if (($s = ppWithoutCall($c, $i)) !== null) {
@@ -842,7 +1028,7 @@ it('reproduces the TS generator bit for bit', function (): void {
     foreach ($ts as $json) {
         $case = json_decode($json, true);
         $php = ppGenerate($case['seed']);
-        unset($php['between'], $php['betweenAt']);
+        unset($php['insert'], $php['later'], $php['forge'], $php['repeats']);
         expect(json_encode($php))->toBe($json);
     }
     expect(array_map(fn (int $index): int => ppCaseSeed(0x6392, $index), [0, 1, 2, 149]))->toBe([2483776628, 2972160347, 2366528728, 3841045332]);
@@ -855,7 +1041,7 @@ it('holds for the seeds that broke the rule on TS main', function (int $seed): v
 
 it('holds over generated steps', function (): void {
     $replay = getenv('PRISM_PROPERTY_SEED');
-    $examples = ppPositive(getenv('PRISM_PROPERTY_EXAMPLES'), 150, 1, 100000);
+    $examples = ppPositive(getenv('PRISM_PROPERTY_EXAMPLES'), PP_DEFAULT_EXAMPLES, 1, 100000);
     $base = ppPositive(getenv('PRISM_PROPERTY_BASE_SEED'), 0x6392);
     $seeds = $replay !== false
         ? [ppU32(ppPositive($replay, 0))]
@@ -881,6 +1067,45 @@ it('the generator reaches every shape the brief asks for', function (): void {
     foreach (PP_PATHS as $path) {
         expect($has(fn (array $c): bool => $c['resume'] === $path))->toBeTrue();
     }
+});
+
+// NO BLIND SPOT: the default fixed-seed set must generate every combination
+// of a later step with inserted rows and with forged results in BOTH
+// segments, every inserted kind before and after the decision, and repeated
+// approval ids with an approval; a run that missed one fails here.
+it('the default set covers every combination the property must check', function (): void {
+    $cases = array_map(fn (int $index): array => ppGenerate(ppCaseSeed(0x6392, $index)), range(0, PP_DEFAULT_EXAMPLES - 1));
+    $has = fn (Closure $predicate): bool => array_filter($cases, $predicate) !== [];
+    $missing = [];
+    foreach (PP_INSERT_KINDS as $kind) {
+        foreach (['before_decision', 'after_decision'] as $when) {
+            if (! $has(fn (array $c): bool => ($c['insert']['kind'] ?? null) === $kind && $c['insert']['when'] === $when)) {
+                $missing[] = "{$kind} {$when}";
+            }
+        }
+    }
+    foreach (['superseding' => true, 'transparent' => false] as $label => $supersedes) {
+        if (! $has(fn (array $c): bool => $c['later'] !== null && $c['insert'] !== null && in_array($c['insert']['kind'], PP_SUPERSEDES, true) === $supersedes)) {
+            $missing[] = "later step + {$label} insert";
+        }
+    }
+    foreach (['earlier', 'later'] as $segment) {
+        if (! $has(fn (array $c): bool => ($c['forge']['segment'] ?? null) === $segment)) {
+            $missing[] = "later step + forged result in the {$segment} segment";
+        }
+        if (! $has(fn (array $c): bool => ($c['forge']['segment'] ?? null) === $segment && $c['insert'] !== null)) {
+            $missing[] = "later step + forged result in the {$segment} segment + insert";
+        }
+    }
+    if (! $has(fn (array $c): bool => $c['later'] !== null && array_filter($c['later']['requests'], fn (array $q): bool => $q['verdict'] === 'approve') !== []
+        && array_filter($c['requests'], fn (array $q): bool => $q['verdict'] === 'approve') !== [])) {
+        $missing[] = 'later step with approvals for both steps';
+    }
+    if (! $has(fn (array $c): bool => $c['repeats'] !== []
+        && array_filter(ppNormalized($c)['requests'], fn (array $q): bool => $q['verdict'] === 'approve') !== [])) {
+        $missing[] = 'repeated approval id with an approve';
+    }
+    expect($missing)->toBe([]);
 });
 
 it('refuses a property setting that is set but is not a whole number in range', function (string $value): void {

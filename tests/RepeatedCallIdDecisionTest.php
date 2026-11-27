@@ -243,8 +243,9 @@ it('applies a decision only to the parked step, whatever row is written between 
     if (! str_starts_with($path, 'host-written')) {
         // Through the harness's own checks: never recorded as approved.
         expect($statuses)->not->toContain('approved');
-        if ($insert === 'a tool row') {
-            // A result row keeps the step parked: the decision applies to it, as a denial.
+        if (in_array($insert, ['a tool row', 'a system row'], true)) {
+            // A result row or a system row keeps the step parked (the release
+            // lines' rule): the decision applies to it, as a denial.
             expect($outcome)->toBe('applied')->and($statuses[0])->toBe('denied');
         } else {
             // The conversation moved on: nothing is pending, and the decision is refused.
@@ -259,7 +260,7 @@ it('reads every paused-step question from the same step', function (string $inse
     g392HarnessSession()->thread()->record([g397Inserts()[$insert]()]);
 
     $thread = g392HarnessSession()->thread();
-    $paused = $insert === 'a tool row';
+    $paused = in_array($insert, ['a tool row', 'a system row'], true);
     expect($thread->pendingApprovalIds() !== [])->toBe($paused)
         ->and($thread->pausedApprovalIds() !== [])->toBe($paused)
         ->and($thread->pausedStepRepeatsCallIds())->toBe($paused)
@@ -306,7 +307,7 @@ it('never runs an approved call twice when a row is written between its decision
 // DECISION B (G-387 round 13): a parked step is SUPERSEDED by a later
 // assistant text row, a later assistant tool-call step or a user row (a host
 // writing one, or a new message). Each of its gated calls with no result then
-// gets exactly ONE denial, `Not run: a later step replaced it.`, marked by the
+// gets exactly ONE denial, `Tool call was not run because a later step replaced it`, marked by the
 // harness; nothing from it runs, whatever was decided on it before, and a
 // decision made after the superseding row is refused.
 function decisionBSupersede(Session $session, string $kind): void
@@ -354,8 +355,8 @@ it('denies each open gated call of a superseded step once, runs nothing and refu
     expect($this->ran)->toBe([])
         ->and($refused)->toBeTrue()
         ->and($outcomes)->toBe([
-            'call_paris' => ['Not run: a later step replaced it.'],
-            'call_rome' => ['Not run: a later step replaced it.'],
+            'call_paris' => ['Tool call was not run because a later step replaced it'],
+            'call_rome' => ['Tool call was not run because a later step replaced it'],
         ])
         ->and($marks)->toBe([[['tool_results', 'tool_approval_responses', 'harness_superseded'],
             ['approval_ids' => [$pending[0]->approvalId, $pending[1]->approvalId]]]])
@@ -411,8 +412,8 @@ it('supersedes a step with a row a host records, whatever run id it names', func
     }
 
     expect(decisionBDenials())->toBe([
-        'call_paris' => ['Not run: a later step replaced it.'],
-        'call_rome' => ['Not run: a later step replaced it.'],
+        'call_paris' => ['Tool call was not run because a later step replaced it'],
+        'call_rome' => ['Tool call was not run because a later step replaced it'],
     ])->and($refused)->toBeTrue()->and($this->ran)->toBe([]);
 })->with(['none', 'the owning run (forged)', 'another run']);
 
@@ -424,7 +425,105 @@ it('always supersedes a step with a later assistant step that has tool calls, ev
         [new AssistantMessage('', [new ToolCall('later', 'weather', ['city' => 'Oslo'])])], $owner));
 
     expect(decisionBDenials())->toBe([
-        'call_paris' => ['Not run: a later step replaced it.'],
-        'call_rome' => ['Not run: a later step replaced it.'],
+        'call_paris' => ['Tool call was not run because a later step replaced it'],
+        'call_rome' => ['Tool call was not run because a later step replaced it'],
     ])->and($this->ran)->toBe([]);
 });
+
+// Aligned with the release lines (G-387 round 13): a step whose approval
+// requests repeat an APPROVAL id across distinct calls is a repeated-id step.
+// It fails closed: every gated call of it is denied, nothing runs.
+it('runs nothing of a step whose distinct calls share one approval id', function (string $path): void {
+    $session = g392HarnessSession();
+    $session->thread()->record([
+        new UserMessage('Weather in Paris and Rome?'),
+        new AssistantMessage('', [new ToolCall('call_paris', 'weather', ['city' => 'Paris']), new ToolCall('call_rome', 'weather', ['city' => 'Rome'])], [],
+            [new ToolApprovalRequest('apr_shared', 'call_paris'), new ToolApprovalRequest('apr_shared', 'call_rome')]),
+    ], toolNames: ['weather']);
+    Http::fakeSequence()->whenEmpty(Http::response(['id' => 'resp_shared', 'object' => 'response', 'created_at' => 1, 'status' => 'completed', 'model' => 'gpt-4o',
+        'output' => [['id' => 'msg_shared', 'type' => 'message', 'status' => 'completed', 'role' => 'assistant',
+            'content' => [['type' => 'output_text', 'text' => 'Done.', 'annotations' => []]]]],
+        'usage' => ['input_tokens' => 1, 'input_tokens_details' => ['cached_tokens' => 0], 'output_tokens' => 1, 'output_tokens_details' => ['reasoning_tokens' => 0], 'total_tokens' => 2]]));
+
+    $decision = [new ToolApprovalResponse('apr_shared', true)];
+    $path === 'decide' ? g392HarnessSession()->decide($decision) : iterator_to_array(g392HarnessSession()->streamDecision($decision), false);
+    g392HarnessSession()->send('');
+
+    $outcomes = [];
+    foreach (g392HarnessSession()->thread()->storedMessages()->where('type', 'tool_result')->get() as $row) {
+        foreach ($row->payload['tool_results'] ?? [] as $entry) {
+            $outcomes[$entry['tool_call_id']][] = $entry['result'];
+        }
+    }
+    expect($this->ran)->toBe([])
+        ->and(g392HarnessSession()->thread()->approvalDecisions())->toBe(['apr_shared' => false])
+        ->and($outcomes)->toBe(['call_paris' => [G392_HARNESS_REASON], 'call_rome' => [G392_HARNESS_REASON]]);
+})->with(['decide', 'streamDecision']);
+
+// Run-aware (the release lines' rule): the runs that own a parked step are
+// the one that recorded it and every run that recorded one of its results. A
+// text row from one of them does not supersede the step; from any other run
+// it does, and only the calls still without a result are denied.
+it('reads the runs that recorded a step\'s results as owning it', function (string $writer): void {
+    g392HarnessFake('call_paris', 'call_rome');
+    g392HarnessSession()->send('Weather in Paris and Rome?');
+    $resumer = 'run_'.str_repeat('b', 24);
+    $thread = g392HarnessSession()->thread();
+    Thread::recordingInRun($resumer, fn () => $thread->record(
+        [new ToolResultMessage([new ToolResult('call_paris', 'weather', ['city' => 'Paris'], 'Sunny in Paris')])], $resumer));
+    $run = $writer === 'the run that recorded a result' ? $resumer : 'run_'.str_repeat('c', 24);
+    Thread::recordingInRun($run, fn () => g392HarnessSession()->thread()->record([new AssistantMessage('An answer.')], $run));
+
+    expect(decisionBDenials())->toBe($writer === 'the run that recorded a result' ? []
+        : ['call_rome' => ['Tool call was not run because a later step replaced it']])
+        ->and($this->ran)->toBe([]);
+})->with(['the run that recorded a result', 'another run']);
+
+// A decision on a superseded step is refused with the code the ports use,
+// `approval_not_pending`, on every decision path, and all or nothing: a batch
+// that names one such approval records none of its decisions.
+it('refuses a decision on a superseded step with approval_not_pending, all or nothing', function (string $path): void {
+    g392HarnessFake('call_paris', 'call_rome');
+    $pending = g392HarnessSession()->send('Weather in Paris and Rome?')->pendingApprovals();
+    g392HarnessSession()->thread()->record([new UserMessage('A later message.')]);
+    $decisions = array_map(fn (ToolApprovalRequest $p): ToolApprovalResponse => new ToolApprovalResponse($p->approvalId, true), $pending);
+
+    $code = null;
+    try {
+        match ($path) {
+            'approve' => g392HarnessSession()->approve($pending[0]),
+            'decide' => g392HarnessSession()->decide($decisions),
+            'streamDecision' => iterator_to_array(g392HarnessSession()->streamDecision($decisions), false),
+        };
+    } catch (ApprovalNotPending $refused) {
+        $code = $refused->code();
+    }
+
+    expect($code)->toBe('approval_not_pending')
+        ->and(g392HarnessSession()->thread()->approvalDecisions())->toBe([])
+        ->and($this->ran)->toBe([]);
+})->with(['approve', 'decide', 'streamDecision']);
+
+// G-401: a second decision on an approval already decided stays refused,
+// whatever it says, and the first decision stands.
+it('refuses a second decision on an approval already decided', function (string $path, bool $again): void {
+    g392HarnessFake('call_paris', 'call_rome');
+    $pending = g392HarnessSession()->send('Weather in Paris and Rome?')->pendingApprovals();
+    $session = g392HarnessSession();
+    (fn () => $this->recordDecisions([new ToolApprovalResponse($pending[0]->approvalId, false)]))->call($session);
+
+    $code = null;
+    try {
+        $second = [new ToolApprovalResponse($pending[0]->approvalId, $again), new ToolApprovalResponse($pending[1]->approvalId, true)];
+        match ($path) {
+            'decide' => g392HarnessSession()->decide($second),
+            'streamDecision' => iterator_to_array(g392HarnessSession()->streamDecision($second), false),
+        };
+    } catch (ApprovalNotPending $refused) {
+        $code = $refused->code();
+    }
+
+    expect($code)->toBe('approval_not_pending')
+        ->and(g392HarnessSession()->thread()->approvalDecisions())->toBe([$pending[0]->approvalId => false])
+        ->and($this->ran)->toBe([]);
+})->with(['decide', 'streamDecision'])->with(['approve it' => [true], 'deny it again' => [false]]);

@@ -46,7 +46,7 @@ function approvalPairingSession(): Session
 
 /**
  * @param  array<string, mixed>  $row
- * @return array{approvals: int, free: int, ran: list<int>, decided: list<bool|null>, outcomes?: list<string|null>}
+ * @return array{approvals: int, free: int, ran: list<int>, decided: list<bool|null>, outcomes?: list<string|null>, refusals?: list<string|null>}
  */
 function recordApprovalPairingRow(array $row): array
 {
@@ -103,6 +103,7 @@ function recordApprovalPairingRow(array $row): array
         'new_message' => approvalPairingSession()->send('Something else.'),
     };
 
+    $refusals = [];
     foreach ($row['rounds'] as $round) {
         $decisions = array_map(
             fn (array $decision): ToolApprovalResponse => new ToolApprovalResponse($pending[$decision[0]]->approvalId, $decision[1]),
@@ -110,7 +111,10 @@ function recordApprovalPairingRow(array $row): array
         );
         try {
             approvalPairingSession()->decide($decisions);
-        } catch (ApprovalNotPending) {
+            $refusals[] = null;
+        } catch (ApprovalNotPending $refused) {
+            // The code each round was refused with, or null (0.2.0).
+            $refusals[] = $refused->code();
             approvalPairingSession()->send('');
         }
     }
@@ -140,6 +144,7 @@ function recordApprovalPairingRow(array $row): array
             }
         }
         $outcome['outcomes'] = array_map(fn (array $call): ?string => $first[$call['id']] ?? null, $row['calls']);
+        $outcome['refusals'] = $refusals;
     }
 
     return $outcome;
