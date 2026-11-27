@@ -479,6 +479,7 @@ class Thread extends Model implements ThreadContract
         $content = $message->additionalContent;
         $toolCalls = $message->toolCalls;
         $changed = false;
+        $host = false;
         if (array_key_exists(self::HOST_ROW, $content)) {
             $host = $content[self::HOST_ROW] === true;
             unset($content[self::HOST_ROW]);
@@ -505,11 +506,11 @@ class Thread extends Model implements ThreadContract
             unset($content['content_blocks']);
             $changed = true;
         }
-        if ($toolCalls !== [] && $message->content !== '' && ! isset($content['output_items']) && ! isset($content['content_blocks'])) {
-            // With no provider content, core sends an OpenAI row as its
-            // calls, then its text, which parts each call from its output.
-            // The row's own items, in the order a response holds them: its
-            // text, then its calls.
+        if ($host && $toolCalls !== [] && $message->content !== '' && ! isset($content['output_items']) && ! isset($content['content_blocks'])) {
+            // A host row with no provider content: core sends it on OpenAI
+            // as its calls, then its text, which parts each call from its
+            // output. Its own items instead: its text, then its calls. A row
+            // the harness recorded is never rewritten.
             $content['output_items'] = [
                 ['type' => 'message', 'role' => 'assistant', 'content' => [['type' => 'output_text', 'text' => $message->content]]],
                 ...array_map(static fn (ToolCall $call): array => ['type' => 'function_call', 'id' => $call->id, 'call_id' => $call->resultId,
@@ -667,17 +668,25 @@ class Thread extends Model implements ThreadContract
      */
     public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null): self
     {
-        // An assistant row a host records carries the host mark beside its
-        // provider content, so its replay can tell it from a row the harness
-        // recorded from a provider response (G-415).
-        $messages = array_map(
+        return $this->recordRows(self::markedAsHost($messages), $runId, $toolNames, outside: true);
+    }
+
+    /**
+     * `$messages`, each assistant row carrying the host mark beside its
+     * provider content, so its replay can tell it from a row the harness
+     * recorded from a provider response (G-415).
+     *
+     * @param  iterable<Message>  $messages
+     * @return list<Message>
+     */
+    private static function markedAsHost(iterable $messages): array
+    {
+        return array_map(
             static fn (Message $message): Message => $message instanceof AssistantMessage
                 ? new AssistantMessage($message->content, $message->toolCalls, [...$message->additionalContent, self::HOST_ROW => true], $message->toolApprovalRequests)
                 : $message,
             is_array($messages) ? array_values($messages) : iterator_to_array($messages, false),
         );
-
-        return $this->recordRows($messages, $runId, $toolNames, outside: true);
     }
 
     /** The additional-content key marking an assistant row a host recorded through record() (G-415). Never sent. */
@@ -699,8 +708,15 @@ class Thread extends Model implements ThreadContract
         // anywhere else this is an ordinary record(), with its lock and its
         // replaced denials.
         $key = $this->sessionKeyOrNull();
-        if ($key === null || ! Session::holdsLock($key)) {
+        if ($key === null) {
+            // A shared thread has no session, so no run holds it: the
+            // harness's own runs write it here, unmarked.
             return $this->recordRows($messages, $runId, $toolNames, outside: true);
+        }
+        if (! Session::holdsLock($key)) {
+            // Not the run that holds the session: a host's write, marked as
+            // record() marks it (G-415).
+            return $this->recordRows(self::markedAsHost($messages), $runId, $toolNames, outside: true);
         }
 
         return $this->recordRows($messages, $runId, $toolNames, outside: false, answers: $answers);
