@@ -499,6 +499,13 @@ function pairingOracle(array $case): array
     // other gated call must not run.
     $refused = false;
     $may = [];
+    // A host step with an approval request recorded after the first park,
+    // before its decision, without its tool offer, is offered only the tool its request names
+    // (G-412). The resume that resolves it, and every step after it, keep
+    // that offer: a later call of another tool is not offered, so it never
+    // runs.
+    $hostScope = pairingInsertBefore($case) === 'assistant_request' && ($case['mode'] ?? 'normal') === 'normal'
+        && array_filter($case['steps'][0]['calls'], fn (array $call): bool => $call['gated']) !== [] ? ($case['insert']['tool'] ?? 'gated') : null;
     foreach ($case['steps'] as $step) {
         $ids = array_column($step['calls'], 'id');
         $repeated = count($ids) !== count(array_unique($ids));
@@ -522,7 +529,8 @@ function pairingOracle(array $case): array
         $runs = [];
         foreach ($step['calls'] as $k => $call) {
             $approved = ! $repeated && ! $superseded && $k !== $forged && ($effective[$k] ?? 'none') === 'approve';
-            $runs[$k] = ! $unserved && (! $call['gated'] || (! $refusedHere && ! $stopped && $approved));
+            $offered = $hostScope === null || $steps === [] || $hostScope === ($call['gated'] ? 'gated' : 'free');
+            $runs[$k] = ! $unserved && $offered && (! $call['gated'] || (! $refusedHere && ! $stopped && $approved));
             if ($runs[$k]) {
                 $ran[] = $call['token'];
             }
@@ -535,7 +543,9 @@ function pairingOracle(array $case): array
             }
         }
         $steps[] = ['repeated' => $repeated, 'runs' => $runs, 'unserved' => $unserved, 'refused' => $refusedHere,
-            'superseded' => $superseded, 'forged' => $forged];
+            'superseded' => $superseded, 'forged' => $forged,
+            // Its gated calls' tool is not offered: they never park.
+            'unoffered' => $hostScope !== null && $steps !== [] && $hostScope !== 'gated'];
         $refused = $refused || $refusedHere;
     }
     $recorded = null;
@@ -996,7 +1006,7 @@ function pairingViolations(array $case, array $observed): array
             $violations[] = "inv2: step {$s} ran ".count($ranGated).' gated calls on '.count($approves).' approvals';
         }
 
-        if ($gated === [] || $expected['unserved']) {
+        if ($gated === [] || $expected['unserved'] || $expected['unoffered']) {
             continue;
         }
         if ($parked === null) {
@@ -1454,7 +1464,9 @@ function pairingSmaller(array $case): array
 {
     $out = [];
     if (count($case['steps']) > 1) {
-        foreach (array_keys($case['steps']) as $s) {
+        // Never the first step: the case's pair, twin and host row name its
+        // calls by index.
+        foreach (array_slice(array_keys($case['steps']), 1) as $s) {
             $smaller = $case;
             array_splice($smaller['steps'], $s, 1);
             $out[] = $smaller;
@@ -1601,7 +1613,16 @@ it('holds the approval pairing invariants on generated steps, decisions and resu
 
     foreach ($seeds as $seed) {
         $case = pairingGenerate($seed);
-        $violations = pairingCheck($case);
+        try {
+            $violations = pairingCheck($case);
+        } catch (Throwable $e) {
+            // The driver or the code under test threw: report the seed, so
+            // the case can be replayed.
+            $this->fail("G-392 approval pairing property THREW
+  replay: PRISM_PROPERTY_SEED={$seed}
+  ".$e::class.': '.$e->getMessage().' at '.basename($e->getFile()).':'.$e->getLine().'
+  case: '.json_encode($case));
+        }
         if ($violations === []) {
             continue;
         }
@@ -1616,7 +1637,12 @@ it('holds the approval pairing invariants on generated steps, decisions and resu
                 if (--$budget < 0) {
                     break;
                 }
-                $candidateViolations = pairingCheck($candidate);
+                try {
+                    $candidateViolations = pairingCheck($candidate);
+                } catch (Throwable) {
+                    // Not a case the generator could make: skip it.
+                    continue;
+                }
                 if ($candidateViolations !== []) {
                     $minimal = $candidate;
                     $minimalViolations = $candidateViolations;
@@ -1633,12 +1659,15 @@ it('holds the approval pairing invariants on generated steps, decisions and resu
     expect(true)->toBeTrue();
 });
 
-// Seeds a run found failing, kept so they stay fixed: 365504846 is the
-// nightly's (identical gated calls with empty ids, a forged result before the
-// decision, a spent run; G-412).
+// Seeds a run found failing, kept so they stay fixed:
+//  - 365504846: identical gated calls with empty ids, a forged result before
+//    the decision, a spent run (G-412);
+//  - 3874437715 and 1272123914: a host step with an approval request recorded
+//    without its offer, then later steps whose calls name other tools
+//    (G-412).
 it('holds on the seeds a run found failing', function (int $seed): void {
     expect(pairingCheck(pairingGenerate($seed)))->toBe([]);
-})->with([365504846]);
+})->with([365504846, 3874437715, 1272123914]);
 
 it('generates every shape the rule distinguishes, in the fixed-seed set', function (): void {
     $seen = [];
