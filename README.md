@@ -1202,15 +1202,28 @@ approval). An approval whose call already has an outcome is never pending, and a
 is refused with `approval_not_pending`. Every call of a step that is no longer the paused one and
 has no stored outcome is given one when the thread is replayed (replaced, when it was waiting on
 an approval; otherwise interrupted, since an ungated call ran, or may have, when the step was
-taken), so the request a provider is sent always answers every tool call. Before core runs an
+taken), so the request a provider is sent always answers every tool call. Each step's results are
+sent directly after it, whatever was written in between while a call ran (a host's user, text or
+system row, or a tool's own nested work): those rows follow the step's results. Each result
+answers one call of its step and is sent with that call's ids; a second result for a call, or one
+that answers no call of its step, stays stored but is not sent. Before core runs an
 ungated call inside a model step the harness records a write-ahead journal row for it, removed
 by the write that stores its result: if that write never happens, the call reads, and is
-replayed, as interrupted. A run takes no further model step once a newer step on its session,
-written by anyone else, is waiting on approval (it ends with `RunNotPermitted`, code
-`parked_elsewhere`): it never replaces the step a caller was just told is waiting. Every harness
-mark is read only on a row the runtime itself wrote, recorded in the `harness_written` column
-(run the package migrations; no public write sets it, and a run id is never proof): on any other
-row a mark is read as absent. A thread is read once per locked operation and then only the rows
+replayed, as interrupted, under ids every provider accepts. A run takes no further model step,
+and writes nothing that would replace it, once a newer step on its session, written by anyone
+else (a tool's own work included, from an approved or an ungated call), is waiting on approval
+(it ends with `RunNotPermitted`, code `parked_elsewhere`): it never replaces the step a caller was
+just told is waiting. A parked response lists only the approvals still pending when it returns;
+when none is left it is not awaiting approval, and `$response->stoppedBecause` says why
+(`replaced`: a row written meanwhile replaced the step; `parked_elsewhere`: a newer step waits).
+Of two results recorded for one call, the model is sent the first, the one every reader counts.
+Every harness mark, and the tool offer a parked step carries, is read only on a row the runtime
+itself wrote, recorded in the `harness_written` column (no public write sets it, and a run id is
+never proof): on any other row it is read as absent, and a step with no offer the runtime stored
+is offered the tools its own approval requests name. **Run the package migrations before you
+deploy this version:** until the `harness_written` column exists no run starts
+(`RunNotPermitted`, code `schema_not_migrated`). A call whose start was refused because a denial
+stands for it reads `Not run: this call was denied before it started.` A thread is read once per locked operation and then only the rows
 appended since. Only the runtime's own record call is inside a run: a
 row a host records while that write is in progress (from a model event, say) is outside,
 whatever run id it names. A result counts only for the calls of the step whose rows it sits in (the rows

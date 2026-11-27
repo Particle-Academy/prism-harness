@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ThreadReads;
 use Prism\Prism\Contracts\Message;
@@ -45,10 +46,10 @@ class ThreadMessage extends Model
 
     /**
      * Whether this connection's schema has the trust column (G-387 round 16,
-     * migration 0001_01_01_000008). A database that has not run it yet keeps
-     * working as before: rows are then read as the harness's own by their run
-     * id, the rule before this column existed, and a warning says so once.
-     * Run the migration: only the column makes a run id no trust signal.
+     * migration 0001_01_01_000008). A database that has not run it yet FAILS
+     * CLOSED (round 17): no row is read as the harness's own, whatever run id
+     * it carries, no run starts ({@see RunNotPermitted::notMigrated()}), and
+     * a warning says so once. A run id is never a trust signal.
      *
      * @internal
      */
@@ -58,11 +59,22 @@ class ThreadMessage extends Model
         if (! array_key_exists($name, self::$trusted)) {
             self::$trusted[$name] = Schema::connection($connection)->hasColumn('harness_thread_messages', 'harness_written');
             if (! self::$trusted[$name]) {
-                Log::warning('The harness_thread_messages.harness_written column is missing: run the prism-harness migrations. Until then a row is read as written by the harness when it carries a run id.');
+                Log::warning('The harness_thread_messages.harness_written column is missing: run the prism-harness migrations. Until then no harness run starts, and no row is read as written by the harness.');
             }
         }
 
         return self::$trusted[$name];
+    }
+
+    /**
+     * Forget what {@see self::hasTrustColumn()} read of each schema: after a
+     * migration runs (or is rolled back) in the same process.
+     *
+     * @internal
+     */
+    public static function forgetSchema(): void
+    {
+        self::$trusted = [];
     }
 
     protected static function booted(): void

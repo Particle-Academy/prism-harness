@@ -70,7 +70,11 @@ final class StepRows
      * other. `harness_call` is a request's binding, inside each request.
      */
     public const MARKS = [self::ANSWERS_STEP, self::STARTED, self::JOURNAL, 'harness_ended_by_start', 'harness_superseded',
-        'harness_replaced', 'harness_steps_used', 'harness_steps_left'];
+        'harness_replaced', 'harness_steps_used', 'harness_steps_left',
+        // Run state a parked step carries (round 17, item 2): the tools its
+        // run offered. Read only on the runtime's own step; a host step
+        // resumes with the legacy scope (its approved requests' tools).
+        'harness_tool_names'];
 
     /**
      * The calls of an assistant row: the OBJECT entries of its `tool_calls`
@@ -341,7 +345,7 @@ final class StepRows
 
     /**
      * The decision that STANDS for each approval decided in one step's rows
-     * (G-387 round 16, items 1 and 10; G-401's recommended option), by ONE
+     * (G-387 round 16, items 1 and 10; G-401, decided: DENIAL WINS), by ONE
      * rule every reader, the start gate and the replay use:
      *
      *  - a decision COUNTS only while its call has no outcome: no result and

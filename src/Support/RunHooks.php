@@ -68,6 +68,18 @@ final class RunHooks
     }
 
     /**
+     * Whether run `$runId` may no longer write a turn (G-387 round 17, item
+     * 3): a newer step on its session, written by anyone else after the run
+     * read it, waits on approval. False for a run nothing attached to.
+     */
+    public static function halted(string $runId): bool
+    {
+        $hooks = self::$hooks[$runId] ?? null;
+
+        return $hooks !== null && ($hooks['halted'])();
+    }
+
+    /**
      * Mark `$run`'s model call as in progress: core runs its ungated calls
      * inside it. The closure ends it.
      *

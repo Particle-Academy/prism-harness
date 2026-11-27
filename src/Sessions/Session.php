@@ -19,11 +19,13 @@ use Prism\Harness\Events\RunCancelRequested;
 use Prism\Harness\Events\RunStepped;
 use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Exceptions\PlansDisabled;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Flow\FlowToolset;
 use Prism\Harness\Models\Thread;
+use Prism\Harness\Models\ThreadMessage;
 use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\Plans\PlanHandle;
 use Prism\Harness\Plans\Plans;
@@ -1171,7 +1173,7 @@ class Session
         $thread = $this->thread();
         $pending = array_fill_keys($thread->pendingApprovalIds(), true);
         // A DENIAL may still revoke an approval no run has acted on yet (G-401,
-        // the recommended option): its call has no outcome and was never
+        // decided: DENIAL WINS): its call has no outcome and was never
         // started. A later APPROVAL never stands over any decision.
         $revocable = array_fill_keys($thread->approvedIdsAwaitingRun(), true);
         foreach ($decisions as $decision) {
@@ -1274,6 +1276,11 @@ class Session
      */
     public function beginRun(string $id, string $mode, string $provider, string $model, ?string $parentRunId = null, ?string $rootRunId = null, ?string $turnId = null, ?array $tree = null, bool $provisional = false): self
     {
+        // No run starts on a schema without the trust column (G-387 round
+        // 17): before it writes, reads or runs anything.
+        if (! ThreadMessage::hasTrustColumn($this->thread()->getConnectionName())) {
+            throw RunNotPermitted::notMigrated();
+        }
         $history = is_array($this->state()['run_history'] ?? null) ? array_values(array_filter($this->state()['run_history'], 'is_string')) : [];
         $history = array_slice(array_values(array_unique([...$history, $id])), -self::RUN_HISTORY);
         // The run tree the run belongs to, kept DURABLY by run id: a cancel

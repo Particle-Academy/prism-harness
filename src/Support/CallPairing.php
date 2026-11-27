@@ -71,6 +71,36 @@ final class CallPairing
     }
 
     /**
+     * The call each result of ONE row (a segment's results, as sent) answers,
+     * by the rule {@see self::answered()} applies to a row: its own call
+     * first (id, tool name and arguments), then id and tool name, then id;
+     * each call answered once. A result left over answers no call of the
+     * step (G-387 round 17): another call's copy, or a result naming a call
+     * the step does not have.
+     *
+     * @param  list<array{0: string, 1: string, 2?: ?string}>  $calls  [id, tool name, args digest], in call order
+     * @param  list<array{0: string, 1: string, 2?: ?string}>  $results  [id, tool name, args digest], in row order
+     * @param  array<int, true>  $taken  calls already answered (an earlier row of the segment)
+     * @return list<int|null> by result, the index of the call it answers, or null
+     */
+    public static function takers(array $calls, array $results, array $taken = []): array
+    {
+        $out = [];
+        foreach ($results as $result) {
+            [$id, $name] = $result;
+            $args = $result[2] ?? null;
+            $at = ($args === null ? null : self::firstFree($calls, $taken, $id, $name, $args))
+                ?? self::firstFree($calls, $taken, $id, $name) ?? self::firstFree($calls, $taken, $id, null);
+            if ($at !== null) {
+                $taken[$at] = true;
+            }
+            $out[] = $at;
+        }
+
+        return $out;
+    }
+
+    /**
      * @param  list<array{0: string, 1: string, 2?: ?string}>  $calls  [id, tool name], in call order
      * @param  list<string>  $requestCallIds  each request's tool_call_id, in issue order
      * @param  list<bool>  $ran  which calls a result of the step's own run answered

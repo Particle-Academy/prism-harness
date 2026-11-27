@@ -794,6 +794,12 @@ class Thread extends Model implements ThreadContract
         return $payload;
     }
 
+    /** Why the last {@see self::recordStarted()} refused, when it can say: {@see self::START_DENIED}, else null. */
+    public function startRefusal(): ?string
+    {
+        return $this->startRefusal;
+    }
+
     /**
      * Record the write-ahead STARTED row (G-387 round 15) for the call of the
      * step at `$position` that the runtime is about to run, under the
@@ -812,8 +818,16 @@ class Thread extends Model implements ThreadContract
             throw new LogicException('Only the harness runtime records a started row.');
         }
 
+        $this->startRefusal = null;
+
         return DB::transaction(function () use ($runId, $position, $callId, $toolName, $arguments): bool {
             static::query()->whereKey($this->getKey())->lockForUpdate()->first();
+            // The start gate decides on the STORE (round 17, PHP run19 Info
+            // 5b): what this operation kept of the step's rows is checked
+            // first, so a row changed in place in the same second as the
+            // latest update (invisible to the kept rows' fingerprint) is read
+            // as it now is.
+            ThreadReads::verifyFrom($this->getConnection(), (int) $this->getKey(), $position);
             $view = $this->view();
             $index = $view->at[$position] ?? null;
             if ($index === null || ! StepRows::isStep($view->rows[$index]['type'], $view->rows[$index]['payload'])) {
@@ -849,6 +863,10 @@ class Thread extends Model implements ThreadContract
             // (round 16): a denial recorded since the run read its history,
             // while the call had no outcome, stops the call (G-401).
             if (! is_string($approval) || (($paired['standing'][$approval] ?? null)['approved'] ?? false) !== true) {
+                // Said precisely (round 17, Py run21 I3): a denial that
+                // stands for it is not the same as a call no longer open.
+                $this->startRefusal = is_string($approval) && is_array($paired['standing'][$approval] ?? null) ? self::START_DENIED : null;
+
                 return false;
             }
             $this->store((int) $this->storedMessages()->max('position') + 1, MessageMapper::TYPE_TOOL_RESULT, $runId,
@@ -1037,16 +1055,21 @@ class Thread extends Model implements ThreadContract
             return array_values(array_unique($scope));
         }
 
-        // Older workers did not persist the offer. Never reconstruct the
-        // whole mode: only approved requests on this record are knowable.
+        // No offer the runtime stored: an older worker did not persist it,
+        // or a HOST wrote the step (round 17: the offer is run state, read
+        // only on the runtime's own step, so a host cannot widen it). Never
+        // reconstruct the whole mode: only the calls this step asked a
+        // person about are knowable. Every one of them, approved or not, so
+        // the resolution can answer each (a denial, or no response) as it
+        // answers a step the runtime wrote; a call runs only on its own
+        // approval, so offering a denied one runs nothing.
         // Constant diagnostic: no arguments, tool names or participant ids.
-        Log::warning('Pending approval has no valid stored tool scope; offering approved requests only.');
+        Log::warning('Pending approval has no valid stored tool scope; offering the requested tools only.');
         $names = [];
         $step = self::pairedStep($payload, $paused['results']);
-        $decisions = self::decisionsOf($step);
         foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
             $call = $at === null ? null : ($step['calls'][$at] ?? null);
-            if (is_string($request['approval_id'] ?? null) && ($decisions[$request['approval_id']] ?? false)
+            if (is_string($request['approval_id'] ?? null)
                 && is_array($call) && is_string($call['name'] ?? null) && $call['name'] !== '' && $call['name'] !== '*') {
                 $names[] = $call['name'];
             }
@@ -1455,6 +1478,14 @@ class Thread extends Model implements ThreadContract
     public const SUPERSEDED_RESULT = 'Tool call was not run because a later step replaced it';
 
     /**
+     * The result of an approved call whose start the decision that stands
+     * refused (G-387 round 17, Py run21 I3): a denial recorded while it had
+     * no outcome stands over the approval (G-401, denial wins), so it never
+     * started.
+     */
+    public const START_DENIED = 'Not run: this call was denied before it started.';
+
+    /**
      * Whether a new message would supersede the paused step now (DECISION
      * B): it has calls with no result. The runtime then records the message
      * and those calls' denials in ONE write before its turn is sent (G-404,
@@ -1537,6 +1568,9 @@ class Thread extends Model implements ThreadContract
 
     /** @var \WeakMap<ToolResultMessage, list<string>>|null */
     private ?\WeakMap $supersededRows = null;
+
+    /** Why the last start was refused, when it can say ({@see self::startRefusal()}). */
+    private ?string $startRefusal = null;
 
     /**
      * The denials the paused step's open gated calls get when it is

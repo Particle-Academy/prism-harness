@@ -44,7 +44,7 @@ final readonly class BudgetedCalls
 
     /** @param Closure(TextResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
-     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
+     * @param  (Closure(ToolCall): (bool|string))|null  $started  asked right before an approved call runs (round 15): true runs it, false or a refusal text does not
      */
     public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): TextResponse
     {
@@ -110,7 +110,7 @@ final readonly class BudgetedCalls
 
     /** @param Closure(StructuredResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
-     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
+     * @param  (Closure(ToolCall): (bool|string))|null  $started  asked right before an approved call runs (round 15): true runs it, false or a refusal text does not
      */
     public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): StructuredResponse
     {
@@ -197,7 +197,7 @@ final readonly class BudgetedCalls
     /**
      * @param  Closure(list<Message>, TextResponse):void  $record  Each completed call's core-built messages.
      * @param  Closure(list<Message>):void  $resolved
-     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
+     * @param  (Closure(ToolCall): (bool|string))|null  $started  asked right before an approved call runs (round 15): true runs it, false or a refusal text does not
      * @return Generator<StreamEvent>
      */
     public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): Generator

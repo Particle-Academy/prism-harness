@@ -37,7 +37,7 @@ final readonly class StepCalls
 {
     /** @param Closure(TextResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
-     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
+     * @param  (Closure(ToolCall): (bool|string))|null  $started  asked right before an approved call runs (round 15): true runs it, false or a refusal text does not
      */
     public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): TextResponse
     {
@@ -93,7 +93,7 @@ final readonly class StepCalls
 
     /** @param Closure(StructuredResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
-     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
+     * @param  (Closure(ToolCall): (bool|string))|null  $started  asked right before an approved call runs (round 15): true runs it, false or a refusal text does not
      */
     public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): StructuredResponse
     {
@@ -173,7 +173,7 @@ final readonly class StepCalls
     /**
      * @param  Closure(list<Message>, TextResponse):void  $record
      * @param  Closure(list<Message>):void  $resolved
-     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
+     * @param  (Closure(ToolCall): (bool|string))|null  $started  asked right before an approved call runs (round 15): true runs it, false or a refusal text does not
      * @return Generator<StreamEvent>
      */
     public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): Generator

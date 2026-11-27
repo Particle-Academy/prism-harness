@@ -32,6 +32,7 @@ use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
+use Tests\Support\SentRequests;
 
 // G-392 QC: property tests for the approval pairing invariants, ported from
 // prism-harness-ts test/approval-pairing-property.test.ts (1e4ca65): the
@@ -434,7 +435,7 @@ function ppClosedDecisions(array $c): array
                 $closed[] = $target;
             }
         }
-        [$c['later']['requests'], $c['closed_later']] = ppWithoutClosed($c, $later['calls'], $later['requests'], $closed);
+        [$c['later']['requests'], $c['closed_later']] = ppWithoutClosed($c, $later['calls'], $later['requests'], $closed, array_keys($later['requests']));
     }
 
     return $c;
@@ -446,10 +447,15 @@ function ppClosedDecisions(array $c): array
  * no outcome before the decisions; only an id no other call shares may pair
  * with a call that has one (the pairing by id).
  *
+ * `$order`: the order the driver records these decisions in (the parked
+ * step's are shuffled by `order`; a later step's go in index order, round 17:
+ * the oracle used the parked step's order for both, seed 1508513416).
+ *
  * @param  list<int>  $closed
+ * @param  list<int>|null  $order
  * @return array{0: list<array<string, mixed>>, 1: bool}
  */
-function ppWithoutClosed(array $c, array $calls, array $requests, array $closed): array
+function ppWithoutClosed(array $c, array $calls, array $requests, array $closed, ?array $order = null): array
 {
     $taken = [];
     $paired = [];
@@ -472,7 +478,7 @@ function ppWithoutClosed(array $c, array $calls, array $requests, array $closed)
         $paired[$k] = $at;
     }
     $hits = fn (int $k): bool => $requests[$k]['verdict'] !== 'none' && $paired[$k] !== null && in_array($paired[$k], $closed, true);
-    $order = array_values(array_filter($c['order'], fn (int $k): bool => isset($requests[$k])));
+    $order = array_values(array_filter($order ?? $c['order'], fn (int $k): bool => isset($requests[$k])));
     if (count($order) !== count($requests)) {
         $order = array_keys($requests);
     }
@@ -731,6 +737,9 @@ final class PpRan
      */
     public static ?Closure $during = null;
 
+    /** The number of requests sent before this case (round 17, invariant 8). */
+    public static int $sentFrom = 0;
+
     /** What that host write did, per case: `locked`, or `recorded` when it was let through. */
     public static ?string $concurrent = null;
 
@@ -752,6 +761,7 @@ function ppRig(array $c): void
     PpRan::$during = null;
     PpRan::$concurrent = null;
     PpRan::$runs++;
+    PpRan::$sentFrom = SentRequests::count();
     // The fake is installed once (beforeEach): Laravel invokes EVERY stub
     // callback on a request, so a fake per case would drain the queue once
     // per case already run. Each case starts on an empty queue.
@@ -1137,9 +1147,11 @@ function ppRunCase(array $c): void
     if (($kind = ppConcurrent($c)) !== null && $first === null) {
         PpRan::$during = function () use ($c, $kind): void {
             try {
-                ppSession($c)->thread()->record([$kind === 'user'
-                    ? new UserMessage('A host row while a call runs.')
-                    : new AssistantMessage('', [new ToolCall('host', 'free', ['n' => 900])])]);
+                ppSession($c)->thread()->record($kind === 'user' ? match (ppConcurrentRows($c)) {
+                    'user' => [new UserMessage('A host row while a call runs.')],
+                    'text' => [new AssistantMessage('A host note while a call runs.')],
+                    default => [new UserMessage('A host row while a call runs.'), new AssistantMessage('A host note while a call runs.')],
+                } : [new AssistantMessage('', [new ToolCall('host', 'free', ['n' => 900])])]);
                 PpRan::$concurrent = 'recorded';
             } catch (SessionLocked) {
                 PpRan::$concurrent = 'locked';
@@ -1237,6 +1249,19 @@ function ppRunCase(array $c): void
     }
     ppReplayAnswersEveryCall($c, '5 (replay, after repeat resumes)');
     ppReplayOnce($c);
+
+    // Invariant 8 (round 17, item 1): every request the provider was SENT
+    // answers every call of every step it carries, exactly once, in that
+    // step's own result run (the multiset; ids as generated, an empty one
+    // included). One more turn re-reads the stored thread, so a result
+    // stored after a row written while its call ran is sent too.
+    try {
+        ppTurn($c, 'send', 'One more.');
+    } catch (Throwable) {
+        // A refusal sends nothing; the requests already sent are checked.
+    }
+    ppCheck(SentRequests::since(PpRan::$sentFrom, ids: false) === [], '8: every sent request answers every call in its own step',
+        ['problems' => SentRequests::since(PpRan::$sentFrom, ids: false), 'requests' => array_map(fn (int $k): string => $k.': '.SentRequests::outline($k), SentRequests::invalid(PpRan::$sentFrom, ids: false))]);
 }
 
 /**
@@ -1351,6 +1376,18 @@ function ppConcurrent(array $c): ?string
     };
 }
 
+/**
+ * Round 17 (item 1): WHAT the concurrent `user` action writes, derived from
+ * the seed so every draw above is unchanged: a user row, an assistant text
+ * row, or both (a host, or a tool, writing while the call runs).
+ */
+function ppConcurrentRows(array $c): string
+{
+    // Not a fresh stream's first draw: that is tied to the seed's residue
+    // mod 3, which already chose `user`. The next base-3 digit is not.
+    return ['user', 'text', 'user_text'][intdiv(ppU32($c['seed']), 3) % 3];
+}
+
 /** Every stored tool result entry, counted. */
 function ppEntryCount(array $c): int
 {
@@ -1378,12 +1415,19 @@ function ppReplayKey(int $segment, string $id, string $tool, mixed $args): strin
  */
 function ppReplayOnce(array $c): void
 {
-    $stored = [];
+    $owed = [];
     $rows = ppRows($c);
     $count = -1;
-    $segments = ppSegments($rows, function () use (&$count): string {
-        return (string) ++$count;
+    $steps = [];
+    $segments = ppSegments($rows, function (array $row) use (&$count, &$steps): string {
+        $steps[++$count] = $row;
+
+        return (string) $count;
     });
+    // Each segment's stored results, the most any one row holds of a key, in
+    // first-seen order.
+    $entries = [];
+    $kept = [];
     foreach ($rows as $index => $row) {
         $segment = $segments[$index] === null ? -1 : (int) $segments[$index];
         if ($segment < 0 || $row['type'] !== 'tool_result') {
@@ -1393,11 +1437,26 @@ function ppReplayOnce(array $c): void
         foreach ($row['tool_results'] ?? [] as $entry) {
             $key = ppReplayKey($segment, (string) $entry['tool_call_id'], (string) $entry['tool_name'], $entry['args'] ?? []);
             $inRow[$key] = ($inRow[$key] ?? 0) + 1;
-        }
-        foreach ($inRow as $key => $count) {
-            $stored[$key] = max($stored[$key] ?? 0, $count);
+            if ($inRow[$key] > count(array_keys($entries[$segment] ?? [], $key, true))) {
+                $entries[$segment][] = $key;
+                $kept[$segment][] = $entry;
+            }
         }
     }
+    // Round 17: what the replay OWES is every stored result that answers a
+    // call of its segment's own step, each call once (the pairing the
+    // harness reads outcomes by); a result answering no call of its step is
+    // never sent, since no provider accepts it.
+    foreach ($entries as $segment => $keys) {
+        $calls = CallPairing::ofStored(array_values(array_filter($steps[$segment]['tool_calls'] ?? [], 'is_array')), 'id', 'name');
+        $takers = CallPairing::takers($calls, CallPairing::ofStored($kept[$segment], 'tool_call_id', 'tool_name'));
+        foreach ($keys as $k => $key) {
+            if ($takers[$k] !== null) {
+                $owed[$key] = ($owed[$key] ?? 0) + 1;
+            }
+        }
+    }
+    $stored = $owed;
     $shown = [];
     $segment = -1;
     foreach (ppSession($c)->thread()->messages() as $message) {
@@ -1419,7 +1478,7 @@ function ppReplayOnce(array $c): void
     }
     ksort($stored);
     ksort($shown);
-    ppCheck($shown === $stored, '7: the replay emits every stored result exactly once, in its own segment', ['stored' => $stored, 'shown' => $shown]);
+    ppCheck($shown === $stored, '7: the replay emits every stored result that answers a call of its step exactly once, in its own segment', ['owed' => $stored, 'shown' => $shown]);
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
@@ -1638,6 +1697,16 @@ it('holds for the seeds that broke the rule on TS main', function (int $seed): v
     expect(true)->toBeTrue();
 })->with(PP_REGRESSION_SEEDS);
 
+// Round 17: seeds a wider run (400 from base 9000) found the ORACLE wrong
+// at (a later step's decisions read in the parked step's order), kept as
+// fixed cases.
+const PP_ROUND17_SEEDS = [1508513416];
+
+it('holds for the seeds a wider run found the oracle wrong at (round 17)', function (int $seed): void {
+    ppHolds([$seed]);
+    expect(true)->toBeTrue();
+})->with(PP_ROUND17_SEEDS);
+
 it('holds over generated steps', function (): void {
     $replay = getenv('PRISM_PROPERTY_SEED');
     $examples = ppPositive(getenv('PRISM_PROPERTY_EXAMPLES'), PP_DEFAULT_EXAMPLES, 1, 100000);
@@ -1734,6 +1803,12 @@ it('the default set covers every combination the property must check', function 
     foreach (['user', 'step'] as $kind) {
         if (! $has(fn (array $c): bool => ppConcurrent($c) === $kind && ppExpected(ppNormalized($c))['runs'] !== [])) {
             $missing[] = "a concurrent supersede ({$kind}) while an approved call runs";
+        }
+    }
+    // Round 17: each row the concurrent `user` action writes, while an approved call runs.
+    foreach (['user', 'text', 'user_text'] as $rows) {
+        if (! $has(fn (array $c): bool => ppConcurrent($c) === 'user' && ppConcurrentRows($c) === $rows && ppExpected(ppNormalized($c))['runs'] !== [])) {
+            $missing[] = "a concurrent {$rows} row while an approved call runs";
         }
     }
     // Round 15: identical duplicate calls, and an altered copy of the parked

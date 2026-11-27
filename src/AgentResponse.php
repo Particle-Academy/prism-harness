@@ -33,6 +33,24 @@ final readonly class AgentResponse
         public ?string $parentRunId = null,
         /** The run at the top of the tree. Equals `$runId` for a root. */
         public ?string $rootRunId = null,
+        /**
+         * The approval ids still pending when the run returned (G-387 round
+         * 17), read from the thread after the run's end events: a host or a
+         * listener may have moved the conversation past the step since. Null:
+         * every request on the steps is listed.
+         *
+         * @var list<string>|null
+         */
+        public ?array $stillPending = null,
+        /**
+         * Why a turn that parked is no longer waiting on anything it asked
+         * for (G-387 round 17, decision 8), or null: `replaced` (a row
+         * written meanwhile replaced the step, and no newer step waits) or
+         * `parked_elsewhere` (a newer step on the session now waits on
+         * approval). Either way {@see self::awaitingApproval()} is false and
+         * {@see self::pendingApprovals()} is empty.
+         */
+        public ?string $stoppedBecause = null,
     ) {}
 
     public function text(): string
@@ -93,7 +111,10 @@ final readonly class AgentResponse
 
         foreach ($this->response->steps as $step) {
             foreach ($step->toolApprovalRequests as $request) {
-                $pending[] = $request;
+                // Never one that is no longer pending (round 17).
+                if ($this->stillPending === null || in_array($request->approvalId, $this->stillPending, true)) {
+                    $pending[] = $request;
+                }
             }
         }
 

@@ -22,8 +22,10 @@ use Prism\Prism\ValueObjects\ToolResult;
  * Anthropic receives an empty user turn for the decision-only row, which it
  * refuses. Folded, the model sees each call's result once, as it did live.
  *
- * A later row's result for the same call replaces an earlier one, in the
- * earlier one's position. The same call is the same tool call id, tool name
+ * A later row's result for the same call is left out: the FIRST stands, in
+ * its position, the result every outcome reader counts as the call's (G-387
+ * round 17, decision 7; it was the later one, so the model could be told
+ * an outcome no reader recorded). The same call is the same tool call id, tool name
  * AND recorded arguments (the n-th such result of a row replacing the n-th of
  * an earlier row), never the call id alone (G-387 round 13b): a provider may
  * give two calls of one step the same id, and keyed by id a later same-id
@@ -63,6 +65,10 @@ class ToolResultRuns
         $replayed = [];
         /** @var array<string, true> $decided by approval id, the decisions this segment replayed */
         $decided = [];
+        /** @var AssistantMessage|null $step the step whose segment this is */
+        $step = null;
+        /** @var array<int, true> $sent by call index, the calls of `$step` this segment answered */
+        $sent = [];
 
         foreach ($messages as $message) {
             if ($message instanceof ToolResultMessage) {
@@ -72,7 +78,7 @@ class ToolResultRuns
             }
 
             if ($run !== []) {
-                $merged = static::unreplayed(static::merge($run), $replayed, $decided);
+                $merged = static::answering(static::unreplayed(static::merge($run), $replayed, $decided), $step, $sent);
                 if ($merged !== null) {
                     yield $merged;
                 }
@@ -83,17 +89,64 @@ class ToolResultRuns
                 // A new step: a new segment.
                 $replayed = [];
                 $decided = [];
+                $step = $message;
+                $sent = [];
             }
 
             yield $message;
         }
 
         if ($run !== []) {
-            $merged = static::unreplayed(static::merge($run), $replayed, $decided);
+            $merged = static::answering(static::unreplayed(static::merge($run), $replayed, $decided), $step, $sent);
             if ($merged !== null) {
                 yield $merged;
             }
         }
+    }
+
+    /**
+     * `$message` with only the results that answer a call of `$step` this
+     * segment has not answered yet ({@see CallPairing::takers()}), each call
+     * once (G-387 round 17): a result answering no call of its step (one
+     * naming a call the step does not have, or a second result for a call)
+     * is never sent, because no provider accepts an output for a call that
+     * is not directly before it. It stays stored; nothing reads it as an
+     * outcome of any other step. Results before any step are sent as they are.
+     *
+     * @param  array<int, true>  $sent
+     */
+    protected static function answering(?ToolResultMessage $message, ?AssistantMessage $step, array &$sent): ?ToolResultMessage
+    {
+        if ($message === null || $step === null || $message->toolResults === []) {
+            return $message;
+        }
+        $takers = CallPairing::takers(CallPairing::ofCalls(array_values($step->toolCalls)), CallPairing::ofResults($message->toolResults), $sent);
+        $calls = array_values($step->toolCalls);
+        $results = [];
+        $changed = false;
+        foreach ($message->toolResults as $k => $result) {
+            $at = $takers[$k];
+            if ($at === null) {
+                $changed = true;
+
+                continue;
+            }
+            $sent[$at] = true;
+            // Sent with the ids of the call it answers (item 4): a result
+            // stored without the provider's call id (a host's, say) would
+            // otherwise reach the provider with a null one.
+            $call = $calls[$at];
+            if ($result->toolCallId !== $call->id || $result->toolCallResultId !== $call->resultId) {
+                $result = new ToolResult($call->id, $result->toolName, $result->args, $result->result, $call->resultId, $result->artifacts);
+                $changed = true;
+            }
+            $results[] = $result;
+        }
+        if (! $changed) {
+            return $message;
+        }
+
+        return $results === [] && $message->toolApprovalResponses === [] ? null : new ToolResultMessage($results, $message->toolApprovalResponses);
     }
 
     /**
@@ -214,7 +267,9 @@ class ToolResultRuns
                 // pair, and no encoding step can fail on an odd value.
                 $same = static::keyOf($result);
                 $seen[$same] = ($seen[$same] ?? 0) + 1;
-                $results[$same.'#'.$seen[$same]] = $result;
+                // The FIRST result per call stands (round 17, decision 7):
+                // the one every outcome reader counts.
+                $results[$same.'#'.$seen[$same]] ??= $result;
             }
 
             foreach ($message->toolApprovalResponses as $decision) {

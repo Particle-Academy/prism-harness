@@ -35,9 +35,9 @@ final class ResolutionAnnouncement
 
     /**
      * Asked, with the call, right before the resolution runs an approved
-     * call (G-387 round 15): true to run it, false when it must not run.
+     * call (G-387 round 15): true to run it, false (or the text that says why, round 17) when it must not run.
      *
-     * @var (\Closure(ToolCall): bool)|null
+     * @var (\Closure(ToolCall): (bool|string))|null
      */
     public ?\Closure $starter = null;
 

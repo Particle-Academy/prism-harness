@@ -24,6 +24,18 @@ use Prism\Prism\ValueObjects\ToolResult;
  */
 final class ThreadView
 {
+    /**
+     * The ids a standing journal row's call is replayed with (round 17,
+     * item 4), followed by the row's stored position: provider-valid for
+     * every provider map, never null. The call's own id (an OpenAI
+     * Responses item id, which must begin `fc`; an Anthropic `tool_use` id
+     * and a Chat Completions call id, which this also satisfies) and its
+     * result id (the Responses `call_id`, which its output repeats).
+     */
+    public const JOURNAL_ITEM_ID = 'fc_harness_journal_';
+
+    public const JOURNAL_CALL_ID = 'call_harness_journal_';
+
     /** @var list<array<array-key, mixed>> each row's payload as every reader sees it ({@see StepRows::honouredPayload()}) */
     public readonly array $honoured;
 
@@ -237,10 +249,17 @@ final class ThreadView
 
     /**
      * The rows in replay order: what a provider is sent, before the fold
-     * (G-387 rounds 15 and 16):
+     * (G-387 rounds 15 to 17):
      *
-     *  - a started row is never sent; a harness result row whose mark names
-     *    an earlier step is placed with that step's own result rows;
+     *  - EACH STEP IS ANSWERED DIRECTLY AFTER ITSELF (round 17): every result
+     *    row that belongs to it ({@see StepRows::owners()}: its segment, or
+     *    the trusted mark naming it) is sent right after the step, oldest
+     *    first, past any user, assistant-text, system or other row written
+     *    in between (a host or a tool writing while its call ran); those
+     *    rows follow its results, in their stored order. So every request
+     *    answers every call of every step it carries, in that step's own
+     *    result run, which every provider requires;
+     *  - a started row is never sent;
      *  - every call of a step that is no longer paused and has no outcome
      *    gets one: `replaced` when a request of the step was issued for it
      *    (an earlier version replaced it without one), else `interrupted`
@@ -248,7 +267,8 @@ final class ThreadView
      *    a started call with no result is `interrupted` wherever it is;
      *  - a journal row still standing (an ungated call that ran inside a
      *    model step whose rows were never stored) is sent as that call,
-     *    answered `interrupted`, after the segment it sits in;
+     *    answered `interrupted`, after the results of the step whose segment
+     *    it sits in, with provider-valid ids ({@see self::JOURNAL_ITEM_ID});
      *  - every decision is the one that STOOD for its approval when its call
      *    was resolved ({@see StepRows::standing()}); one that never stood is
      *    not sent.
@@ -258,34 +278,22 @@ final class ThreadView
     public function placed(): array
     {
         $rows = $this->rows;
-        $segment = null;
         $segmentOf = [];
-        $ends = [];
-        $last = null;
+        $segment = null;
         foreach ($rows as $index => $row) {
             if (StepRows::isStep($row['type'], $row['payload'])) {
                 $segment = $index;
-                $last = $index;
-                $ends[$index] = $index;
 
                 continue;
             }
             $segmentOf[$index] = $segment;
-            if ($last !== null && ($row['type'] === MessageMapper::TYPE_TOOL_RESULT || $row['type'] === MessageMapper::TYPE_SYSTEM)) {
-                $ends[$last] = $index;
-            } else {
-                $last = null;
-            }
         }
-        // Each step's moved rows (a harness mark placing them with it).
-        $moved = [];
-        foreach ($this->owned as $owner => $indexes) {
-            foreach ($indexes as $index) {
-                if ($owner !== ($segmentOf[$index] ?? null) && ! StepRows::isStarted($this->honoured[$index])) {
-                    $moved[$owner][] = $index;
-                }
-            }
-        }
+        // What each step is answered by, directly after it (round 17): every
+        // result row that belongs to it, oldest first, wherever it was
+        // stored (in its own segment past a user, text or system row written
+        // while its call ran, or after a later step), then the results
+        // synthesised for its calls with no outcome, then a standing journal
+        // row's call. Nothing else ever sits between a step and its results.
         $extras = [];
         $standing = [];
         foreach ($this->steps as $step) {
@@ -310,25 +318,30 @@ final class ThreadView
                 }
             }
             ksort($answers);
-            $extra = array_map(static fn (int $i): array => ['type' => $rows[$i]['type'], 'payload' => $rows[$i]['payload']], $moved[$step] ?? []);
+            $extra = [];
+            foreach ($this->owned[$step] ?? [] as $i) {
+                if (! StepRows::isStarted($this->honoured[$i])) {
+                    $extra[] = ['index' => $i, 'type' => $rows[$i]['type'], 'payload' => $rows[$i]['payload']];
+                }
+            }
             if ($answers !== []) {
                 $extra[] = ['type' => MessageMapper::TYPE_TOOL_RESULT, 'payload' => self::asStored(new ToolResultMessage(array_values($answers)))];
             }
             if ($extra !== []) {
-                $extras[$ends[$step] ?? $step][] = $extra;
+                $extras[$step][] = $extra;
             }
         }
         // A standing journal row: the call it names, answered interrupted,
-        // after the segment it sits in.
+        // after the results of the step whose segment it sits in (in place
+        // when it sits before any step).
         foreach ($rows as $index => $row) {
             if ($row['type'] !== MessageMapper::TYPE_TOOL_RESULT || ! self::isJournal($this->honoured[$index])) {
                 continue;
             }
             $journal = $this->honoured[$index][StepRows::JOURNAL];
-            $call = ['id' => 'harness_journal_'.$row['position'], 'name' => $journal['tool_name'],
-                'arguments' => is_array($journal['args'] ?? null) ? $journal['args'] : [], 'result_id' => null];
-            $owner = $segmentOf[$index] ?? null;
-            $extras[$owner === null ? $index : ($ends[$owner] ?? $index)][] = [
+            $call = ['id' => self::JOURNAL_ITEM_ID.$row['position'], 'name' => $journal['tool_name'],
+                'arguments' => is_array($journal['args'] ?? null) ? $journal['args'] : [], 'result_id' => self::JOURNAL_CALL_ID.$row['position']];
+            $extras[$segmentOf[$index] ?? $index][] = [
                 ['type' => MessageMapper::TYPE_ASSISTANT, 'payload' => ['content' => '', 'tool_calls' => [[...$call, 'reasoning_id' => null, 'reasoning_summary' => null]],
                     'additional_content' => [], 'tool_approval_requests' => []]],
                 ['type' => MessageMapper::TYPE_TOOL_RESULT, 'payload' => self::asStored(new ToolResultMessage([self::endedResult($call, StepRows::INTERRUPTED_RESULT)]))],
@@ -353,8 +366,10 @@ final class ThreadView
         foreach ($rows as $index => $row) {
             $payload = $this->honoured[$index];
             $owner = $this->owners[$index] ?? null;
+            // A result row that belongs to a step is sent with that step
+            // (above); a started or journal row is never sent as stored.
             $skip = $row['type'] === MessageMapper::TYPE_TOOL_RESULT
-                && (StepRows::isStarted($payload) || self::isJournal($payload) || ($owner !== null && $owner >= 0 && $owner !== ($segmentOf[$index] ?? null)));
+                && (StepRows::isStarted($payload) || self::isJournal($payload) || ($owner !== null && $owner >= 0));
             if (! $skip) {
                 $out[] = ['type' => $row['type'], 'payload' => $this->sent($index, $row, $standing, $legacy)];
             }

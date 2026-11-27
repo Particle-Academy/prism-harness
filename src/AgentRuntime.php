@@ -542,11 +542,11 @@ final readonly class AgentRuntime
      * call is no longer open: a superseding write denied it, or it started
      * already).
      *
-     * @return Closure(ToolCall): bool
+     * @return Closure(ToolCall): (bool|string) true: run it; false or a refusal text: do not
      */
     private function starter(Session $session, string $runId): Closure
     {
-        return function (ToolCall $call) use ($session, $runId): bool {
+        return function (ToolCall $call) use ($session, $runId): bool|string {
             $position = $this->answering[$runId] ?? null;
             if ($position === null) {
                 return false;
@@ -558,7 +558,12 @@ final readonly class AgentRuntime
             $name = $call->name;
             $arguments = $call->argumentsForResult();
 
-            return (bool) self::recordInRun($runId, static fn (): bool => $thread->recordStarted($runId, $position, $id, $name, $arguments));
+            if ((bool) self::recordInRun($runId, static fn (): bool => $thread->recordStarted($runId, $position, $id, $name, $arguments))) {
+                return true;
+            }
+
+            // Refused: the text says why when the gate can (round 17).
+            return $thread->startRefusal() ?? false;
         };
     }
 
@@ -917,7 +922,19 @@ final readonly class AgentRuntime
             throw RunNotPermitted::cancelled();
         }
 
-        return $agentResponse;
+        // What it lists is what is STILL pending (G-387 round 17): read again
+        // after the end events, since a listener or the host may have moved
+        // the conversation past the parked step.
+        if (! $agentResponse->awaitingApproval()) {
+            return $agentResponse;
+        }
+        $still = $session->thread()->pendingApprovalIds();
+        $open = new AgentResponse($agentResponse->runId, $agentResponse->response, $agentResponse->parentRunId, $agentResponse->rootRunId, $still);
+
+        // Nothing it asked for is pending any more (decision 8): say why,
+        // never "awaiting approval" with nothing to approve.
+        return $open->pendingApprovals() !== [] ? $open : new AgentResponse($agentResponse->runId, $agentResponse->response,
+            $agentResponse->parentRunId, $agentResponse->rootRunId, $still, self::stoppedBecause($still));
     }
 
     /**
@@ -1172,6 +1189,10 @@ final readonly class AgentRuntime
             response: $response,
             parentRunId: $run->parentRunId,
             rootRunId: $run->rootRunId(),
+            // Read again after the end events (round 17), as for send().
+            stillPending: $still = $parked ? $session->thread()->pendingApprovalIds() : null,
+            stoppedBecause: $parked && (new StructuredAgentResponse($runId, $response, stillPending: $still))->pendingApprovals() === []
+                ? self::stoppedBecause($still ?? []) : null,
         );
     }
 
@@ -2384,6 +2405,29 @@ final readonly class AgentRuntime
     {
         // Materialised once: the thread and the observers both read it.
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
+        // A NESTED PARK (G-387 round 17, item 3): a tool this run ran (an
+        // ungated one inside the model step, or an approved one) parked a
+        // newer step on the session, or the host did, after the run read it.
+        // The run writes NOTHING that would replace that step: no prompt, no
+        // step, no answer. Only the results its resolution gave the step it
+        // resumed are kept (they answer that step, wherever they land, and
+        // change nothing about which step is paused); an ungated call that
+        // ran in the withheld step keeps its journal row, so it replays as
+        // the call it was, answered interrupted. Then the run stops.
+        $halted = RunHooks::halted($runId);
+        if ($halted) {
+            $kept = [];
+            foreach ($messages as $message) {
+                if (! $message instanceof ToolResultMessage) {
+                    break;
+                }
+                $kept[] = $message;
+            }
+            $messages = ($this->answering[$runId] ?? null) === null ? [] : $kept;
+            if ($messages === []) {
+                throw RunNotPermitted::parkedElsewhere();
+            }
+        }
         $ended = array_values(array_filter($messages, fn (Message $message): bool => $message instanceof ToolResultMessage && isset($this->endedByStart[$message])));
         // Recorded as the run's own rows (DECISION B): a row this run writes
         // supersedes a step only when it would from outside, or has tool calls.
@@ -2422,6 +2466,20 @@ final readonly class AgentRuntime
         // AFTER the durable record, so an observer can never lose a turn the
         // thread kept, and its failure (isolated in MemoryHooks) cannot undo one.
         app(MemoryHooks::class)->recorded($session, $runId, $messages);
+        if ($halted) {
+            throw RunNotPermitted::parkedElsewhere();
+        }
+    }
+
+    /**
+     * Why a parked turn no longer waits on what it asked for (G-387 round
+     * 17, decision 8): another step's approvals are pending, or none are.
+     *
+     * @param  list<string>  $stillPending  the session's pending approval ids now
+     */
+    private static function stoppedBecause(array $stillPending): string
+    {
+        return $stillPending === [] ? 'replaced' : 'parked_elsewhere';
     }
 
     /**

@@ -25,12 +25,15 @@ use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\SystemMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
+use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
+use Tests\Support\SentRequests;
 
 // G-387 round 11: THE INVARIANT MATRIX. Every reader of a child's state is
 // driven through every phase of a runner start, and read both from INSIDE
@@ -768,3 +771,116 @@ it('runs two starts of one child in the same parent step one after the other', f
         ->and(app(RunTrees::class)->delegationBusy(imChild()))->toBeFalse()
         ->and($outcomes)->not->toBe([]);
 });
+
+// ---------------------------------------------------------------------------
+// G-387 round 17: THE REQUEST MATRIX. What the matrix above measures is the
+// thread a reader reads; this measures what a PROVIDER IS SENT. Every action a
+// host or a tool can take on the session while a call runs (approved, or
+// ungated inside its model step), and the request every later turn sends:
+// each call of each step it carries answered exactly once, in that step's own
+// result run, read from the faked HTTP itself (never from the stored rows).
+// The expected cell is written first, as data.
+// ---------------------------------------------------------------------------
+
+/** @return array<string, array{outcome: string, inner: list<string>}> by action: the turn's outcome and what stays pending */
+function imRequestExpected(): array
+{
+    $plain = ['outcome' => 'recorded', 'inner' => []];
+
+    return [
+        'host user row' => $plain,
+        'host text row' => $plain,
+        'host user row + text row' => $plain,
+        'host system row' => $plain,
+        // PHP holds the session lock for the whole run: refused at once.
+        'nested send answered with plain text' => [...$plain, 'nested' => 'locked'],
+        // The run stops before it writes anything that would replace it.
+        'nested park' => ['outcome' => 'parked_elsewhere', 'inner' => ['apr_inner']],
+        // A host stamping the parked step with the running turn's OWN run
+        // id changes nothing: a caller-passed run id is never ownership.
+        'nested park, forged_run' => ['outcome' => 'parked_elsewhere', 'inner' => ['apr_inner']],
+    ];
+}
+
+it('sends every provider request with each call answered once, in its own step, whatever is written while a call runs (THE REQUEST MATRIX)', function (string $action, string $gate): void {
+    config()->set('prism-harness.agent.modes.chat.tools', ['weather', 'echo']);
+    config()->set('prism-harness.agent.modes.chat.requires_approval', ['weather']);
+    config()->set('prism-harness.agent.modes.chat.subagents', []);
+    app()->forgetInstance(ModeRegistry::class);
+    $during = null;
+    $ran = [];
+    $hook = function () use (&$during): void {
+        if ($during !== null) {
+            $run = $during;
+            $during = null;
+            $run();
+        }
+    };
+    app(ToolRegistry::class)->registerMany([
+        (new Tool)->as('weather')->for('Weather.')->withStringParameter('city', 'City')
+            ->using(function (string $city) use (&$ran, $hook): string {
+                $ran[] = $city;
+                $hook();
+
+                return "Sunny in {$city}";
+            }),
+        (new Tool)->as('echo')->for('Echo.')->withStringParameter('text', 'Text')
+            ->using(function (string $text) use (&$ran, $hook): string {
+                $ran[] = $text;
+                $hook();
+
+                return "echo:{$text}";
+            }),
+    ]);
+    $session = fn (): Session => G360::session('Matrix');
+    $nested = null;
+    $act = match ($action) {
+        'host user row' => fn () => $session()->thread()->record([new UserMessage('Host row.')]),
+        'host text row' => fn () => $session()->thread()->record([new AssistantMessage('Host text.')]),
+        'host user row + text row' => fn () => $session()->thread()->record([new UserMessage('Host row.'), new AssistantMessage('Host text.')]),
+        'host system row' => fn () => $session()->thread()->record([new SystemMessage('Host note.')]),
+        'nested send answered with plain text' => function () use ($session, &$nested): void {
+            try {
+                $session()->send('Inner.');
+                $nested = 'recorded';
+            } catch (SessionLocked) {
+                $nested = 'locked';
+            }
+        },
+        'nested park', 'nested park, forged_run' => fn () => $session()->thread()->record([new AssistantMessage('',
+            [new ToolCall('call_inner', 'weather', ['city' => 'Rome'], 'call_inner')], [], [new ToolApprovalRequest('apr_inner', 'call_inner')])],
+            $action === 'nested park' ? null : ($session()->run()['id'] ?? null), toolNames: ['weather']),
+    };
+    $expected = imRequestExpected()[$action];
+
+    if ($gate === 'approved') {
+        G360::calls([['weather', ['city' => 'Paris'], 'call_paris']]);
+        $approval = $session()->send('Weather?')->pendingApprovals()[0]->approvalId;
+        $during = $act;
+        G360::text('Done.');
+        $do = fn () => $session()->decide([new ToolApprovalResponse($approval, true)]);
+        $call = 'Paris';
+    } else {
+        G360::calls([['echo', ['text' => 'hi'], 'call_echo']]);
+        G360::text('Done.');
+        $during = $act;
+        $do = fn () => $session()->send('Echo hi.');
+        $call = 'hi';
+    }
+    try {
+        $do();
+        $outcome = 'recorded';
+    } catch (RunNotPermitted $refused) {
+        $outcome = $refused->code();
+    }
+    $pending = $session()->thread()->pendingApprovalIds();
+    // A later turn re-reads the stored thread: the request it sends is the
+    // one a stored misplacement would break.
+    G360::text('Later.');
+    $session()->send('And later?');
+
+    expect(['outcome' => $outcome, 'inner' => $pending, 'nested' => $nested ?? ($expected['nested'] ?? null)])
+        ->toBe(['outcome' => $expected['outcome'], 'inner' => $expected['inner'], 'nested' => $expected['nested'] ?? null])
+        ->and($ran)->toBe([$call])
+        ->and(SentRequests::since())->toBe([]);
+})->with(array_keys(imRequestExpected()))->with(['approved', 'ungated']);

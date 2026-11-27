@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Orchestra\Testbench\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\PrismHarnessServiceProvider;
@@ -146,7 +147,19 @@ final class LegacyDefaultCompatibilityTest extends TestCase
         $session->tasks()->add('Session task', 'session-task');
         $harness->tasks()->add('Global task', 'global-task');
         Prism::fake([TextResponseFake::make()->withText('done')]);
-        $session->send('Synthetic request');
+        // From G-387 round 17 no run starts on a schema without the trust
+        // column (fail closed); the dist this file also runs against has no
+        // such refusal, and runs the turn.
+        if (method_exists(RunNotPermitted::class, 'notMigrated')) {
+            try {
+                $session->send('Synthetic request');
+                self::fail('A run must not start before the trust column migration has run.');
+            } catch (RunNotPermitted $refused) {
+                self::assertSame('schema_not_migrated', $refused->code());
+            }
+        } else {
+            $session->send('Synthetic request');
+        }
         $thread = $session->thread();
         $id = $thread->getKey();
         $thread->scope = 'renamed';
