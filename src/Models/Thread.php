@@ -1128,6 +1128,66 @@ class Thread extends Model implements ThreadContract
         return array_values(array_unique($answered));
     }
 
+    /**
+     * Whether core, resolving the paused step, would append its results
+     * after a row that is not a tool result (G-412): the step has a call
+     * with no result, and a user, assistant or system row follows it, or the
+     * turn adds a new message (`$withPrompt`). Core puts the resolution at
+     * the end of the request, so then the harness resolves the step itself
+     * and places the results directly after it.
+     *
+     * @internal Read before a run hands its history to core.
+     */
+    public function resolutionWouldTrail(bool $withPrompt): bool
+    {
+        $step = $this->resolvableStep();
+        if ($step === null || self::callsWithoutResult($step['assistant']->toolCalls, $step['results']) === []) {
+            return false;
+        }
+
+        return $withPrompt || $this->storedMessages()->where('position', '>', $step['position'])
+            ->where('type', '!=', MessageMapper::TYPE_TOOL_RESULT)->exists();
+    }
+
+    /**
+     * Give each call of the paused step that no result answers and that no
+     * approval request of the step names `$reason` as its stored result, so
+     * it is never run (G-412). Core resolves only the calls a request names:
+     * any other call of the step (an ungated call whose result was never
+     * stored, or one a host recorded) would stay unanswered in every later
+     * request, which a provider rejects. Returns whether a row was written.
+     *
+     * @internal Called before a run reads the conversation.
+     */
+    public function endUnrequestedOpenCalls(string $reason, ?string $runId = null): bool
+    {
+        $step = $this->resolvableStep();
+        if ($step === null) {
+            return false;
+        }
+        $requested = array_fill_keys(array_map(static fn (ToolApprovalRequest $request): string => $request->toolCallId, $step['assistant']->toolApprovalRequests), true);
+        $open = array_values(array_filter(
+            self::callsWithoutResult($step['assistant']->toolCalls, $step['results']),
+            static fn (ToolCall $call): bool => ! isset($requested[$call->id]),
+        ));
+        if ($open === []) {
+            return false;
+        }
+
+        $this->writeRows([new ToolResultMessage(array_map(
+            static fn (ToolCall $call): ToolResult => new ToolResult(
+                toolCallId: $call->id,
+                toolName: $call->name,
+                args: $call->argumentsForResult(),
+                result: $reason,
+                toolCallResultId: $call->resultId,
+            ),
+            $open,
+        ))], $runId, null, false, $step['position'], false);
+
+        return true;
+    }
+
     /** The position of the step a run would resolve, or null. @internal */
     public function pausedStepPosition(): ?int
     {
