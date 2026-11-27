@@ -140,3 +140,21 @@ it('keeps a denial a host recorded when an approval follows it', function (): vo
     expect($this->ran)->toBe([])
         ->and(firstDecisionStored($approvalId))->not->toContain(true);
 });
+
+it('reads the first of two decision rows already in the thread for one approval', function (bool $first, string $resume): void {
+    $approvalId = firstDecisionSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
+
+    // Two writers, each recording a decision row for the same approval: in
+    // separate rows, or both in one row.
+    $rows = $resume === 'one row'
+        ? [new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($approvalId, $first), new ToolApprovalResponse($approvalId, ! $first)])]
+        : [new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($approvalId, $first)]),
+            new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($approvalId, ! $first)])];
+    foreach ($rows as $row) {
+        firstDecisionSession()->thread()->record([$row]);
+    }
+    $resume === 'stream' ? iterator_to_array(firstDecisionSession()->stream(''), false) : firstDecisionSession()->send('');
+    firstDecisionSession()->send('');
+
+    expect($this->ran)->toBe($first ? ['Paris'] : []);
+})->with(['deny first' => [false], 'approve first' => [true]])->with(['send', 'stream', 'one row']);
