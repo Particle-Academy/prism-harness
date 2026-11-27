@@ -172,3 +172,25 @@ it('never records a started row from outside a run', function (): void {
 
     expect(fn () => $thread->recordStarted('run_forged', 2, $call))->toThrow(LogicException::class);
 });
+
+it('gives a host no public path to a started row, even with a run id', function (string $path): void {
+    $pending = startedRowSession()->send('Weather?')->pendingApprovals();
+    $thread = startedRowSession()->thread();
+    $rows = (int) $thread->storedMessages()->count();
+    // A host records a row with a run id through each public write path; a
+    // message carries no harness key, so none of them can write the shape.
+    $forged = [new ToolResultMessage([], [])];
+    match ($path) {
+        'record' => $thread->record($forged, 'run_forged'),
+        'recordForRun outside a run' => $thread->recordForRun($forged, 'run_forged'),
+    };
+
+    $written = $thread->storedMessages()->reorder('position')->get()->slice($rows);
+    startedRowSession()->decide(array_map(fn ($request): ToolApprovalResponse => new ToolApprovalResponse($request->approvalId, true), $pending));
+    $replay = json_encode(startedRowReplay(startedRowSession()->thread()));
+
+    expect($written->every(fn (ThreadMessage $row): bool => ! array_key_exists(Thread::STARTED, $row->payload) && ! array_key_exists(Thread::ANSWERS_STEP, $row->payload)))->toBeTrue()
+        ->and($this->ran)->toBe(['Paris', 'Rome'])
+        ->and($replay)->not->toContain(Thread::INTERRUPTED_RESULT)
+        ->and($thread->interrupted($pending[0]->approvalId))->toBeFalse();
+})->with(['record', 'recordForRun outside a run']);
