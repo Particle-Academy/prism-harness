@@ -28,6 +28,7 @@ use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
@@ -441,10 +442,39 @@ class Thread extends Model implements ThreadContract
      * subagent writing into the same conversation are indistinguishable after
      * the fact, which makes a tree impossible to reconstruct from storage.
      *
+     * A text or user row written HERE is written outside the run that owns
+     * a paused step, whatever `$runId` says, and so supersedes that step
+     * (G-392/G-397). The harness records its own runs' rows through
+     * recordForRun().
+     *
      * @param  iterable<Message>  $messages
      * @param  list<string>|null  $toolNames  the actual offer, stored only beside pending approvals
      */
     public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null): self
+    {
+        return $this->recordRows($messages, $runId, $toolNames, outside: true);
+    }
+
+    /**
+     * Append the rows a harness run wrote, attributed to `$runId`. Its text
+     * and user rows never supersede a paused step: the run that resolves a
+     * step writes them (G-392/G-397). A later tool-call step always does.
+     *
+     * @internal The harness's own turns only.
+     *
+     * @param  iterable<Message>  $messages
+     * @param  list<string>|null  $toolNames
+     */
+    public function recordForRun(iterable $messages, string $runId, ?array $toolNames = null): self
+    {
+        return $this->recordRows($messages, $runId, $toolNames, outside: false);
+    }
+
+    /**
+     * @param  iterable<Message>  $messages
+     * @param  list<string>|null  $toolNames
+     */
+    private function recordRows(iterable $messages, ?string $runId, ?array $toolNames, bool $outside): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
@@ -463,7 +493,7 @@ class Thread extends Model implements ThreadContract
         // A turn that half-writes leaves a tool call with no result, which
         // replays to the model as an unanswered question rather than as an
         // error anyone can see.
-        return DB::transaction(function () use ($messages, $runId, $toolNames): self {
+        return DB::transaction(function () use ($messages, $runId, $toolNames, $outside): self {
             // Locks the thread ROW so a concurrent recorder waits instead of
             // reading the same max. A no-op on SQLite, which is why the suite
             // cannot exercise this and why the guarantee lives in the database.
@@ -471,8 +501,15 @@ class Thread extends Model implements ThreadContract
 
             $position = (int) $this->storedMessages()->max('position');
 
-            foreach ($this->withReplacedStepsEnded($messages) as $message) {
+            [$messages, $marks] = $this->withReplacedStepsEnded($messages, $outside);
+            foreach ($messages as $message) {
                 $payload = MessageMapper::toArray($message);
+                if ($message instanceof ToolResultMessage && isset($marks[$message])) {
+                    // Harness metadata, beside the results: these calls were
+                    // ended because their step was superseded, under these
+                    // approvals. MessageMapper does not send it back.
+                    $payload[self::REPLACED_MARK] = ['approval_ids' => $marks[$message]];
+                }
                 if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $toolNames !== null) {
                     // Harness metadata on the same durable approval record.
                     // MessageMapper does not send it back to the provider.
@@ -490,7 +527,7 @@ class Thread extends Model implements ThreadContract
         });
     }
 
-    /** The result a call of a step replaced before it was resolved is recorded with (G-392/G-397). */
+    /** The result a call of a step superseded before it was resolved is recorded with (G-392/G-397). */
     public const REPLACED_REASON = 'Tool call was not run because a later step replaced it';
 
     /**
@@ -636,10 +673,11 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * The approval ids of every step that asked for approval and is no longer
-     * the one core resolves: a later tool-call step replaced it. A decision
-     * naming one of them is recorded as a denial, so it runs nothing
-     * (G-392/G-397).
+     * The approval ids of every step that asked for approval and was
+     * SUPERSEDED: a later assistant row with tool calls was recorded after
+     * it, or a text or user row recorded outside its run ended it (the
+     * {@see self::REPLACED_MARK} on the row that did). A decision naming one
+     * of them is recorded as a denial, so it runs nothing (G-392/G-397).
      *
      * @internal Read when decisions are recorded.
      *
@@ -647,16 +685,20 @@ class Thread extends Model implements ThreadContract
      */
     public function replacedApprovalIds(): array
     {
+        $ids = [];
         $steps = [];
-        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position')->cursor() as $stored) {
-            $message = self::storedMessage($stored);
+        foreach ($this->storedMessages()->reorder('position')->cursor() as $stored) {
+            $payload = $stored->payload ?? null;
+            $mark = is_array($payload) ? ($payload[self::REPLACED_MARK]['approval_ids'] ?? null) : null;
+            if (is_array($mark)) {
+                $ids = [...$ids, ...array_filter($mark, 'is_string')];
+            }
+            $message = ($stored->type ?? null) === MessageMapper::TYPE_ASSISTANT ? self::storedMessage($stored) : null;
             if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
                 $steps[] = $message;
             }
         }
         array_pop($steps);
-
-        $ids = [];
         foreach ($steps as $step) {
             foreach ($step->toolApprovalRequests as $request) {
                 $ids[] = $request->approvalId;
@@ -666,49 +708,77 @@ class Thread extends Model implements ThreadContract
         return array_values(array_unique($ids));
     }
 
+    /** The payload key marking a row that ended a superseded step's calls (G-392/G-397). */
+    public const REPLACED_MARK = 'harness_replaced';
+
     /**
      * `$messages`, with a result row ending the calls of a step that is
-     * replaced before it was resolved (G-392/G-397).
+     * superseded before it was resolved, and those rows' approval ids
+     * (G-392/G-397).
      *
-     * A later tool-call step replaces the step that asked for approval: core
-     * resolves only the newest one, so a call of the earlier step with no
-     * result of its own would never get one. Each such call gets the denial
-     * {@see self::REPLACED_REASON}, recorded immediately before the step that
-     * replaces it, and so exactly once. Results are matched to calls by
-     * position, as in endRepeatedIdStep().
+     * A later assistant row WITH TOOL CALLS always supersedes the step that
+     * asked for approval: core resolves only the newest. A later assistant
+     * text row or user row supersedes it when written outside the run that
+     * owns it (`$outside`): a host's note, or the user's follow-up. A call of
+     * that step with no result of its own gets the denial
+     * {@see self::REPLACED_REASON}, recorded immediately before the row that
+     * supersedes it, and so exactly once; a result for it later in the same
+     * write counts as its result. Results are matched to calls by position,
+     * as in endRepeatedIdStep(). System and tool result rows supersede
+     * nothing.
      *
      * @param  iterable<Message>  $messages
-     * @return list<Message>
+     * @return array{0: list<Message>, 1: \WeakMap<ToolResultMessage, list<string>>}
      */
-    private function withReplacedStepsEnded(iterable $messages): array
+    private function withReplacedStepsEnded(iterable $messages, bool $outside): array
     {
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
-        $replaces = array_filter($messages, static fn (Message $message): bool => $message instanceof AssistantMessage && $message->toolCalls !== []);
-        if ($replaces === []) {
-            return $messages;
+        /** @var \WeakMap<ToolResultMessage, list<string>> $marks */
+        $marks = new \WeakMap;
+        $supersedes = static fn (Message $message): bool => ($message instanceof AssistantMessage && $message->toolCalls !== [])
+            || ($outside && ($message instanceof AssistantMessage || $message instanceof UserMessage));
+        if (array_filter($messages, $supersedes) === []) {
+            return [$messages, $marks];
         }
 
         $step = $this->resolvableStep();
         $current = $step['assistant'] ?? null;
         $results = $step['results'] ?? [];
         $out = [];
-        foreach ($messages as $message) {
-            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
-                if ($current instanceof AssistantMessage && $current->toolApprovalRequests !== []) {
-                    $open = self::callsWithoutResult($current->toolCalls, $results);
-                    if ($open !== []) {
-                        $out[] = new ToolResultMessage(array_map(
-                            static fn (ToolCall $call): ToolResult => new ToolResult(
-                                toolCallId: $call->id,
-                                toolName: $call->name,
-                                args: $call->argumentsForResult(),
-                                result: self::REPLACED_REASON,
-                                toolCallResultId: $call->resultId,
-                            ),
-                            $open,
-                        ));
+        foreach ($messages as $index => $message) {
+            if ($supersedes($message) && $current instanceof AssistantMessage && $current->toolApprovalRequests !== []) {
+                // Results this write records for the step, after this row.
+                $ahead = [];
+                for ($i = $index + 1, $n = count($messages); $i < $n; $i++) {
+                    if ($messages[$i] instanceof AssistantMessage && $messages[$i]->toolCalls !== []) {
+                        break;
+                    }
+                    if ($messages[$i] instanceof ToolResultMessage) {
+                        $ahead = [...$ahead, ...$messages[$i]->toolResults];
                     }
                 }
+                $open = self::callsWithoutResult($current->toolCalls, [...$results, ...$ahead]);
+                if ($open !== []) {
+                    $ended = array_map(
+                        static fn (ToolCall $call): ToolResult => new ToolResult(
+                            toolCallId: $call->id,
+                            toolName: $call->name,
+                            args: $call->argumentsForResult(),
+                            result: self::REPLACED_REASON,
+                            toolCallResultId: $call->resultId,
+                        ),
+                        $open,
+                    );
+                    $row = new ToolResultMessage($ended);
+                    $marks[$row] = array_values(array_unique(array_map(
+                        static fn (ToolApprovalRequest $request): string => $request->approvalId,
+                        $current->toolApprovalRequests,
+                    )));
+                    $out[] = $row;
+                    $results = [...$results, ...$ended];
+                }
+            }
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
                 $current = $message;
                 $results = [];
             } elseif ($message instanceof ToolResultMessage) {
@@ -717,7 +787,7 @@ class Thread extends Model implements ThreadContract
             $out[] = $message;
         }
 
-        return $out;
+        return [$out, $marks];
     }
 
     /**
