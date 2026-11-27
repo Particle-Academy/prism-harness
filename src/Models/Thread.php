@@ -887,6 +887,40 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
+     * Whether the step the run paused at the transcript tail repeats a call
+     * id, among its tool calls or among its approval requests. A decision
+     * reaches a call through the call id its request names, so a repeated id
+     * cannot say which call a decision belongs to.
+     *
+     * @internal Read when decisions are recorded.
+     */
+    public function pausedStepRepeatsCallIds(): bool
+    {
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            if ($stored->type === MessageMapper::TYPE_USER) {
+                return false;
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                continue;
+            }
+
+            $callIds = [];
+            foreach ($stored->payload['tool_calls'] ?? [] as $call) {
+                $callIds[] = is_array($call) && is_scalar($call['id'] ?? null) ? (string) $call['id'] : '';
+            }
+            $requestCallIds = [];
+            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
+                $requestCallIds[] = is_array($request) && is_scalar($request['tool_call_id'] ?? null) ? (string) $request['tool_call_id'] : '';
+            }
+
+            return count($callIds) !== count(array_unique($callIds, SORT_STRING))
+                || count($requestCallIds) !== count(array_unique($requestCallIds, SORT_STRING));
+        }
+
+        return false;
+    }
+
+    /**
      * Every approval id the run paused at the transcript tail asked for,
      * answered or not; empty when the tail is a user turn or an assistant
      * step that asked nothing. A turn with no new message continues exactly

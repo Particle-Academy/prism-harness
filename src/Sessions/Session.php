@@ -182,6 +182,11 @@ class Session
     private const MODE_MARK = 'mode_provisional';
 
     /**
+     * The reason a decision for a step whose call ids repeat is recorded as.
+     */
+    public const REPEATED_CALL_ID_REASON = 'Tool call was not run because another call in this step has the same id';
+
+    /**
      * The mode a runner start's commit (b) writes (G-387): PROVISIONAL like
      * the rest of (b), read as the mode before it until the start's task row
      * exists ({@see self::mode()}).
@@ -1088,6 +1093,7 @@ class Session
         // BEFORE anything is written or emitted, and so before any provider
         // call: a decision answers a question the run asked (G-354).
         $this->assertDecisionsPending($decisions);
+        $decisions = $this->deniedWhenCallIdsRepeat($decisions);
         // A decision the resuming turn could not act on at all (a lost child
         // binding, a cancelled or spent context) is refused here, with
         // nothing recorded, rather than consumed by a resume that refuses.
@@ -1108,6 +1114,29 @@ class Session
         // A plan held on one of these approvals reads the decision from the
         // thread, before the run resumes (G-360).
         app(Plans::class)->decided($this);
+    }
+
+    /**
+     * Every decision for a step whose call ids repeat, as a denial.
+     *
+     * A decision reaches a call through the call id its request names, and a
+     * provider can give two calls in one step the same id. Such a step is
+     * denied whatever was decided, so no gated call in it runs and the
+     * recorded decisions say so.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @return list<ToolApprovalResponse>
+     */
+    protected function deniedWhenCallIdsRepeat(array $decisions): array
+    {
+        if (! $this->thread()->pausedStepRepeatsCallIds()) {
+            return $decisions;
+        }
+
+        return array_map(
+            static fn (ToolApprovalResponse $decision): ToolApprovalResponse => new ToolApprovalResponse($decision->approvalId, false, self::REPEATED_CALL_ID_REASON),
+            $decisions,
+        );
     }
 
     /**
