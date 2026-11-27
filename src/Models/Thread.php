@@ -465,7 +465,9 @@ class Thread extends Model implements ThreadContract
      * that step's calls, unanswered, in every later request, and never send
      * the row's own text. Otherwise the provider content is dropped, and the
      * row is sent from its own text and tool calls. A row the harness records
-     * from a provider response matches, and is replayed unchanged.
+     * from a provider response matches, and is replayed unchanged. A row a
+     * host recorded (its {@see self::HOST_ROW} mark) that carries reasoning
+     * is sent without any provider content and without reasoning.
      */
     private static function withOwnProviderContent(Message $message): Message
     {
@@ -475,7 +477,23 @@ class Thread extends Model implements ThreadContract
         $calls = array_map(static fn (ToolCall $call): string => strlen($call->id).':'.$call->id.'|'.$call->name, $message->toolCalls);
         sort($calls);
         $content = $message->additionalContent;
+        $toolCalls = $message->toolCalls;
         $changed = false;
+        if (array_key_exists(self::HOST_ROW, $content)) {
+            $host = $content[self::HOST_ROW] === true;
+            unset($content[self::HOST_ROW]);
+            $changed = true;
+            if ($host && self::carriesReasoning($content, $toolCalls)) {
+                // Reasoning cannot be checked against the row (a signature,
+                // an encrypted item): a host row's is another response's, and
+                // would be sent twice. Its provider content goes entirely, and
+                // its calls are sent without reasoning.
+                foreach (['output_items', 'content_blocks', 'thinking', 'thinking_signature', 'thinking_blocks'] as $key) {
+                    unset($content[$key]);
+                }
+                $toolCalls = array_map(static fn (ToolCall $call): ToolCall => new ToolCall($call->id, $call->name, $call->arguments(), $call->resultId), $toolCalls);
+            }
+        }
 
         $items = $content['output_items'] ?? null;
         if (is_array($items) && ! self::outputItemsAreOwn(array_values($items), $calls, $message->content)) {
@@ -487,7 +505,7 @@ class Thread extends Model implements ThreadContract
             unset($content['content_blocks']);
             $changed = true;
         }
-        if ($message->toolCalls !== [] && $message->content !== '' && ! isset($content['output_items']) && ! isset($content['content_blocks'])) {
+        if ($toolCalls !== [] && $message->content !== '' && ! isset($content['output_items']) && ! isset($content['content_blocks'])) {
             // With no provider content, core sends an OpenAI row as its
             // calls, then its text, which parts each call from its output.
             // The row's own items, in the order a response holds them: its
@@ -495,12 +513,46 @@ class Thread extends Model implements ThreadContract
             $content['output_items'] = [
                 ['type' => 'message', 'role' => 'assistant', 'content' => [['type' => 'output_text', 'text' => $message->content]]],
                 ...array_map(static fn (ToolCall $call): array => ['type' => 'function_call', 'id' => $call->id, 'call_id' => $call->resultId,
-                    'name' => $call->name, 'arguments' => $call->argumentsAsJson()], array_values($message->toolCalls)),
+                    'name' => $call->name, 'arguments' => $call->argumentsAsJson()], array_values($toolCalls)),
             ];
             $changed = true;
         }
 
-        return $changed ? new AssistantMessage($message->content, $message->toolCalls, $content, $message->toolApprovalRequests) : $message;
+        return $changed ? new AssistantMessage($message->content, $toolCalls, $content, $message->toolApprovalRequests) : $message;
+    }
+
+    /**
+     * Whether provider content carries reasoning that cannot be checked
+     * against the row: OpenAI reasoning items, Anthropic thinking blocks or
+     * thinking fields, or calls naming a reasoning item.
+     *
+     * @param  array<string, mixed>  $content
+     * @param  array<array-key, ToolCall>  $toolCalls
+     */
+    private static function carriesReasoning(array $content, array $toolCalls): bool
+    {
+        foreach (['thinking', 'thinking_signature', 'thinking_blocks'] as $key) {
+            if (! empty($content[$key])) {
+                return true;
+            }
+        }
+        foreach (is_array($content['output_items'] ?? null) ? $content['output_items'] : [] as $item) {
+            if (is_array($item) && ($item['type'] ?? null) === 'reasoning') {
+                return true;
+            }
+        }
+        foreach (is_array($content['content_blocks'] ?? null) ? $content['content_blocks'] : [] as $block) {
+            if (is_array($block) && in_array($block['type'] ?? null, ContentBlocks::THINKING_TYPES, true)) {
+                return true;
+            }
+        }
+        foreach ($toolCalls as $call) {
+            if ($call->reasoningId !== null) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -615,8 +667,21 @@ class Thread extends Model implements ThreadContract
      */
     public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null): self
     {
+        // An assistant row a host records carries the host mark beside its
+        // provider content, so its replay can tell it from a row the harness
+        // recorded from a provider response (G-415).
+        $messages = array_map(
+            static fn (Message $message): Message => $message instanceof AssistantMessage
+                ? new AssistantMessage($message->content, $message->toolCalls, [...$message->additionalContent, self::HOST_ROW => true], $message->toolApprovalRequests)
+                : $message,
+            is_array($messages) ? array_values($messages) : iterator_to_array($messages, false),
+        );
+
         return $this->recordRows($messages, $runId, $toolNames, outside: true);
     }
+
+    /** The additional-content key marking an assistant row a host recorded through record() (G-415). Never sent. */
+    public const HOST_ROW = 'harness_host_row';
 
     /**
      * Append the rows a harness run wrote, attributed to `$runId`. Its text
