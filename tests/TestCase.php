@@ -6,6 +6,7 @@ namespace Tests;
 
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Orchestra\Testbench\TestCase as Orchestra;
 use Prism\Harness\PrismHarnessServiceProvider;
@@ -14,6 +15,38 @@ use Prism\Prism\PrismServiceProvider;
 abstract class TestCase extends Orchestra
 {
     use RefreshDatabase;
+
+    /** Where every proxy variable points in a test: a closed local port. */
+    public const BLOCKED_PROXY = 'http://127.0.0.1:1';
+
+    /**
+     * NO TEST REACHES THE NETWORK. Every request through Laravel's HTTP
+     * client must match a fake (the provider handlers all use it), and any
+     * client that bypasses it, a raw Guzzle client or curl, is sent to a
+     * closed local proxy and fails to connect. A test file that forgets its
+     * own guard fails instead of calling a real provider.
+     */
+    protected function setUp(): void
+    {
+        self::blockRealTransfers();
+
+        parent::setUp();
+
+        Http::preventStrayRequests();
+    }
+
+    /** Point every proxy variable at {@see self::BLOCKED_PROXY}, with no exemptions. */
+    public static function blockRealTransfers(): void
+    {
+        foreach (['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'] as $name) {
+            putenv($name.'='.self::BLOCKED_PROXY);
+            $_SERVER[$name] = $_ENV[$name] = self::BLOCKED_PROXY;
+        }
+        foreach (['NO_PROXY', 'no_proxy'] as $name) {
+            putenv($name.'=');
+            unset($_SERVER[$name], $_ENV[$name]);
+        }
+    }
 
     /**
      * @return array<int, class-string>
