@@ -1633,6 +1633,13 @@ it('holds the approval pairing invariants on generated steps, decisions and resu
     expect(true)->toBeTrue();
 });
 
+// Seeds a run found failing, kept so they stay fixed: 365504846 is the
+// nightly's (identical gated calls with empty ids, a forged result before the
+// decision, a spent run; G-412).
+it('holds on the seeds a run found failing', function (int $seed): void {
+    expect(pairingCheck(pairingGenerate($seed)))->toBe([]);
+})->with([365504846]);
+
 it('generates every shape the rule distinguishes, in the fixed-seed set', function (): void {
     $seen = [];
     foreach (range(0, PAIRING_FAST_EXAMPLES - 1) as $i) {
