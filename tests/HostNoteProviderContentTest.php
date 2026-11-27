@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
+use Prism\Harness\Models\Thread;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolRegistry;
@@ -45,7 +46,8 @@ beforeEach(function (): void {
         $n = count($requests);
         if (str_contains($request->url(), 'anthropic')) {
             $content = $n === 1
-                ? [['type' => 'text', 'text' => 'Let me check.'], ['type' => 'tool_use', 'id' => 'toolu_paris', 'name' => 'weather', 'input' => ['city' => 'Paris']]]
+                ? [['type' => 'thinking', 'thinking' => 'Paris first.', 'signature' => 'sig_1'], ['type' => 'text', 'text' => 'Let me check.'],
+                    ['type' => 'tool_use', 'id' => 'toolu_paris', 'name' => 'weather', 'input' => ['city' => 'Paris']]]
                 : [['type' => 'text', 'text' => 'Done '.$n.'.']];
 
             return Http::response(['id' => 'm'.$n, 'type' => 'message', 'role' => 'assistant', 'model' => 'x', 'content' => $content,
@@ -203,4 +205,30 @@ it('replays every provider content the harness recorded unchanged', function (st
         ->toBe(array_map(fn (AssistantMessage $message): array => $message->additionalContent, $stored))
         ->and(count($stored))->toBe(3)
         ->and($this->ran)->toBe(1);
+})->with(['OpenAI' => 'openai', 'Anthropic' => 'anthropic']);
+
+it('never sends the reasoning a host row copied', function (string $provider): void {
+    config()->set('prism-harness.agent.provider', $provider);
+    config()->set('prism-harness.agent.model', $provider === 'openai' ? 'gpt-4o' : 'claude-sonnet-5-5');
+
+    $id = hostNoteSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
+    hostNoteSession()->approve($id);
+    // A host row whose text and (absent) calls match its provider content,
+    // but whose reasoning is the step's: it cannot be checked, so it is not
+    // the row's own.
+    $thread = hostNoteSession()->thread();
+    $step = $thread->storedMessages()->where('type', 'assistant')->reorder('position')->get()
+        ->first(fn ($row): bool => ! empty($row->payload['tool_calls']))->toPrismMessage();
+    $thread->record([new AssistantMessage('Thinking.', [], $provider === 'openai'
+        ? ['output_items' => [$step->additionalContent['output_items'][0], ['type' => 'message', 'role' => 'assistant', 'content' => [['type' => 'output_text', 'text' => 'Thinking.']]]]]
+        : ['content_blocks' => [$step->additionalContent['content_blocks'][0], ['type' => 'text', 'text' => 'Thinking.']]])]);
+    hostNoteSession()->send('Next question.');
+
+    $last = json_encode(end($this->requests));
+
+    expect(hostNoteOrphans($this->requests))->toBe([])
+        ->and(hostNoteInputErrors($this->requests))->toBe([])
+        ->and(substr_count($last, 'Thinking.'))->toBe(1)
+        ->and(substr_count($last, $provider === 'openai' ? '"rs_1"' : '"signature":"sig_1"'))->toBe(1)
+        ->and(substr_count($last, Thread::HOST_ROW))->toBe(0);
 })->with(['OpenAI' => 'openai', 'Anthropic' => 'anthropic']);
