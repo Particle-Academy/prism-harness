@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentResponse;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Exceptions\ApprovalNotPending;
+use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Plans\Plans;
 use Prism\Harness\PrismHarness;
@@ -15,6 +16,7 @@ use Prism\Harness\Steps\RunStep;
 use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Schema\BooleanSchema;
 use Prism\Prism\Schema\ObjectSchema;
@@ -519,6 +521,17 @@ final class PpRan
     /** @var list<int> */
     public static array $free = [];
 
+    /**
+     * Run once inside the next gated call's body (G-387 round 14, G-404): a
+     * host row that would supersede the step while the approved call runs.
+     *
+     * @var (Closure(): void)|null
+     */
+    public static ?Closure $during = null;
+
+    /** What that host write did, per case: `locked`, or `recorded` when it was let through. */
+    public static ?string $concurrent = null;
+
     /** Each run (a shrink candidate included) on a session of its own, as each TS rig has fresh stores. */
     public static int $runs = 0;
 }
@@ -534,6 +547,8 @@ function ppRig(array $c): void
 {
     PpRan::$echo = [];
     PpRan::$free = [];
+    PpRan::$during = null;
+    PpRan::$concurrent = null;
     PpRan::$runs++;
     // The fake is installed once (beforeEach): Laravel invokes EVERY stub
     // callback on a request, so a fake per case would drain the queue once
@@ -853,7 +868,25 @@ function ppRunCase(array $c): void
     if ($inserted !== null && $insert['when'] === 'after_decision') {
         $thread()->record([$inserted]);
     }
+    // A CONCURRENT SUPERSEDE (G-387 round 14, G-404), derived from the seed
+    // so no earlier draw changes: on one case in three a host records a user
+    // row while the first approved call is running. The run holds the
+    // session lock, so the write is refused and nothing else changes: the
+    // oracle is the same, and the call keeps its one outcome.
+    if (ppConcurrent($c)) {
+        PpRan::$during = function () use ($c): void {
+            try {
+                ppSession($c)->thread()->record([new UserMessage('A host row while a call runs.')]);
+                PpRan::$concurrent = 'recorded';
+            } catch (SessionLocked) {
+                PpRan::$concurrent = 'locked';
+            }
+        };
+    }
     $first ??= ppTurn($c, $c['resume'], '');
+    PpRan::$during = null;
+    ppCheck(PpRan::$concurrent === null || PpRan::$concurrent === 'locked',
+        'G-404: a superseding host write is refused while an approved call runs', PpRan::$concurrent);
     $superseded = $later !== null || ($insert !== null && in_array($insert['kind'], PP_SUPERSEDES, true));
 
     // Invariants 1-4, then full equality with the oracle.
@@ -925,6 +958,67 @@ function ppRunCase(array $c): void
         ppCheck(count(PpRan::$free) === count($frees), '3: an ungated call runs once', PpRan::$free);
     }
     ppSettledOutcomes($c, $oracle, '5 (after repeat resumes)');
+    ppReplayOnce($c);
+}
+
+/** Whether this case runs the concurrent-supersede action (one seed in three). */
+function ppConcurrent(array $c): bool
+{
+    return ppU32($c['seed']) % 3 === 0;
+}
+
+/** The replay key of one result: its segment, call id, tool name and canonical arguments. */
+function ppReplayKey(int $segment, string $id, string $tool, mixed $args): string
+{
+    return $segment.'|'.strlen($id).':'.$id.'|'.strlen($tool).':'.$tool.'|'.CanonicalJson::digest(is_array($args) ? $args : []);
+}
+
+/**
+ * Invariant 7 (G-387 round 14, G-403 and item 5): the replay a provider is
+ * sent keeps EVERY stored result, and emits none twice, each in its own
+ * segment (the rows after its step and before the next step with tool
+ * calls). A stored row may carry results an earlier row of the segment
+ * already holds (a resolution repeats the step's results): what the replay
+ * owes a key is the most any one row of the segment holds of it.
+ */
+function ppReplayOnce(array $c): void
+{
+    $stored = [];
+    $segment = -1;
+    foreach (ppRows($c) as $row) {
+        if ($row['type'] === 'assistant' && ($row['tool_calls'] ?? []) !== []) {
+            $segment++;
+
+            continue;
+        }
+        if ($segment < 0 || $row['type'] !== 'tool_result') {
+            continue;
+        }
+        $inRow = [];
+        foreach ($row['tool_results'] ?? [] as $entry) {
+            $key = ppReplayKey($segment, (string) $entry['tool_call_id'], (string) $entry['tool_name'], $entry['args'] ?? []);
+            $inRow[$key] = ($inRow[$key] ?? 0) + 1;
+        }
+        foreach ($inRow as $key => $count) {
+            $stored[$key] = max($stored[$key] ?? 0, $count);
+        }
+    }
+    $shown = [];
+    $segment = -1;
+    foreach (ppSession($c)->thread()->messages() as $message) {
+        if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+            $segment++;
+        }
+        if ($message instanceof ToolResultMessage && $segment >= 0) {
+            foreach ($message->toolResults as $result) {
+                $key = ppReplayKey($segment, $result->toolCallId, $result->toolName, $result->args);
+                $shown[$key] = ($shown[$key] ?? 0) + 1;
+            }
+        }
+    }
+    ksort($stored);
+    ksort($shown);
+    ppCheck($shown === $stored, '7: the replay emits every stored result exactly once, in its own segment', ['stored' => $stored, 'shown' => $shown]);
 }
 
 /** Invariants 5 and 6 on the thread rows: every call has exactly one outcome, the oracle's. */
@@ -1098,6 +1192,11 @@ beforeEach(function (): void {
         (new Tool)->as('echo')->for('Echo.')->withNumberParameter('n', 'A number')
             ->using(function (int|float $n): string {
                 PpRan::$echo[] = (int) $n;
+                if (PpRan::$during !== null) {
+                    $during = PpRan::$during;
+                    PpRan::$during = null;
+                    $during();
+                }
 
                 return 'ran:'.(int) $n;
             }),
@@ -1223,6 +1322,10 @@ it('the default set covers every combination the property must check', function 
     if (! $has(fn (array $c): bool => $c['repeats'] !== []
         && array_filter(ppNormalized($c)['requests'], fn (array $q): bool => $q['verdict'] === 'approve') !== [])) {
         $missing[] = 'repeated approval id with an approve';
+    }
+    // G-387 round 14: the concurrent supersede reaches an approved call that runs.
+    if (! $has(fn (array $c): bool => ppConcurrent($c) && ppExpected(ppNormalized($c))['runs'] !== [])) {
+        $missing[] = 'a concurrent supersede while an approved call runs';
     }
     expect($missing)->toBe([]);
 });
