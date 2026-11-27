@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Models;
 
+use Closure;
 use Generator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
@@ -32,6 +33,8 @@ use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolResult;
 use Throwable;
 
 /**
@@ -501,6 +504,15 @@ class Thread extends Model implements ThreadContract
 
             $position = (int) $this->storedMessages()->max('position');
 
+            // DECISION B (G-387 round 13): a row that supersedes the paused
+            // step (an assistant row or a user row) is recorded after ONE
+            // denial for each of that step's gated calls that has no result,
+            // in this batch or before it. A runner start ends them itself.
+            $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
+            if ($endedByStart === []) {
+                $messages = $this->withSupersededDenials($messages, self::$recordingInRun === $runId ? $runId : null);
+            }
+
             foreach ($messages as $message) {
                 $endedApprovals = null;
                 foreach ($endedByStart as $ended) {
@@ -508,7 +520,9 @@ class Thread extends Model implements ThreadContract
                         $endedApprovals = $ended['approvals'];
                     }
                 }
-                $payload = self::rowPayload($message, $toolNames, $parked, $endedApprovals);
+                $payload = $message instanceof ToolResultMessage && $this->supersededRows !== null && isset($this->supersededRows[$message])
+                    ? self::supersededPayload($message, $this->supersededRows[$message])
+                    : self::rowPayload($message, $toolNames, $parked, $endedApprovals);
                 $this->storedMessages()->create([
                     'position' => ++$position,
                     'type' => MessageMapper::typeOf($message),
@@ -728,7 +742,7 @@ class Thread extends Model implements ThreadContract
      * G-397), with the result rows after it, oldest first. Null when the
      * conversation moved on past it, or nothing is paused.
      *
-     * @return array{position: int, assistant: array<string, mixed>, results: list<array<string, mixed>>}|null
+     * @return array{position: int, run_id: ?string, assistant: array<string, mixed>, results: list<array<string, mixed>>}|null
      */
     private function pausedStep(): ?array
     {
@@ -742,6 +756,7 @@ class Thread extends Model implements ThreadContract
 
         return [
             'position' => (int) $found['step']->position,
+            'run_id' => is_string($found['step']->run_id) && $found['step']->run_id !== '' ? $found['step']->run_id : null,
             'assistant' => $found['step']->payload,
             'results' => array_map(static fn ($stored): array => $stored->payload, $found['results']),
         ];
@@ -882,6 +897,17 @@ class Thread extends Model implements ThreadContract
      */
     public static function endedByStartIn(iterable $rows, string $approvalId): bool
     {
+        return self::markedIn($rows, $approvalId, self::ENDED_BY_START);
+    }
+
+    /**
+     * Whether a result row after the approval's own request, and before the
+     * next model step, carries the harness mark `$key` naming it.
+     *
+     * @param  iterable<array<array-key, mixed>>  $rows
+     */
+    private static function markedIn(iterable $rows, string $approvalId, string $key): bool
+    {
         $asked = false;
         $ended = false;
         foreach ($rows as $row) {
@@ -906,7 +932,7 @@ class Thread extends Model implements ThreadContract
             if (! $asked || $type !== MessageMapper::TYPE_TOOL_RESULT) {
                 continue;
             }
-            $mark = $row[self::ENDED_BY_START] ?? null;
+            $mark = $row[$key] ?? null;
             if (is_array($mark) && is_array($mark['approval_ids'] ?? null) && in_array($approvalId, $mark['approval_ids'], true)) {
                 $ended = true;
             }
@@ -917,6 +943,207 @@ class Thread extends Model implements ThreadContract
 
     /** The payload key marking a result row a runner start ended calls with (G-387). */
     public const ENDED_BY_START = 'harness_ended_by_start';
+
+    /** The payload key marking the row that denied a superseded step's calls (DECISION B, G-387 round 13). */
+    public const SUPERSEDED = 'harness_superseded';
+
+    /** The result each gated call of a superseded step is given, the same in every language (DECISION B). */
+    public const SUPERSEDED_RESULT = 'Not run: a later step replaced it.';
+
+    /**
+     * Supersede the paused step now (DECISION B): record ONE denial for each
+     * of its gated calls that has no result. What a new message does before
+     * its turn is sent: nothing from the step runs, whatever was decided on
+     * it, and no decision is accepted for it afterwards.
+     *
+     * @internal Called by the runtime when a new message starts a turn.
+     */
+    public function supersedePausedStep(): void
+    {
+        DB::transaction(function (): void {
+            static::query()->whereKey($this->getKey())->lockForUpdate()->first();
+            $denials = $this->supersededDenials([]);
+            if ($denials === null) {
+                return;
+            }
+            $position = (int) $this->storedMessages()->max('position');
+            $this->storedMessages()->create([
+                'position' => $position + 1,
+                'type' => MessageMapper::TYPE_TOOL_RESULT,
+                'run_id' => null,
+                'payload' => self::supersededPayload($denials['message'], $denials['approvals']),
+            ]);
+            $this->afterRecording();
+        });
+    }
+
+    /**
+     * `$messages` with the superseded step's denials before the first row
+     * that supersedes it (DECISION B), or unchanged.
+     *
+     * What supersedes the paused step (the refinement of DECISION B): ANY
+     * later assistant row with tool calls; or a later assistant text row or
+     * user row recorded OUTSIDE the run that owns the step. The harness's own
+     * rows inside that run (a structured turn's own answer) do not. Inside is
+     * `$inRun`, the run the RUNTIME says it is recording for
+     * ({@see self::recordingInRun()}): a run id a caller passes to record()
+     * itself proves nothing, so a host row reads as outside whatever run id
+     * it names.
+     *
+     * @param  list<Message>  $messages
+     * @return list<Message>
+     */
+    private function withSupersededDenials(array $messages, ?string $inRun): array
+    {
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return $messages;
+        }
+        $owner = $paused['run_id'];
+        $outside = $inRun === null || $owner === null || $inRun !== $owner;
+        $at = null;
+        foreach ($messages as $index => $message) {
+            if (($message instanceof AssistantMessage && $message->toolCalls !== [])
+                || ($outside && ($message instanceof UserMessage || $message instanceof AssistantMessage))) {
+                $at = $index;
+
+                break;
+            }
+        }
+        if ($at === null) {
+            return $messages;
+        }
+        $denials = $this->supersededDenials(array_values(array_filter(array_slice($messages, 0, $at), static fn (Message $m): bool => $m instanceof ToolResultMessage)));
+        if ($denials === null) {
+            return $messages;
+        }
+        $this->supersededRows ??= new \WeakMap;
+        $this->supersededRows[$denials['message']] = $denials['approvals'];
+
+        return [...array_slice($messages, 0, $at), $denials['message'], ...array_slice($messages, $at)];
+    }
+
+    /** @var \WeakMap<ToolResultMessage, list<string>>|null */
+    private ?\WeakMap $supersededRows = null;
+
+    /** The run the runtime is recording rows for, set only around its own record() call. */
+    private static ?string $recordingInRun = null;
+
+    /**
+     * Record rows as the harness's own, inside `$runId` (DECISION B): the
+     * only way a row counts as written inside the run that owns a step.
+     *
+     * @internal Called by the runtime when it records a run's turn.
+     *
+     * @template T
+     *
+     * @param  Closure(): T  $record
+     * @return T
+     */
+    public static function recordingInRun(string $runId, Closure $record): mixed
+    {
+        $previous = self::$recordingInRun;
+        self::$recordingInRun = $runId;
+        try {
+            return $record();
+        } finally {
+            self::$recordingInRun = $previous;
+        }
+    }
+
+    /**
+     * The denials the paused step's open gated calls get when it is
+     * superseded, and the approvals they were asked under (call order); null
+     * when nothing is paused or nothing of it is open. A gated call is one an
+     * approval request was issued for; one with a result of its own, stored
+     * or in `$alsoResults`, is not open.
+     *
+     * @param  list<ToolResultMessage>  $alsoResults
+     * @return array{message: ToolResultMessage, approvals: list<string>}|null
+     */
+    private function supersededDenials(array $alsoResults): ?array
+    {
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return null;
+        }
+        $extra = array_map(static fn (ToolResultMessage $m): array => MessageMapper::toArray($m), $alsoResults);
+        $step = self::pairedStep($paused['assistant'], [...$paused['results'], ...$extra]);
+        // Every call of the step with no result of its own: a call that ran
+        // has one, so the rest were waiting on a person.
+        $open = array_keys(array_filter($step['answered'], static fn (bool $answered): bool => ! $answered));
+        if ($open === []) {
+            return null;
+        }
+        $approvals = [];
+        foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
+            if ($at !== null && in_array($at, $open, true) && is_string($request['approval_id'] ?? null)) {
+                $approvals[$at] = $request['approval_id'];
+            }
+        }
+        ksort($approvals);
+        $results = [];
+        foreach ($open as $at) {
+            $call = $step['calls'][$at];
+            $arguments = $call['arguments'] ?? [];
+            $arguments = is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments;
+            $results[] = new ToolResult(
+                toolCallId: is_scalar($call['id'] ?? null) ? (string) $call['id'] : '',
+                toolName: is_string($call['name'] ?? null) ? $call['name'] : '',
+                args: is_array($arguments) ? $arguments : [],
+                result: self::SUPERSEDED_RESULT,
+                toolCallResultId: is_string($call['result_id'] ?? null) ? $call['result_id'] : null,
+            );
+        }
+
+        return ['message' => new ToolResultMessage($results), 'approvals' => array_values($approvals)];
+    }
+
+    /**
+     * The stored payload of a superseded step's denials: the result row, then
+     * the harness's mark naming the approvals (DECISION B), the same shape as
+     * the ended mark of a runner start.
+     *
+     * @internal Pure: the cross-language corpora pin it.
+     *
+     * @param  list<string>  $approvals
+     * @return array<string, mixed>
+     */
+    public static function supersededPayload(ToolResultMessage $message, array $approvals): array
+    {
+        return [...MessageMapper::toArray($message), self::SUPERSEDED => ['approval_ids' => $approvals]];
+    }
+
+    /**
+     * Whether the paused step this approval was asked on was superseded with
+     * its call open (DECISION B): the harness's own mark, scoped as the ended
+     * mark is ({@see self::endedByStart()}).
+     *
+     * @internal
+     */
+    public function supersededByLaterStep(string $approvalId): bool
+    {
+        $request = null;
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position', 'desc')->cursor() as $stored) {
+            foreach ($stored->payload['tool_approval_requests'] ?? [] as $asked) {
+                if (is_array($asked) && ($asked['approval_id'] ?? null) === $approvalId) {
+                    $request = $stored;
+
+                    break 2;
+                }
+            }
+        }
+        if ($request === null) {
+            return false;
+        }
+
+        return self::markedIn((function () use ($request): Generator {
+            yield ['type' => $request->type, ...$request->payload];
+            foreach ($this->storedMessages()->where('position', '>', (int) $request->position)->reorder('position')->cursor() as $stored) {
+                yield ['type' => $stored->type, ...$stored->payload];
+            }
+        })(), $approvalId, self::SUPERSEDED);
+    }
 
     /**
      * The calls of the approval paused at the transcript tail that have no
@@ -1163,6 +1390,7 @@ class Thread extends Model implements ThreadContract
     private function afterRecording(): self
     {
 
+        $this->supersededRows = null;
         // The relation may already be loaded; without this a caller that reads
         // messages() after record() in the same request sees the stale set.
         $this->unsetRelation('storedMessages');

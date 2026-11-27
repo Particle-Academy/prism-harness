@@ -681,6 +681,11 @@ final readonly class AgentRuntime
             // The history is read HERE, once, and handed to Prism as
             // messages rather than as a Thread. See newMessages() for why
             // this run has to know exactly which message objects it sent.
+            // A new message supersedes the paused step (DECISION B): its open
+            // gated calls are denied first, so nothing from it runs.
+            if ($prompt !== '' && ! $committedStart) {
+                $session->thread()->supersedePausedStep();
+            }
             $history = iterator_to_array($session->thread()->messages(), false);
             $turn = $prompt === '' ? [] : [TurnMessages::of(new UserMessage($prompt, $attachments))];
             if ($committedStart && $prompt !== '') {
@@ -939,6 +944,11 @@ final readonly class AgentRuntime
         try {
             $run = $this->observedRun($run);
             $this->assertMeteredCompaction($run);
+            // A new message supersedes the paused step (DECISION B): its open
+            // gated calls are denied first, so nothing from it runs.
+            if ($prompt !== '') {
+                $session->thread()->supersedePausedStep();
+            }
             $history = iterator_to_array($session->thread()->messages(), false);
             $userMessage = $prompt === '' ? null : TurnMessages::of(new UserMessage($prompt, $attachments));
 
@@ -1363,6 +1373,11 @@ final readonly class AgentRuntime
         $completedCall = false;
         try {
             $run = $this->observedRun($run);
+            // A new message supersedes the paused step (DECISION B): its open
+            // gated calls are denied first, so nothing from it runs.
+            if ($prompt !== '') {
+                $session->thread()->supersedePausedStep();
+            }
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
@@ -1492,6 +1507,11 @@ final readonly class AgentRuntime
         try {
             $run = $this->observedRun($run);
             $this->assertMeteredCompaction($run);
+            // A new message supersedes the paused step (DECISION B): its open
+            // gated calls are denied first, so nothing from it runs.
+            if ($prompt !== '') {
+                $session->thread()->supersedePausedStep();
+            }
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
@@ -2156,9 +2176,11 @@ final readonly class AgentRuntime
         // Materialised once: the thread and the observers both read it.
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
         $ended = array_values(array_filter($messages, fn (Message $message): bool => $message instanceof ToolResultMessage && isset($this->endedByStart[$message])));
-        $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
+        // Recorded as the run's own rows (DECISION B): a row this run writes
+        // supersedes a step only when it would from outside, or has tool calls.
+        Thread::recordingInRun($runId, fn () => $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
             app(RunTrees::class)->parkFacts($runId),
-            array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended));
+            array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended)));
         // A runner start's task row is written: known in memory from here,
         // so nothing that settles the start needs a store read to keep it
         // (round 13), not even after a listener below throws.

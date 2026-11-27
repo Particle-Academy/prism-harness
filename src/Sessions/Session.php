@@ -1436,7 +1436,7 @@ class Session
         if (array_key_exists($approvalId, $decided)) {
             // A runner start ended the call, and it never ran (G-387): the
             // decision was never acted on, so the call reads as ended.
-            if ($thread->endedByStart($approvalId)) {
+            if ($thread->endedByStart($approvalId) || $thread->supersededByLaterStep($approvalId)) {
                 return 'superseded';
             }
 

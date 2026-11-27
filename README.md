@@ -1170,7 +1170,12 @@ A decision applies only to the step that asked for it: the paused step is the ne
 step with tool calls when only result rows follow it, chosen by one rule for every reader (the
 decision checks, the repeated-id guard, the resolver and the plan's readers). Any other row
 written after it (an answer, a user turn, a system row) ends that step's approvals: a decision is
-refused, nothing resolves the step, and no gated tool there counts as approved. The mark is one shape in all three languages, pinned by the
+refused, nothing resolves the step, and no gated tool there counts as approved. A step is
+SUPERSEDED by any later assistant row with tool calls, or by an assistant text row or a user row
+recorded outside the run that owns it (a host's row, or a new message; the harness's own rows in
+that run do not count, and naming the run when recording does not make a row the harness's): each
+of its calls that has no result then gets exactly one, `Not run: a later step replaced it.`,
+marked by the harness, and `approvalStatus()` reads its approval as `superseded`. The mark is one shape in all three languages, pinned by the
 `harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
 `{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
