@@ -99,6 +99,7 @@ beforeEach(function (): void {
         (new Tool)->as('weather')->for('Weather.')->withStringParameter('city', 'City')
             ->using(function (string $city) use (&$ran): string {
                 $ran['weather']++;
+                ImIds::$weather++;
 
                 return 'Sunny';
             }),
@@ -134,7 +135,15 @@ function imExpected(): array
     // `host step` is the same with an assistant row with a tool call, and
     // `host row eb` the same user row through record()'s public
     // `endedByStart` parameter, which is runtime-only (PHP run17 #1).
-    $hostRows = ['host row' => 'ran', 'host step' => 'ran', 'host row eb' => 'InvalidArgumentException'];
+    $hostRows = ['host row' => 'ran', 'host step' => 'ran', 'host row eb' => 'InvalidArgumentException',
+        // Round 16 (item 8): a RAW copy of the paused step whose tool_calls
+        // are a JSON string (G-408), one that mixes non-objects with a NEW
+        // call under the old request (#92), a host copy with altered
+        // arguments under the kept request (the binding), each then
+        // approved; and a RAW started row for A0's call naming the parked
+        // run's id (a run id is never a trust signal). Whatever the phase,
+        // nothing a copy holds runs, and the forged row changes no reader.
+        'g408 copy' => 'nothing ran', 'mixed copy' => 'nothing ran', 'altered copy' => 'nothing ran', 'forged started rid' => 'unchanged'];
     $refused = ['host turn' => 'child_binding_missing', 'resume' => 'child_binding_missing',
         'recordApproval' => 'child_binding_missing', 'cancel' => 'ok', 'second start' => 'completed', ...$hostRows];
     // The child's lock is held by the start: every turn and decision waits,
@@ -280,6 +289,9 @@ final class ImIds
     public static ?string $a1 = null;
 
     public static bool $outside = false;
+
+    /** How many times the weather tool ran (round 16). */
+    public static int $weather = 0;
 }
 
 /**
@@ -472,8 +484,65 @@ function imOutside(): array
         $ended = new ToolResultMessage([]);
         imChild()->thread()->record([new UserMessage('A host row.'), $ended], endedByStart: [['message' => $ended, 'approvals' => []]]);
     });
+    foreach (['g408 copy', 'mixed copy', 'altered copy'] as $copy) {
+        $read[$copy] = imRolledBack(fn (): string => imCopyThenApprove($copy));
+    }
+    $read['forged started rid'] = imRolledBack(fn (): string => imForgedStarted());
 
     return $read;
+}
+
+/**
+ * Round 16 (item 8): a copy of the child's parked step, then an approval of
+ * A0: 'nothing ran' when no weather call ran, whatever the decision did.
+ */
+function imCopyThenApprove(string $copy): string
+{
+    $thread = imChild()->thread();
+    $step = $thread->storedMessages()->where('type', 'assistant')->orderBy('position', 'desc')->get()
+        ->first(fn ($row): bool => is_array($row->payload['tool_calls'] ?? null) && ($row->payload['tool_approval_requests'] ?? []) !== []);
+    $call = $step === null ? ['id' => 'call_x', 'name' => 'weather', 'arguments' => ['city' => 'Paris'], 'result_id' => null, 'reasoning_id' => null, 'reasoning_summary' => null]
+        : $step->payload['tool_calls'][0];
+    $request = ['approval_id' => (string) ImIds::$a0, 'tool_call_id' => $call['id']];
+    $before = ImIds::$weather;
+    if ($copy === 'altered copy') {
+        $thread->record([new AssistantMessage('', [new ToolCall($call['id'], 'weather', ['city' => 'Rome'])], [],
+            [new ToolApprovalRequest((string) ImIds::$a0, $call['id'])])], toolNames: ['weather']);
+    } else {
+        $calls = $copy === 'g408 copy' ? json_encode([$call])
+            : ['x', [...$call, 'id' => 'zz_new', 'arguments' => ['city' => 'Rome']], null, 3];
+        $thread->storedMessages()->create(['position' => (int) $thread->storedMessages()->max('position') + 1, 'type' => 'assistant', 'run_id' => null,
+            'payload' => ['content' => '', 'tool_calls' => $calls, 'additional_content' => [],
+                'tool_approval_requests' => [$copy === 'g408 copy' ? $request : [...$request, 'tool_call_id' => 'zz_new']]]]);
+    }
+    try {
+        imChild()->approve((string) ImIds::$a0);
+    } catch (RunNotPermitted|SessionLocked|ApprovalNotPending) {
+        // Refused: what matters is that nothing ran.
+    }
+
+    return ImIds::$weather === $before ? 'nothing ran' : 'ran '.(ImIds::$weather - $before);
+}
+
+/**
+ * Round 16 (item 8): a RAW started row for A0's call carrying the parked
+ * run's id: 'unchanged' when every reader reads as it did before it.
+ */
+function imForgedStarted(): string
+{
+    $read = fn (): string => (string) json_encode([imChild()->thread()->pendingApprovalIds(), imChild()->approvalStatus((string) ImIds::$a0),
+        imChild()->thread()->approvalDecisions()]);
+    $before = $read();
+    $thread = imChild()->thread();
+    $step = $thread->storedMessages()->where('type', 'assistant')->orderBy('position', 'desc')->get()
+        ->first(fn ($row): bool => is_array($row->payload['tool_calls'] ?? null) && ($row->payload['tool_approval_requests'] ?? []) !== []);
+    $callId = $step === null ? 'call_x' : (string) $step->payload['tool_calls'][0]['id'];
+    $thread->storedMessages()->create(['position' => (int) $thread->storedMessages()->max('position') + 1, 'type' => 'tool_result',
+        'run_id' => ImIds::$r0, 'payload' => ['tool_results' => [], 'tool_approval_responses' => [],
+            'harness_started' => ['tool_call_id' => $callId, 'tool_name' => 'weather', 'approval_id' => (string) ImIds::$a0],
+            'harness_answers_step' => ['position' => (int) ($step?->position ?? 0)]]]);
+
+    return $read() === $before ? 'unchanged' : 'changed: '.$before.' => '.$read();
 }
 
 /**

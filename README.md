@@ -1195,7 +1195,23 @@ real result, which names its step the same way, stays that call's one outcome wh
 A call that was started and never got a result (the worker died, the tool threw past the
 runtime) reads `Tool call was interrupted, it may have run`, never "not run": it is never run
 again, `approvalStatus()` reads `interrupted`, and running it again needs a new call and a new
-approval. Only the runtime's own record call is inside a run: a
+approval. A decision counts only while its call has no outcome: one recorded after the call
+started, ran or was answered (by any writer) never stands, on any reader or in what the model is
+sent, which always shows the decision that stood when the call was resolved (a denial over an
+approval). An approval whose call already has an outcome is never pending, and a decision on it
+is refused with `approval_not_pending`. Every call of a step that is no longer the paused one and
+has no stored outcome is given one when the thread is replayed (replaced, when it was waiting on
+an approval; otherwise interrupted, since an ungated call ran, or may have, when the step was
+taken), so the request a provider is sent always answers every tool call. Before core runs an
+ungated call inside a model step the harness records a write-ahead journal row for it, removed
+by the write that stores its result: if that write never happens, the call reads, and is
+replayed, as interrupted. A run takes no further model step once a newer step on its session,
+written by anyone else, is waiting on approval (it ends with `RunNotPermitted`, code
+`parked_elsewhere`): it never replaces the step a caller was just told is waiting. Every harness
+mark is read only on a row the runtime itself wrote, recorded in the `harness_written` column
+(run the package migrations; no public write sets it, and a run id is never proof): on any other
+row a mark is read as absent. A thread is read once per locked operation and then only the rows
+appended since. Only the runtime's own record call is inside a run: a
 row a host records while that write is in progress (from a model event, say) is outside,
 whatever run id it names. A result counts only for the calls of the step whose rows it sits in (the rows
 after that step and before the next assistant row with tool calls), matched there by exact

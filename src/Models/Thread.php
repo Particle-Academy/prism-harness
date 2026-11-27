@@ -25,11 +25,12 @@ use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\Sessions\DatabaseAddressIndex;
 use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Subagents\RunBudgets;
-use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\PausedStep;
 use Prism\Harness\Support\StepRows;
+use Prism\Harness\Support\ThreadReads;
+use Prism\Harness\Support\ThreadView;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Contracts\Message;
@@ -445,32 +446,21 @@ class Thread extends Model implements ThreadContract
 
     /**
      * Every stored row as a Prism message, oldest first, before the fold,
-     * with each row the harness wrote for a step placed with that step
-     * (G-387 round 15, {@see StepRows}):
-     *
-     *  - a started row is never sent; a started call that never got a result
-     *    is answered there with the interrupted outcome, so it never runs again;
-     *  - a harness result row whose mark names an earlier step is placed in
-     *    that step's own result rows, wherever it landed.
+     * placed as {@see ThreadView::placed()} places them (G-387 rounds 15 and
+     * 16): started and journal rows never sent, marked rows with their step,
+     * every call of a step no longer paused answered, and every decision the
+     * one that stood.
      *
      * @return list<Message>
      */
     private function replayRows(): array
     {
-        $rows = [];
-        foreach ($this->storedMessages()->reorder('position')->lazy() as $stored) {
-            $rows[] = ['position' => (int) $stored->position, 'type' => (string) $stored->type,
-                'run_id' => is_string($stored->run_id) ? $stored->run_id : null,
-                'payload' => is_array($stored->payload) ? $stored->payload : []];
-        }
-
-        return array_map(static fn (array $row): Message => MessageMapper::fromArray($row['type'], $row['payload']), self::placedRows($rows));
+        return array_map(static fn (array $row): Message => MessageMapper::fromArray($row['type'], $row['payload']), $this->view()->placed());
     }
 
     /**
-     * The rows in replay order (see {@see self::replayRows()}), started rows
-     * out and the interrupted outcome in. Pure: the thread-rows corpus drives
-     * it through the fold (G-387 round 15).
+     * The rows in replay order (see {@see self::replayRows()}). Pure: the
+     * thread-rows corpus drives it through the fold (G-387 round 15).
      *
      * @internal
      *
@@ -479,157 +469,18 @@ class Thread extends Model implements ThreadContract
      */
     public static function placedRows(array $rows): array
     {
-        $owners = StepRows::owners($rows);
-        $segment = null;
-        $segmentOf = [];
-        $ends = [];
-        $steps = [];
-        $last = null;
-        $paused = null;
-        foreach ($rows as $index => $row) {
-            if (StepRows::isStep($row['type'], $row['payload'])) {
-                $segment = $index;
-                $last = $index;
-                $ends[$index] = $index;
-                $steps[] = $index;
-                $paused = $index;
-                // A request repeating an approval id an earlier step issued
-                // asks for nothing (round 15, G-408): not sent either.
-                $rows[$index]['payload']['tool_approval_requests'] = StepRows::ownRequests($rows, $index);
-
-                continue;
-            }
-            if ($row['type'] === MessageMapper::TYPE_ASSISTANT) {
-                // Only a step asks for anything (G-408): a text row never
-                // carries a request.
-                $rows[$index]['payload']['tool_approval_requests'] = [];
-            }
-            $segmentOf[$index] = $segment;
-            if ($last !== null && ($row['type'] === MessageMapper::TYPE_TOOL_RESULT || $row['type'] === MessageMapper::TYPE_SYSTEM)) {
-                $ends[$last] = $index;
-            } else {
-                $last = null;
-                // Anything else after the newest step: nothing is paused.
-                $paused = null;
-            }
-        }
-        // Each step's own rows.
-        $moved = [];
-        $owned = [];
-        foreach ($owners as $index => $owner) {
-            if ($owner === null || $owner < 0) {
-                continue;
-            }
-            $owned[$owner][] = $index;
-            if ($owner !== ($segmentOf[$index] ?? null) && ! StepRows::isStarted(StepRows::honouredPayload($rows[$index]))) {
-                $moved[$owner][] = $index;
-            }
-        }
-        $extras = [];
-        foreach ($steps as $step) {
-            $payloads = array_map(static fn (int $i): array => StepRows::honouredPayload($rows[$i]), $owned[$step] ?? []);
-            $paired = self::pairedStep($rows[$step]['payload'], $payloads);
-            // A started call with no result: interrupted, it may have run.
-            $answers = [];
-            foreach ($paired['interrupted'] as $at => $flag) {
-                if ($flag) {
-                    $answers[$at] = self::endedResult($paired['calls'][$at], StepRows::INTERRUPTED_RESULT);
-                }
-            }
-            if ($step !== $paused) {
-                // A step nothing can decide any more whose asked-for call has
-                // no outcome (a thread an earlier version wrote, which replaced
-                // it without one): replaced, denied, never run (round 15).
-                foreach ($paired['requests'] as ['call' => $at]) {
-                    if ($at !== null && ! $paired['answered'][$at]) {
-                        $answers[$at] = self::endedResult($paired['calls'][$at], self::SUPERSEDED_RESULT);
-                    }
-                }
-            }
-            ksort($answers);
-            $extra = array_map(static fn (int $i): array => ['type' => $rows[$i]['type'], 'payload' => $rows[$i]['payload']], $moved[$step] ?? []);
-            if ($answers !== []) {
-                // As a stored row reads (decoded JSON), so the arguments survive the mapper.
-                $extra[] = ['type' => MessageMapper::TYPE_TOOL_RESULT, 'payload' => json_decode(
-                    (string) json_encode(MessageMapper::toArray(new ToolResultMessage(array_values($answers))), JSON_THROW_ON_ERROR), true, 512, JSON_THROW_ON_ERROR)];
-            }
-            if ($extra !== []) {
-                $extras[$ends[$step] ?? $step][] = $extra;
-            }
-        }
-        // The decision that stands for each approval (G-401): a denial, when
-        // any recorded for it is one; else the first approval.
-        $standing = [];
-        foreach ($rows as $row) {
-            if ($row['type'] !== MessageMapper::TYPE_TOOL_RESULT) {
-                continue;
-            }
-            foreach (is_array($row['payload']['tool_approval_responses'] ?? null) ? $row['payload']['tool_approval_responses'] : [] as $response) {
-                if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                    $current = $standing[$response['approval_id']] ?? null;
-                    if ($current === null || (($current['approved'] ?? false) === true && ($response['approved'] ?? false) !== true)) {
-                        $standing[$response['approval_id']] = $response;
-                    }
-                }
-            }
-        }
-        $out = [];
-        foreach ($rows as $index => $row) {
-            $payload = StepRows::honouredPayload($row);
-            $owner = $owners[$index] ?? null;
-            $skip = $row['type'] === MessageMapper::TYPE_TOOL_RESULT
-                && (StepRows::isStarted($payload) || ($owner !== null && $owner >= 0 && $owner !== ($segmentOf[$index] ?? null)));
-            if (! $skip) {
-                $out[] = ['type' => $row['type'], 'payload' => self::withStandingDecisions($row, $standing)];
-            }
-            foreach ($extras[$index] ?? [] as $extra) {
-                foreach ($extra as $placed) {
-                    $out[] = ['type' => $placed['type'], 'payload' => self::withStandingDecisions($placed, $standing)];
-                }
-            }
-        }
-
-        return $out;
+        return ThreadView::of($rows)->placed();
     }
 
     /**
-     * A result row's decisions, each the one that stands for its approval.
-     *
-     * @param  array{type: string, payload: array<array-key, mixed>}  $row
-     * @param  array<string, array<array-key, mixed>>  $standing
-     * @return array<array-key, mixed>
+     * This thread's rows, read as {@see ThreadReads} reads them: once per
+     * locked operation, then only what was appended since.
      */
-    private static function withStandingDecisions(array $row, array $standing): array
+    private function view(): ThreadView
     {
-        $payload = $row['payload'];
-        if ($row['type'] !== MessageMapper::TYPE_TOOL_RESULT || ! is_array($payload['tool_approval_responses'] ?? null)) {
-            return $payload;
-        }
-        $payload['tool_approval_responses'] = array_map(static fn (mixed $response): mixed => is_array($response) && is_string($response['approval_id'] ?? null)
-            ? ($standing[$response['approval_id']] ?? $response) : $response, $payload['tool_approval_responses']);
+        $key = $this->getKey();
 
-        return $payload;
-    }
-
-    /**
-     * The result a call that never ran on its own is read as: interrupted
-     * (it was started, and may have run) or replaced (it never ran).
-     *
-     * @param  mixed  $call  the stored call
-     */
-    private static function endedResult(mixed $call, string $text): ToolResult
-    {
-        $call = is_array($call) ? $call : [];
-        $arguments = $call['arguments'] ?? [];
-        $arguments = is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments;
-
-        return new ToolResult(
-            toolCallId: is_scalar($call['id'] ?? null) ? (string) $call['id'] : '',
-            toolName: is_string($call['name'] ?? null) ? $call['name'] : '',
-            args: is_array($arguments) ? $arguments : [],
-            result: $text,
-            toolCallResultId: is_string($call['result_id'] ?? null) ? $call['result_id'] : null,
-        );
+        return $key === null ? ThreadView::of([]) : ThreadReads::view($this->getConnection(), (int) $key);
     }
 
     /**
@@ -656,6 +507,11 @@ class Thread extends Model implements ThreadContract
      * null for anything written outside a run — but without it a parent and a
      * subagent writing into the same conversation are indistinguishable after
      * the fact, which makes a tree impossible to reconstruct from storage.
+     * It is NEVER a trust signal (G-387 round 16): a row this call writes is a
+     * host row whatever run id it names, and no harness mark on it is read.
+     * Only the runtime's own write, under its private token, stores rows as
+     * the harness's (the `harness_written` column, which nothing a host
+     * passes can set).
      *
      * A row that supersedes the paused step is NEVER refused (G-387 round
      * 15): a call a run has started (its write-ahead started row) is
@@ -684,8 +540,9 @@ class Thread extends Model implements ThreadContract
             throw new InvalidArgumentException('Only the harness runtime records a parked count or the rows a runner start ended calls with.');
         }
         $answers = $context['answers'] ?? null;
+        $journal = array_values(array_filter(is_array($context['journal'] ?? null) ? $context['journal'] : [], 'is_int'));
 
-        return $this->recordRows($messages, $runId, $toolNames, $parked, $endedByStart, $inRun, is_int($answers) ? $answers : null);
+        return $this->recordRows($messages, $runId, $toolNames, $parked, $endedByStart, $inRun, is_int($answers) ? $answers : null, $journal);
     }
 
     /**
@@ -694,8 +551,9 @@ class Thread extends Model implements ThreadContract
      * @param  array{harness_steps_used: int, harness_steps_left: int}|null  $parked
      * @param  list<array{message: Message, approvals: list<string>}>  $endedByStart
      * @param  int|null  $answers  the step the run's result rows answer before it writes a step of its own
+     * @param  list<int>  $journal  the run's journal rows this write answers, removed with it (round 16)
      */
-    private function recordRows(array $messages, ?string $runId, ?array $toolNames, ?array $parked, array $endedByStart, ?string $inRun, ?int $answers = null): self
+    private function recordRows(array $messages, ?string $runId, ?array $toolNames, ?array $parked, array $endedByStart, ?string $inRun, ?int $answers = null, array $journal = []): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
@@ -714,11 +572,24 @@ class Thread extends Model implements ThreadContract
         // A turn that half-writes leaves a tool call with no result, which
         // replays to the model as an unanswered question rather than as an
         // error anyone can see.
-        return DB::transaction(function () use ($messages, $runId, $toolNames, $parked, $endedByStart, $inRun, $answers): self {
+        return DB::transaction(function () use ($messages, $runId, $toolNames, $parked, $endedByStart, $inRun, $answers, $journal): self {
             // Locks the thread ROW so a concurrent recorder waits instead of
             // reading the same max. A no-op on SQLite, which is why the suite
             // cannot exercise this and why the guarantee lives in the database.
             static::query()->whereKey($this->getKey())->lockForUpdate()->first();
+
+            if ($inRun !== null && $journal !== []) {
+                // The journal rows of the calls whose results this write
+                // stores (round 16): removed in the same write, so a call is
+                // journaled until its result is durable, and never after.
+                $owned = $this->storedMessages()->whereIn('id', $journal)->where('run_id', $inRun);
+                if (ThreadMessage::hasTrustColumn($this->getConnectionName())) {
+                    $owned->where('harness_written', true);
+                }
+                $gone = array_map('intval', $owned->pluck('id')->all());
+                $owned->delete();
+                ThreadReads::removed((int) $this->getKey(), $gone);
+            }
 
             $position = (int) $this->storedMessages()->max('position');
 
@@ -766,12 +637,9 @@ class Thread extends Model implements ThreadContract
                     // answer, wherever the row lands (round 15).
                     $payload[StepRows::ANSWERS_STEP] = ['position' => $target];
                 }
-                $this->storedMessages()->create([
-                    'position' => ++$position,
-                    'type' => MessageMapper::typeOf($message),
-                    'run_id' => $runId,
-                    'payload' => $payload,
-                ]);
+                // The harness's own row: the runtime's write, or a denial the
+                // harness itself gave a superseded step (round 16).
+                $this->store(++$position, MessageMapper::typeOf($message), $runId, $payload, $inRun !== null || $denials);
                 if ($inRun !== null && $message instanceof AssistantMessage && $message->toolCalls !== []) {
                     $target = $position;
                 }
@@ -779,6 +647,23 @@ class Thread extends Model implements ThreadContract
 
             return $this->afterRecording();
         });
+    }
+
+    /**
+     * Store one row. `$harness`: the runtime wrote it (the trust column no
+     * public write sets, G-387 round 16).
+     *
+     * @param  array<array-key, mixed>  $payload
+     */
+    private function store(int $position, string $type, ?string $runId, array $payload, bool $harness): ThreadMessage
+    {
+        $row = $this->storedMessages()->make(['position' => $position, 'type' => $type, 'run_id' => $runId, 'payload' => $payload]);
+        if (ThreadMessage::hasTrustColumn($this->getConnectionName())) {
+            $row->forceFill(['harness_written' => $harness]);
+        }
+        $row->save();
+
+        return $row;
     }
 
     /**
@@ -829,18 +714,37 @@ class Thread extends Model implements ThreadContract
      */
     private function withoutAnswered(ToolResultMessage $message, int $position): ?ToolResultMessage
     {
-        $step = $this->storedMessages()->where('position', $position)->first();
-        if ($step === null || ! StepRows::isStep((string) $step->type, $step->payload)) {
+        $view = $this->view();
+        $index = $view->at[$position] ?? null;
+        if ($index === null || ! StepRows::isStep($view->rows[$index]['type'], $view->rows[$index]['payload'])) {
             return $message;
         }
-        // A result is the same as one the step already holds when its call
-        // id, tool name and arguments are (the fold's key), occurrence by
-        // occurrence: what any one row of the step holds of a key is already
-        // written, and only results beyond that are new.
-        $key = static fn (mixed $id, mixed $name, mixed $args): string => json_encode([is_scalar($id) ? (string) $id : '', is_string($name) ? $name : '', StepRows::argsDigest($args)]);
+        $kept = self::newResults($view->ownedPayloads($index), $message->toolResults);
+        if (count($kept) === count($message->toolResults)) {
+            return $message;
+        }
+
+        return $kept === [] && $message->toolApprovalResponses === [] ? null : new ToolResultMessage($kept, $message->toolApprovalResponses);
+    }
+
+    /**
+     * Of `$results`, the ones a step's rows do not already hold (round 15;
+     * pinned by the corpus in round 16). A result is the same as one the
+     * step holds when its call id, tool name and arguments are (the fold's
+     * key), occurrence by occurrence: what any ONE row of the step holds of a
+     * key is already written, and only results beyond that are new. So a
+     * result answers the first call that has no outcome, and an answer row
+     * writes ONLY the new results.
+     *
+     * @param  list<array<array-key, mixed>>  $owned  the step's result payloads (honoured)
+     * @param  list<ToolResult>  $results
+     * @return list<ToolResult>
+     */
+    public static function newResults(array $owned, array $results): array
+    {
+        $key = static fn (mixed $id, mixed $name, mixed $args): string => (string) json_encode([is_scalar($id) ? (string) $id : '', is_string($name) ? $name : '', StepRows::argsDigest($args)]);
         $held = [];
-        foreach ($this->ownedRows($step) as $owned) {
-            $payload = StepRows::honouredPayload(self::rowOf($owned));
+        foreach ($owned as $payload) {
             $inRow = [];
             foreach (is_array($payload['tool_results'] ?? null) ? $payload['tool_results'] : [] as $entry) {
                 $k = is_array($entry) ? $key($entry['tool_call_id'] ?? null, $entry['tool_name'] ?? null, $entry['args'] ?? []) : '';
@@ -852,18 +756,42 @@ class Thread extends Model implements ThreadContract
         }
         $kept = [];
         $here = [];
-        foreach ($message->toolResults as $result) {
+        foreach ($results as $result) {
             $k = $key($result->toolCallId, $result->toolName, $result->args);
             $here[$k] = ($here[$k] ?? 0) + 1;
             if ($here[$k] > ($held[$k] ?? 0)) {
                 $kept[] = $result;
             }
         }
-        if (count($kept) === count($message->toolResults)) {
-            return $message;
+
+        return $kept;
+    }
+
+    /**
+     * The row the runtime stores when it answers the step at `$position` of
+     * `$rows` with `$message` (G-387 round 16): only the new results
+     * ({@see self::newResults()}), its decisions, and the step mark last; null
+     * when nothing is left to write. Pure: the thread-rows corpus pins it.
+     *
+     * @internal
+     *
+     * @param  list<array{position: int, type: string, run_id?: ?string, harness?: bool, payload: array<array-key, mixed>}>  $rows
+     * @return array<string, mixed>|null
+     */
+    public static function answerPayload(array $rows, int $position, ToolResultMessage $message): ?array
+    {
+        $view = ThreadView::of($rows);
+        $index = $view->at[$position] ?? null;
+        $kept = $index === null ? $message->toolResults : self::newResults($view->ownedPayloads($index), $message->toolResults);
+        if ($kept === [] && $message->toolApprovalResponses === []) {
+            return null;
+        }
+        $payload = MessageMapper::toArray(new ToolResultMessage($kept, $message->toolApprovalResponses));
+        if ($kept !== []) {
+            $payload[StepRows::ANSWERS_STEP] = ['position' => $position];
         }
 
-        return $kept === [] && $message->toolApprovalResponses === [] ? null : new ToolResultMessage($kept, $message->toolApprovalResponses);
+        return $payload;
     }
 
     /**
@@ -871,7 +799,8 @@ class Thread extends Model implements ThreadContract
      * step at `$position` that the runtime is about to run, under the
      * runtime's private single-use token. True: recorded, run it. False: the
      * call is no longer open (it has a result, a started row, or the denial
-     * of a superseding write), and it must NOT run.
+     * of a superseding write), or the decision that stands for it is no
+     * longer an approval, and it must NOT run.
      *
      * @internal Called by the runtime, inside its own token window.
      *
@@ -885,21 +814,21 @@ class Thread extends Model implements ThreadContract
 
         return DB::transaction(function () use ($runId, $position, $callId, $toolName, $arguments): bool {
             static::query()->whereKey($this->getKey())->lockForUpdate()->first();
-            $step = $this->storedMessages()->where('position', $position)->first();
-            if ($step === null || ! StepRows::isStep((string) $step->type, $step->payload)) {
+            $view = $this->view();
+            $index = $view->at[$position] ?? null;
+            if ($index === null || ! StepRows::isStep($view->rows[$index]['type'], $view->rows[$index]['payload'])) {
                 return false;
             }
-            $paired = self::pairedStep($this->withOwnRequests($step), array_map(
-                static fn (object $row): array => StepRows::honouredPayload(self::rowOf($row)), $this->ownedRows($step)));
+            $paired = self::pairedStep($view->step($index), $view->ownedPayloads($index));
             $digest = is_array($arguments) ? CanonicalJson::digest($arguments) : null;
             $at = null;
             foreach ([true, false] as $byArguments) {
-                foreach ($paired['calls'] as $index => $call) {
+                foreach ($paired['calls'] as $i => $call) {
                     $stored = is_array($call) ? ($call['arguments'] ?? []) : [];
                     $stored = is_string($stored) ? json_decode($stored, true) : $stored;
-                    if ($at === null && ! $paired['answered'][$index] && is_array($call) && ($call['id'] ?? null) === $callId && ($call['name'] ?? null) === $toolName
+                    if ($at === null && ! $paired['answered'][$i] && is_array($call) && ($call['id'] ?? null) === $callId && ($call['name'] ?? null) === $toolName
                         && (! $byArguments || ($digest !== null && is_array($stored) && CanonicalJson::digest($stored) === $digest))) {
-                        $at = $index;
+                        $at = $i;
                     }
                 }
             }
@@ -916,17 +845,14 @@ class Thread extends Model implements ThreadContract
                         && ($digest === null || StepRows::argsDigest($paired['calls'][$at]['arguments'] ?? []) === $digest) ? $request['approval_id'] : false;
                 }
             }
-            // The decision that stands for it, read now: a denial recorded
-            // since the run read its history stops the call (G-401).
-            if (! is_string($approval) || ($this->approvalDecisions()[$approval] ?? false) !== true) {
+            // The decision that STANDS for it, read now, by the one rule
+            // (round 16): a denial recorded since the run read its history,
+            // while the call had no outcome, stops the call (G-401).
+            if (! is_string($approval) || (($paired['standing'][$approval] ?? null)['approved'] ?? false) !== true) {
                 return false;
             }
-            $this->storedMessages()->create([
-                'position' => (int) $this->storedMessages()->max('position') + 1,
-                'type' => MessageMapper::TYPE_TOOL_RESULT,
-                'run_id' => $runId,
-                'payload' => self::startedPayload($callId, $toolName, $approval, $position),
-            ]);
+            $this->store((int) $this->storedMessages()->max('position') + 1, MessageMapper::TYPE_TOOL_RESULT, $runId,
+                self::startedPayload($callId, $toolName, $approval, $position), true);
             $this->afterRecording();
 
             return true;
@@ -951,81 +877,43 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * The result rows that belong to `$step` ({@see StepRows}), oldest
-     * first: the rows of its segment no harness mark gives another step,
-     * and any harness row after it whose mark names it.
+     * Record the write-ahead JOURNAL row (G-387 round 16) for an ungated call
+     * the runtime is about to run inside a model step, under its private
+     * single-use token: the call's step is not stored yet, so the row names
+     * the call itself. The write that stores the call's result removes it;
+     * one left standing reads (and replays) as interrupted. The row's id.
      *
-     * @param  ThreadMessage|\stdClass  $step
-     * @return list<ThreadMessage|\stdClass>
+     * @internal Called by the runtime, inside its own token window.
+     *
+     * @param  array<array-key, mixed>  $arguments
      */
-    private function ownedRows(object $step): array
+    public function recordJournal(string $runId, string $toolName, array $arguments): int
     {
-        $position = (int) $step->position;
-        $segment = [];
-        $end = null;
-        foreach ($this->storedMessages()->where('position', '>', $position)->reorder('position')->cursor() as $row) {
-            if (StepRows::isStep((string) $row->type, $row->payload)) {
-                $end = (int) $row->position;
-
-                break;
-            }
-            if ($row->type === MessageMapper::TYPE_TOOL_RESULT) {
-                $segment[] = $row;
-            }
-        }
-        // Marks in the segment that name a step BEFORE this one.
-        $named = [];
-        foreach ($segment as $row) {
-            $mark = StepRows::markedPosition(StepRows::honouredPayload(self::rowOf($row)));
-            if ($mark !== null && $mark < $position) {
-                $named[] = $mark;
-            }
-        }
-        $earlier = [];
-        if ($named !== []) {
-            foreach ($this->storedMessages()->whereIn('position', array_values(array_unique($named)))->get() as $row) {
-                if (StepRows::isStep((string) $row->type, $row->payload)) {
-                    $earlier[(int) $row->position] = $row->payload;
-                }
-            }
-        }
-        $window = [self::rowOf($step), ...array_map(static fn (object $row): array => self::rowOf($row), $segment)];
-        $owners = StepRows::owners($window, $earlier);
-        $owned = [];
-        foreach ($segment as $i => $row) {
-            if (($owners[$i + 1] ?? null) === 0) {
-                $owned[] = $row;
-            }
-        }
-        if ($end !== null) {
-            // Harness rows after the segment whose mark names this step.
-            $later = $this->storedMessages()->where('position', '>', $end)->where('type', MessageMapper::TYPE_TOOL_RESULT)
-                ->where('payload->'.StepRows::ANSWERS_STEP.'->position', $position)->reorder('position')->get();
-            foreach ($later as $row) {
-                $payload = StepRows::honouredPayload(self::rowOf($row));
-                if (StepRows::markedPosition($payload) === $position && StepRows::fits($payload, $step->payload)) {
-                    $owned[] = $row;
-                }
-            }
+        if (InRunRecording::take($runId) === null) {
+            throw new LogicException('Only the harness runtime records a journal row.');
         }
 
-        return $owned;
+        return DB::transaction(function () use ($runId, $toolName, $arguments): int {
+            static::query()->whereKey($this->getKey())->lockForUpdate()->first();
+            $row = $this->store((int) $this->storedMessages()->max('position') + 1, MessageMapper::TYPE_TOOL_RESULT, $runId,
+                self::journalPayload($toolName, $arguments), true);
+            $this->afterRecording();
+
+            return (int) $row->getKey();
+        });
     }
 
     /**
-     * A stored row as the pure readers take it.
+     * The stored payload of a journal row (G-387 round 16). Pure.
      *
-     * @param  ThreadMessage|\stdClass  $row
-     * @return array{position: int, type: string, run_id: ?string, payload: array<array-key, mixed>}
+     * @internal
+     *
+     * @param  array<array-key, mixed>  $arguments
+     * @return array<string, mixed>
      */
-    private static function rowOf(object $row): array
+    public static function journalPayload(string $toolName, array $arguments): array
     {
-        /** @var ThreadMessage $row */
-        $runId = $row->getAttribute('run_id');
-        $payload = $row->getAttribute('payload');
-
-        return ['position' => (int) $row->getAttribute('position'), 'type' => (string) $row->getAttribute('type'),
-            'run_id' => is_string($runId) ? $runId : null, 'payload' => is_array($payload) ? $payload : []];
+        return [...MessageMapper::toArray(new ToolResultMessage([])), StepRows::JOURNAL => ['tool_name' => $toolName, 'args' => $arguments]];
     }
 
     /**
@@ -1062,12 +950,12 @@ class Thread extends Model implements ThreadContract
      */
     public function replacedWithoutOutcome(string $approvalId): bool
     {
-        $stored = $this->requestRowOf($approvalId);
-        if ($stored === null || $this->pausedStepPosition() === (int) $stored->position) {
+        $view = $this->view();
+        $index = $view->askerOf($approvalId);
+        if ($index === null || $index === $view->paused) {
             return false;
         }
-        $step = self::pairedStep($stored->payload, array_map(
-            static fn (object $row): array => StepRows::honouredPayload(self::rowOf($row)), $this->ownedRows($stored)));
+        $step = self::pairedStep($view->step($index), $view->ownedPayloads($index));
         foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
             if (($request['approval_id'] ?? null) === $approvalId) {
                 return $at !== null && ! $step['answered'][$at];
@@ -1085,7 +973,44 @@ class Thread extends Model implements ThreadContract
      */
     public function pausedStepPosition(): ?int
     {
-        return $this->pausedStep()['position'] ?? null;
+        $view = $this->view();
+
+        return $view->paused === null ? null : $view->rows[$view->paused]['position'];
+    }
+
+    /**
+     * The highest stored position (0 for an empty thread).
+     *
+     * @internal Read by the runtime when a run reads its history (round 16).
+     */
+    public function lastPosition(): int
+    {
+        $rows = $this->view()->rows;
+
+        return $rows === [] ? 0 : (int) $rows[array_key_last($rows)]['position'];
+    }
+
+    /**
+     * Whether a step NEWER than `$position` that the run `$runId` did not
+     * write is now the paused step and waits on approval: another run (a
+     * tool's own nested send) or the host parked this session after the run
+     * read it (G-387 round 16). The run then takes no further model step: its
+     * answer would replace the step a caller was just told is waiting.
+     *
+     * @internal Read by the runtime before each model step.
+     */
+    public function parkedAfter(int $position, string $runId): bool
+    {
+        $view = $this->view();
+        if ($view->paused === null) {
+            return false;
+        }
+        $row = $view->rows[$view->paused];
+        if ($row['position'] <= $position || (($row['harness'] ?? false) === true && ($row['run_id'] ?? null) === $runId)) {
+            return false;
+        }
+
+        return $this->pendingApprovalIds() !== [];
     }
 
     /**
@@ -1102,7 +1027,6 @@ class Thread extends Model implements ThreadContract
             return null;
         }
         $payload = $paused['assistant'];
-        $decisions = self::decisionsIn($paused['results']);
         $requests = $payload['tool_approval_requests'] ?? [];
         if (! is_array($requests) || $requests === []) {
             return null;
@@ -1119,6 +1043,7 @@ class Thread extends Model implements ThreadContract
         Log::warning('Pending approval has no valid stored tool scope; offering approved requests only.');
         $names = [];
         $step = self::pairedStep($payload, $paused['results']);
+        $decisions = self::decisionsOf($step);
         foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
             $call = $at === null ? null : ($step['calls'][$at] ?? null);
             if (is_string($request['approval_id'] ?? null) && ($decisions[$request['approval_id']] ?? false)
@@ -1149,15 +1074,17 @@ class Thread extends Model implements ThreadContract
     {
         $paused = null;
         $steps = 0;
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            if ($stored->type === MessageMapper::TYPE_USER) {
+        $rows = $this->view()->rows;
+        for ($i = count($rows) - 1; $i >= 0; $i--) {
+            $stored = $rows[$i];
+            if ($stored['type'] === MessageMapper::TYPE_USER) {
                 break;
             }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+            if ($stored['type'] !== MessageMapper::TYPE_ASSISTANT) {
                 continue;
             }
             if ($paused === null) {
-                $requests = $stored->payload['tool_approval_requests'] ?? [];
+                $requests = $stored['payload']['tool_approval_requests'] ?? [];
                 $paused = is_array($requests) && $requests !== [];
                 if (! $paused) {
                     return null;
@@ -1172,7 +1099,8 @@ class Thread extends Model implements ThreadContract
     /**
      * What the run paused at the transcript tail wrote it had used, on the
      * row it parked on (G-387): `none` when nothing at the tail is waiting on
-     * an approval, `absent` for a row written before the count was kept,
+     * an approval, `absent` for a row written before the count was kept (or
+     * by anyone but the runtime: the count is a harness mark, round 16),
      * `invalid` for a value this runtime could not have written, `valid`
      * with the count otherwise.
      *
@@ -1182,14 +1110,16 @@ class Thread extends Model implements ThreadContract
      */
     public function pausedStepsUsed(): array
     {
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            if ($stored->type === MessageMapper::TYPE_USER) {
+        $view = $this->view();
+        for ($i = count($view->rows) - 1; $i >= 0; $i--) {
+            $stored = $view->rows[$i];
+            if ($stored['type'] === MessageMapper::TYPE_USER) {
                 return ['none', null];
             }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+            if ($stored['type'] !== MessageMapper::TYPE_ASSISTANT) {
                 continue;
             }
-            $payload = is_array($stored->payload) ? $stored->payload : [];
+            $payload = $view->honoured[$i];
             $requests = $payload['tool_approval_requests'] ?? [];
             if (! is_array($requests) || $requests === []) {
                 return ['none', null];
@@ -1234,8 +1164,8 @@ class Thread extends Model implements ThreadContract
         if ($paused === null) {
             return [];
         }
-        $answered = self::decisionsIn($paused['results']);
         $step = self::pairedStep($paused['assistant'], $paused['results']);
+        $answered = self::decisionsOf($step);
         $ids = [];
         foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
             if (is_string($request['approval_id'] ?? null) && isset($answered[$request['approval_id']])
@@ -1262,8 +1192,8 @@ class Thread extends Model implements ThreadContract
         if ($paused === null) {
             return [];
         }
-        $decisions = self::decisionsIn($paused['results']);
         $step = self::pairedStep($paused['assistant'], $paused['results']);
+        $decisions = self::decisionsOf($step);
         $ids = [];
         foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
             $id = $request['approval_id'] ?? null;
@@ -1284,78 +1214,55 @@ class Thread extends Model implements ThreadContract
      * `$exceptStartedBy`: the started rows of that run are left out, so the
      * run that is about to run a call it started still finds it awaiting.
      *
-     * @return array{position: int, run_id: ?string, assistant: array<string, mixed>, results: list<array<string, mixed>>, result_runs: list<string>}|null
+     * The run ids it names (the step's own, and each run that recorded one
+     * of its results) are only those of rows the RUNTIME wrote (round 16): a
+     * run id on any other row is a host's claim and owns nothing.
+     *
+     * @return array{position: int, run_id: ?string, assistant: array<array-key, mixed>, results: list<array<array-key, mixed>>, result_runs: list<string>}|null
      */
     private function pausedStep(?string $exceptStartedBy = null): ?array
     {
-        $found = PausedStep::find(
-            $this->storedMessages()->reorder('position', 'desc')->cursor(),
-            static fn ($stored): string => PausedStep::kindOfRow((string) $stored->type, $stored->payload),
-        );
-        if ($found === null) {
-            return null;
-        }
-        $results = [];
-        $runs = [];
-        foreach ($this->ownedRows($found['step']) as $row) {
-            $payload = StepRows::honouredPayload(self::rowOf($row));
-            if ($exceptStartedBy !== null && StepRows::isStarted($payload) && $row->run_id === $exceptStartedBy) {
-                continue;
-            }
-            $results[] = $payload;
-            if (($payload['tool_results'] ?? []) !== [] && is_string($row->run_id) && $row->run_id !== '') {
-                $runs[] = $row->run_id;
-            }
-        }
-
-        return [
-            'position' => (int) $found['step']->position,
-            'run_id' => is_string($found['step']->run_id) && $found['step']->run_id !== '' ? $found['step']->run_id : null,
-            'assistant' => $this->withOwnRequests($found['step']),
-            'results' => $results,
-            'result_runs' => array_values(array_unique($runs)),
-        ];
+        return self::pausedOf($this->view(), $exceptStartedBy);
     }
 
     /**
-     * A step's payload with only the requests that ask for something: never
-     * one repeating an approval id an EARLIER step issued (G-408, the rule
-     * of prism-harness-ts 0.11.x #92). Such a request is void.
+     * {@see self::pausedStep()} over a view.
      *
-     * @param  ThreadMessage|\stdClass  $step
-     * @return array<array-key, mixed>
+     * @return array{position: int, run_id: ?string, assistant: array<array-key, mixed>, results: list<array<array-key, mixed>>, result_runs: list<string>}|null
      */
-    private function withOwnRequests(object $step): array
+    private static function pausedOf(ThreadView $view, ?string $exceptStartedBy = null): ?array
     {
-        $payload = $step->payload;
-        $requests = StepRows::requestsOf($payload);
-        if ($requests === []) {
-            return $payload;
+        if ($view->paused === null) {
+            return null;
         }
-        $earlier = [];
-        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->where('position', '<', (int) $step->position)->cursor() as $row) {
-            if (StepRows::isStep((string) $row->type, $row->payload)) {
-                foreach (StepRows::requestsOf($row->payload) as $request) {
-                    $earlier[(string) $request['approval_id']] = true;
-                }
+        $index = $view->paused;
+        $runs = [];
+        foreach ($view->owned[$index] ?? [] as $i) {
+            $row = $view->rows[$i];
+            if (($view->honoured[$i]['tool_results'] ?? []) !== [] && ($row['harness'] ?? false) === true
+                && is_string($row['run_id'] ?? null) && $row['run_id'] !== '') {
+                $runs[] = $row['run_id'];
             }
         }
-        if ($earlier === []) {
-            return $payload;
-        }
-        $payload['tool_approval_requests'] = array_values(array_filter(is_array($payload['tool_approval_requests'] ?? null) ? $payload['tool_approval_requests'] : [],
-            static fn (mixed $request): bool => ! (is_array($request) && is_scalar($request['approval_id'] ?? null) && isset($earlier[(string) $request['approval_id']]))));
+        $step = $view->rows[$index];
 
-        return $payload;
+        return [
+            'position' => $step['position'],
+            'run_id' => ($step['harness'] ?? false) === true && is_string($step['run_id'] ?? null) && $step['run_id'] !== '' ? $step['run_id'] : null,
+            'assistant' => $view->step($index),
+            'results' => $view->ownedPayloads($index, $exceptStartedBy),
+            'result_runs' => array_values(array_unique($runs)),
+        ];
     }
 
     /**
      * The approvals the harness itself answered in result rows (G-387 round
      * 14): named by its replaced-step mark, the 0.26.x line's replaced mark,
      * or a runner start's ended mark. Every reader of what is still pending
-     * treats them as answered, whatever row follows.
+     * treats them as answered, whatever row follows. Read only on rows the
+     * runtime wrote (the payloads given are honoured).
      *
-     * @param  list<array<string, mixed>>  $results  oldest first
+     * @param  list<array<array-key, mixed>>  $results  oldest first
      * @return array<string, true>
      */
     private static function markedApprovals(array $results): array
@@ -1376,33 +1283,19 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * Whether a result row carries one of the harness's own marks.
+     * The decision that stands for each approval decided on a paired step,
+     * by approval id: true when it is an approval ({@see StepRows::standing()}).
+     * An approval whose decisions all came after its call's outcome has none.
      *
-     * @param  array<string, mixed>  $payload
-     */
-    private static function isMarkedRow(array $payload): bool
-    {
-        return array_key_exists(self::SUPERSEDED, $payload) || array_key_exists(self::REPLACED_026, $payload)
-            || array_key_exists(self::ENDED_BY_START, $payload) || StepRows::isStarted($payload);
-    }
-
-    /**
-     * The decisions in result rows, by approval id: the FIRST recorded answer.
-     *
-     * @param  list<array<string, mixed>>  $results  oldest first
+     * @param  array{standing: array<string, array<array-key, mixed>|null>}  $step
      * @return array<string, bool>
      */
-    private static function decisionsIn(array $results): array
+    private static function decisionsOf(array $step): array
     {
         $decisions = [];
-        foreach ($results as $payload) {
-            foreach ($payload['tool_approval_responses'] ?? [] as $response) {
-                if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                    // A DENIAL is final (G-401): it stands over any approval
-                    // recorded for the same approval, before or after it.
-                    $id = $response['approval_id'];
-                    $decisions[$id] = ($decisions[$id] ?? true) && ($response['approved'] ?? false) === true;
-                }
+        foreach ($step['standing'] as $id => $response) {
+            if ($response !== null) {
+                $decisions[$id] = ($response['approved'] ?? false) === true;
             }
         }
 
@@ -1410,151 +1303,89 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * One stored step paired by position (G-387 round 13, {@see CallPairing}):
-     * its calls, whether each has a result of its own among the result rows
-     * recorded after it, and the call each approval request was issued for.
-     * A request prefers a call no result of the step's own run answered (the
-     * rows before its first decision), because a call that ran was never
-     * waiting on a person.
+     * One stored step paired by position ({@see ThreadView::pair()}).
      *
-     * A started row (round 15) answers its call IN PROGRESS: `answered` is
-     * true for it, and `interrupted` is true while no result of its own is
-     * among the rows.
-     *
-     * @param  array<string, mixed>  $assistant  the step's stored payload
-     * @param  list<array<string, mixed>>  $results  the tool_result payloads that belong to it, oldest first (honoured)
-     * @return array{calls: list<mixed>, answered: list<bool>, interrupted: list<bool>, requests: list<array{request: array<array-key, mixed>, call: int|null}>}
+     * @param  array<array-key, mixed>  $assistant  the step's payload, as read
+     * @param  list<array<array-key, mixed>>  $results  the tool_result payloads that belong to it, oldest first (honoured)
+     * @return array{calls: list<mixed>, answered: list<bool>, interrupted: list<bool>, requests: list<array{request: array<array-key, mixed>, call: int|null}>, standing: array<string, array<array-key, mixed>|null>}
      */
     private static function pairedStep(array $assistant, array $results): array
     {
-        $stepCalls = StepRows::objectCalls($assistant['tool_calls'] ?? null) ?? [];
-        $calls = CallPairing::ofStored($stepCalls, 'id', 'name');
-        $rows = [];
-        // The calls that ran at once: results before the first decision, and
-        // never a row the harness wrote to END calls (its replaced mark, the
-        // 0.26.x replaced mark or a start's ended mark, round 14): the calls
-        // such a row answers never ran.
-        $ranRows = [];
-        $ran = null;
-        $started = [];
-        foreach ($results as $payload) {
-            if (StepRows::isStarted($payload)) {
-                $started[] = [$payload[StepRows::STARTED]['tool_call_id'], $payload[StepRows::STARTED]['tool_name']];
-
-                continue;
-            }
-            $responses = $payload['tool_approval_responses'] ?? [];
-            if ($ran === null && is_array($responses) && $responses !== []) {
-                $ran = CallPairing::answered($calls, $ranRows);
-            }
-            $row = CallPairing::ofStored($payload['tool_results'] ?? [], 'tool_call_id', 'tool_name');
-            $rows[] = $row;
-            if (! self::isMarkedRow($payload)) {
-                $ranRows[] = $row;
-            }
-        }
-        $answered = CallPairing::answered($calls, $rows);
-        // Each started row names one call (id and tool): the first such call
-        // with no outcome. Answered in progress; interrupted while it has no
-        // result of its own.
-        $interrupted = array_fill(0, count($calls), false);
-        foreach ($started as [$id, $name]) {
-            foreach ($calls as $i => $call) {
-                if (! $answered[$i] && ! $interrupted[$i] && $call[0] === $id && $call[1] === $name) {
-                    $interrupted[$i] = true;
-
-                    break;
-                }
-            }
-        }
-        $answered = array_map(static fn (bool $a, bool $b): bool => $a || $b, $answered, $interrupted);
-        $ran ??= CallPairing::answered($calls, $ranRows);
-        $requests = array_values(array_filter(is_array($assistant['tool_approval_requests'] ?? null) ? $assistant['tool_approval_requests'] : [], 'is_array'));
-        $paired = CallPairing::requests($calls, array_map(
-            static fn (array $request): string => is_scalar($request['tool_call_id'] ?? null) ? (string) $request['tool_call_id'] : '', $requests), $ran);
-
-        return [
-            'calls' => $stepCalls,
-            'answered' => $answered,
-            'interrupted' => $interrupted,
-            'requests' => array_map(static fn (array $request, ?int $call): array => ['request' => $request, 'call' => $call], $requests, $paired),
-        ];
+        return ThreadView::pair($assistant, $results);
     }
 
     /**
-     * The stored step that issued `$approvalId` and the result rows that
+     * The stored step that FIRST issued `$approvalId` and the result rows that
      * belong to it ({@see StepRows}), or null (G-387 round 13; round 15).
      *
-     * @return array{assistant: array<string, mixed>, results: list<array<string, mixed>>}|null
+     * @return array{index: int, assistant: array<array-key, mixed>, results: list<array<array-key, mixed>>}|null
      */
     private function stepOf(string $approvalId): ?array
     {
-        $stored = $this->requestRowOf($approvalId);
-        if ($stored === null) {
+        $view = $this->view();
+        $index = $view->askerOf($approvalId);
+        if ($index === null) {
             return null;
         }
 
-        return ['assistant' => $stored->payload, 'results' => array_map(
-            static fn (object $row): array => StepRows::honouredPayload(self::rowOf($row)), $this->ownedRows($stored))];
-    }
-
-    /**
-     * The STEP (G-408) that FIRST asked for `$approvalId`, or null: the approval belongs to it alone.
-     *
-     * @return \stdClass|null a stored row
-     */
-    private function requestRowOf(string $approvalId): ?object
-    {
-        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position')->cursor() as $stored) {
-            if (! StepRows::isStep((string) $stored->type, $stored->payload)) {
-                continue;
-            }
-            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
-                if (is_array($request) && ($request['approval_id'] ?? null) === $approvalId) {
-                    return $stored;
-                }
-            }
-        }
-
-        return null;
+        return ['index' => $index, 'assistant' => $view->step($index), 'results' => $view->ownedPayloads($index)];
     }
 
     /**
      * Whether a runner start ended the call this approval id was requested
      * for, never run (G-387).
      *
-     * Decided ONLY by the harness's own mark, and scoped to the approval's
-     * own request: the approval reads ended when ANY result row after the
-     * row that asked for it, and before the next model step, carries the
-     * mark and the mark names this approval id (round 13). Not only the
-     * first result carrying its call id: a provider may give two calls in a
-     * step one id, and a sibling's earlier result, which has no mark, said
-     * nothing about this call. Only the harness writes the mark, so reading
-     * every row of the step is no looser. Never by result text (a tool can
-     * return any text) and never by a tool-call id across the thread (a
-     * provider may reuse ids: Gemini names them by function).
+     * Decided ONLY by the harness's own mark, on a row the runtime wrote
+     * (round 16), and scoped to the approval's own request: the approval
+     * reads ended when ANY result row after the row that asked for it, and
+     * before the next model step, carries the mark and the mark names this
+     * approval id (round 13). Never by result text (a tool can return any
+     * text) and never by a tool-call id across the thread (a provider may
+     * reuse ids: Gemini names them by function).
      *
      * @internal
      */
     public function endedByStart(string $approvalId): bool
     {
-        $request = $this->requestRowOf($approvalId);
-        if ($request === null) {
+        return $this->markedAfterRequest($approvalId, self::ENDED_BY_START);
+    }
+
+    /**
+     * Whether a row after the step that first asked for `$approvalId`, and
+     * before the next assistant row, carries one of the marks `$keys` naming
+     * it, read only on rows the runtime wrote.
+     */
+    private function markedAfterRequest(string $approvalId, string ...$keys): bool
+    {
+        $view = $this->view();
+        $index = $view->askerOf($approvalId);
+        if ($index === null) {
             return false;
         }
-
-        return self::endedByStartIn((function () use ($request): Generator {
-            yield ['type' => $request->type, ...$request->payload];
-            foreach ($this->storedMessages()->where('position', '>', (int) $request->position)->reorder('position')->cursor() as $stored) {
-                yield ['type' => $stored->type, ...$stored->payload];
+        for ($i = $index + 1, $n = count($view->rows); $i < $n; $i++) {
+            $type = $view->rows[$i]['type'];
+            if ($type === MessageMapper::TYPE_ASSISTANT) {
+                break;
             }
-        })(), $approvalId);
+            if ($type !== MessageMapper::TYPE_TOOL_RESULT) {
+                continue;
+            }
+            foreach ($keys as $key) {
+                $mark = $view->honoured[$i][$key] ?? null;
+                if (is_array($mark) && is_array($mark['approval_ids'] ?? null) && in_array($approvalId, $mark['approval_ids'], true)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**
      * {@see self::endedByStart()} over stored rows (each a payload with its
-     * `type`), oldest first. Pure: the cross-language thread-rows corpus
-     * pins the reading by driving this (G-387 round 13).
+     * `type`, and `harness: true` on a row the runtime wrote), oldest first.
+     * Pure: the cross-language thread-rows corpus pins the reading by driving
+     * this (G-387 round 13; the trust signal, round 16).
      *
      * @internal
      *
@@ -1567,7 +1398,8 @@ class Thread extends Model implements ThreadContract
 
     /**
      * Whether a result row after the approval's own request, and before the
-     * next model step, carries the harness mark `$key` naming it.
+     * next model step, carries the harness mark `$key` naming it (on a row
+     * the runtime wrote: `harness: true`).
      *
      * @param  iterable<array<array-key, mixed>>  $rows
      */
@@ -1598,7 +1430,7 @@ class Thread extends Model implements ThreadContract
 
                 continue;
             }
-            if (! $asked || $type !== MessageMapper::TYPE_TOOL_RESULT) {
+            if (! $asked || $type !== MessageMapper::TYPE_TOOL_RESULT || ($row['harness'] ?? false) !== true) {
                 continue;
             }
             $mark = $row[$key] ?? null;
@@ -1682,7 +1514,8 @@ class Thread extends Model implements ThreadContract
             return null;
         }
         // The runs that own the step: the one that recorded it, and every
-        // run that recorded one of its results (a resume answering it).
+        // run that recorded one of its results (a resume answering it), each
+        // read only from a row the runtime wrote (round 16).
         $owners = array_filter([$paused['run_id'], ...$paused['result_runs']], 'is_string');
         $outside = $inRun === null || ! in_array($inRun, $owners, true);
         $at = null;
@@ -1738,16 +1571,7 @@ class Thread extends Model implements ThreadContract
         ksort($approvals);
         $results = [];
         foreach ($open as $at) {
-            $call = $step['calls'][$at];
-            $arguments = $call['arguments'] ?? [];
-            $arguments = is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments;
-            $results[] = new ToolResult(
-                toolCallId: is_scalar($call['id'] ?? null) ? (string) $call['id'] : '',
-                toolName: is_string($call['name'] ?? null) ? $call['name'] : '',
-                args: is_array($arguments) ? $arguments : [],
-                result: self::SUPERSEDED_RESULT,
-                toolCallResultId: is_string($call['result_id'] ?? null) ? $call['result_id'] : null,
-            );
+            $results[] = ThreadView::endedResult($step['calls'][$at], self::SUPERSEDED_RESULT);
         }
 
         return ['message' => new ToolResultMessage($results), 'approvals' => array_values($approvals)];
@@ -1777,29 +1601,17 @@ class Thread extends Model implements ThreadContract
      */
     public function supersededByLaterStep(string $approvalId): bool
     {
-        $request = $this->requestRowOf($approvalId);
-        if ($request === null) {
-            return false;
-        }
-
-        $rows = function () use ($request): Generator {
-            yield ['type' => $request->type, ...$request->payload];
-            foreach ($this->storedMessages()->where('position', '>', (int) $request->position)->reorder('position')->cursor() as $stored) {
-                yield ['type' => $stored->type, ...$stored->payload];
-            }
-        };
-
         // This line's mark, or the one 0.26.x writes on the same row
         // (`harness_replaced: {approval_ids}`): an upgraded thread reads the
         // same. 0.26.x rows written before that mark carry none, and read by
         // the decision recorded, as they did there.
-        return self::markedIn($rows(), $approvalId, self::SUPERSEDED)
-            || self::markedIn($rows(), $approvalId, self::REPLACED_026);
+        return $this->markedAfterRequest($approvalId, self::SUPERSEDED, self::REPLACED_026);
     }
 
     /**
      * The calls of the approval paused at the transcript tail that have no
-     * recorded decision, oldest first. Empty when nothing is waiting.
+     * recorded decision and no outcome, oldest first. Empty when nothing is
+     * waiting.
      *
      * @return list<array{name: string, arguments: mixed}>
      */
@@ -1809,14 +1621,14 @@ class Thread extends Model implements ThreadContract
         if ($paused === null) {
             return [];
         }
-        $answered = [...self::decisionsIn($paused['results']), ...self::markedApprovals($paused['results'])];
         // Each request's OWN call, by position (round 13): never the last
         // call that happens to share its id.
         $step = self::pairedStep($paused['assistant'], $paused['results']);
+        $answered = [...self::decisionsOf($step), ...self::markedApprovals($paused['results'])];
         $unanswered = [];
         foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
             $call = $at === null ? null : ($step['calls'][$at] ?? null);
-            if (is_string($request['approval_id'] ?? null) && ! isset($answered[$request['approval_id']])
+            if (is_string($request['approval_id'] ?? null) && ! isset($answered[$request['approval_id']]) && ($at === null || ! $step['answered'][$at])
                 && is_string($request['tool_call_id'] ?? null) && is_array($call) && is_string($call['id'] ?? null) && is_string($call['name'] ?? null)) {
                 $unanswered[] = ['name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
             }
@@ -1831,24 +1643,44 @@ class Thread extends Model implements ThreadContract
      *
      * Read from the raw stored rows, newest first, so compaction cannot erase
      * it. A user turn, or an assistant step that asked nothing, ends the scope:
-     * nothing before it is pending. An id answered once is no longer pending.
+     * nothing before it is pending. An id answered once is no longer pending,
+     * and neither is one whose call already has an OUTCOME (a result, a
+     * started row: round 16), by the same pairing the replay and the resolver
+     * use: a decision on it could never be acted on.
      *
      * @return list<string>
      */
     public function pendingApprovalIds(): array
     {
-        $paused = $this->pausedStep();
+        return self::pendingOf($this->view());
+    }
+
+    /**
+     * {@see self::pendingApprovalIds()} over a view.
+     *
+     * @return list<string>
+     */
+    private static function pendingOf(ThreadView $view): array
+    {
+        $paused = self::pausedOf($view);
         if ($paused === null) {
             return [];
         }
+        $step = self::pairedStep($paused['assistant'], $paused['results']);
         // A decision, or the harness's own mark (round 14): an approval whose
         // call the harness ended or denied as replaced is answered, even with
         // no row after the one that says so.
-        $answered = [...self::decisionsIn($paused['results']), ...self::markedApprovals($paused['results'])];
+        $answered = [...self::decisionsOf($step), ...self::markedApprovals($paused['results'])];
+        $closed = [];
+        foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
+            if (is_string($request['approval_id'] ?? null) && $at !== null && $step['answered'][$at]) {
+                $closed[$request['approval_id']] = true;
+            }
+        }
         $pending = [];
         foreach ($paused['assistant']['tool_approval_requests'] ?? [] as $request) {
             if (is_array($request) && is_string($request['approval_id'] ?? null) && $request['approval_id'] !== ''
-                && ! array_key_exists($request['approval_id'], $answered)) {
+                && ! array_key_exists($request['approval_id'], $answered) && ! isset($closed[$request['approval_id']])) {
                 $pending[] = $request['approval_id'];
             }
         }
@@ -1919,9 +1751,11 @@ class Thread extends Model implements ThreadContract
      */
     public function approvalRunId(string $approvalId): ?string
     {
-        $stored = $this->requestRowOf($approvalId);
+        $view = $this->view();
+        $index = $view->askerOf($approvalId);
+        $runId = $index === null ? null : ($view->rows[$index]['run_id'] ?? null);
 
-        return $stored !== null && is_string($stored->run_id) && $stored->run_id !== '' ? $stored->run_id : null;
+        return is_string($runId) && $runId !== '' ? $runId : null;
     }
 
     /**
@@ -1957,9 +1791,9 @@ class Thread extends Model implements ThreadContract
      * How many calls of the turn paused at the transcript tail a person
      * approved, for this tool and these arguments, that have no result yet.
      *
-     * The FIRST recorded answer for an approval id is the answer, as in
+     * The decision that STANDS for an approval id is the answer, as in
      * {@see self::approvalDecisions()} and in the history a provider is sent:
-     * a later approval never overrides an earlier denial.
+     * a later approval never overrides a denial.
      *
      * @internal The evidence a gated tool requires before it runs. `$runId`: the run asking.
      */
@@ -1977,10 +1811,10 @@ class Thread extends Model implements ThreadContract
         if ($this->pausedStepRepeatsCallIds()) {
             return 0;
         }
-        $approved = array_diff_key(array_filter(self::decisionsIn($paused['results'])), self::markedApprovals($paused['results']));
         // Each approved request's OWN call, and a result of its own
         // (round 13): a same-id sibling's result finishes nothing.
         $step = self::pairedStep($paused['assistant'], $paused['results']);
+        $approved = array_diff_key(array_filter(self::decisionsOf($step)), self::markedApprovals($paused['results']));
         $count = 0;
         foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
             $call = $at === null ? null : ($step['calls'][$at] ?? null);
@@ -2024,7 +1858,12 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * Every recorded decision, by approval id: true when approved (G-360).
+     * The decision that STANDS for every decided approval, by approval id:
+     * true when it is an approval (G-360; G-401; round 16). Read by the ONE
+     * rule ({@see StepRows::standing()}) over the rows of the step that first
+     * asked for each: a decision recorded after the call started, ran or was
+     * answered never counts. An approval no step asked for reads as before: a
+     * denial over an approval.
      *
      * @internal
      *
@@ -2032,11 +1871,30 @@ class Thread extends Model implements ThreadContract
      */
     public function approvalDecisions(): array
     {
+        return self::standingOf($this->view());
+    }
+
+    /**
+     * {@see self::approvalDecisions()} over a view.
+     *
+     * @return array<string, bool>
+     */
+    private static function standingOf(ThreadView $view): array
+    {
         $decided = [];
-        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_TOOL_RESULT)->reorder('position')->cursor() as $stored) {
-            foreach ($stored->payload['tool_approval_responses'] ?? [] as $response) {
-                if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                    // A denial is final (G-401).
+        foreach ($view->steps as $index) {
+            foreach (self::pairedStep($view->step($index), $view->ownedPayloads($index))['standing'] as $id => $response) {
+                if ($response !== null && $view->askerOf($id) === $index) {
+                    $decided[$id] = ($response['approved'] ?? false) === true;
+                }
+            }
+        }
+        foreach ($view->rows as $row) {
+            if ($row['type'] !== MessageMapper::TYPE_TOOL_RESULT) {
+                continue;
+            }
+            foreach (is_array($row['payload']['tool_approval_responses'] ?? null) ? $row['payload']['tool_approval_responses'] : [] as $response) {
+                if (is_array($response) && is_string($response['approval_id'] ?? null) && $view->askerOf($response['approval_id']) === null) {
                     $id = $response['approval_id'];
                     $decided[$id] = ($decided[$id] ?? true) && ($response['approved'] ?? false) === true;
                 }
@@ -2046,9 +1904,50 @@ class Thread extends Model implements ThreadContract
         return $decided;
     }
 
+    /**
+     * Whether each call of the step at `$position` of `$rows` has an outcome
+     * (G-387 round 16, the reader rule: a result answers the first call of
+     * its step that has none). Pure: the thread-rows corpus pins it.
+     *
+     * @internal
+     *
+     * @param  list<array{position: int, type: string, run_id?: ?string, harness?: bool, payload: array<array-key, mixed>}>  $rows
+     * @return list<bool>
+     */
+    public static function callOutcomesIn(array $rows, int $position): array
+    {
+        $view = ThreadView::of($rows);
+        $index = $view->at[$position] ?? null;
+        if ($index === null || ! StepRows::isStep($view->rows[$index]['type'], $view->rows[$index]['payload'])) {
+            return [];
+        }
+
+        return self::pairedStep($view->step($index), $view->ownedPayloads($index))['answered'];
+    }
+
+    /**
+     * What each approval reads over `$rows` (G-387 round 16): whether it is
+     * pending, and the decision that stands for it (null for none). Pure:
+     * the thread-rows corpus pins it.
+     *
+     * @internal
+     *
+     * @param  list<array{position: int, type: string, run_id?: ?string, harness?: bool, payload: array<array-key, mixed>}>  $rows
+     * @param  list<string>  $approvalIds
+     * @return list<array{approval_id: string, pending: bool, decision: bool|null}>
+     */
+    public static function approvalReadsIn(array $rows, array $approvalIds): array
+    {
+        $view = ThreadView::of($rows);
+        $pending = self::pendingOf($view);
+        $decided = self::standingOf($view);
+
+        return array_map(static fn (string $id): array => ['approval_id' => $id, 'pending' => in_array($id, $pending, true),
+            'decision' => $decided[$id] ?? null], $approvalIds);
+    }
+
     private function afterRecording(): self
     {
-
         $this->supersededRows = null;
         // The relation may already be loaded; without this a caller that reads
         // messages() after record() in the same request sees the stale set.

@@ -15,10 +15,16 @@ use RuntimeException;
  */
 final class SessionLocked extends RuntimeException
 {
+    /**
+     * The message names no session key (G-387 round 16): a tool that
+     * records on its own session can meet this error, and a tool's error
+     * text can reach the model. The key (participant, scope, agent) is the
+     * host's to log, never the model's to read.
+     */
     public static function forKey(string $key, int $waitSeconds): self
     {
         return new self(
-            "Timed out after {$waitSeconds}s waiting for the harness session lock [{$key}]. "
+            "Timed out after {$waitSeconds}s waiting for the harness session lock. "
             .'Another worker is advancing this session.'
         );
     }

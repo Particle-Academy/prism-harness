@@ -297,6 +297,9 @@ jobs:
           persist-credentials: false
       - name: tools/property-examples.sh must refuse what it claims to
         run: sh tools/property-examples.test.sh
+      # And the branch it tests (G-387 round 16): the default branch or release/*.
+      - name: tools/property-ref.sh must refuse what it claims to
+        run: sh tools/property-ref.test.sh
 
   release-notes:
     name: Release-notes check

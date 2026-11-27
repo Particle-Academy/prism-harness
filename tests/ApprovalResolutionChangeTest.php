@@ -66,10 +66,13 @@ it('records nothing more on later turns after a streamed call whose arguments co
     $fresh()->send('three');
 
     // The rows v0.26.7 records for the same turns: one per message, and no
-    // resolution recorded on a turn that resolved nothing.
-    $expected = $gate === 'gated'
-        ? ['user', 'assistant', 'tool_result', 'assistant', 'assistant', 'user', 'assistant', 'assistant', 'user', 'tool_result', 'assistant']
-        : ['user', 'assistant', 'tool_result', 'assistant', 'assistant', 'user', 'assistant', 'assistant', 'user', 'assistant'];
+    // resolution recorded on a turn that resolved nothing. Round 16: the
+    // rebuilt step core hands back (row 5) is no longer the paused one, and
+    // the replay gives its call, which has no stored outcome, one (G-387,
+    // item 3), so the request stays valid and the last turn has nothing
+    // left to resolve: the gated case no longer records the resolution
+    // v0.26.7 recorded for it.
+    $expected = ['user', 'assistant', 'tool_result', 'assistant', 'assistant', 'user', 'assistant', 'assistant', 'user', 'assistant'];
     expect($runs)->toBe(0)
         ->and($fresh()->thread()->storedMessages()->orderBy('position')->pluck('type')->all())->toBe($expected);
 })->with(['gated', 'ungated']);

@@ -12,7 +12,8 @@ final class SessionLockLost extends RuntimeException
 
     public static function forKey(string $key): self
     {
-        return new self("session_lock_lost: the harness run no longer owns the session lock [{$key}].");
+        // No session key in the text (G-387 round 16): it can reach a model.
+        return new self('session_lock_lost: the harness run no longer owns the session lock.');
     }
 
     /** @internal A rejected atomic write must not enter ordinary failure cleanup. */

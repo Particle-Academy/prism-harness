@@ -271,7 +271,7 @@ it('never lists an approval as pending once its call has an outcome, and refuses
 // 3. Ungated calls, the replay of a call with no outcome, and a nested park.
 // ---------------------------------------------------------------------------
 
-it('never leaves an ungated call that ran without an outcome when its results write fails (T4)', function (): void {
+it('never leaves an ungated call that ran without an outcome when its results write fails (T4)', function (string $path): void {
     G360::calls([['echo', ['text' => 'hi'], 'call_echo'], ['weather', ['city' => 'Paris'], 'call_paris']]);
     // The write of the turn that holds the echo's result fails.
     ThreadMessage::creating(function (ThreadMessage $row): void {
@@ -281,7 +281,8 @@ it('never leaves an ungated call that ran without an outcome when its results wr
             }
         }
     });
-    $turn = r16Try(fn () => r16Session()->send('Echo hi and the weather.'));
+    $turn = r16Try(fn () => $path === 'send' ? r16Session()->send('Echo hi and the weather.')
+        : iterator_to_array(r16Session()->streamSteps('Echo hi and the weather.'), false));
     ThreadMessage::flushEventListeners();
 
     G360::text('Next.');
@@ -298,6 +299,25 @@ it('never leaves an ungated call that ran without an outcome when its results wr
     expect($turn)->not->toBe('recorded')
         ->and($this->echoed)->toBe(['hi'])
         ->and($told)->toContain(R16_INTERRUPTED)
+        ->and(r16RequestAnswersEveryCall())->toBeTrue();
+})->with(['send', 'streamSteps']);
+
+it('refuses a nested send by a tool on its session while its run holds it: no newer step parks (Py run20 F3, PHP)', function (): void {
+    config()->set('prism-harness.agent.lock_wait', 0);
+    $approval = r16Park();
+    $inner = null;
+    $this->during = function () use (&$inner): void {
+        $inner = r16Try(fn () => r16Session()->send('Inner.'));
+    };
+    G360::text('Done.');
+
+    r16Session()->decide([new ToolApprovalResponse($approval, true)]);
+
+    // PHP holds the session lock for the whole run, so a nested send is
+    // refused at once; the outer run completes with every call answered.
+    expect($inner)->toBe('locked')
+        ->and($this->ran)->toBe(['Paris'])
+        ->and(r16Outcomes())->toBe(['call_paris' => ['Sunny in Paris']])
         ->and(r16RequestAnswersEveryCall())->toBeTrue();
 });
 
@@ -320,7 +340,8 @@ it('gives every call of a step no longer paused that has no outcome one in the r
         }
     }
     // The ungated call has no result of its own: it may have run.
-    expect($results)->toBe(['u1' => [R16_INTERRUPTED], 'c1' => ['Sunny in Rome']]);
+    ksort($results);
+    expect($results)->toBe(['c1' => ['Sunny in Rome'], 'u1' => [R16_INTERRUPTED]]);
 });
 
 it('stops a run before another model step once a newer step on its session waits on approval (a nested park)', function (): void {
@@ -540,9 +561,13 @@ function r16ResumeQueries(string $approval): array
         $all++;
         $sql = strtolower($query->sql);
         if (str_contains($sql, 'from "harness_thread_messages"') && str_starts_with($sql, 'select')
-            && ! str_contains($sql, '"position" >') && ! str_contains($sql, '"position" <') && ! str_contains($sql, '"position" =')
+            && ! str_contains($sql, '"position" >') && ! str_contains($sql, '"position" <') && ! str_contains($sql, '"position" =') && ! str_contains($sql, '"id" >')
             && ! str_contains($sql, 'limit') && ! str_contains($sql, 'count(') && ! str_contains($sql, 'max(')) {
             $whole++;
+            if (getenv('R16_TRACE')) {
+                fwrite(STDERR, $query->sql.' @ '.collect(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 40))->map(fn ($f) => basename($f['file'] ?? '').':'.($f['line'] ?? ''))->filter(fn ($l) => str_contains($l, 'src') || preg_match('/^(Thread|Session|AgentRuntime|Plans|StepCalls|ApprovedTools|ThreadReads|RunTrees)/', $l))->take(8)->implode(' < ').'
+');
+            }
         }
     });
     r16Session()->decide([new ToolApprovalResponse($approval, true)]);
@@ -562,7 +587,8 @@ it('resumes a long thread with a fixed number of store reads, whatever its lengt
         unset($GLOBALS['r16Participant']);
     }
 
-    expect($long['whole'])->toBeLessThanOrEqual(2)
+    // One read of the whole thread; after it, only the rows appended since.
+    expect($long['whole'])->toBeLessThanOrEqual(1)
         ->and($long['all'])->toBe($short['all'])
         ->and($this->ran)->toBe(['Paris']);
 });

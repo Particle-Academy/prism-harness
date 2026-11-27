@@ -130,6 +130,11 @@ function sgSnapshot(bool $childOnly = false): array
         }
         $out['thread '.$row->id] = (string) json_encode($row);
         foreach (DB::table('harness_thread_messages')->where('thread_id', $row->id)->orderBy('id')->get() as $message) {
+            // The parent turn's own write-ahead journal row for the tool call
+            // it is making (G-387 round 16), not anything a start wrote.
+            if (str_contains((string) $message->payload, '"harness_journal"')) {
+                continue;
+            }
             $out['row '.$message->id] = (string) json_encode($message);
         }
     }

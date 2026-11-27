@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Tools;
 
 use Closure;
+use Prism\Harness\Support\RunHooks;
 use Prism\Prism\Tool;
 use Prism\Prism\Tools\LaravelMcpTool;
 use Prism\Prism\ValueObjects\ToolError;
@@ -81,6 +82,11 @@ final class CancelGuardedTool extends Tool
         if (($this->cancelled)()) {
             return ToolRefusals::record($this->runId, $this->name(), self::REFUSAL);
         }
+
+        // The write-ahead journal row of an ungated call core runs inside a
+        // model step, whose step is not stored yet (G-387 round 16): until
+        // its result is durable, the thread says it ran, or may have.
+        RunHooks::beforeUngatedCall($this->runId, $this->name(), $args);
 
         return $this->inner->handle(...$args);
     }

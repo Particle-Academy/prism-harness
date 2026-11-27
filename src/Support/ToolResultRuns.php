@@ -41,6 +41,12 @@ use Prism\Prism\ValueObjects\ToolResult;
  * every result (same key, same occurrence) and decision an earlier run of it
  * already replayed; the first one stands where it was. A run left with
  * nothing is not replayed at all.
+ *
+ * THE DECISION THAT STOOD (G-387 round 16, item 10): each decision is
+ * replayed as the one that stood for its approval when its call was
+ * resolved ({@see StepRows::standing()}): a decision recorded after the call
+ * had its outcome never stood, and is not replayed, nor does it replace one
+ * that did.
  */
 class ToolResultRuns
 {
@@ -50,6 +56,7 @@ class ToolResultRuns
      */
     public static function fold(iterable $messages): Generator
     {
+        $messages = static::withStandingDecisions(is_array($messages) ? array_values($messages) : iterator_to_array($messages, false));
         /** @var list<ToolResultMessage> $run */
         $run = [];
         /** @var array<string, int> $replayed by result key, how many this segment replayed */
@@ -87,6 +94,58 @@ class ToolResultRuns
                 yield $merged;
             }
         }
+    }
+
+    /**
+     * `$messages` with every decision after a step the one that stood for its
+     * approval (round 16): a decision that never stood is left out.
+     *
+     * @param  list<Message>  $messages
+     * @return list<Message>
+     */
+    protected static function withStandingDecisions(array $messages): array
+    {
+        $n = count($messages);
+        for ($s = 0; $s < $n; $s++) {
+            $step = $messages[$s];
+            if (! $step instanceof AssistantMessage || $step->toolCalls === []) {
+                continue;
+            }
+            // Paired exactly as a stored step is ({@see ThreadView::pair()}).
+            $results = [];
+            $at = [];
+            for ($i = $s + 1; $i < $n && ! ($messages[$i] instanceof AssistantMessage && $messages[$i]->toolCalls !== []); $i++) {
+                if ($messages[$i] instanceof ToolResultMessage) {
+                    $at[] = $i;
+                    $results[] = MessageMapper::toArray($messages[$i]);
+                }
+            }
+            $standing = ThreadView::pair(MessageMapper::toArray($step), $results)['standing'];
+            if ($standing === []) {
+                continue;
+            }
+            foreach ($at as $i) {
+                $message = $messages[$i];
+                if (! $message instanceof ToolResultMessage) {
+                    continue;
+                }
+                $decisions = [];
+                foreach ($message->toolApprovalResponses as $response) {
+                    if (! array_key_exists($response->approvalId, $standing)) {
+                        $decisions[] = $response;
+                    } elseif ($standing[$response->approvalId] !== null) {
+                        $stood = $standing[$response->approvalId];
+                        $decisions[] = new ToolApprovalResponse($stood['approval_id'], ($stood['approved'] ?? false) === true,
+                            is_string($stood['reason'] ?? null) ? $stood['reason'] : null);
+                    }
+                }
+                if ($decisions !== $message->toolApprovalResponses) {
+                    $messages[$i] = new ToolResultMessage($message->toolResults, $decisions);
+                }
+            }
+        }
+
+        return $messages;
     }
 
     /**

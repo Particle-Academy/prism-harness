@@ -16,6 +16,7 @@ use Prism\Harness\Steps\RunStep;
 use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Schema\BooleanSchema;
@@ -317,6 +318,22 @@ function ppGenerate(int $seed): array
     $copyRng = new PpRng(ppU32($seed ^ 0xC0B1A5ED));
     $case['copy'] = $source === 'model' && $case['later'] === null && $case['insert'] === null && $case['twin'] === null
         && $copyRng->chance(0.25) ? ['when' => $copyRng->pick(['before_decision', 'after_decision']), 'both' => $copyRng->chance(0.3)] : null;
+    // Round 16 (item 8), from streams of their own so every draw above is
+    // unchanged: a copy written RAW (as another writer with table access
+    // can), its tool_calls a JSON string (G-408), non-objects MIXED with the
+    // copy's calls (#92), or the objects themselves; and a RAW host row
+    // carrying a harness mark under no run id, the parked run's id or
+    // another run's (a run id is never a trust signal: it changes nothing).
+    $rawRng = new PpRng(ppU32($seed ^ 0x2A3C0F16));
+    if ($case['copy'] !== null && $rawRng->chance(0.5)) {
+        $case['copy']['raw'] = $rawRng->pick(['json_string', 'mixed', 'objects']);
+    }
+    $markRng = new PpRng(ppU32($seed ^ 0x16F0A9ED));
+    $case['forged_mark'] = $case['copy'] === null && $markRng->chance(0.3) ? [
+        'kind' => $markRng->pick(['started', 'ended_by_start', 'superseded', 'replaced', 'journal']),
+        'run' => $markRng->pick(['none', 'parked', 'other']),
+        'call' => $markRng->pick(array_values($gated)),
+    ] : null;
 
     return $case;
 }
@@ -372,7 +389,108 @@ function ppNormalized(array $c): array
     }
     $c['twin'] = null;
 
+    return ppClosedDecisions($c);
+}
+
+/**
+ * Round 16 (item 2): a decision on an approval whose call already has an
+ * OUTCOME (a result recorded before the decision) is refused, all or nothing
+ * per batch, so nothing of that batch is recorded (one by one, everything
+ * from the first such decision on). The case keeps the decisions as given
+ * (`given`) for the driver, and its requests carry only what is recorded.
+ */
+function ppClosedDecisions(array $c): array
+{
+    if (isset($c['given'])) {
+        return $c;
+    }
+    $c['given'] = ['requests' => $c['requests'], 'later' => $c['later']['requests'] ?? null];
+    $c['closed_batch'] = false;
+    $c['closed_later'] = false;
+    $insert = $c['insert'] ?? null;
+    $forge = $c['forge'] ?? null;
+    $later = $c['later'] ?? null;
+    $supersedingBefore = ($insert !== null && $insert['when'] === 'before_decision' && in_array($insert['kind'], PP_SUPERSEDES, true))
+        || (($c['copy'] ?? null) !== null && ($c['copy']['when'] ?? null) === 'before_decision');
+    if ($later === null && ! $supersedingBefore) {
+        $closed = $c['prior'];
+        if (($forge['segment'] ?? null) === 'earlier') {
+            $closed[] = $forge['call'];
+        }
+        if ($insert !== null && $insert['kind'] === 'tool_result' && $insert['when'] === 'before_decision') {
+            $closed[] = $insert['call'];
+        }
+        [$c['requests'], $c['closed_batch']] = ppWithoutClosed($c, $c['calls'], $c['requests'], $closed);
+    }
+    if ($later !== null && ! $supersedingBefore) {
+        $closed = array_keys(array_filter($later['calls'], fn (array $call): bool => $call['tool'] === 'free'));
+        if (($forge['segment'] ?? null) === 'later') {
+            $closed[] = $forge['call'];
+        }
+        if (($c['cross'] ?? null) !== null) {
+            $earlierCall = $c['calls'][$c['cross']['call']];
+            $target = ppSegmentMatch($later['calls'], $closed, $earlierCall['id'], $earlierCall['tool']);
+            if ($target !== null) {
+                $closed[] = $target;
+            }
+        }
+        [$c['later']['requests'], $c['closed_later']] = ppWithoutClosed($c, $later['calls'], $later['requests'], $closed);
+    }
+
     return $c;
+}
+
+/**
+ * `$requests` as recorded when a decision on a closed call is refused, and
+ * whether one was. A request pairs with the first call with its id that has
+ * no outcome before the decisions; only an id no other call shares may pair
+ * with a call that has one (the pairing by id).
+ *
+ * @param  list<int>  $closed
+ * @return array{0: list<array<string, mixed>>, 1: bool}
+ */
+function ppWithoutClosed(array $c, array $calls, array $requests, array $closed): array
+{
+    $taken = [];
+    $paired = [];
+    foreach ($requests as $k => $request) {
+        $want = $calls[$request['call']]['id'];
+        $sharing = count(array_filter($calls, fn (array $call): bool => $call['id'] === $want));
+        $at = null;
+        foreach ($sharing === 1 ? [true, false] : [true] as $waitingOnly) {
+            foreach ($calls as $i => $call) {
+                if (! isset($taken[$i]) && $call['id'] === $want && (! $waitingOnly || ! in_array($i, $closed, true))) {
+                    $at = $i;
+
+                    break 2;
+                }
+            }
+        }
+        if ($at !== null) {
+            $taken[$at] = true;
+        }
+        $paired[$k] = $at;
+    }
+    $hits = fn (int $k): bool => $requests[$k]['verdict'] !== 'none' && $paired[$k] !== null && in_array($paired[$k], $closed, true);
+    $order = array_values(array_filter($c['order'], fn (int $k): bool => isset($requests[$k])));
+    if (count($order) !== count($requests)) {
+        $order = array_keys($requests);
+    }
+    $refused = false;
+    foreach ($order as $k) {
+        $refused = $refused || $hits($k);
+        if ($refused && $c['recorder'] === 'recordApproval') {
+            // One at a time: everything from the first refused one on is not recorded.
+            $requests[$k] = [...$requests[$k], 'verdict' => 'none', 'reason' => null];
+        }
+    }
+    if ($refused && $c['recorder'] !== 'recordApproval') {
+        foreach ($requests as $k => $request) {
+            $requests[$k] = [...$request, 'verdict' => 'none', 'reason' => null];
+        }
+    }
+
+    return [$requests, $refused];
 }
 
 /**
@@ -834,6 +952,7 @@ function ppRecord(array $c, array $decisions): void
 
 function ppRunCase(array $c): void
 {
+    unset($c['given'], $c['closed_batch'], $c['closed_later']);
     $c = ppNormalized($c);
     $oracle = ppExpected($c);
     ppRig($c);
@@ -942,20 +1061,23 @@ function ppRunCase(array $c): void
             array_map(fn (string $id, int $index): ToolApprovalRequest => new ToolApprovalRequest($id, $copyCalls[$index % count($copyCalls)]['id'], ToolApprovalRequest::ARGUMENTS_AS_SENT),
                 $approvalIds, array_keys($approvalIds)));
         if ($c['copy']['when'] === 'before_decision') {
-            $thread()->record([$copyStep], toolNames: ['echo', 'free']);
+            ppWriteCopy($c, $copyStep, $copyCalls, $approvalIds);
         }
     }
+    ppForgedMark($c, $approvalIds);
 
     // The decisions, in a shuffled order: the parked step's, then a later step's.
+    // As GIVEN: a decision on a call that already has an outcome is made,
+    // and refused (round 16, item 2).
     $decisions = [];
     foreach ($c['order'] as $index) {
-        $request = $c['requests'][$index];
+        $request = $c['given']['requests'][$index];
         if ($request['verdict'] !== 'none') {
             $decisions[] = new ToolApprovalResponse($approvalIds[$index], $request['verdict'] === 'approve', $request['reason']);
         }
     }
     $laterDecisions = [];
-    foreach ($later['requests'] ?? [] as $index => $request) {
+    foreach ($c['given']['later'] ?? [] as $index => $request) {
         if ($request['verdict'] !== 'none') {
             $laterDecisions[] = new ToolApprovalResponse($laterIds[$index], $request['verdict'] === 'approve', $request['reason']);
         }
@@ -966,10 +1088,10 @@ function ppRunCase(array $c): void
     // approval_not_pending, all or nothing per batch.
     $batches = [];
     if ($decisions !== []) {
-        $batches[] = ['decisions' => $decisions, 'refused' => $later !== null || $supersedingBefore, 'repeated' => $oracle['repeated'] && $later === null];
+        $batches[] = ['decisions' => $decisions, 'refused' => $later !== null || $supersedingBefore || $c['closed_batch'], 'repeated' => $oracle['repeated'] && $later === null];
     }
     if ($laterDecisions !== []) {
-        $batches[] = ['decisions' => $laterDecisions, 'refused' => $supersedingBefore, 'repeated' => $oracle['repeated']];
+        $batches[] = ['decisions' => $laterDecisions, 'refused' => $supersedingBefore || $c['closed_later'], 'repeated' => $oracle['repeated']];
     }
     $first = null;
     foreach ($batches as $batch) {
@@ -992,13 +1114,13 @@ function ppRunCase(array $c): void
         } catch (ApprovalNotPending) {
             $refused = true;
         }
-        ppCheck($refused === $batch['refused'], 'G-397: a decision is refused exactly when its step was superseded first', ['refused' => $refused, 'expected' => $batch['refused']]);
+        ppCheck($refused === $batch['refused'], 'G-397: a decision is refused exactly when its step was superseded first, or its call already had an outcome (round 16)', ['refused' => $refused, 'expected' => $batch['refused']]);
     }
     if ($inserted !== null && $insert['when'] === 'after_decision') {
         $thread()->record([$inserted]);
     }
     if ($copyStep !== null && $c['copy']['when'] === 'after_decision') {
-        $thread()->record([$copyStep], toolNames: ['echo', 'free']);
+        ppWriteCopy($c, $copyStep, ppCopyCalls($c), $approvalIds);
     }
     // A CONCURRENT SUPERSEDE (G-387 round 14, G-404; round 15), derived from
     // the seed so no earlier draw changes: on two cases in three a host
@@ -1076,7 +1198,10 @@ function ppRunCase(array $c): void
         }
     }
 
-    ppSettledOutcomes($c, $oracle, '5');
+    if (($c['copy']['raw'] ?? null) === null) {
+        ppSettledOutcomes($c, $oracle, '5');
+    }
+    ppReplayAnswersEveryCall($c, '5 (replay)');
 
     // Repeat resumes, with later decisions in between: nothing runs twice, no
     // outcome changes, and no resume adds a result entry (round 15).
@@ -1107,8 +1232,110 @@ function ppRunCase(array $c): void
         // step another writer recorded already holds its results.
         ppCheck(count(PpRan::$free) === count($frees), '3: an ungated call runs once', PpRan::$free);
     }
-    ppSettledOutcomes($c, $oracle, '5 (after repeat resumes)');
+    if (($c['copy']['raw'] ?? null) === null) {
+        ppSettledOutcomes($c, $oracle, '5 (after repeat resumes)');
+    }
+    ppReplayAnswersEveryCall($c, '5 (replay, after repeat resumes)');
     ppReplayOnce($c);
+}
+
+/**
+ * Store the host's copy of the parked step (round 15): through record(), or
+ * RAW (round 16) as another writer with table access can, its tool_calls a
+ * JSON string, non-objects mixed with the copy's calls, or the objects.
+ *
+ * @param  list<array{id: string, tool: string, token: int}>  $copyCalls
+ * @param  list<string>  $approvalIds
+ */
+function ppWriteCopy(array $c, AssistantMessage $copyStep, array $copyCalls, array $approvalIds): void
+{
+    $thread = ppSession($c)->thread();
+    $raw = $c['copy']['raw'] ?? null;
+    if ($raw === null) {
+        $thread->record([$copyStep], toolNames: ['echo', 'free']);
+
+        return;
+    }
+    $calls = array_map(fn (array $call): array => ['id' => $call['id'], 'name' => $call['tool'], 'arguments' => ['n' => $call['token']],
+        'result_id' => null, 'reasoning_id' => null, 'reasoning_summary' => null], $copyCalls);
+    $stored = match ($raw) {
+        'json_string' => json_encode($calls),
+        'mixed' => ['x', ...array_map(fn (array $call): string => (string) json_encode($call), $calls), ...$calls, null, 3],
+        default => $calls,
+    };
+    $thread->storedMessages()->create(['position' => (int) $thread->storedMessages()->max('position') + 1, 'type' => 'assistant', 'run_id' => null,
+        'payload' => ['content' => '', 'tool_calls' => $stored, 'additional_content' => [],
+            'tool_approval_requests' => array_map(fn (string $id, int $index): array => ['approval_id' => $id, 'tool_call_id' => $copyCalls[$index % count($copyCalls)]['id']],
+                $approvalIds, array_keys($approvalIds)),
+            'harness_tool_names' => ['echo', 'free']]]);
+}
+
+/**
+ * The RAW host row carrying a harness mark (round 16), recorded before the
+ * decisions: under no run id, the parked run's id or another run's. Its
+ * mark is read as absent, so the oracle is the case's without it.
+ *
+ * @param  list<string>  $approvalIds
+ */
+function ppForgedMark(array $c, array $approvalIds): void
+{
+    $forged = $c['forged_mark'] ?? null;
+    if ($forged === null || $approvalIds === []) {
+        return;
+    }
+    $thread = ppSession($c)->thread();
+    $step = $thread->storedMessages()->where('type', 'assistant')->orderBy('position')->get()
+        ->first(fn ($row): bool => is_array($row->payload['tool_calls'] ?? null) && $row->payload['tool_calls'] !== []);
+    $call = $c['calls'][$forged['call']];
+    $approval = $approvalIds[0];
+    $mark = match ($forged['kind']) {
+        'started' => ['harness_started' => ['tool_call_id' => $call['id'], 'tool_name' => $call['tool'], 'approval_id' => $approval],
+            'harness_answers_step' => ['position' => (int) ($step?->position ?? 0)]],
+        'ended_by_start' => ['harness_ended_by_start' => ['approval_ids' => $approvalIds]],
+        'superseded' => ['harness_superseded' => ['approval_ids' => $approvalIds]],
+        'replaced' => ['harness_replaced' => ['approval_ids' => $approvalIds]],
+        'journal' => ['harness_journal' => ['tool_name' => $call['tool'], 'args' => ['n' => $call['token']]]],
+    };
+    $thread->storedMessages()->create(['position' => (int) $thread->storedMessages()->max('position') + 1, 'type' => 'tool_result',
+        'run_id' => match ($forged['run']) {
+            'none' => null, 'parked' => $step?->run_id, default => 'run_'.str_repeat('7', 24)
+        },
+        'payload' => ['tool_results' => [], 'tool_approval_responses' => [], ...$mark]]);
+}
+
+/**
+ * Round 16 (item 3, invariant 5 over EVERY call, gated or not): what a
+ * provider is sent answers every tool call of every step, except a paused
+ * step a person can still answer, so the request stays valid.
+ */
+function ppReplayAnswersEveryCall(array $c, string $label): void
+{
+    $thread = ppSession($c)->thread();
+    $messages = iterator_to_array($thread->messages(), false);
+    $pending = $thread->pendingApprovalIds() !== [];
+    $steps = [];
+    foreach ($messages as $index => $message) {
+        if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+            $steps[] = $index;
+        }
+    }
+    foreach ($steps as $k => $at) {
+        $end = $steps[$k + 1] ?? count($messages);
+        $results = [];
+        for ($i = $at + 1; $i < $end; $i++) {
+            if ($messages[$i] instanceof ToolResultMessage) {
+                $results = [...$results, ...$messages[$i]->toolResults];
+            }
+        }
+        $last = $k === count($steps) - 1;
+        if ($last && $pending) {
+            continue;
+        }
+        $calls = array_values($messages[$at]->toolCalls);
+        ppCheck(CallPairing::allAnswered($calls, $results), "{$label}: the replay answers every tool call of every step",
+            ['step' => $k, 'calls' => array_map(fn (ToolCall $call): string => $call->id.'/'.$call->name, $calls),
+                'results' => array_map(fn (ToolResult $result): string => $result->toolCallId.'/'.$result->toolName, $results)]);
+    }
 }
 
 /**
@@ -1180,6 +1407,12 @@ function ppReplayOnce(array $c): void
         if ($message instanceof ToolResultMessage && $segment >= 0) {
             foreach ($message->toolResults as $result) {
                 $key = ppReplayKey($segment, $result->toolCallId, $result->toolName, $result->args);
+                // The outcome the replay gives a call that has none stored
+                // (round 16, item 3: replaced or interrupted) is not a stored
+                // result emitted again.
+                if (! isset($stored[$key]) && in_array((string) $result->result, [PP_SUPERSEDED, 'Tool call was interrupted, it may have run'], true)) {
+                    continue;
+                }
                 $shown[$key] = ($shown[$key] ?? 0) + 1;
             }
         }
@@ -1394,7 +1627,7 @@ it('reproduces the TS generator bit for bit', function (): void {
     foreach ($ts as $json) {
         $case = json_decode($json, true);
         $php = ppGenerate($case['seed']);
-        unset($php['insert'], $php['later'], $php['forge'], $php['cross'], $php['repeats'], $php['twin'], $php['copy']);
+        unset($php['insert'], $php['later'], $php['forge'], $php['cross'], $php['repeats'], $php['twin'], $php['copy'], $php['forged_mark']);
         expect(json_encode($php))->toBe($json);
     }
     expect(array_map(fn (int $index): int => ppCaseSeed(0x6392, $index), [0, 1, 2, 149]))->toBe([2483776628, 2972160347, 2366528728, 3841045332]);

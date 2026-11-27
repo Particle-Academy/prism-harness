@@ -31,11 +31,13 @@ use Prism\Harness\Tools\CanonicalJson;
  * landed. A mark on any other row, or naming anything else, changes nothing:
  * segment ownership applies, which fails closed.
  *
- * A row is the harness's own when its run id is set: the only rows that can
- * carry either mark are written by the runtime under its private token (a
- * public record() maps typed messages, and no message maps to these keys).
- * A row passed in with an explicit `harness` flag (the cross-language
- * corpora) is read by that flag instead.
+ * ONE TRUST SIGNAL (round 16): a row is the harness's own only when the
+ * RUNTIME wrote it, under its private single-use token: the `harness_written`
+ * column of a stored row (no public write can set it: it is not
+ * mass-assignable and Thread::record() never sets it), the `harness` flag of
+ * a corpus row. A run id is NEVER a trust signal. Every mark (see
+ * {@see self::MARKS}) on any other row is read as ABSENT, by every reader: a
+ * forged mark is exactly as if it were not there.
  *
  * @internal
  */
@@ -52,6 +54,23 @@ final class StepRows
 
     /** What a started call that never got a result reads as (never "not run"). */
     public const INTERRUPTED_RESULT = 'Tool call was interrupted, it may have run';
+
+    /**
+     * The write-ahead journal row (round 16, PHP only): recorded before an
+     * UNGATED call runs inside a model step, whose step is not stored yet,
+     * naming the call's tool and arguments; removed by the write that stores
+     * the call's result. One still standing is a call that ran, or may have,
+     * with no stored outcome: the replay answers it as interrupted.
+     */
+    public const JOURNAL = 'harness_journal';
+
+    /**
+     * Every key only the harness writes on a row: honoured only on a row the
+     * runtime wrote ({@see self::isHarnessRow()}), read as absent on any
+     * other. `harness_call` is a request's binding, inside each request.
+     */
+    public const MARKS = [self::ANSWERS_STEP, self::STARTED, self::JOURNAL, 'harness_ended_by_start', 'harness_superseded',
+        'harness_replaced', 'harness_steps_used', 'harness_steps_left'];
 
     /**
      * The calls of an assistant row: the OBJECT entries of its `tool_calls`
@@ -119,7 +138,8 @@ final class StepRows
     /**
      * Whether a request may decide this call: its binding names the call's
      * tool and the digest of its arguments. A request stored before bindings
-     * were kept has none, and binds to its own step's call, paired by position
+     * were kept has none (and a binding on a row the runtime did not write is
+     * read as absent), and binds to its own step's call, paired by position
      * (the documented upgrade: the request is its FIRST asker's, so that call
      * is the one the person was shown).
      *
@@ -186,11 +206,7 @@ final class StepRows
      */
     public static function isHarnessRow(array $row): bool
     {
-        if (array_key_exists('harness', $row)) {
-            return $row['harness'] === true;
-        }
-
-        return is_string($row['run_id'] ?? null) && $row['run_id'] !== '';
+        return ($row['harness'] ?? false) === true;
     }
 
     /**
@@ -203,8 +219,18 @@ final class StepRows
     public static function honouredPayload(array $row): array
     {
         $payload = $row['payload'];
-        if (! self::isHarnessRow($row)) {
-            unset($payload[self::ANSWERS_STEP], $payload[self::STARTED]);
+        if (self::isHarnessRow($row)) {
+            return $payload;
+        }
+        foreach (self::MARKS as $mark) {
+            unset($payload[$mark]);
+        }
+        if (is_array($payload['tool_approval_requests'] ?? null)) {
+            foreach ($payload['tool_approval_requests'] as $k => $request) {
+                if (is_array($request)) {
+                    unset($payload['tool_approval_requests'][$k][self::CALL_BINDING]);
+                }
+            }
         }
 
         return $payload;
@@ -311,6 +337,91 @@ final class StepRows
         }
 
         return $owners;
+    }
+
+    /**
+     * The decision that STANDS for each approval decided in one step's rows
+     * (G-387 round 16, items 1 and 10; G-401's recommended option), by ONE
+     * rule every reader, the start gate and the replay use:
+     *
+     *  - a decision COUNTS only while its call has no outcome: no result and
+     *    no started row among the step's rows BEFORE the row that carries it
+     *    (a decision in the same row as the call's result counts). One
+     *    recorded after the call started, ran or was answered never counts,
+     *    whoever wrote it;
+     *  - of the decisions that count, a DENIAL stands over an approval,
+     *    before or after it; else the first approval stands;
+     *  - an approval no request of the step pairs with a call counts always.
+     *
+     * Each decided id maps to the standing decision as stored, or to null
+     * when decisions were recorded for it and none counted (the call's
+     * outcome came first; nothing a person decided stood for it).
+     *
+     * @param  list<array{0: string, 1: string, 2?: ?string}>  $calls  the step's calls ({@see CallPairing::ofStored()})
+     * @param  array<string, int|null>  $pairs  approval id => the index of the call its request was issued for
+     * @param  list<array{results: list<array{0: string, 1: string, 2?: ?string}>, started: list<array{0: string, 1: string}>, responses: list<mixed>}>  $rows  oldest first
+     * @return array<string, array<array-key, mixed>|null>
+     */
+    public static function standing(array $calls, array $pairs, array $rows): array
+    {
+        $standing = [];
+        $seen = [];
+        $resultRows = [];
+        $started = [];
+        foreach ($rows as $row) {
+            $answered = self::outcomes($calls, $resultRows, $started);
+            foreach ($row['responses'] as $response) {
+                if (! is_array($response) || ! is_string($response['approval_id'] ?? null)) {
+                    continue;
+                }
+                $id = $response['approval_id'];
+                $seen[$id] = true;
+                $at = $pairs[$id] ?? null;
+                if ($at !== null && ($answered[$at] ?? false)) {
+                    continue;
+                }
+                $current = $standing[$id] ?? null;
+                if ($current === null || (($current['approved'] ?? false) === true && ($response['approved'] ?? false) !== true)) {
+                    $standing[$id] = $response;
+                }
+            }
+            if ($row['results'] !== []) {
+                $resultRows[] = $row['results'];
+            }
+            foreach ($row['started'] as $call) {
+                $started[] = $call;
+            }
+        }
+        foreach (array_keys($seen) as $id) {
+            $standing[$id] ??= null;
+        }
+
+        return $standing;
+    }
+
+    /**
+     * Which calls have an outcome: a result of their own, or a started row
+     * (the first such call with no outcome of its id and tool).
+     *
+     * @param  list<array{0: string, 1: string, 2?: ?string}>  $calls
+     * @param  list<list<array{0: string, 1: string, 2?: ?string}>>  $resultRows
+     * @param  list<array{0: string, 1: string}>  $started
+     * @return list<bool>
+     */
+    public static function outcomes(array $calls, array $resultRows, array $started): array
+    {
+        $answered = CallPairing::answered($calls, $resultRows);
+        foreach ($started as [$id, $name]) {
+            foreach ($calls as $i => $call) {
+                if (! $answered[$i] && $call[0] === $id && $call[1] === $name) {
+                    $answered[$i] = true;
+
+                    break;
+                }
+            }
+        }
+
+        return $answered;
     }
 
     private static function key(mixed $id, mixed $name): string
