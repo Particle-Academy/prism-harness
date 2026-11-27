@@ -54,6 +54,7 @@ use Prism\Harness\Subagents\RunStarts;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\ClassLabel;
 use Prism\Harness\Support\RunSettles;
 use Prism\Harness\Support\TurnAttachments;
@@ -278,36 +279,59 @@ final readonly class AgentRuntime
                         throw new \LogicException('A runner start begins only through the start gate.');
                     }
                     [$undo, $delegation] = $this->commitRunnerStart($session, $membership, $facts, $child, $start, $runId);
+                    // From here until its run ends, the start's own run reads
+                    // what (b) committed on this Session object (G-387); every
+                    // other reader keeps the provisional rule. Only a view
+                    // this runtime entered confirms anything.
+                    $this->enteredStarts[$session->enterStart($runId)] = true;
                     // Whatever ends this run settles the start first (G-387).
-                    $this->startSettles->put($runId, function () use (&$undo, $session, $runId): void {
+                    // Registered after the view is entered, and settled by
+                    // the catch below too, so nothing between commit (b) and
+                    // the run can leave it unsettled.
+                    $this->startSettles->put($runId, function (bool $failed) use (&$undo, $session, $runId): void {
                         // The start's own view ends first: what follows
                         // reads the child as every other reader does.
                         $session->leaveStart();
+                        $pending = $undo;
+                        $undo = null;
+                        // The success path NEVER undoes a start (round 13):
+                        // it completed, so its task row is recorded and the
+                        // delegation stands. Nor does a failure once this
+                        // runtime wrote the task row, which it knows in
+                        // memory, before any store read.
+                        if ($pending === null || ! $failed || $this->startSettles->recorded($runId)) {
+                            return;
+                        }
                         // A runner start that failed before its task row was
                         // recorded never happened. Its records are
                         // provisional, and with no task row every reader
                         // already sees them as absent; putting the child's
                         // records, its count and the thread link back, and
                         // returning the tree hold, is housekeeping, and its
-                        // failure changes nothing. Once the task row is
-                        // recorded, the delegation happened and stands.
-                        if ($undo !== null && ! $this->taskRecorded($session, $runId)) {
-                            $pending = $undo;
-                            $undo = null;
-                            try {
-                                $pending();
-                            } catch (Throwable $undoFailure) {
-                                report(new RuntimeException('A subagent start could not be undone: '.ClassLabel::of($undoFailure).'.'));
-                            }
+                        // failure changes nothing. A store read that cannot
+                        // say whether a row was recorded undoes nothing: the
+                        // records stay unconfirmed, and read as absent.
+                        try {
+                            $recorded = Thread::existingAt($session->address())?->storedMessages()->where('run_id', $runId)->exists() ?? false;
+                        } catch (Throwable $unknown) {
+                            report(new RuntimeException('A subagent start could not be checked: '.ClassLabel::of($unknown).'.'));
+
+                            return;
+                        }
+                        if ($recorded) {
+                            return;
+                        }
+                        try {
+                            $pending();
+                        } catch (Throwable $undoFailure) {
+                            report(new RuntimeException('A subagent start could not be undone: '.ClassLabel::of($undoFailure).'.'));
                         }
                     });
-                    // From here until its run ends, the start's own run reads
-                    // what (b) committed on this Session object (G-387); every
-                    // other reader keeps the provisional rule. Only a view
-                    // this runtime entered confirms anything.
-                    $this->enteredStarts[$session->enterStart($runId)] = true;
                 }
             } catch (Throwable $failure) {
+                // A start committed before this threw never ran: settled as
+                // failed (its view ended, and undone) before RunFailed.
+                $this->settleStart($runId);
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
                 // run the session never started trips its own state guard —
                 // which then throws OVER the configuration error that actually
@@ -376,7 +400,9 @@ final readonly class AgentRuntime
 
                 throw $failure;
             } finally {
-                $this->settleStart($runId);
+                // Every failure exit settled the start above; what is left
+                // here is the success path, which keeps it (round 13).
+                $this->settleStart($runId, failed: false);
                 $session->leaveStart();
             }
         }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
@@ -430,24 +456,34 @@ final readonly class AgentRuntime
         if ($index === null) {
             return null;
         }
-        $answered = [];
-        for ($i = $index + 1, $n = count($history); $i < $n; $i++) {
-            if ($history[$i] instanceof ToolResultMessage) {
-                foreach ($history[$i]->toolResults as $result) {
-                    $answered[$result->toolCallId] = true;
-                }
-            }
-        }
-        $ended = [];
-        $approvals = [];
         /** @var AssistantMessage $assistant */
         $assistant = $history[$index];
-        foreach ($assistant->toolCalls as $call) {
-            if (isset($answered[$call->id])) {
+        // By POSITION, never by call id (round 13): a call is answered only
+        // by a result of its own, and a request names only its own call, so
+        // a gated call that shares its id with an ungated one that ran is
+        // still ended here, under its own approval.
+        $calls = CallPairing::ofCalls($assistant->toolCalls);
+        $rows = [];
+        $ran = null;
+        for ($i = $index + 1, $n = count($history); $i < $n; $i++) {
+            if ($history[$i] instanceof ToolResultMessage) {
+                if ($ran === null && $history[$i]->toolApprovalResponses !== []) {
+                    $ran = CallPairing::answered($calls, $rows);
+                }
+                $rows[] = CallPairing::ofResults($history[$i]->toolResults);
+            }
+        }
+        $answered = CallPairing::answered($calls, $rows);
+        $requests = array_values($assistant->toolApprovalRequests);
+        $paired = CallPairing::requests($calls, array_map(static fn ($request): string => $request->toolCallId, $requests), $ran ?? $answered);
+        $ended = [];
+        $approvals = [];
+        foreach (array_values($assistant->toolCalls) as $at => $call) {
+            if ($answered[$at]) {
                 continue;
             }
-            foreach ($assistant->toolApprovalRequests as $request) {
-                if ($request->toolCallId === $call->id) {
+            foreach ($requests as $k => $request) {
+                if ($paired[$k] === $at) {
                     $approvals[] = $request->approvalId;
                 }
             }
@@ -466,12 +502,16 @@ final readonly class AgentRuntime
         return ['message' => new ToolResultMessage($ended), 'approvals' => array_values(array_unique($approvals))];
     }
 
-    /** Settle the runner start `$runId` is, if it is one and was not settled yet (G-387). */
-    private function settleStart(string $runId): void
+    /**
+     * Settle the runner start `$runId` is, if it is one and was not settled
+     * yet (G-387). `$failed` is false only on the success path, which never
+     * undoes a start (round 13).
+     */
+    private function settleStart(string $runId, bool $failed = true): void
     {
         $settle = $this->startSettles->take($runId);
         if ($settle !== null) {
-            $settle();
+            $settle($failed);
         }
     }
 
@@ -647,7 +687,9 @@ final readonly class AgentRuntime
                 // calls the child was parked on are ended with its task row,
                 // never run, so a decision recorded before it (one a bare
                 // resume would refuse) is never acted on by a delegation.
-                $ended = $this->endedCalls($history);
+                // Read from the rows as stored, unfolded: a fold keys results
+                // by call id, which cannot tell same-id calls apart.
+                $ended = $this->endedCalls($session->thread()->storedHistory());
                 if ($ended !== null) {
                     $turn[] = $ended;
                 }
@@ -743,7 +785,7 @@ final readonly class AgentRuntime
             try {
                 if ($committedStart && $prompt !== '' && $failure instanceof RunNotPermitted
                     && ! $session->thread()->storedMessages()->where('run_id', $runId)->exists()) {
-                    $ended = $this->endedCalls(iterator_to_array($session->thread()->messages(), false));
+                    $ended = $this->endedCalls($session->thread()->storedHistory());
                     $this->recordTurn($session, [new UserMessage($prompt, $attachments), ...($ended === null ? [] : [$ended])], $runId, []);
                 }
             } catch (Throwable $unrecorded) {
@@ -2107,6 +2149,10 @@ final readonly class AgentRuntime
         $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
             app(RunTrees::class)->parkFacts($runId),
             array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended));
+        // A runner start's task row is written: known in memory from here,
+        // so nothing that settles the start needs a store read to keep it
+        // (round 13), not even after a listener below throws.
+        $this->startSettles->markRecorded($runId);
         // The calls a runner start ended are announced as denied only now
         // that the rows ending them are durable (G-387): a store failure on
         // that write announces nothing that was not recorded.
@@ -3076,18 +3122,6 @@ final readonly class AgentRuntime
             }
             $undo();
         };
-    }
-
-    /** Whether the run recorded any row on the session's thread: a runner start's task row first (G-387). */
-    private function taskRecorded(Session $session, string $runId): bool
-    {
-        try {
-            return Thread::existingAt($session->address())?->storedMessages()->where('run_id', $runId)->exists() ?? false;
-        } catch (Throwable) {
-            // Unknown: undone, which fails closed (a child without its
-            // binding is refused, never run on rules nobody chose for it).
-            return false;
-        }
     }
 
     /**

@@ -1141,13 +1141,22 @@ spends from. These reads are reads: a host tool provider may make them from the 
 tool-resolution view while a start is running. The child's binding, count, mode and thread link are also put back
 (each only if no later writer changed it) and the tree hold is returned, BEFORE the run is
 failed and `RunFailed` fires, so a `RunFailed` listener never sees a hold about to be released;
-but that is housekeeping, and its failure changes nothing. A start acts on no decision recorded on the
+but that is housekeeping, and its failure changes nothing. Only a start that failed before its
+task row is ever put back: a start that completed, or failed after this runtime wrote its task
+row, stands whatever a store read says while its run is cleaned up, and a read that cannot say
+whether the row was written puts nothing back. A start acts on no decision recorded on the
 child: the calls the child was parked on are ended with its task row, with a fixed result, and
 never run. Each one is announced as `ToolDenied` (decided by `policy`) only once that row is
 recorded, and `approvalStatus()` reads it as `superseded`, never `approved`. That reading is
 decided only by the harness's own mark on that row, which names the approvals it ended, and
-only for the result that follows the approval's own request: a tool's result text cannot end a
-call, and a tool-call id a provider reuses (some name ids by function) cannot end or un-end one. The mark is one shape in all three languages, pinned by the
+only on a result row after the approval's own request and before the next model step (any such
+row, not only the first carrying the call's id): a tool's result text cannot end a call, and a
+tool-call id a provider reuses (some name ids by function) cannot end or un-end one. Results
+and approval requests are matched to the calls of a step by position, never by a map keyed by
+call id: when two calls in one step share an id, the result of the one that ran is never read as
+the other's, so a gated call sharing its id with an ungated one still waits for its approval
+(every decision on such a step is recorded as a denial, and nothing gated in it runs) and a
+start still ends it. The mark is one shape in all three languages, pinned by the
 `harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
 `{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
