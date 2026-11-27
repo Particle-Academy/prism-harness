@@ -2102,7 +2102,8 @@ it('reads the start\'s own state inside its run, so a mode-gated host tool is ne
         ->and($tool[0]['binding'])->toBeTrue()
         ->and($tool[0]['ceiling'])->toBe(3)
         ->and($tool[0]['depth'])->toBe(1)
-        ->and($tool[0]['tree'])->toBeTrue()
+        // In the root's tree through the tool; a host-built context keeps what was saved (none).
+        ->and($tool[0]['tree'])->toBe($entry === 'tool')
         // Outside the start's run, its records are still provisional.
         ->and($tool[0]['outside mode'])->toBe($prior === 'chat' ? 'chat' : null)
         ->and($tool[0]['outside binding'])->toBeFalse()
@@ -2292,5 +2293,40 @@ it('keeps a start whose task row is recorded when a denial listener throws', fun
         ->and(sgFreshChild()->mode())->toBe('work')
         ->and(sgFreshChild()->approvalStatus($dead))->toBe('superseded')
         ->and(sgFreshChild()->thread()->storedMessages()->where('type', 'user')->where('payload', 'like', '%Start over%')->exists())->toBeTrue()
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// New channel (round 11): the start's own view is the runtime's, for a run
+// that is running. A host that names a failed start's run on a session of
+// its own confirms nothing: the dead approval stays dead.
+it('confirms nothing for a start view on a run that is not running', function (): void {
+    $dead = sgDeadChild();
+    $on = true;
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use (&$on): array {
+        if ($on && str_contains($session->key(), '::sub::worker')) {
+            sgFailChildUndo();
+
+            throw new RuntimeException('provider down');
+        }
+
+        return [];
+    }, name: 'outage');
+    expect(sgRedelegate('Start over'))->toContain('"outcome":"failed"');
+    $on = false;
+    sgUnfailChildUndo();
+    $provisional = sgRawChild()['child_binding']['provisional'] ?? null;
+    expect($provisional)->toBeString();
+
+    $forged = sgFreshChild();
+    $forged->enterStart((string) $provisional);
+    $code = 'accepted';
+    try {
+        $forged->approve($dead);
+    } catch (RunNotPermitted $e) {
+        $code = $e->code();
+    }
+    expect($forged->childBinding())->toBeNull()
+        ->and($forged->childStepCeiling())->toBeNull()
+        ->and($code)->toBe('child_binding_missing')
         ->and($this->ran['weather'])->toBe(0);
 });

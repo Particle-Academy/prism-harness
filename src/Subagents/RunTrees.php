@@ -10,6 +10,7 @@ use Prism\Harness\Contracts\SessionStore;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Plans\PlanBudget;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Support\ClassLabel;
 use RuntimeException;
 use Throwable;
 use WeakMap;
@@ -400,7 +401,7 @@ final class RunTrees
                 }, 10, 5);
             } catch (Throwable $failure) {
                 // The hold stays and is charged in full once it expires.
-                report(new RuntimeException('A run tree hold release failed: '.$failure::class.'.'));
+                report(new RuntimeException('A run tree hold release failed: '.ClassLabel::of($failure).'.'));
             }
         };
     }
@@ -475,7 +476,7 @@ final class RunTrees
                 ? [null, null] : [PlanBudget::settle($state, $runId, $steps, $cost), null]);
         } catch (Throwable $failure) {
             // The hold stays and is charged in full once it expires.
-            report(new RuntimeException('A run tree budget update failed: '.$failure::class.'.'));
+            report(new RuntimeException('A run tree budget update failed: '.ClassLabel::of($failure).'.'));
         }
     }
 
@@ -567,7 +568,7 @@ final class RunTrees
                     }
                 }, 10, 5);
             } catch (Throwable $failure) {
-                report(new RuntimeException('A subagent start could not be undone: '.$failure::class.'.'));
+                report(new RuntimeException('A subagent start could not be undone: '.ClassLabel::of($failure).'.'));
             }
         };
     }
@@ -662,7 +663,7 @@ final class RunTrees
             }, 10, 5);
         } catch (Throwable $failure) {
             // The hold stays and is charged in full once it expires.
-            report(new RuntimeException('A delegation count update failed: '.$failure::class.'.'));
+            report(new RuntimeException('A delegation count update failed: '.ClassLabel::of($failure).'.'));
         }
     }
 

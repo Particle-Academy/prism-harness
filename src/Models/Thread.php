@@ -456,7 +456,7 @@ class Thread extends Model implements ThreadContract
      * @param  iterable<Message>  $messages
      * @param  list<string>|null  $toolNames  the actual offer, stored only beside pending approvals
      * @param  array{harness_steps_used: int, harness_steps_left: int}|null  $parked  stored on the row a run parks on (G-387)
-     * @param  list<Message>  $endedByStart  the result rows a runner start ENDED calls with, never ran (G-387), marked as such
+     * @param  list<array{message: Message, approvals: list<string>}>  $endedByStart  the result rows a runner start ENDED calls with, never ran (G-387), each marked with the approval ids of the calls it ended
      */
     public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null, ?array $parked = null, array $endedByStart = []): self
     {
@@ -498,9 +498,14 @@ class Thread extends Model implements ThreadContract
                     $payload['harness_steps_used'] = $parked['harness_steps_used'];
                     $payload['harness_steps_left'] = $parked['harness_steps_left'];
                 }
-                if ($message instanceof ToolResultMessage && in_array($message, $endedByStart, true)) {
-                    // Harness metadata: these calls were ended, never run.
-                    $payload[self::ENDED_BY_START] = true;
+                foreach ($endedByStart as $ended) {
+                    if ($message instanceof ToolResultMessage && $ended['message'] === $message) {
+                        // Harness metadata, beside (never inside) the results:
+                        // these calls were ended, never run, and these are the
+                        // approvals they were asked under. A tool controls only
+                        // its result text, never this key.
+                        $payload[self::ENDED_BY_START] = ['approval_ids' => array_values(array_filter($ended['approvals'], 'is_string'))];
+                    }
                 }
                 $this->storedMessages()->create([
                     'position' => ++$position,
@@ -741,30 +746,48 @@ class Thread extends Model implements ThreadContract
 
     /**
      * Whether a runner start ended the call this approval id was requested
-     * for, with a result row it marked as ended, never run (G-387).
+     * for, never run (G-387).
+     *
+     * Decided ONLY by the harness's own mark, and scoped to the approval's
+     * own request: the result that counts is the first one for its call
+     * AFTER the row that asked for the approval and before the next model
+     * step, and it counts as ended only when that row carries the mark and
+     * the mark names this approval id. Never by result text (a tool can
+     * return any text) and never by a tool-call id across the thread (a
+     * provider may reuse ids: Gemini names them by function).
      *
      * @internal
      */
     public function endedByStart(string $approvalId): bool
     {
-        $callId = null;
+        $request = null;
         foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position', 'desc')->cursor() as $stored) {
-            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
-                if (is_array($request) && ($request['approval_id'] ?? null) === $approvalId && is_string($request['tool_call_id'] ?? null)) {
-                    $callId = $request['tool_call_id'];
+            foreach ($stored->payload['tool_approval_requests'] ?? [] as $asked) {
+                if (is_array($asked) && ($asked['approval_id'] ?? null) === $approvalId && is_string($asked['tool_call_id'] ?? null)) {
+                    $request = ['position' => (int) $stored->position, 'call' => $asked['tool_call_id']];
 
                     break 2;
                 }
             }
         }
-        if ($callId === null) {
+        if ($request === null) {
             return false;
         }
-        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_TOOL_RESULT)->reorder('position')->cursor() as $stored) {
+        foreach ($this->storedMessages()->where('position', '>', $request['position'])->reorder('position')->cursor() as $stored) {
+            if ($stored->type === MessageMapper::TYPE_ASSISTANT) {
+                // A later step: the call had no result in its own turn.
+                return false;
+            }
+            if ($stored->type !== MessageMapper::TYPE_TOOL_RESULT) {
+                continue;
+            }
             foreach ($stored->payload['tool_results'] ?? [] as $result) {
-                if (is_array($result) && ($result['tool_call_id'] ?? null) === $callId) {
-                    // The first result of the call is its result.
-                    return ($stored->payload[self::ENDED_BY_START] ?? null) === true;
+                if (is_array($result) && ($result['tool_call_id'] ?? null) === $request['call']) {
+                    // The first result of the call after its request is its result.
+                    $mark = $stored->payload[self::ENDED_BY_START] ?? null;
+
+                    return is_array($mark) && is_array($mark['approval_ids'] ?? null)
+                        && in_array($approvalId, $mark['approval_ids'], true);
                 }
             }
         }

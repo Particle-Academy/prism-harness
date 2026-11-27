@@ -1120,7 +1120,11 @@ read: steps the context spends after the read count against it. What the start w
 child is provisional until the child's task row (the start's user row in the child's thread)
 is recorded: its binding record, its session mode and its run state name the start's run, and
 every other reader (a decision, a host turn or resume on the child, the next start's checks, a
-cancel, `mode()`) treats them as absent until that row exists. A start that fails before its
+cancel, `mode()`) treats them as absent until that row exists. The start's own run is the
+exception: from the commit until its run ends, the session it runs on (and every read-only
+view of it a tool provider is handed) reads the mode, binding, run tree, depth and ceiling the
+start committed, so a host provider or tool that decides from `mode()` sees the mode the child
+is actually running in. A start that fails before its
 task row therefore needs no second write to be undone: the child reads as it did before, a
 linked child with no binding is refused, an approval nobody could answer stays that way, its
 mode reads as the mode before the start, and the run the child was parked on can still be
@@ -1133,7 +1137,10 @@ tool-resolution view while a start is running. The child's binding, count, mode 
 housekeeping, and its failure changes nothing. A start acts on no decision recorded on the
 child: the calls the child was parked on are ended with its task row, with a fixed result, and
 never run. Each one is announced as `ToolDenied` (decided by `policy`) only once that row is
-recorded, and `approvalStatus()` reads it as `superseded`, never `approved`. Once a start has committed, a stop that lands later (a cancel, say) stops its model
+recorded, and `approvalStatus()` reads it as `superseded`, never `approved`. That reading is
+decided only by the harness's own mark on that row, which names the approvals it ended, and
+only for the result that follows the approval's own request: a tool's result text cannot end a
+call, and a tool-call id a provider reuses (some name ids by function) cannot end or un-end one. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
 parity op `start_gate`; the tool-call limit exists only here.
 
