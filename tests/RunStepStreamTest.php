@@ -430,8 +430,10 @@ it('runs nothing twice when the same decision is streamed again', function (): v
     collectSteps(stepSession('approval')->streamDecision([new ToolApprovalResponse($approvalId, true)]));
     $again = collectSteps(stepSession('approval')->streamDecision([new ToolApprovalResponse($approvalId, true)]));
 
+    // The call already ran: the second decision is not recorded, so none is
+    // reported, and nothing runs again.
     expect($ran['tick'])->toBe(1)
-        ->and($again[0]->type)->toBe(RunStep::DECISION_RECORDED)
+        ->and(stepsOfType($again, RunStep::DECISION_RECORDED))->toBe([])
         ->and(stepsOfType($again, RunStep::TOOL_RESULT))->toBe([]);
 });
 

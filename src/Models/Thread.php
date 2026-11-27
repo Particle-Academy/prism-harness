@@ -1066,6 +1066,43 @@ class Thread extends Model implements ThreadContract
         return null;
     }
 
+    /**
+     * The approval ids of the paused step whose call already has an outcome:
+     * a result, or a started row. Each request is paired with its own call
+     * as the unresolved reader pairs them (the first call with the request's
+     * tool call id not taken by an earlier request), and an answered call's
+     * approval is no longer pending, so no decision for it is recorded.
+     *
+     * @internal Read when decisions are recorded.
+     *
+     * @return list<string>
+     */
+    public function answeredApprovalIds(): array
+    {
+        $step = $this->resolvableStep();
+        if ($step === null || $step['assistant']->toolApprovalRequests === []) {
+            return [];
+        }
+        $open = self::callsWithoutResult($step['assistant']->toolCalls, $step['results']);
+        $taken = [];
+        $answered = [];
+        foreach ($step['assistant']->toolApprovalRequests as $request) {
+            foreach ($step['assistant']->toolCalls as $index => $call) {
+                if (isset($taken[$index]) || $call->id !== $request->toolCallId) {
+                    continue;
+                }
+                $taken[$index] = true;
+                if (! in_array($call, $open, true)) {
+                    $answered[] = $request->approvalId;
+                }
+
+                break;
+            }
+        }
+
+        return array_values(array_unique($answered));
+    }
+
     /** The position of the step a run would resolve, or null. @internal */
     public function pausedStepPosition(): ?int
     {
