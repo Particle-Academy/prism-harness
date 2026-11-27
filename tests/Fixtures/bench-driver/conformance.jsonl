@@ -1,0 +1,12 @@
+{"dir":"driver","msg":{"v":1,"type":"hello","protocol":"prism-bench-driver/1","driver":{"name":"prism-harness-php","harness_version":"reference","runtime":"php"}},"volatile":["driver.harness_version","driver.runtime"]}
+{"dir":"adapter","msg":{"v":1,"type":"start","run_id":"fixture-run-1","task_id":"hello-world","instruction":"List the files in the working directory, then stop.","tools":[{"name":"bash","description":"Run a shell command in the task container and return its output.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The command to run."}},"required":["command"]}}],"model":{"provider":"anthropic","id":"claude-haiku-5-5","reasoning_effort":"default"},"limits":{"max_cost_usd":0.5,"max_steps":4,"max_output_tokens_per_call":256},"pricing":{"inputPerMTok":1,"outputPerMTok":5,"cacheWritePerMTok":1.25,"cacheReadPerMTok":0.1,"toolOverheadTokens":300},"approval_policy":"auto_grant_all"}}
+{"dir":"driver","msg":{"v":1,"type":"tool_call","call_id":"t1","name":"bash","arguments":{"command":"ls"}}}
+{"dir":"adapter","msg":{"v":1,"type":"tool_result","call_id":"t1","output":"README.md\nsrc\n","is_error":false}}
+{"dir":"driver","msg":{"v":1,"type":"usage","call_id":"dc0d9fe58d845dfb0ed329952fc8b85e","outcome":"completed","usage_known":true,"input_tokens":100,"cache_write_tokens":40,"cache_read_tokens":0,"output_tokens":20,"reasoning_tokens":null,"charged_usd":0.00025},"volatile":["call_id"]}
+{"dir":"driver","msg":{"v":1,"type":"usage","call_id":"da89876694e869bf3417158389453263","outcome":"completed","usage_known":true,"input_tokens":30,"cache_write_tokens":0,"cache_read_tokens":140,"output_tokens":5,"reasoning_tokens":null,"charged_usd":6.9e-05},"volatile":["call_id"]}
+{"dir":"driver","msg":{"v":1,"type":"reply","text":"done"}}
+{"dir":"adapter","msg":{"v":1,"type":"user","text":"Thanks. Now say stopped."}}
+{"dir":"driver","msg":{"v":1,"type":"usage","call_id":"21bad9bbdd8b588919e96a947ab4a98a","outcome":"completed","usage_known":true,"input_tokens":12,"cache_write_tokens":0,"cache_read_tokens":180,"output_tokens":3,"reasoning_tokens":null,"charged_usd":4.5e-05},"volatile":["call_id"]}
+{"dir":"driver","msg":{"v":1,"type":"reply","text":"Stopped."}}
+{"dir":"adapter","msg":{"v":1,"type":"close"}}
+{"dir":"driver","msg":{"v":1,"type":"end","status":"completed","code":null,"final_text":"Stopped.","steps":3,"charged_usd":0.000364}}

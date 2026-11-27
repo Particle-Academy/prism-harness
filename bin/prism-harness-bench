@@ -1,0 +1,106 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Composer\InstalledVersions;
+use Illuminate\Contracts\Console\Kernel;
+use Orchestra\Testbench\Foundation\Application;
+use Prism\Harness\Bench\BenchDriver;
+use Prism\Harness\PrismHarnessServiceProvider;
+use Prism\Prism\PrismServiceProvider;
+
+/*
+ * prism-harness-bench: the PHP harness driver for `prism-bench-driver/1`
+ * (prism-parity specs/bench-driver.md). A benchmark adapter starts this
+ * process, writes a `start` line and answers each `tool_call`; this process
+ * runs ONE task through the real harness loop and exits after `end`.
+ *
+ *   prism-harness-bench [--autoload=vendor/autoload.php] [--app=bootstrap/app.php]
+ *
+ * --autoload  the Composer autoloader to load the harness from. Pointing it at
+ *             another install runs THAT install's harness, which is how a
+ *             benchmark measures a released version with this driver.
+ * --app       a Laravel bootstrap file returning an Application (your app's
+ *             bootstrap/app.php). Without it, a throwaway Testbench app with an
+ *             in-memory SQLite database is used (requires orchestra/testbench).
+ *
+ * The provider key is read by Prism core from its usual environment variable
+ * (ANTHROPIC_API_KEY, OPENAI_API_KEY). No .env file is loaded, and nothing
+ * here prints the environment. stdout is the protocol; logs go to stderr.
+ */
+
+$options = getopt('', ['autoload:', 'app:']);
+$autoload = $options['autoload'] ?? null;
+if (! is_string($autoload)) {
+    foreach ([__DIR__.'/../vendor/autoload.php', __DIR__.'/../../../autoload.php'] as $candidate) {
+        if (is_file($candidate)) {
+            $autoload = $candidate;
+            break;
+        }
+    }
+}
+if (! is_string($autoload) || ! is_file($autoload)) {
+    fwrite(STDERR, "prism-harness-bench: no Composer autoloader found; pass --autoload\n");
+    exit(2);
+}
+require $autoload;
+foreach (['ProtocolError', 'InvalidStart', 'UsageReporter', 'BenchDriver'] as $class) {
+    require_once __DIR__.'/bench/'.$class.'.php';
+}
+
+// Anything a provider or the framework prints must not corrupt the protocol.
+$protocol = fopen('php://stdout', 'wb');
+ob_start(static function (string $buffer): string {
+    if ($buffer !== '') {
+        fwrite(STDERR, $buffer);
+    }
+
+    return '';
+}, 1);
+
+$appFile = $options['app'] ?? null;
+if (is_string($appFile)) {
+    $app = require $appFile;
+    $app->make(Kernel::class)->bootstrap();
+} elseif (class_exists(Application::class)) {
+    $app = Application::create(options: [
+        'load_environment_variables' => false,
+        'extra' => [
+            'providers' => [PrismServiceProvider::class, PrismHarnessServiceProvider::class],
+            'dont-discover' => ['*'],
+        ],
+    ]);
+    // A private database that dies with the process: one task, one run.
+    $app['config']->set('database.default', 'bench');
+    $app['config']->set('database.connections.bench', [
+        'driver' => 'sqlite', 'database' => ':memory:', 'prefix' => '', 'foreign_key_constraints' => true,
+    ]);
+    $app['config']->set('prism-harness.stores', ['ephemeral' => 'database', 'durable' => 'database']);
+    // The migrator, not `artisan migrate`: the console command drains stdin,
+    // which is this process's protocol channel. Only the harness's own
+    // migrations run, and only against the private connection set above.
+    if ($app['db']->connection()->getDriverName() !== 'sqlite') {
+        fwrite(STDERR, 'prism-harness-bench: refusing to migrate a database that is not the private sqlite one
+');
+        exit(2);
+    }
+    $migrator = $app->make('migrator');
+    $migrator->getRepository()->createRepository();
+    $migrator->run($migrator->paths());
+} else {
+    fwrite(STDERR, "prism-harness-bench: pass --app, or install orchestra/testbench for the throwaway app\n");
+    exit(2);
+}
+
+$version = class_exists(InstalledVersions::class) && InstalledVersions::isInstalled('particle-academy/prism-harness')
+    ? (string) InstalledVersions::getPrettyVersion('particle-academy/prism-harness')
+    : 'unknown';
+$reference = class_exists(InstalledVersions::class) && InstalledVersions::isInstalled('particle-academy/prism-harness')
+    ? InstalledVersions::getReference('particle-academy/prism-harness')
+    : null;
+if (is_string($reference) && $reference !== '') {
+    $version .= '@'.$reference;
+}
+
+exit((new BenchDriver(STDIN, $protocol, $version))->run($app));
