@@ -16,10 +16,12 @@ use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
 use Tests\Fixtures\Participant;
 
-// G-392/G-397/G-404: a write that would supersede a parked step, made WHILE a
-// run is acting on that step's approved call, does not end that call. The
-// call keeps exactly one outcome, its own result, and no denial is recorded
-// for it. Deterministic: the tool itself makes the write while it runs.
+// G-392/G-397/G-404/G-407: a write that would supersede a parked step, made
+// WHILE a run is acting on that step's approved call, does not end that call.
+// The call keeps exactly one outcome, its own result, and no denial is
+// recorded for it. A host tool writing on its own session is never refused;
+// another run on the session is. Deterministic: the tool itself makes the
+// write while it runs.
 
 const SUPERSEDE_RUNNING_REPLACED = 'Tool call was not run because a later step replaced it';
 
@@ -136,14 +138,14 @@ it('refuses a new message while the approved call runs, and keeps one outcome', 
         ->and(supersedeRunningOutcomes())->toBe(['Sunny in Paris']);
 })->with(array_keys(supersedeRunningResumes()));
 
-it('serialises a host tool-call step written while the approved call runs, and keeps one outcome', function (string $resume, string $laterId): void {
+it('keeps one outcome when a host tool records a later tool-call step while the approved call runs', function (string $resume, string $laterId): void {
     $approvalId = supersedeRunningSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
     $this->refused = null;
     $this->during = function () use ($laterId): void {
         $this->during = null;
         try {
             // A later step, with its own gated call (its id sometimes the
-            // running call's), recorded by the host while the call runs.
+            // running call's), recorded by a host tool on its own session.
             supersedeRunningSession()->thread()->record([new AssistantMessage('', [new ToolCall($laterId, 'weather', ['city' => 'Rome'])], [],
                 [new ToolApprovalRequest('apr_later', $laterId, ToolApprovalRequest::ARGUMENTS_AS_SENT)])], null, ['weather']);
         } catch (SessionLocked $e) {
@@ -153,10 +155,11 @@ it('serialises a host tool-call step written while the approved call runs, and k
 
     supersedeRunningResumes()[$resume](supersedeRunningSession(), $approvalId);
 
-    expect($this->refused)->toBe(SessionLocked::class)
+    // Never refused: the running call's result rows name its step (G-407).
+    expect($this->refused)->toBeNull()
         ->and($this->ran)->toBe(['Paris'])
         ->and(supersedeRunningOutcomes())->toBe(['Sunny in Paris']);
-})->with(array_keys(supersedeRunningResumes()))->with(['its own id' => ['later'], 'the running call\'s id' => ['c1']]);
+})->with(array_keys(supersedeRunningResumes()))->with(['its own id' => ['later'], "the running call's id" => ['c1']]);
 
 it('refuses another run on the same session while the approved call runs', function (string $resume): void {
     $approvalId = supersedeRunningSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;

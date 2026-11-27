@@ -23,6 +23,7 @@ use Prism\Harness\Contracts\EvictionSink;
 use Prism\Harness\Contracts\FencedSessionStore;
 use Prism\Harness\Participants\ParticipantRef;
 use Prism\Harness\Sessions\DatabaseAddressIndex;
+use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Sessions\SessionStoreManager;
 use Prism\Harness\Support\MessageMapper;
@@ -368,12 +369,12 @@ class Thread extends Model implements ThreadContract
             // at the end, cannot work from a generator — and paying that on
             // every thread to support a strategy nobody selected would make the
             // common case worse to serve the uncommon one.
-            yield from ToolResultRuns::fold($this->hydrated());
+            yield from $this->replayed();
 
             return;
         }
 
-        $messages = iterator_to_array(ToolResultRuns::fold($this->hydrated()), false);
+        $messages = iterator_to_array($this->replayed(), false);
 
         $outcome = app(ToolPairGuard::class)->enforce($strategy->compact($messages));
 
@@ -409,15 +410,33 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * Every stored row as a Prism message, paged from the database.
+     * The stored rows folded for replay, each result row the harness wrote
+     * for a step placed with that step (G-407): its `harness_answers_step`
+     * mark names the step's position. The mark itself is not replayed.
      *
      * @return Generator<int, Message>
      */
-    private function hydrated(): Generator
+    private function replayed(): Generator
     {
+        $messages = [];
+        $positions = [];
+        $marks = [];
         foreach ($this->storedMessages()->lazy() as $stored) {
-            yield $stored->toPrismMessage();
+            $messages[] = $stored->toPrismMessage();
+            $positions[(int) $stored->position] = count($messages) - 1;
+            $mark = $stored->payload[self::ANSWERS_STEP]['position'] ?? null;
+            if (is_int($mark)) {
+                $marks[count($messages) - 1] = $mark;
+            }
         }
+        $answers = [];
+        foreach ($marks as $index => $position) {
+            if (isset($positions[$position])) {
+                $answers[$index] = $positions[$position];
+            }
+        }
+
+        yield from ToolResultRuns::fold($messages, $answers);
     }
 
     /**
@@ -468,35 +487,74 @@ class Thread extends Model implements ThreadContract
      * @param  iterable<Message>  $messages
      * @param  list<string>|null  $toolNames
      */
-    public function recordForRun(iterable $messages, string $runId, ?array $toolNames = null): self
+    public function recordForRun(iterable $messages, string $runId, ?array $toolNames = null, ?int $answers = null): self
     {
-        return $this->recordRows($messages, $runId, $toolNames, outside: false);
+        // Only the run that holds this thread's session writes as a run: from
+        // anywhere else this is an ordinary record(), with its lock and its
+        // replaced denials.
+        $key = $this->sessionKeyOrNull();
+        if ($key === null || ! Session::holdsLock($key)) {
+            return $this->recordRows($messages, $runId, $toolNames, outside: true);
+        }
+
+        return $this->recordRows($messages, $runId, $toolNames, outside: false, answers: $answers);
     }
 
     /**
      * @param  iterable<Message>  $messages
      * @param  list<string>|null  $toolNames
      */
-    private function recordRows(iterable $messages, ?string $runId, ?array $toolNames, bool $outside): self
+    private function recordRows(iterable $messages, ?string $runId, ?array $toolNames, bool $outside, ?int $answers = null): self
     {
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
-        if ($outside && $this->wouldSupersedeOpenStep($messages)) {
-            // A write that would end a parked step's calls is SERIALISED with
-            // the run that may be acting on them (G-404): it takes the
-            // session's own lock, so it never lands while an approved call
-            // runs. Held, it waits as a turn does, or throws SessionLocked
-            // having written nothing.
-            $store = app(SessionStoreManager::class)->ephemeral();
-            if ($store instanceof FencedSessionStore) {
-                return $store->withFencedLock($this->sessionAddress()->sessionKey(), function (Closure $owned) use ($messages, $runId, $toolNames): self {
-                    $owned();
+        // A shared thread (no participant) has no session, so no run holds it.
+        $key = $this->sessionKeyOrNull();
+        if ($key === null || ! $outside || ! $this->wouldSupersedeOpenStep($messages)) {
+            return $this->writeRows($messages, $runId, $toolNames, $outside, $answers);
+        }
+        if (Session::holdsLock($key)) {
+            // Written from inside the run that holds the session (a host tool
+            // or listener): waiting for the lock would wait on itself, and the
+            // host is never refused. When that run is answering the paused
+            // step, its own result rows name that step (G-407), so nothing is
+            // ended here; otherwise the step is superseded as usual (G-404).
+            $step = $this->resolvableStep();
+            $answering = $step !== null && $step['position'] === Session::answering($key);
 
-                    return $this->writeRows($messages, $runId, $toolNames, true);
-                }, max(1, (int) config('prism-harness.agent.lock_ttl', 300)), max(0, (int) config('prism-harness.agent.lock_wait', 0)));
-            }
+            return $this->writeRows($messages, $runId, $toolNames, true, null, ! $answering);
+        }
+        // From outside the run (another worker or process): SERIALISED with
+        // the run that may be acting on the step (G-404). It takes the
+        // session's own lock and waits as a turn does, or throws SessionLocked
+        // having written nothing. A run that has begun and not finished is
+        // still acting on the step even if its lock lease lapsed (a call that
+        // outlives lock_ttl): its calls are then left to it, never denied.
+        $store = app(SessionStoreManager::class)->ephemeral();
+        if (! $store instanceof FencedSessionStore) {
+            return $this->writeRows($messages, $runId, $toolNames, true);
         }
 
-        return $this->writeRows($messages, $runId, $toolNames, $outside);
+        return $store->withFencedLock($key, function (Closure $owned) use ($messages, $runId, $toolNames, $key, $store): self {
+            $owned();
+
+            return $this->writeRows($messages, $runId, $toolNames, true, null, ! self::runInFlight($store, $key));
+        }, max(1, (int) config('prism-harness.agent.lock_ttl', 300)), max(0, (int) config('prism-harness.agent.lock_wait', 0)));
+    }
+
+    /** Whether the session at `$key` has a run that began and has not finished. */
+    private static function runInFlight(FencedSessionStore $store, string $key): bool
+    {
+        $state = $store->get($key.':ephemeral') ?? $store->get($key);
+
+        return is_array($state) && is_array($state['run'] ?? null) && ($state['run']['status'] ?? null) === 'running';
+    }
+
+    /** This thread's session key, or null for a shared thread (no participant). */
+    private function sessionKeyOrNull(): ?string
+    {
+        $address = $this->sessionAddress();
+
+        return $address->participantType === null ? null : $address->sessionKey();
     }
 
     /**
@@ -533,7 +591,7 @@ class Thread extends Model implements ThreadContract
      * @param  list<Message>  $messages
      * @param  list<string>|null  $toolNames
      */
-    private function writeRows(array $messages, ?string $runId, ?array $toolNames, bool $outside): self
+    private function writeRows(array $messages, ?string $runId, ?array $toolNames, bool $outside, ?int $answers = null, bool $endSteps = true): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
@@ -552,7 +610,7 @@ class Thread extends Model implements ThreadContract
         // A turn that half-writes leaves a tool call with no result, which
         // replays to the model as an unanswered question rather than as an
         // error anyone can see.
-        return DB::transaction(function () use ($messages, $runId, $toolNames, $outside): self {
+        return DB::transaction(function () use ($messages, $runId, $toolNames, $outside, $answers, $endSteps): self {
             // Locks the thread ROW so a concurrent recorder waits instead of
             // reading the same max. A no-op on SQLite, which is why the suite
             // cannot exercise this and why the guarantee lives in the database.
@@ -560,8 +618,27 @@ class Thread extends Model implements ThreadContract
 
             $position = (int) $this->storedMessages()->max('position');
 
-            [$messages, $marks] = $this->withReplacedStepsEnded($messages, $outside);
+            [$messages, $marks, $replacedStep] = $endSteps ? $this->withReplacedStepsEnded($messages, $outside) : [$messages, new \WeakMap, null];
+            $deferred = null;
+            if (! $endSteps && $outside) {
+                $paused = $this->resolvableStep();
+                $deferred = $paused === null ? null : array_values(array_unique(array_map(
+                    static fn (ToolApprovalRequest $request): string => $request->approvalId,
+                    $paused['assistant']->toolApprovalRequests,
+                )));
+            }
+            // The step each result row the HARNESS writes answers (G-407): the
+            // step before it in this write, else the step this run answers.
+            // Rows a host writes carry no mark.
+            $own = $outside ? null : $this->newestStepOf($runId);
+            $target = $outside ? null : ($answers === null ? $own : max($answers, $own ?? 0));
             foreach ($messages as $message) {
+                // Re-read: a write nested inside this one (a host listener)
+                // may have taken the next position.
+                $position = max($position, (int) $this->storedMessages()->max('position'));
+                if ($message instanceof AssistantMessage && $message->toolCalls !== [] && ! $outside) {
+                    $target = $position + 1;
+                }
                 $payload = MessageMapper::toArray($message);
                 if ($message instanceof ToolResultMessage && isset($marks[$message])) {
                     // Harness metadata, beside the results: these calls were
@@ -573,6 +650,18 @@ class Thread extends Model implements ThreadContract
                     // Harness metadata on the same durable approval record.
                     // MessageMapper does not send it back to the provider.
                     $payload['harness_tool_names'] = array_values(array_unique($toolNames));
+                }
+                if ($deferred !== null && $deferred !== [] && ($message instanceof UserMessage || $message instanceof AssistantMessage)) {
+                    // Superseded while a run answers it: the row names the
+                    // step's approvals, so no later decision for it runs.
+                    $payload[self::REPLACED_MARK] = ['approval_ids' => $deferred];
+                    $deferred = null;
+                }
+                $answered = $message instanceof ToolResultMessage && isset($marks[$message]) ? $replacedStep : $target;
+                if ($message instanceof ToolResultMessage && $message->toolResults !== [] && ! $outside && $answered !== null) {
+                    // Harness metadata, beside the results: the step these
+                    // results answer, wherever the row lands (G-407).
+                    $payload[self::ANSWERS_STEP] = ['position' => $answered];
                 }
                 $this->storedMessages()->create([
                     'position' => ++$position,
@@ -670,7 +759,7 @@ class Thread extends Model implements ThreadContract
             return false;
         }
 
-        $this->record([new ToolResultMessage(array_map(
+        $this->writeRows([new ToolResultMessage(array_map(
             static fn (ToolCall $call): ToolResult => new ToolResult(
                 toolCallId: $call->id,
                 toolName: $call->name,
@@ -679,7 +768,7 @@ class Thread extends Model implements ThreadContract
                 toolCallResultId: $call->resultId,
             ),
             $open,
-        ))], $runId);
+        ))], $runId, null, false, $step['position'], false);
 
         return true;
     }
@@ -689,18 +778,79 @@ class Thread extends Model implements ThreadContract
      * tool calls, not stopping at user, system or text-only assistant rows,
      * and every tool result recorded after it, in order.
      *
-     * @return array{assistant: AssistantMessage, results: list<ToolResult>}|null
+     * @return array{assistant: AssistantMessage, results: list<ToolResult>, position: int}|null
      */
     private function resolvableStep(): ?array
     {
-        $results = [];
+        $rows = [];
         foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
             $message = self::storedMessage($stored);
             if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
-                return ['assistant' => $message, 'results' => $results];
+                $position = (int) $stored->position;
+                $results = [];
+                foreach (array_reverse($rows) as [$row, $mark, $at]) {
+                    // A harness row naming another step answers that step,
+                    // not this one (G-407), when its mark is valid.
+                    if ($mark !== null && $mark !== $position && $this->answersStep($row, $mark, $at)) {
+                        continue;
+                    }
+                    $results = [...$results, ...$row->toolResults];
+                }
+
+                return ['assistant' => $message, 'results' => $results, 'position' => $position];
             }
             if ($message instanceof ToolResultMessage) {
-                $results = [...$message->toolResults, ...$results];
+                $mark = is_array($stored->payload ?? null) ? ($stored->payload[self::ANSWERS_STEP]['position'] ?? null) : null;
+                $rows[] = [$message, is_int($mark) ? $mark : null, (int) $stored->position];
+            }
+        }
+
+        return null;
+    }
+
+    /** The position of the step a run would resolve, or null. @internal */
+    public function pausedStepPosition(): ?int
+    {
+        return $this->resolvableStep()['position'] ?? null;
+    }
+
+    /** The payload key naming the step a harness result row answers (G-407). */
+    public const ANSWERS_STEP = 'harness_answers_step';
+
+    /**
+     * Whether `$row`, stored at `$at`, validly answers the step at `$position`:
+     * an earlier tool-call step with a call of each result's id and tool name.
+     */
+    private function answersStep(ToolResultMessage $row, int $position, int $at): bool
+    {
+        if ($position >= $at) {
+            return false;
+        }
+        $stored = $this->storedMessages()->where('position', $position)->first();
+        $step = $stored === null ? null : self::storedMessage($stored);
+        if (! $step instanceof AssistantMessage || $step->toolCalls === []) {
+            return false;
+        }
+        $calls = array_map(static fn (ToolCall $call): string => $call->id."\0".$call->name, $step->toolCalls);
+        foreach ($row->toolResults as $result) {
+            if (! in_array($result->toolCallId."\0".$result->toolName, $calls, true)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /** The position of the newest tool-call step `$runId` recorded, or null. */
+    private function newestStepOf(?string $runId): ?int
+    {
+        if ($runId === null) {
+            return null;
+        }
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->where('run_id', $runId)->reorder('position', 'desc')->cursor() as $stored) {
+            $message = self::storedMessage($stored);
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                return (int) $stored->position;
             }
         }
 
@@ -787,7 +937,7 @@ class Thread extends Model implements ThreadContract
      * nothing.
      *
      * @param  iterable<Message>  $messages
-     * @return array{0: list<Message>, 1: \WeakMap<ToolResultMessage, list<string>>}
+     * @return array{0: list<Message>, 1: \WeakMap<ToolResultMessage, list<string>>, 2: ?int}
      */
     private function withReplacedStepsEnded(iterable $messages, bool $outside): array
     {
@@ -797,12 +947,13 @@ class Thread extends Model implements ThreadContract
         $supersedes = static fn (Message $message): bool => ($message instanceof AssistantMessage && $message->toolCalls !== [])
             || ($outside && ($message instanceof AssistantMessage || $message instanceof UserMessage));
         if (array_filter($messages, $supersedes) === []) {
-            return [$messages, $marks];
+            return [$messages, $marks, null];
         }
 
         $step = $this->resolvableStep();
         $current = $step['assistant'] ?? null;
         $results = $step['results'] ?? [];
+        $replacedStep = $step['position'] ?? null;
         $out = [];
         foreach ($messages as $index => $message) {
             if ($supersedes($message) && $current instanceof AssistantMessage && $current->toolApprovalRequests !== []) {
@@ -846,7 +997,7 @@ class Thread extends Model implements ThreadContract
             $out[] = $message;
         }
 
-        return [$out, $marks];
+        return [$out, $marks, $replacedStep];
     }
 
     /**

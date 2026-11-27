@@ -1619,7 +1619,7 @@ final readonly class AgentRuntime
     {
         // Materialised once: the thread and the observers both read it.
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
-        $session->thread()->recordForRun($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools));
+        $session->thread()->recordForRun($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools), Session::answering($session->key()));
         // AFTER the durable record, so an observer can never lose a turn the
         // thread kept, and its failure (isolated in MemoryHooks) cannot undo one.
         app(MemoryHooks::class)->recorded($session, $runId, $messages);
@@ -1946,6 +1946,9 @@ final readonly class AgentRuntime
      */
     private function endRepeatedIdStep(Session $session, string $runId): void
     {
+        // The step this run answers: its result rows name it (G-407), and a
+        // host row written from inside this run leaves it to the run.
+        Session::rememberAnswering($session->key(), $session->thread()->pausedStepPosition());
         $session->thread()->endRepeatedIdStep(Session::REPEATED_CALL_ID_REASON, $runId);
     }
 

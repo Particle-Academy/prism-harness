@@ -701,14 +701,21 @@ class Session
         $previous = $this->writeFence;
         $this->writeFence = fn (array $state): bool => $store->putIfOwned($key, $token, $state, $this->ttlSeconds);
         $released = false;
+        $held = self::$held[$key] ?? null;
+        self::$held[$key] = ['answering' => null];
 
-        return function () use ($store, $key, $token, $previous, &$released): void {
+        return function () use ($store, $key, $token, $previous, &$released, $held): void {
             if ($released) {
                 return;
             }
             $released = true;
             $this->writeFence = $previous;
             $this->cachedState = null;
+            if ($held === null) {
+                unset(self::$held[$key]);
+            } else {
+                self::$held[$key] = $held;
+            }
             $store->releaseFencedLock($key, $token);
         };
     }
@@ -734,6 +741,8 @@ class Session
             $this->cachedState = null;
             $previous = $this->writeFence;
             $this->writeFence = fn (array $state): bool => $store->putIfOwned($this->key(), $token, $state, $this->ttlSeconds);
+            $held = self::$held[$this->key()] ?? null;
+            self::$held[$this->key()] = ['answering' => null];
             try {
                 $owned();
 
@@ -741,8 +750,41 @@ class Session
             } finally {
                 $this->writeFence = $previous;
                 $this->cachedState = null;
+                if ($held === null) {
+                    unset(self::$held[$this->key()]);
+                } else {
+                    self::$held[$this->key()] = $held;
+                }
             }
         }, $ttlSeconds, $waitSeconds);
+    }
+
+    /**
+     * The session locks this process holds, by session key, with the step
+     * position the run holding each one is answering (G-407).
+     *
+     * @var array<string, array{answering: ?int}>
+     */
+    private static array $held = [];
+
+    /** @internal Whether THIS process holds the session lock for `$key`. */
+    public static function holdsLock(string $key): bool
+    {
+        return isset(self::$held[$key]);
+    }
+
+    /** @internal The step position the run holding `$key` is answering, if any. */
+    public static function answering(string $key): ?int
+    {
+        return self::$held[$key]['answering'] ?? null;
+    }
+
+    /** @internal Record the step the run holding `$key` is answering. */
+    public static function rememberAnswering(string $key, ?int $position): void
+    {
+        if (isset(self::$held[$key])) {
+            self::$held[$key]['answering'] = $position;
+        }
     }
 
     /**

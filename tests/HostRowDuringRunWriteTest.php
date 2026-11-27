@@ -13,11 +13,11 @@ use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Tests\Fixtures\Participant;
 
-// G-392/G-397/G-406: a row a host records through Thread::record() is
+// G-392/G-397/G-406/G-407: a row a host records through Thread::record() is
 // outside every run, whatever run id it names, even while a run is writing
-// the step it would supersede. During the run's own write it is serialised
-// with the run (refused here, recording nothing); afterwards it supersedes
-// the parked step, and each open call gets the one replaced denial.
+// the step it would supersede: recorded from inside that run it is never
+// refused, and as the run is parking the step (not answering it), the host
+// row supersedes it and each open call gets the one replaced denial.
 
 const HOST_ROW_REPLACED = 'Tool call was not run because a later step replaced it';
 
@@ -81,14 +81,10 @@ it('treats a host row recorded during the run\'s own parked-step write as outsid
 
     hostRowSession()->send('Weather in Paris?');
 
-    // During the run's write the host row was serialised with the run and
-    // recorded nothing; the step is parked, nothing ended.
-    expect($attempts)->toBe(['refused'])
-        ->and(hostRowOutcomes())->toBe([]);
-
-    // Recorded once the run has ended, it is outside the run: it supersedes
-    // the parked step, and the open call gets the one replaced denial.
-    hostRowSession()->thread()->record([new UserMessage('Hurry.')], $namesRun ? (hostRowSession()->run()['id'] ?? null) : null);
-
-    expect(hostRowOutcomes())->toBe([HOST_ROW_REPLACED]);
+    // Recorded during the run's write, never refused, and outside the run
+    // whatever run id it names: the run is parking the step, not answering
+    // it, so the host row supersedes it and the open call gets the one
+    // replaced denial.
+    expect($attempts)->toBe(['recorded'])
+        ->and(hostRowOutcomes())->toBe([HOST_ROW_REPLACED]);
 })->with(['naming the run id' => [true], 'naming no run' => [false]]);
