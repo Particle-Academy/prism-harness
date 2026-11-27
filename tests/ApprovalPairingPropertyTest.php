@@ -309,6 +309,10 @@ function pairingGenerate(int $seed): array
             $u = $steps[0]['calls'][$g->pick($ungated)];
             $case['recorded']['calls'][0] = ['id' => $u['id'], 'gated' => true, 'token' => $u['token'], 'copy' => true];
         }
+        // A host copy of the parked step: its first call is asked for under
+        // the FIRST step's approval id. That approval belongs to the first
+        // step, so it decides nothing here.
+        $case['recorded']['reuseApproval'] = $g->chance(0.3);
 
         return $case;
     }
@@ -453,7 +457,10 @@ function pairingOracle(array $case): array
         }
         $runsR = [];
         foreach ($r['calls'] as $k => $call) {
-            $runsR[$k] = ! $repeatedR && ! $supersededR && ! $refusedR && $k !== $forgedK && $effectiveR[$k] === 'approve';
+            // A call asked for under the first step's approval id is asked
+            // for by nobody: it never runs.
+            $borrowed = ($r['reuseApproval'] ?? false) && $r['approvals'][$k] === $r['approvals'][0];
+            $runsR[$k] = ! $repeatedR && ! $supersededR && ! $refusedR && ! $borrowed && $k !== $forgedK && $effectiveR[$k] === 'approve';
             if ($runsR[$k]) {
                 $ran[] = $call['token'];
             }
@@ -659,6 +666,11 @@ function pairingRun(array $case): array
 function pairingReplace(Session $session, array $case, array $requestFor, array $step, array &$observed): void
 {
     $recorded = $case['recorded'];
+    if ($recorded['reuseApproval'] ?? false) {
+        $first = $requestFor[array_key_first(array_filter($step['calls'], fn (array $call): bool => $call['gated']))];
+        $reused = $recorded['approvals'][0];
+        $recorded['approvals'] = array_map(fn (string $id): string => $id === $reused ? (string) $first : $id, $recorded['approvals']);
+    }
     $before = pairingInsertBefore($case) !== null;
     if ($before && $case['insert']['segment'] === 'earlier') {
         $session->thread()->record([pairingInsertedRow($case)]);
@@ -1416,6 +1428,9 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
             if ($case['recorded']['stringArgs']) {
                 $seen['a later step with its arguments stored as a string'] = true;
             }
+            if ($case['recorded']['reuseApproval'] ?? false) {
+                $seen['a later step asking under the first step approval id'] = true;
+            }
             if ($case['recorded']['calls'][0]['copy'] ?? false) {
                 $seen['a later call with the id and arguments of an earlier call that ran'] = true;
             }
@@ -1453,6 +1468,6 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'a forged result in the earlier step\'s segment', 'a forged result in the later step\'s segment',
         'an id reused in a later step', 'a later step with its arguments stored as a string', 'two identical gated calls in one step',
         'results sharing a call id, with other arguments, in later rows of one segment',
-        'a later call with the id and arguments of an earlier call that ran',
+        'a later call with the id and arguments of an earlier call that ran', 'a later step asking under the first step approval id',
     ]);
 });
