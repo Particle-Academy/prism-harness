@@ -20,8 +20,11 @@ use Prism\Prism\ValueObjects\ToolResult;
  * Anthropic receives an empty user turn for the decision-only row, which it
  * refuses. Folded, the model sees each call's result once, as it did live.
  *
- * A result is keyed by its tool call id, and a later row's result for the same
- * call replaces an earlier one, in the earlier one's position. A decision is
+ * A later row's result for the same call replaces an earlier one, in the
+ * earlier one's position. The same call is the same tool call id, tool name
+ * AND arguments (the n-th such result of a row replacing the n-th of an
+ * earlier row), never the call id alone: a provider may give two calls of one
+ * step the same id, and each keeps its own result. A decision is
  * keyed by its approval id, the same way.
  */
 class ToolResultRuns
@@ -70,8 +73,14 @@ class ToolResultRuns
         $decisions = [];
 
         foreach ($run as $message) {
+            $seen = [];
             foreach ($message->toolResults as $result) {
-                $results[$result->toolCallId] = $result;
+                // The same call is the same id, tool name and arguments, the
+                // n-th such result of a row replacing the n-th of an earlier
+                // row; never the id alone.
+                $same = self::callKey($result);
+                $seen[$same] = ($seen[$same] ?? 0) + 1;
+                $results[$same.'#'.$seen[$same]] = $result;
             }
 
             foreach ($message->toolApprovalResponses as $decision) {
@@ -80,5 +89,30 @@ class ToolResultRuns
         }
 
         return new ToolResultMessage(array_values($results), array_values($decisions));
+    }
+
+    /**
+     * A result's call, as an unambiguous key: its id and tool name, each
+     * length-prefixed, and a digest of its arguments in canonical form.
+     */
+    private static function callKey(ToolResult $result): string
+    {
+        return strlen($result->toolCallId).':'.$result->toolCallId
+            .'|'.strlen($result->toolName).':'.$result->toolName
+            .'|'.hash('sha256', (string) json_encode(self::canonical($result->args), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION));
+    }
+
+    /** `$value` with every string-keyed array's keys sorted, recursively. */
+    private static function canonical(mixed $value): mixed
+    {
+        if (! is_array($value)) {
+            return $value;
+        }
+        $value = array_map(self::canonical(...), $value);
+        if (! array_is_list($value)) {
+            ksort($value, SORT_STRING);
+        }
+
+        return $value;
     }
 }

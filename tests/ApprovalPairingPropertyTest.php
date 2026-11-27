@@ -609,6 +609,8 @@ function pairingRun(array $case): array
     $observed['rows'] = $session()->thread()->storedMessages()->reorder('position')->get()
         ->map(fn ($row): array => ['type' => $row->type, 'message' => $row->toPrismMessage(), 'payload' => $row->payload])->all();
     $observed['session'] = $session();
+    // What the thread replays to the provider and the resolver.
+    $observed['replay'] = iterator_to_array($session()->thread()->messages(), false);
 
     return $observed;
 }
@@ -900,6 +902,8 @@ function pairingViolations(array $case, array $observed): array
         array_push($violations, ...pairingReplacedViolations($case, $observed, $oracle['recorded']));
     }
 
+    array_push($violations, ...pairingReplayViolations($case, $observed));
+
     // Full equality: what ran is what the oracle says runs (plus, in a turn
     // the provider refused, any call its own approval approved).
     $actual = array_values(array_unique($ran));
@@ -907,6 +911,72 @@ function pairingViolations(array $case, array $observed): array
     $extra = array_values(array_diff($actual, $oracle['ran']));
     if (array_diff($oracle['ran'], $actual) !== [] || array_diff($extra, $oracle['may']) !== []) {
         $violations[] = 'equality: ran '.json_encode($actual).', the oracle runs '.json_encode($oracle['ran']);
+    }
+
+    return $violations;
+}
+
+/**
+ * 5, as REPLAYED: a call with a stored outcome keeps its own result in the
+ * thread replay of its step's segment, never more than once in one replayed
+ * row. A later result with the same call id and other arguments never stands
+ * in for it.
+ *
+ * @param  array<string, mixed>  $case
+ * @param  array<string, mixed>  $observed
+ * @return list<string>
+ */
+function pairingReplayViolations(array $case, array $observed): array
+{
+    $segments = function (array $messages) use ($case): array {
+        $found = [];
+        $current = null;
+        foreach ($messages as $message) {
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                $tokens = array_map(fn ($call): ?string => pairingToken($call->arguments()), $message->toolCalls);
+                $current = null;
+                foreach ($case['steps'] as $s => $step) {
+                    if ($tokens === array_column($step['calls'], 'token')) {
+                        $current = $s;
+                        $found[$s] = [];
+                    }
+                }
+
+                continue;
+            }
+            if ($current !== null && $message instanceof ToolResultMessage) {
+                $row = [];
+                foreach ($message->toolResults as $result) {
+                    $token = pairingToken($result->args) ?? '?';
+                    $found[$current][$token][] = $result->result;
+                    $row[$token] = ($row[$token] ?? 0) + 1;
+                }
+                foreach ($row as $token => $times) {
+                    $found[$current]['@most'][$token] = max($found[$current]['@most'][$token] ?? 0, $times);
+                }
+            }
+        }
+
+        return $found;
+    };
+    $stored = $segments(array_column($observed['rows'], 'message'));
+    $replayed = $segments($observed['replay']);
+    $violations = [];
+    foreach ($case['steps'] as $s => $step) {
+        foreach ($step['calls'] as $call) {
+            $distinct = count(array_unique($stored[$s][$call['token']] ?? []));
+            $times = count($replayed[$s][$call['token']] ?? []);
+            $inOneRow = $replayed[$s]['@most'][$call['token']] ?? 0;
+            // Never lost from the replay, and never twice in one replayed row.
+            // (A row the harness's own new-message turn writes after a user
+            // row is a separate replayed row: core resolves it there.)
+            if ($distinct === 1 && $times === 0) {
+                $violations[] = "inv5: {$call['token']}'s own result is missing from the replay";
+            }
+            if ($inOneRow > 1) {
+                $violations[] = "inv5: {$call['token']}'s result is replayed {$inOneRow} times in one row";
+            }
+        }
     }
 
     return $violations;
@@ -1247,6 +1317,16 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
                 $seen['a row after the park, then a resume with no step left, then repeat resumes'] = true;
             }
         }
+        foreach ($case['steps'] as $step) {
+            $ids = array_column($step['calls'], 'id');
+            $gated = array_column(array_filter($step['calls'], fn (array $call): bool => $call['gated']), 'id');
+            $ungated = array_column(array_filter($step['calls'], fn (array $call): bool => ! $call['gated']), 'id');
+            // An ungated call's result is written when the step parks, its
+            // gated namesake's in a later row of the same segment.
+            if (array_intersect($gated, $ungated) !== []) {
+                $seen['results sharing a call id, with other arguments, in later rows of one segment'] = true;
+            }
+        }
         if (count($case['steps']) > 1 && array_intersect(array_column($case['steps'][1]['calls'], 'id'), array_column($case['steps'][0]['calls'], 'id')) !== []) {
             $seen['an id reused in a later step'] = true;
         }
@@ -1290,6 +1370,7 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'replaced, then insert tool_result before_decision', 'replaced, then insert tool_result after_decision',
         'a forged result in the earlier step\'s segment', 'a forged result in the later step\'s segment',
         'an id reused in a later step', 'a later step with its arguments stored as a string',
+        'results sharing a call id, with other arguments, in later rows of one segment',
         'a later call with the id and arguments of an earlier call that ran',
     ]);
 });
