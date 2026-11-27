@@ -181,10 +181,12 @@ beforeEach(function (): void {
                 PairingPropertyWorld::$served[] = $next['step'];
             }
             $output = $next['kind'] === 'calls'
-                // The call's id is both the item id and the call_id, so it is
+                // A reasoning model: a reasoning item, then the calls. The
+                // call's id is both the item id and the call_id, so it is
                 // the id the harness reads, as on the other provider.
-                ? array_map(fn (array $call): array => ['id' => $call['id'], 'type' => 'function_call', 'status' => 'completed',
-                    'arguments' => json_encode(['token' => $call['token']]), 'call_id' => $call['id'], 'name' => $call['gated'] ? 'gated' : 'free'], $next['calls'])
+                ? [['id' => 'rs_'.(++PairingPropertyWorld::$item), 'type' => 'reasoning', 'summary' => []],
+                    ...array_map(fn (array $call): array => ['id' => $call['id'], 'type' => 'function_call', 'status' => 'completed',
+                        'arguments' => json_encode(['token' => $call['token']]), 'call_id' => $call['id'], 'name' => $call['gated'] ? 'gated' : 'free'], $next['calls'])]
                 : [['id' => 'msg_'.(++PairingPropertyWorld::$item), 'type' => 'message', 'status' => 'completed', 'role' => 'assistant',
                     'content' => [['type' => 'output_text', 'text' => '{"ok":true}', 'annotations' => []]]]];
 
@@ -264,9 +266,13 @@ function pairingWithProvider(array $case, int $seed): array
 {
     $g = new PairingPropertyRng(($seed ^ 0x415415) & 0xFFFFFFFF);
     $case['provider'] = $g->chance(0.3) ? 'openai' : 'anthropic';
-    // Half the assistant notes carry the step's provider content.
+    // Some assistant notes carry the step's provider content, and some host
+    // copies with a call of their own carry it too.
     if (($case['insert']['kind'] ?? null) === 'assistant_text' && $g->chance(0.4)) {
         $case['insert']['kind'] = 'assistant_content';
+    }
+    if (($case['insert']['kind'] ?? null) === 'assistant_call' && $g->chance(0.4)) {
+        $case['insert']['kind'] = 'assistant_mismatch';
     }
     if ($case['provider'] === 'openai') {
         $case['entry'] = 'send';
@@ -499,7 +505,7 @@ function pairingOracle(array $case): array
         // A row that supersedes the parked step (an assistant row, with or
         // without a call, or a user row) runs none of its gated calls; a
         // forged result is its call's only outcome, and that call never runs.
-        $superseded = in_array($insert, ['assistant_text', 'assistant_content', 'assistant_call', 'user'], true);
+        $superseded = in_array($insert, ['assistant_text', 'assistant_content', 'assistant_call', 'assistant_mismatch', 'user'], true);
         $forged = ($case['insert']['kind'] ?? null) === 'tool_result' && $steps === [] && $insert !== null
             && ($case['insert']['segment'] ?? 'earlier') === 'earlier' ? $case['insert']['call'] : null;
         $runs = [];
@@ -539,7 +545,7 @@ function pairingOracle(array $case): array
         // the provider refuse the turn.
         $kind = pairingInsertBefore($case);
         $later = ($case['insert']['segment'] ?? null) === 'later';
-        $supersededR = $later && in_array($kind, ['assistant_text', 'assistant_content', 'assistant_call', 'user'], true);
+        $supersededR = $later && in_array($kind, ['assistant_text', 'assistant_content', 'assistant_call', 'assistant_mismatch', 'user'], true);
         $refusedR = $kind === 'system';
         $forgedK = null;
         if ($later && $kind === 'tool_result') {
@@ -848,6 +854,9 @@ function pairingInsertedRow(array $case, Session $session): Message
         // A note with no tool calls carrying the newest step's provider
         // content (output_items / content_blocks), as a host can copy it (G-415).
         'assistant_content' => new AssistantMessage('A note.', [], pairingNewestStepContent($session)),
+        // A copy whose call is its own, carrying the newest step's provider
+        // content, whose tool items are another step's (G-415).
+        'assistant_mismatch' => new AssistantMessage('A copy.', [new ToolCall('q900', 'free', ['token' => 'x901'], pairingResultId('q900'))], pairingNewestStepContent($session)),
         'assistant_call' => new AssistantMessage('', [new ToolCall($call['id'], 'free', ['token' => 'x900'], pairingResultId($call['id']))]),
         'user' => new UserMessage('Something else.'),
         'system' => new SystemMessage('A system note.'),
@@ -926,7 +935,7 @@ function pairingViolations(array $case, array $observed): array
         }
         $message = $row['message'];
         if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
-            $tokens = array_map(fn ($call): ?string => pairingToken($call->arguments()), $message->toolCalls);
+            $tokens = array_map(fn ($call): ?string => pairingToken($call->arguments()), array_values($message->toolCalls));
             $current = null;
             foreach ($case['steps'] as $s => $step) {
                 if ($tokens === array_column($step['calls'], 'token')) {
@@ -1170,6 +1179,23 @@ function pairingSentViolations(array $requests): array
                 }
                 $i--;
             }
+            // A reasoning item is sent once, and is followed by the
+            // function_call or message it led to.
+            $reasoning = [];
+            foreach ($items as $i => $item) {
+                if (($item['type'] ?? null) !== 'reasoning') {
+                    continue;
+                }
+                $id = (string) ($item['id'] ?? '');
+                if (isset($reasoning[$id])) {
+                    $violations[] = "inv7: request {$r} sends reasoning item ".json_encode($id).' twice';
+                }
+                $reasoning[$id] = true;
+                $next = $items[$i + 1] ?? [];
+                if (! in_array($next['type'] ?? null, ['function_call', 'message'], true) && ($next['role'] ?? null) !== 'assistant') {
+                    $violations[] = "inv7: request {$r} sends reasoning item ".json_encode($id).' with nothing it led to after it';
+                }
+            }
 
             continue;
         }
@@ -1216,7 +1242,7 @@ function pairingReplayViolations(array $case, array $observed): array
         $current = null;
         foreach ($messages as $message) {
             if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
-                $tokens = array_map(fn ($call): ?string => pairingToken($call->arguments()), $message->toolCalls);
+                $tokens = array_map(fn ($call): ?string => pairingToken($call->arguments()), array_values($message->toolCalls));
                 $current = null;
                 foreach ($case['steps'] as $s => $step) {
                     if ($tokens === array_column($step['calls'], 'token')) {
@@ -1270,7 +1296,7 @@ function pairingReplayViolations(array $case, array $observed): array
     $seen = [];
     foreach ($observed['replay'] as $message) {
         if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
-            $owners = array_map(fn ($call): string => (string) json_encode([$call->id, $call->name]), $message->toolCalls);
+            $owners = array_map(fn ($call): string => (string) json_encode([$call->id, $call->name]), array_values($message->toolCalls));
             $seen = [];
 
             continue;
@@ -1335,7 +1361,7 @@ function pairingReplacedViolations(array $case, array $observed, array $expected
     foreach ($observed['rows'] as $index => $row) {
         $message = $row['message'];
         if ($message instanceof AssistantMessage && $message->toolCalls !== []
-            && array_map(fn ($call): ?string => pairingToken($call->arguments()), $message->toolCalls) === $tokens) {
+            && array_map(fn ($call): ?string => pairingToken($call->arguments()), array_values($message->toolCalls)) === $tokens) {
             $from = $index;
         }
     }
@@ -1677,7 +1703,9 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'entry send', 'entry stream', '1 steps', '2 steps',
         'provider anthropic', 'provider openai',
         'insert assistant_content before_decision', 'insert assistant_content after_decision',
+        'insert assistant_mismatch before_decision', 'insert assistant_mismatch after_decision',
         'replaced, then insert assistant_content before_decision', 'replaced, then insert assistant_content after_decision',
+        'replaced, then insert assistant_mismatch before_decision', 'replaced, then insert assistant_mismatch after_decision',
         'repeat send', 'repeat stream', 'repeat structured', 'repeat redecide', 'repeat lateApprove', 'repeat lateDeny',
         'a pair of decision rows, approve first', 'a pair of decision rows, deny first',
         'resume decide', 'resume streamDecision', 'resume approveOne', 'resume newMessage',

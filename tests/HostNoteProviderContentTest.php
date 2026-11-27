@@ -9,15 +9,17 @@ use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\ToolCall;
 use Tests\Fixtures\Participant;
 
-// G-415: a host records an assistant note through Thread::record() with no
-// tool calls, but carrying a stored step's provider content (OpenAI
-// `output_items`, Anthropic `content_blocks`). Core replays that content as
-// it is, so the step's function_call / tool_use would be sent again with
-// nothing answering it, in every later request. The note's tool items are
-// not replayed; its text is. A step the harness recorded replays its
-// provider content unchanged.
+// G-415: a host records an assistant row through Thread::record() carrying a
+// stored step's provider content (OpenAI `output_items`, Anthropic
+// `content_blocks`): a note with no tool calls, or a copy with a call of its
+// own. Core sends that content in place of the row's text and calls, so the
+// step's function_call / tool_use would go out again with nothing answering
+// it, in every later request, and the row's own text would never be sent.
+// Provider content is replayed only when it is the row's own; every row the
+// harness recorded replays its provider content unchanged.
 
 beforeEach(function (): void {
     Http::preventStrayRequests();
@@ -49,8 +51,10 @@ beforeEach(function (): void {
             return Http::response(['id' => 'm'.$n, 'type' => 'message', 'role' => 'assistant', 'model' => 'x', 'content' => $content,
                 'stop_reason' => $n === 1 ? 'tool_use' : 'end_turn', 'stop_sequence' => null, 'usage' => ['input_tokens' => 1, 'output_tokens' => 1]]);
         }
+        // A reasoning model's tool step: its reasoning item, then its call.
         $output = $n === 1
-            ? [['id' => 'fc_paris', 'type' => 'function_call', 'status' => 'completed', 'arguments' => '{"city":"Paris"}', 'call_id' => 'call_paris', 'name' => 'weather']]
+            ? [['id' => 'rs_1', 'type' => 'reasoning', 'summary' => []],
+                ['id' => 'fc_paris', 'type' => 'function_call', 'status' => 'completed', 'arguments' => '{"city":"Paris"}', 'call_id' => 'call_paris', 'name' => 'weather']]
             : [['id' => 'msg_'.$n, 'type' => 'message', 'status' => 'completed', 'role' => 'assistant', 'content' => [['type' => 'output_text', 'text' => 'Done '.$n.'.', 'annotations' => []]]]];
 
         return Http::response(['id' => 'resp_'.$n, 'object' => 'response', 'created_at' => 1, 'status' => 'completed', 'model' => 'gpt-4o', 'output' => $output,
@@ -63,13 +67,15 @@ function hostNoteSession(): Session
     return app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
 }
 
-/** The host's note: no tool calls, the stored step's provider content. */
-function hostNoteRecord(): void
+/** The host's row carrying the stored step's provider content: a note, or a copy with a call of its own. */
+function hostNoteRecord(string $shape): void
 {
     $thread = hostNoteSession()->thread();
     $step = $thread->storedMessages()->where('type', 'assistant')->reorder('position')->get()
         ->first(fn ($row): bool => ! empty($row->payload['tool_calls']))->toPrismMessage();
-    $thread->record([new AssistantMessage('A note.', [], $step->additionalContent)]);
+    $thread->record([$shape === 'note'
+        ? new AssistantMessage('A note.', [], $step->additionalContent)
+        : new AssistantMessage('A note.', [new ToolCall('q', 'weather', ['city' => 'Rome'], 'q')], $step->additionalContent)]);
 }
 
 /**
@@ -124,43 +130,77 @@ function hostNoteOrphans(array $requests): array
     return $orphans;
 }
 
-it('never sends a host note\'s copied tool calls again', function (string $provider, string $when): void {
+/**
+ * OpenAI input rules beyond pairing: no item id sent twice, and a reasoning
+ * item followed by a function_call or a message.
+ *
+ * @param  list<array<string, mixed>>  $requests
+ * @return list<string>
+ */
+function hostNoteInputErrors(array $requests): array
+{
+    $errors = [];
+    foreach ($requests as $r => $body) {
+        $items = array_values($body['input'] ?? []);
+        $ids = array_values(array_filter(array_map(fn ($item) => $item['id'] ?? null, $items), 'is_string'));
+        foreach (array_count_values($ids) as $id => $count) {
+            if ($count > 1) {
+                $errors[] = "request {$r}: item {$id} is sent {$count} times";
+            }
+        }
+        foreach ($items as $i => $item) {
+            $next = $items[$i + 1] ?? [];
+            if (($item['type'] ?? null) === 'reasoning' && ! in_array($next['type'] ?? null, ['function_call', 'message'], true) && ($next['role'] ?? null) !== 'assistant') {
+                $errors[] = "request {$r}: reasoning item {$item['id']} is not followed by its item";
+            }
+        }
+    }
+
+    return $errors;
+}
+
+it('never sends a host row\'s copied tool calls, and sends its own text', function (string $provider, string $shape, string $when): void {
     config()->set('prism-harness.agent.provider', $provider);
     config()->set('prism-harness.agent.model', $provider === 'openai' ? 'gpt-4o' : 'claude-sonnet-5-5');
 
     $id = hostNoteSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
     if ($when === 'while parked') {
-        hostNoteRecord();
+        hostNoteRecord($shape);
         hostNoteSession()->approve($id);
     } else {
         hostNoteSession()->approve($id);
-        hostNoteRecord();
+        hostNoteRecord($shape);
     }
     hostNoteSession()->send('Next question.');
     hostNoteSession()->send('');
 
-    // The note is still replayed: its provider content's text (the step's
-    // "Let me check." block, which core prefers to the row's own text), or,
-    // when only tool items were copied, its own text.
+    // The row is sent from its own text (and its own call), once; the step's
+    // own text block, once, with the step.
     $last = json_encode(end($this->requests));
 
     expect(hostNoteOrphans($this->requests))->toBe([])
-        ->and($provider === 'openai' ? substr_count($last, 'A note.') : substr_count($last, 'Let me check.'))->toBe($provider === 'openai' ? 1 : 2)
+        ->and(hostNoteInputErrors($this->requests))->toBe([])
+        ->and(substr_count($last, 'A note.'))->toBe(1)
+        ->and(substr_count($last, 'Let me check.'))->toBe($provider === 'openai' ? 0 : 1)
         ->and($this->ran)->toBe($when === 'while parked' ? 0 : 1);
 })->with(['OpenAI' => 'openai', 'Anthropic' => 'anthropic'])
+    ->with(['a note with no tool calls' => 'note', 'a copy with a call of its own' => 'copy'])
     ->with(['while parked' => 'while parked', 'after the step resolved' => 'after the step resolved']);
 
-it('replays a harness-written step\'s provider content unchanged', function (string $provider): void {
+it('replays every provider content the harness recorded unchanged', function (string $provider): void {
     config()->set('prism-harness.agent.provider', $provider);
     config()->set('prism-harness.agent.model', $provider === 'openai' ? 'gpt-4o' : 'claude-sonnet-5-5');
 
     $id = hostNoteSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
     hostNoteSession()->approve($id);
+    hostNoteSession()->send('Next question.');
 
-    $step = collect(iterator_to_array(hostNoteSession()->thread()->messages(), false))
-        ->first(fn ($message): bool => $message instanceof AssistantMessage && $message->toolCalls !== []);
-    $stored = hostNoteSession()->thread()->storedMessages()->where('type', 'assistant')->reorder('position')->first()->toPrismMessage();
+    // Every assistant row, as replayed and as stored, in order.
+    $replayed = array_values(array_filter(iterator_to_array(hostNoteSession()->thread()->messages(), false), fn ($message): bool => $message instanceof AssistantMessage));
+    $stored = hostNoteSession()->thread()->storedMessages()->where('type', 'assistant')->reorder('position')->get()->map(fn ($row) => $row->toPrismMessage())->all();
 
-    expect($step->additionalContent)->toBe($stored->additionalContent)
+    expect(array_map(fn (AssistantMessage $message): array => $message->additionalContent, $replayed))
+        ->toBe(array_map(fn (AssistantMessage $message): array => $message->additionalContent, $stored))
+        ->and(count($stored))->toBe(3)
         ->and($this->ran)->toBe(1);
 })->with(['OpenAI' => 'openai', 'Anthropic' => 'anthropic']);
