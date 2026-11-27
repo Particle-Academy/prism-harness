@@ -61,6 +61,12 @@ function corpusToolCalls(array $calls): array
  */
 function corpusRows(array $case): array
 {
+    if (($case['read'] ?? null) === 'approval_states') {
+        // How each approval READS over rows as stored (0.4.0, G-387 round
+        // 13): whether a runner start ended its call, by the harness's mark.
+        return array_map(fn (string $id): array => ['approval_id' => $id, 'ended_by_start' => Thread::endedByStartIn($case['stored'], $id)],
+            $case['approvals']);
+    }
     if (isset($case['fold'])) {
         $messages = array_map(function (array $stored): Message {
             $type = $stored['type'];
@@ -106,7 +112,7 @@ function corpusRows(array $case): array
 }
 
 it('is the whole suite, not a subset someone trimmed to green', function (): void {
-    expect(threadRowsCorpus()['cases'])->toHaveCount(14);
+    expect(threadRowsCorpus()['cases'])->toHaveCount(15);
 });
 
 it('stores and replays every row as the corpus records for the reference', function (array $case): void {

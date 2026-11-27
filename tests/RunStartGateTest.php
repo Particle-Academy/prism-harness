@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Contracts\HasErrorCode;
 use Prism\Harness\Events\RunFailed;
+use Prism\Harness\Events\RunFinished;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Events\ToolDenied;
 use Prism\Harness\Exceptions\ApprovalNotPending;
@@ -30,7 +31,13 @@ use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Schema\ObjectSchema;
 use Prism\Prism\Schema\StringSchema;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
+use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
 
@@ -1121,6 +1128,8 @@ function sgApproveCode(string $approval): string
         sgChild()->approve($approval);
     } catch (RunNotPermitted $e) {
         return $e->code();
+    } catch (ApprovalNotPending) {
+        return 'not_pending';
     }
 
     return 'accepted';
@@ -2529,4 +2538,408 @@ it('confirms nothing for a start view a host sets, even on a provisional run lef
     expect($read)->toBe([null, null, null])
         ->and($code)->toBe('child_binding_missing')
         ->and($this->ran['weather'])->toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// G-387 round 13.
+// ---------------------------------------------------------------------------
+
+const SG_REPEATED_REASON = 'Tool call was not run because another call in this step has the same id';
+
+/**
+ * The child parks on ONE step whose gated weather call shares its id with an
+ * ungated echo call, in the order given: a provider that names calls by
+ * function (Gemini), or one that sends empty ids. echo runs at step time.
+ */
+function sgMixedRepeated(string $id, bool $gatedFirst): void
+{
+    $weather = ['weather', ['city' => 'Paris'], $id];
+    $echo = ['echo', ['text' => 'hi'], $id];
+    G360::calls([['worker', ['task' => 'Go']]]);
+    G360::calls($gatedFirst ? [$weather, $echo] : [$echo, $weather]);
+    for ($i = 0; $i < 4; $i++) {
+        G360::text('Asked.');
+    }
+    sgRoot()->send('Go');
+}
+
+/** Record a person's decision on the child without resuming it (the window a start can land in). */
+function sgDecideOnly(string $approval, bool $approved): void
+{
+    $child = sgChild();
+    (fn () => $this->recordDecisions([new ToolApprovalResponse($approval, $approved)]))->call($child);
+}
+
+/**
+ * Every recorded decision on the child, by approval id: the first answer and its reason.
+ *
+ * @return array<string, array{0: bool, 1: ?string}>
+ */
+function sgRecordedDecisions(): array
+{
+    $out = [];
+    foreach (sgChild()->thread()->storedMessages()->where('type', 'tool_result')->orderBy('position')->get() as $row) {
+        foreach ($row->payload['tool_approval_responses'] ?? [] as $response) {
+            $out[$response['approval_id']] ??= [$response['approved'], $response['reason'] ?? null];
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * The ended marks stored on the child's thread, raw: each marked row's keys and its mark.
+ *
+ * @return list<array{0: list<string>, 1: mixed}>
+ */
+function sgEndedMarks(): array
+{
+    $marks = [];
+    foreach (sgChild()->thread()->storedMessages()->where('type', 'tool_result')->orderBy('position')->get() as $row) {
+        if (array_key_exists(Thread::ENDED_BY_START, $row->payload)) {
+            $marks[] = [array_keys($row->payload), $row->payload[Thread::ENDED_BY_START]];
+        }
+    }
+
+    return $marks;
+}
+
+// Item 3 (Py F1, the PHP reference's rule): a GATED call that shares its id
+// with an UNGATED call in the same step. The ungated call's result is ITS
+// result, never the gated call's: results are matched to calls by position,
+// so the step parks on the gated call's approval. Every decision on such a
+// step is recorded as a denial with the G-392 text, and a resume runs nothing.
+it('parks a gated call that shares its id with an ungated one and denies every decision on it', function (string $id, bool $gatedFirst): void {
+    sgMixedRepeated($id, $gatedFirst);
+    $pending = sgChild()->thread()->pendingApprovalIds();
+    expect($this->ran)->toBe(['weather' => 0, 'echo' => 1])
+        ->and($pending)->toHaveCount(1)
+        ->and(array_column(sgChild()->thread()->pendingApprovalCalls(), 'name'))->toBe(['weather']);
+
+    G360::$queue = [];
+    G360::text('Child done.');
+    G360::text('Pad.');
+    sgFreshChild()->approve($pending[0]);
+
+    expect($this->ran)->toBe(['weather' => 0, 'echo' => 1])
+        ->and(sgRecordedDecisions())->toBe([$pending[0] => [false, SG_REPEATED_REASON]])
+        ->and(sgFreshChild()->approvalStatus($pending[0]))->toBe('denied')
+        ->and(sgFreshChild()->thread()->pendingApprovalIds())->toBe([]);
+})->with([
+    'shared id, gated first' => ['dup', true],
+    'shared id, ungated first' => ['dup', false],
+    'empty id, gated first' => ['', true],
+    'empty id, ungated first' => ['', false],
+]);
+
+// Items 1 and 3 together (TS F1 P1, Py F1 P3): a person decides the gated
+// call while it is answerable; the child then loses its binding and a start
+// ends the call. The start's mark names the approval although an earlier,
+// UNMARKED result row carries the same call id: the approval reads ended,
+// never approved, and is not offered again.
+it('ends a gated call that shares its id with an ungated one when a start lands, and reads it ended', function (string $id, bool $gatedFirst): void {
+    sgMixedRepeated($id, $gatedFirst);
+    $approval = (string) (sgChild()->thread()->pendingApprovalIds()[0] ?? '');
+    expect($approval)->not->toBe('');
+    sgDecideOnly($approval, true);
+    expect(sgRecordedDecisions())->toBe([$approval => [false, SG_REPEATED_REASON]]);
+    DB::table('harness_session_state')->where('key', sgChild()->key().':child')->delete();
+
+    expect(sgRedelegate('Start over'))->toContain('"outcome":"completed"');
+
+    $child = sgFreshChild();
+    expect(sgEndedMarks())->toBe([[['tool_results', 'tool_approval_responses', Thread::ENDED_BY_START], ['approval_ids' => [$approval]]]])
+        ->and($child->approvalStatus($approval))->toBe('superseded')
+        ->and(array_filter($child->thread()->approvalDecisions()))->toBe([])
+        ->and($child->thread()->pendingApprovalIds())->toBe([])
+        ->and(sgApproveCode($approval))->toBe('not_pending')
+        ->and($this->ran)->toBe(['weather' => 0, 'echo' => 1]);
+})->with([
+    'shared id, gated first' => ['dup', true],
+    'shared id, ungated first' => ['dup', false],
+    'empty id, gated first' => ['', true],
+    'empty id, ungated first' => ['', false],
+]);
+
+// Item 1 (TS F1 P1b, Gemini-style): two calls to the SAME tool share an id,
+// and one already has a result (its arguments were malformed, so core
+// reported it failed at step time). The other is gated.
+it('ends the gated one of two same-tool calls sharing an id when one already failed', function (): void {
+    G360::calls([['worker', ['task' => 'Go']]]);
+    G360::$queue[] = (string) json_encode([
+        'id' => 'resp_p1b', 'object' => 'response', 'created_at' => 1741989983, 'status' => 'completed', 'model' => 'gpt-4o-2024-08-06',
+        'output' => [
+            ['id' => 'w', 'type' => 'function_call', 'status' => 'completed', 'arguments' => '{"city":"Paris"}', 'call_id' => 'w', 'name' => 'weather'],
+            ['id' => 'w', 'type' => 'function_call', 'status' => 'completed', 'arguments' => '{"city":', 'call_id' => 'w', 'name' => 'weather'],
+        ],
+        'usage' => ['input_tokens' => 10, 'input_tokens_details' => ['cached_tokens' => 0], 'output_tokens' => 5,
+            'output_tokens_details' => ['reasoning_tokens' => 0], 'total_tokens' => 15],
+    ]);
+    for ($i = 0; $i < 4; $i++) {
+        G360::text('Asked.');
+    }
+    sgRoot()->send('Go');
+    $pending = sgChild()->thread()->pendingApprovalIds();
+    expect($pending)->toHaveCount(1);
+    sgDecideOnly($pending[0], true);
+    DB::table('harness_session_state')->where('key', sgChild()->key().':child')->delete();
+
+    expect(sgRedelegate('Start over'))->toContain('"outcome":"completed"')
+        ->and(sgEndedMarks()[0][1] ?? null)->toBe(['approval_ids' => [$pending[0]]])
+        ->and(sgFreshChild()->approvalStatus($pending[0]))->toBe('superseded')
+        ->and(sgApproveCode($pending[0]))->toBe('not_pending')
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// Item 1, the reading alone, through the writer the harness uses: rows as a
+// start leaves them on a step whose call ids repeat. ANY result row after the
+// approval's own request and before the next model step that carries the
+// harness's mark naming it ends it; a row with no mark, or a mark after the
+// next model step, does not.
+it('reads an approval ended when any result row of its step carries the mark naming it', function (): void {
+    $thread = sgChild()->thread();
+    $ended = new ToolResultMessage([new ToolResult('dup', 'weather', ['city' => 'Paris'], 'Not run: the delegation this call was proposed under ended.')]);
+    $thread->record([
+        new UserMessage('Go'),
+        new AssistantMessage('', [new ToolCall('c1', 'weather', ['city' => 'Rome'])], [], [new ToolApprovalRequest('apr_0', 'c1')]),
+        new ToolResultMessage([new ToolResult('c1', 'weather', ['city' => 'Rome'], 'Sunny')], [new ToolApprovalResponse('apr_0', true)]),
+        new AssistantMessage('', [new ToolCall('dup', 'weather', ['city' => 'Paris']), new ToolCall('dup', 'echo', ['text' => 'hi'])], [],
+            [new ToolApprovalRequest('apr_1', 'dup')]),
+        new ToolResultMessage([new ToolResult('dup', 'echo', ['text' => 'hi'], 'hi')]),
+        new ToolResultMessage([], [new ToolApprovalResponse('apr_1', false, SG_REPEATED_REASON)]),
+        $ended,
+        new UserMessage('Start over'),
+    ], endedByStart: [['message' => $ended, 'approvals' => ['apr_1', 'apr_0']]]);
+
+    expect($thread->endedByStart('apr_1'))->toBeTrue()
+        ->and($thread->endedByStart('apr_0'))->toBeFalse()
+        ->and($thread->endedByStart('apr_9'))->toBeFalse();
+});
+
+// Item 5 (PHP run15, probe ZB): the success path NEVER undoes a start. A
+// store read that throws while a completed start is cleaned up only ends the
+// start's own view; the binding and the mode stand, and the child's next
+// host turn runs. A failure exit after the task row keeps it too.
+
+/**
+ * Throw on every "did this run record a row" read for the child's start, from
+ * when `$arm` (asked on every query) returns true until the next model request.
+ *
+ * @param  Closure(string): bool  $arm
+ */
+function sgFailingTaskRead(Closure $arm, int &$thrown): void
+{
+    $armed = false;
+    $start = null;
+    Event::listen(RunStarted::class, function (RunStarted $event) use (&$start): void {
+        if (str_contains($event->sessionKey, '::sub::worker') && $start === null) {
+            $start = $event->runId;
+        }
+    });
+    $checking = false;
+    DB::listen(function (QueryExecuted $query) use (&$armed, &$start, &$thrown, &$checking, $arm): void {
+        if ($checking || $start === null) {
+            return;
+        }
+        if (! $armed) {
+            $checking = true;
+            try {
+                $armed = $arm($start);
+            } finally {
+                $checking = false;
+            }
+
+            return;
+        }
+        if (! str_contains($query->sql, 'harness_thread_messages') || ! str_contains($query->sql, 'exists')
+            || str_contains($query->sql, '"type"') || ! in_array($start, $query->bindings, true)) {
+            return;
+        }
+        $thrown++;
+
+        throw new RuntimeException('SECRET store outage');
+    });
+    $previous = G360::$onRequest;
+    G360::$onRequest = function (int $n) use (&$armed, $previous): void {
+        $armed = false;
+        if ($previous !== null) {
+            $previous($n);
+        }
+    };
+}
+
+it('keeps a completed start when its cleanup read fails', function (): void {
+    $dead = sgDeadChild();
+    $finished = false;
+    Event::listen(RunFinished::class, function (RunFinished $event) use (&$finished): void {
+        if (str_contains($event->sessionKey, '::sub::worker')) {
+            $finished = true;
+        }
+    });
+    $thrown = 0;
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::text('Child done.');
+    G360::text('Handled.');
+    sgPad(3);
+    $before = count(G360::outputs());
+    sgFailingTaskRead(function () use (&$finished): bool {
+        return $finished;
+    }, $thrown);
+    sgRoot()->send('Go again');
+    $out = implode(' ', array_slice(G360::outputs(), $before));
+    G360::$onRequest = null;
+
+    G360::$queue = [];
+    G360::text('Hello back.');
+    expect($out)->toContain('"outcome":"completed"')
+        ->and($out)->not->toContain('SECRET')
+        ->and(sgFreshChild()->childBinding())->not->toBeNull()
+        ->and(sgFreshChild()->mode())->toBe('work')
+        ->and(sgFreshChild()->approvalStatus($dead))->toBe('superseded')
+        ->and(sgHostTurnCode('Hello'))->toBe('ran')
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+it('keeps a start that failed after its task row when its cleanup read fails', function (): void {
+    $dead = sgDeadChild();
+    $thrown = 0;
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::calls([['echo', ['text' => 'step one']]]);
+    G360::text('Handled.');
+    sgPad(3);
+    sgFailingTaskRead(fn (string $start): bool => sgChild()->taskRowExists($start), $thrown);
+    // This turn's requests: the root's, the child's first step (echo), then
+    // the child's second step, which the provider fails.
+    $seen = 0;
+    $previous = G360::$onRequest;
+    G360::$onRequest = function (int $n) use ($previous, &$seen): void {
+        $seen++;
+        if ($seen === 3) {
+            throw new RuntimeException('provider down');
+        }
+        $previous($n);
+    };
+    sgRoot()->send('Go again');
+    G360::$onRequest = null;
+
+    G360::$queue = [];
+    G360::text('Hello back.');
+    expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+        ->and($this->ran['echo'])->toBe(1)
+        ->and(sgFreshChild()->childBinding())->not->toBeNull()
+        ->and(sgFreshChild()->mode())->toBe('work')
+        ->and(sgFreshChild()->approvalStatus($dead))->toBe('superseded')
+        ->and(sgHostTurnCode('Hello'))->toBe('ran')
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// The other side of the rule: a start that failed BEFORE its task row never
+// happened, whether its cleanup read works (it is undone) or throws (its
+// records stay unconfirmed, and every reader sees them as absent): a read
+// that failed confirms nothing.
+it('never confirms a start that failed before its task row, whether or not its cleanup read fails', function (bool $readFails): void {
+    $dead = sgDeadChild();
+    $on = true;
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use (&$on): array {
+        if ($on && str_contains($session->key(), '::sub::worker')) {
+            throw new RuntimeException('provider down');
+        }
+
+        return [];
+    }, name: 'outage');
+    $thrown = 0;
+    if ($readFails) {
+        sgFailingTaskRead(fn (): bool => true, $thrown);
+    }
+    expect(sgRedelegate('Start over'))->toContain('"outcome":"failed"');
+    $on = false;
+    G360::$onRequest = null;
+
+    expect(sgFreshChild()->childBinding())->toBeNull()
+        ->and(sgApproveCode($dead))->toBe('child_binding_missing')
+        ->and(sgHostTurnCode('Hello'))->toBe('child_binding_missing')
+        ->and($this->ran['weather'])->toBe(0);
+})->with(['read works' => [false], 'read fails' => [true]]);
+
+// Item 4 (Py P5, I2): the object that committed a start cannot re-enter that
+// start's view on its own crash residue. In PHP only a view the runtime
+// entered confirms anything, and the runtime ends it when the run ends: the
+// start's own Session object entering it again by hand confirms nothing.
+it('confirms nothing when the start\'s own object re-enters its view on its crash residue', function (): void {
+    $dead = sgDeadChild();
+    $kept = null;
+    $on = true;
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use (&$on, &$kept): array {
+        if ($on && str_contains($session->key(), '::sub::worker')) {
+            $kept = $session;
+            sgFailChildUndo();
+
+            throw new RuntimeException('provider down');
+        }
+
+        return [];
+    }, name: 'outage');
+    expect(sgRedelegate('Start over'))->toContain('"outcome":"failed"');
+    $on = false;
+    sgUnfailChildUndo();
+    $provisional = (string) (sgRawChild()['child_binding']['provisional'] ?? '');
+    expect($provisional)->not->toBe('')->and($kept)->toBeInstanceOf(Session::class);
+    $key = sgChild()->key().':ephemeral';
+    $state = json_decode((string) DB::table('harness_session_state')->where('key', $key)->value('payload'), true);
+    $state['run'] = [...$state['run'], 'id' => $provisional, 'status' => 'running'];
+    DB::table('harness_session_state')->where('key', $key)->update(['payload' => json_encode($state)]);
+
+    $kept->enterStart($provisional);
+    $read = [$kept->childBinding(), $kept->childStepCeiling(), $kept->childDelegation()];
+    $code = 'accepted';
+    try {
+        $kept->approve($dead);
+    } catch (RunNotPermitted $e) {
+        $code = $e->code();
+    } catch (Throwable $other) {
+        $code = $other::class;
+    }
+
+    expect($read)->toBe([null, null, null])
+        ->and($code)->toBe('child_binding_missing')
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// Item 4 (Py I3): a run stopped by an Error (PHP's analogue of a Python
+// BaseException) is finished through the same path as any other failure:
+// Session::finishRun, which writes the run's end and then runs the plan's
+// after-turn hook and the run tree's settle. Plans is final, so the hook is
+// observed by what it reads: the plan record, after the failed run is written.
+it('finishes a run an Error stopped through the path that runs the plan after-turn hook', function (): void {
+    config()->set('prism-harness.plans.enabled', true);
+    app()->forgetInstance(Plans::class);
+    app(ToolRegistry::class)->registerProvider(function (Session $session): array {
+        throw new class('SECRET') extends Error {};
+    }, name: 'erroring');
+    G360::text('Never.');
+    $failedWritten = false;
+    $planReadAfter = 0;
+    DB::listen(function (QueryExecuted $query) use (&$failedWritten, &$planReadAfter): void {
+        foreach ($query->bindings as $binding) {
+            if (is_string($binding) && str_contains($binding, '"status":"failed"')) {
+                $failedWritten = true;
+            }
+        }
+        if ($failedWritten && str_starts_with(strtolower($query->sql), 'select') && str_contains(implode(' ', array_map('strval', $query->bindings)), ':plan')) {
+            $planReadAfter++;
+        }
+    });
+    $thrown = null;
+    try {
+        sgRoot()->send('Go');
+    } catch (Throwable $e) {
+        $thrown = $e;
+    }
+
+    expect($thrown)->toBeInstanceOf(Error::class)
+        ->and($failedWritten)->toBeTrue()
+        ->and($planReadAfter)->toBeGreaterThan(0)
+        ->and(sgRoot()->run()['status'] ?? null)->toBe('failed');
 });

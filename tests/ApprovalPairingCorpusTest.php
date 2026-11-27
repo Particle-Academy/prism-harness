@@ -43,7 +43,7 @@ function approvalPairingSession(): Session
 
 /**
  * @param  array<string, mixed>  $row
- * @return array{approvals: int, free: int, ran: list<int>}
+ * @return array{approvals: int, free: int, ran: list<int>, decided: list<bool|null>}
  */
 function recordApprovalPairingRow(array $row): array
 {
@@ -104,8 +104,13 @@ function recordApprovalPairingRow(array $row): array
 
     $ran = PairingCorpusRan::$echo;
     sort($ran);
+    // The decision the thread RECORDED for each approval, in issue order
+    // (0.2.0): the first answer, or null when none was recorded. On a step
+    // whose call ids repeat every recorded decision is a denial.
+    $recorded = approvalPairingSession()->thread()->approvalDecisions();
+    $decided = array_map(fn ($request): ?bool => $recorded[$request->approvalId] ?? null, $pending);
 
-    return ['approvals' => count($pending), 'free' => PairingCorpusRan::$free, 'ran' => $ran];
+    return ['approvals' => count($pending), 'free' => PairingCorpusRan::$free, 'ran' => $ran, 'decided' => $decided];
 }
 
 it('has rows', function (): void {
