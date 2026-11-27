@@ -868,10 +868,13 @@ class Thread extends Model implements ThreadContract
                     // approvals. MessageMapper does not send it back.
                     $payload[self::REPLACED_MARK] = ['approval_ids' => $marks[$message]];
                 }
-                if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $toolNames !== null) {
+                if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== []) {
                     // Harness metadata on the same durable approval record.
-                    // MessageMapper does not send it back to the provider.
-                    $payload['harness_tool_names'] = array_values(array_unique($toolNames));
+                    // MessageMapper does not send it back to the provider. A
+                    // step recorded without its offer is offered the tools its
+                    // own approval requests name (G-412), so the next turn
+                    // resolves it instead of sending its calls unanswered.
+                    $payload['harness_tool_names'] = array_values(array_unique($toolNames ?? self::requestedToolNames($message)));
                 }
                 if ($deferred !== null && $deferred !== [] && ($message instanceof UserMessage || $message instanceof AssistantMessage)) {
                     // Superseded while a run answers it: the row names the
@@ -1395,6 +1398,68 @@ class Thread extends Model implements ThreadContract
 
         return true;
     }
+
+    /**
+     * The tool names `$step`'s approval requests name, through the calls they
+     * ask for. Names a stored offer cannot hold ('' and '*') are left out.
+     *
+     * @return list<string>
+     */
+    private static function requestedToolNames(AssistantMessage $step): array
+    {
+        $requested = array_fill_keys(array_map(static fn (ToolApprovalRequest $request): string => $request->toolCallId, $step->toolApprovalRequests), true);
+        $names = [];
+        foreach ($step->toolCalls as $call) {
+            if (isset($requested[$call->id]) && $call->name !== '' && $call->name !== '*') {
+                $names[] = $call->name;
+            }
+        }
+
+        return array_values(array_unique($names));
+    }
+
+    /**
+     * Give each call of the paused step that a request names, that no result
+     * answers, and whose tool the run cannot offer `$reason` as its one
+     * stored outcome (G-412). No resolution answers such a call (core
+     * resolves only calls whose tool it is offered), so every later request
+     * would send it unanswered. Returns whether a row was written.
+     *
+     * @internal Called before a run reads the conversation.
+     *
+     * @param  Closure(string): bool  $offered  whether the run can offer a tool of this name
+     */
+    public function endRequestedCallsNotOffered(Closure $offered, string $reason, ?string $runId = null): bool
+    {
+        $step = $this->resolvableStep();
+        if ($step === null || $step['assistant']->toolApprovalRequests === []) {
+            return false;
+        }
+        $requested = array_fill_keys(array_map(static fn (ToolApprovalRequest $request): string => $request->toolCallId, $step['assistant']->toolApprovalRequests), true);
+        $open = array_values(array_filter(
+            self::callsWithoutResult($step['assistant']->toolCalls, $step['results']),
+            static fn (ToolCall $call): bool => isset($requested[$call->id]) && ! $offered($call->name),
+        ));
+        if ($open === []) {
+            return false;
+        }
+
+        $this->writeRows([new ToolResultMessage(array_map(
+            static fn (ToolCall $call): ToolResult => new ToolResult(
+                toolCallId: $call->id,
+                toolName: $call->name,
+                args: $call->argumentsForResult(),
+                result: $reason,
+                toolCallResultId: $call->resultId,
+            ),
+            $open,
+        ))], $runId, null, false, $step['position'], false);
+
+        return true;
+    }
+
+    /** What a requested call of a tool the run does not offer is answered with (G-412). */
+    public const NOT_OFFERED_RESULT = 'Tool call was not run because its tool is not offered';
 
     /** The position of the step a run would resolve, or null. @internal */
     public function pausedStepPosition(): ?int

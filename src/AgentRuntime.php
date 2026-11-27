@@ -1978,9 +1978,38 @@ final readonly class AgentRuntime
         // A call of the paused step no request names and no result answers:
         // no resolution answers it, so it gets its one outcome now (G-412).
         $session->thread()->endUnrequestedOpenCalls(Thread::INTERRUPTED_RESULT, $runId);
+        // A requested call whose tool this session's mode does not offer:
+        // no resolution answers it either, so it gets its denial (G-412).
+        $session->thread()->endRequestedCallsNotOffered($this->offerable($session), Thread::NOT_OFFERED_RESULT, $runId);
         // What the run reads: a denial recorded after this refuses a call it
         // has not started (G-410).
         Session::rememberReadUpTo($session->key(), (int) $session->thread()->storedMessages()->max('position'), $runId);
+    }
+
+    /**
+     * Whether this session's mode can offer a tool named `$name`, read from
+     * the mode and the registry's names alone (no tool is built): a tool the
+     * mode lists, the skill builtin of a mode with skills, or one of its
+     * subagents. Under a `*` mode, a registered name.
+     *
+     * @return Closure(string): bool
+     */
+    private function offerable(Session $session): Closure
+    {
+        $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
+        $registered = null;
+
+        return function (string $name) use ($mode, $session, &$registered): bool {
+            if (($name === 'skill_read' && $mode->skills !== []) || array_key_exists($name, $mode->subagents)) {
+                return true;
+            }
+            if (! in_array('*', $mode->tools, true)) {
+                return in_array($name, $mode->tools, true);
+            }
+            $registered ??= $this->tools->forAgent($session->agent())->names();
+
+            return in_array($name, $registered, true);
+        };
     }
 
     /**

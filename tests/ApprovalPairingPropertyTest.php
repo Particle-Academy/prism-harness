@@ -274,6 +274,11 @@ function pairingWithProvider(array $case, int $seed): array
     if (($case['insert']['kind'] ?? null) === 'assistant_call' && $g->chance(0.4)) {
         $case['insert']['kind'] = 'assistant_mismatch';
     }
+    // A host step with an approval request of its own, recorded without its
+    // tool offer (G-412).
+    if (($case['insert']['kind'] ?? null) === 'assistant_call' && $g->chance(0.5)) {
+        $case['insert']['kind'] = 'assistant_request';
+    }
     if ($case['provider'] === 'openai') {
         $case['entry'] = 'send';
         foreach ($case['steps'] as $s => $step) {
@@ -505,7 +510,7 @@ function pairingOracle(array $case): array
         // A row that supersedes the parked step (an assistant row, with or
         // without a call, or a user row) runs none of its gated calls; a
         // forged result is its call's only outcome, and that call never runs.
-        $superseded = in_array($insert, ['assistant_text', 'assistant_content', 'assistant_call', 'assistant_mismatch', 'user'], true);
+        $superseded = in_array($insert, ['assistant_text', 'assistant_content', 'assistant_call', 'assistant_mismatch', 'assistant_request', 'user'], true);
         $forged = ($case['insert']['kind'] ?? null) === 'tool_result' && $steps === [] && $insert !== null
             && ($case['insert']['segment'] ?? 'earlier') === 'earlier' ? $case['insert']['call'] : null;
         $runs = [];
@@ -545,7 +550,7 @@ function pairingOracle(array $case): array
         // the provider refuse the turn.
         $kind = pairingInsertBefore($case);
         $later = ($case['insert']['segment'] ?? null) === 'later';
-        $supersededR = $later && in_array($kind, ['assistant_text', 'assistant_content', 'assistant_call', 'assistant_mismatch', 'user'], true);
+        $supersededR = $later && in_array($kind, ['assistant_text', 'assistant_content', 'assistant_call', 'assistant_mismatch', 'assistant_request', 'user'], true);
         $refusedR = $kind === 'system';
         $forgedK = null;
         if ($later && $kind === 'tool_result') {
@@ -856,6 +861,7 @@ function pairingInsertedRow(array $case, Session $session): Message
         'assistant_content' => new AssistantMessage('A note.', [], pairingNewestStepContent($session)),
         // A copy whose call is its own, carrying the newest step's provider
         // content, whose tool items are another step's (G-415).
+        'assistant_request' => new AssistantMessage('', [new ToolCall('h900', 'gated', ['token' => 'x902'], pairingResultId('h900'))], [], [new ToolApprovalRequest('apr_h900', 'h900')]),
         'assistant_mismatch' => new AssistantMessage('A copy.', [new ToolCall('q900', 'free', ['token' => 'x901'], pairingResultId('q900'))], pairingNewestStepContent($session)),
         'assistant_call' => new AssistantMessage('', [new ToolCall($call['id'], 'free', ['token' => 'x900'], pairingResultId($call['id']))]),
         'user' => new UserMessage('Something else.'),
@@ -1704,8 +1710,10 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'provider anthropic', 'provider openai',
         'insert assistant_content before_decision', 'insert assistant_content after_decision',
         'insert assistant_mismatch before_decision', 'insert assistant_mismatch after_decision',
+        'insert assistant_request before_decision', 'insert assistant_request after_decision',
         'replaced, then insert assistant_content before_decision', 'replaced, then insert assistant_content after_decision',
         'replaced, then insert assistant_mismatch before_decision', 'replaced, then insert assistant_mismatch after_decision',
+        'replaced, then insert assistant_request before_decision', 'replaced, then insert assistant_request after_decision',
         'repeat send', 'repeat stream', 'repeat structured', 'repeat redecide', 'repeat lateApprove', 'repeat lateDeny',
         'a pair of decision rows, approve first', 'a pair of decision rows, deny first',
         'resume decide', 'resume streamDecision', 'resume approveOne', 'resume newMessage',
