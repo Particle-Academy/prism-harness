@@ -38,6 +38,7 @@ use Prism\Harness\Plans\PlanMachine;
 use Prism\Harness\Plans\Plans;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Sessions\SessionAddress;
+use Prism\Harness\Sessions\StartView;
 use Prism\Harness\Skills\SkillRegistry;
 use Prism\Harness\Steps\RunStep;
 use Prism\Harness\Steps\RunStepTagger;
@@ -54,6 +55,7 @@ use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\ClassLabel;
+use Prism\Harness\Support\RunSettles;
 use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Tools\CancelGuardedTool;
 use Prism\Harness\Tools\CanonicalJson;
@@ -102,6 +104,25 @@ final readonly class AgentRuntime
      */
     private WeakMap $endedByStart;
 
+    /**
+     * What ends a runner start's own view and, when it failed before its
+     * task row, puts its records back and returns its holds (G-387), by
+     * run id. Called by whichever path ends the run, BEFORE that path
+     * writes the run's end or emits its terminal event, so a listener never
+     * observes (or races) a hold that is about to be released. Once only.
+     */
+    private RunSettles $startSettles;
+
+    /**
+     * The start views THIS runtime entered (G-387): the only ones that
+     * confirm a start's records. A view a host sets with
+     * Session::enterStart() itself is not in here, so it confirms nothing,
+     * whatever the run slot says.
+     *
+     * @var WeakMap<StartView, true>
+     */
+    private WeakMap $enteredStarts;
+
     /** @param array<string, mixed> $config */
     public function __construct(
         private ModeRegistry $modes,
@@ -129,6 +150,8 @@ final readonly class AgentRuntime
     ) {
         $this->policySlot = new ToolPolicySlot;
         $this->endedByStart = new WeakMap;
+        $this->startSettles = new RunSettles;
+        $this->enteredStarts = new WeakMap;
         foreach ($agents as $agent => $options) {
             SessionAddress::validateAgent($agent);
             if (! is_array($options)) {
@@ -255,10 +278,34 @@ final readonly class AgentRuntime
                         throw new \LogicException('A runner start begins only through the start gate.');
                     }
                     [$undo, $delegation] = $this->commitRunnerStart($session, $membership, $facts, $child, $start, $runId);
+                    // Whatever ends this run settles the start first (G-387).
+                    $this->startSettles->put($runId, function () use (&$undo, $session, $runId): void {
+                        // The start's own view ends first: what follows
+                        // reads the child as every other reader does.
+                        $session->leaveStart();
+                        // A runner start that failed before its task row was
+                        // recorded never happened. Its records are
+                        // provisional, and with no task row every reader
+                        // already sees them as absent; putting the child's
+                        // records, its count and the thread link back, and
+                        // returning the tree hold, is housekeeping, and its
+                        // failure changes nothing. Once the task row is
+                        // recorded, the delegation happened and stands.
+                        if ($undo !== null && ! $this->taskRecorded($session, $runId)) {
+                            $pending = $undo;
+                            $undo = null;
+                            try {
+                                $pending();
+                            } catch (Throwable $undoFailure) {
+                                report(new RuntimeException('A subagent start could not be undone: '.ClassLabel::of($undoFailure).'.'));
+                            }
+                        }
+                    });
                     // From here until its run ends, the start's own run reads
                     // what (b) committed on this Session object (G-387); every
-                    // other reader keeps the provisional rule.
-                    $session->enterStart($runId);
+                    // other reader keeps the provisional rule. Only a view
+                    // this runtime entered confirms anything.
+                    $this->enteredStarts[$session->enterStart($runId)] = true;
                 }
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
@@ -317,31 +364,19 @@ final readonly class AgentRuntime
                 }
             } catch (Throwable $failure) {
                 // Clean up FIRST, each step on its own, reading nothing of
-                // the failure but its class (G-387). The start's own view
-                // ends first: what follows reads the child as every other
-                // reader does. A run that began and was not ended by the
-                // path that threw is failed here, with its RunFailed event.
-                $session->leaveStart();
+                // the failure but its class (G-387): a runner start is
+                // settled (its view ended; undone, holds returned, if it
+                // never recorded its task row) BEFORE its run is failed and
+                // RunFailed emitted. A run that began and was not ended by
+                // the path that threw is failed here, with its RunFailed.
+                $this->settleStart($runId);
                 if ($begun) {
                     $this->closeRun($session, $runId, $context, $failure);
-                }
-                // A runner start that failed before its task row was recorded
-                // never happened (G-387). Its records are provisional, and
-                // with no task row every reader already sees them as absent;
-                // putting the child's records, its count and the thread link
-                // back, and returning the tree hold, is housekeeping, and its
-                // failure changes nothing. Once the task row is recorded, the
-                // delegation happened and stands.
-                if ($undo !== null && ! $this->taskRecorded($session, $runId)) {
-                    try {
-                        $undo();
-                    } catch (Throwable $undoFailure) {
-                        report(new RuntimeException('A subagent start could not be undone: '.ClassLabel::of($undoFailure).'.'));
-                    }
                 }
 
                 throw $failure;
             } finally {
+                $this->settleStart($runId);
                 $session->leaveStart();
             }
         }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
@@ -360,6 +395,29 @@ final readonly class AgentRuntime
      * @param  list<Message>  $history
      */
     private function endedCalls(array $history): ?ToolResultMessage
+    {
+        $ended = self::endedCallsOf($history);
+        if ($ended === null) {
+            return null;
+        }
+        // Recorded marked as ended, naming the approvals of the calls it
+        // ended, and announced only once it is durable.
+        $this->endedByStart[$ended['message']] = $ended['approvals'];
+
+        return $ended['message'];
+    }
+
+    /**
+     * What {@see self::endedCalls()} ends, and the approvals the ended calls
+     * were asked under, in call order. Pure: the cross-language thread-rows
+     * corpus drives it, so every port writes the same row (G-387).
+     *
+     * @internal
+     *
+     * @param  list<Message>  $history
+     * @return array{message: ToolResultMessage, approvals: list<string>}|null
+     */
+    public static function endedCallsOf(array $history): ?array
     {
         $index = null;
         for ($i = count($history) - 1; $i >= 0; $i--) {
@@ -404,12 +462,28 @@ final readonly class AgentRuntime
         if ($ended === []) {
             return null;
         }
-        $message = new ToolResultMessage($ended);
-        // Recorded marked as ended, naming the approvals of the calls it
-        // ended, and announced only once it is durable.
-        $this->endedByStart[$message] = array_values(array_unique($approvals));
 
-        return $message;
+        return ['message' => new ToolResultMessage($ended), 'approvals' => array_values(array_unique($approvals))];
+    }
+
+    /** Settle the runner start `$runId` is, if it is one and was not settled yet (G-387). */
+    private function settleStart(string $runId): void
+    {
+        $settle = $this->startSettles->take($runId);
+        if ($settle !== null) {
+            $settle();
+        }
+    }
+
+    /**
+     * Whether `$view` is a start view this runtime entered on a runner
+     * start's own Session (G-387). A view a host made is not.
+     *
+     * @internal Read by Session for the start's own view.
+     */
+    public function enteredStart(StartView $view): bool
+    {
+        return isset($this->enteredStarts[$view]);
     }
 
     /**
@@ -421,6 +495,7 @@ final readonly class AgentRuntime
      */
     private function closeRun(Session $session, string $runId, ?RunContext $context, Throwable $failure): void
     {
+        $this->settleStart($runId);
         if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
             return;
         }
@@ -621,6 +696,7 @@ final readonly class AgentRuntime
                     });
             $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
             if ($failed) {
+                $this->settleStart($runId);
                 $session->failRun($runId, $response->finishReason->value);
             } else {
                 $session->completeRun($runId, $response->finishReason->value, $this->toolCallNames($response));
@@ -768,20 +844,30 @@ final readonly class AgentRuntime
             $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
                 tree: $membership);
 
-            $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
-                maxSteps: $this->ceilingFor($session, $mode),
-                maxCostUsd: $this->floatConfig('max_cost_usd'),
-                maxSeconds: $this->nullableIntConfig('max_seconds'),
-                maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
-            )));
-            $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
-            $this->continuePausedSteps($session, $prompt, $context, $run, $runId, $facts, $paused);
-            $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true, facts: $facts);
-            $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
+            // From here the run exists: ANY throw (a RunStarted listener's
+            // included, an Error as much as an Exception) fails it, by class
+            // name only, with its RunFailed, unless the path that threw
+            // already ended it (G-387).
             try {
-                return $this->sendStructuredRun($session, $prompt, $schema, $toolNames, $attachments, $runId, $mode, $provider, $model, $run);
-            } finally {
-                $unwatch();
+                $run = $this->atMemberDepth($membership, $context ?? RunContext::root($runId, new RunBudget(
+                    maxSteps: $this->ceilingFor($session, $mode),
+                    maxCostUsd: $this->floatConfig('max_cost_usd'),
+                    maxSeconds: $this->nullableIntConfig('max_seconds'),
+                    maxOutputTokensPerCall: $this->nullableIntConfig('max_output_tokens_per_call', $session),
+                )));
+                $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
+                $this->continuePausedSteps($session, $prompt, $context, $run, $runId, $facts, $paused);
+                $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true, facts: $facts);
+                $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
+                try {
+                    return $this->sendStructuredRun($session, $prompt, $schema, $toolNames, $attachments, $runId, $mode, $provider, $model, $run);
+                } finally {
+                    $unwatch();
+                }
+            } catch (Throwable $failure) {
+                $this->closeRun($session, $runId, $context, $failure);
+
+                throw $failure;
             }
         }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
     }
@@ -1200,9 +1286,14 @@ final readonly class AgentRuntime
         $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
-        event($tagger->resuming()
+        $this->announceStart($session, $runId, $run, $tagger->resuming()
             ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
-            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()),
+            function () use ($unwatch, $session, $runId, $tagger): void {
+                $unwatch();
+                $this->rememberSeq($session, $runId, $tagger);
+                ToolRefusals::forget($runId);
+            });
         try {
             $this->refuseSpentRun($session, $runId, $run, $run->budget, $prompt);
         } catch (Throwable $refused) {
@@ -1323,9 +1414,14 @@ final readonly class AgentRuntime
         $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
         // A parked run continued under its own id has already STARTED once;
         // a second RunStarted for it would read as a new run.
-        event($tagger->resuming()
+        $this->announceStart($session, $runId, $run, $tagger->resuming()
             ? new RunResumed($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent())
-            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+            : new RunStarted($session->key(), $runId, $mode->name, $provider, $model, $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()),
+            function () use ($unwatch, $session, $runId, $tagger): void {
+                $unwatch();
+                $this->rememberSeq($session, $runId, $tagger);
+                ToolRefusals::forget($runId);
+            });
         // The same refusal as every other path, before anything is recorded:
         // no user row, and no result closing an approval still pending.
         try {
@@ -1462,6 +1558,8 @@ final readonly class AgentRuntime
      */
     private function failRunOn(Session $session, string $runId, RunContext $run, Throwable $failure): void
     {
+        // A runner start is settled before its end is written or announced.
+        $this->settleStart($runId);
         if ($failure instanceof RunNotPermitted && $failure->code() === 'run_cancelled') {
             $session->cancelRun($runId);
         } else {
@@ -1469,6 +1567,29 @@ final readonly class AgentRuntime
         }
         $this->announceEnd($session, $runId, $run, new RunFailed($session->key(), $runId, ClassLabel::of($failure),
             $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
+    }
+
+    /**
+     * Fire a streamed run's start event (G-387). The run already began, so a
+     * listener that throws (an Error as much as an Exception) fails it, by
+     * class name only, with its RunFailed, after `$cleanup`; the throw then
+     * propagates. A run is never left `running` by its own start event.
+     *
+     * @param  Closure(): void  $cleanup
+     */
+    private function announceStart(Session $session, string $runId, RunContext $run, HarnessEvent $event, Closure $cleanup): void
+    {
+        try {
+            event($event);
+        } catch (Throwable $failure) {
+            try {
+                $cleanup();
+            } finally {
+                $this->closeRun($session, $runId, $run, $failure);
+            }
+
+            throw $failure;
+        }
     }
 
     /**
@@ -2408,6 +2529,7 @@ final readonly class AgentRuntime
                 throw $failure;
             }
             $refused = $failure instanceof RunNotPermitted || $failure instanceof PlanRefused;
+            $this->settleStart($runId);
             $session->failRun($runId, $refused ? 'budget' : ClassLabel::of($failure));
             if (! $refused) {
                 event(new RunFailed(

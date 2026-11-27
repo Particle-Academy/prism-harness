@@ -27,6 +27,8 @@ use Prism\Harness\Subagents\Subagent;
 use Prism\Harness\Subagents\SubagentResult;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Schema\ObjectSchema;
+use Prism\Prism\Schema\StringSchema;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Tests\Fixtures\Participant;
@@ -2327,6 +2329,204 @@ it('confirms nothing for a start view on a run that is not running', function ()
     }
     expect($forged->childBinding())->toBeNull()
         ->and($forged->childStepCeiling())->toBeNull()
+        ->and($code)->toBe('child_binding_missing')
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// G-387 round 12.
+// ---------------------------------------------------------------------------
+
+/** The child's raw run slot, as stored. */
+function sgRawRun(): ?array
+{
+    $row = DB::table('harness_session_state')->where('key', sgChild()->key().':ephemeral')->first();
+    $state = $row === null ? [] : (json_decode((string) $row->payload, true) ?? []);
+
+    return is_array($state['run'] ?? null) ? $state['run'] : null;
+}
+
+/**
+ * Records without the session lock rows: a RunFailed listener runs while
+ * the run's own lock is still held, which is not a record of the start.
+ *
+ * @param  array<string, string>  $records
+ * @return array<string, string>
+ */
+function sgWithoutLocks(array $records): array
+{
+    return array_filter($records, fn (string $key): bool => ! str_starts_with($key, 'state lock:'), ARRAY_FILTER_USE_KEY);
+}
+
+/** A RunStarted listener that throws `$failure` once, for the first run whose session key contains `$on`. */
+function sgThrowingStart(string $on, Throwable $failure): void
+{
+    $armed = true;
+    Event::listen(RunStarted::class, function (RunStarted $event) use (&$armed, $on, $failure): void {
+        if ($armed && str_contains($event->sessionKey, $on)) {
+            $armed = false;
+
+            throw $failure;
+        }
+    });
+}
+
+// Item 4 (Py I2) and item 7: an exception that skips the normal handlers
+// (in PHP an Error, not an Exception) raised in a RunStarted listener never
+// leaves the ROOT run `running`, on any path: the run is failed by class
+// name only, RunFailed fires, and the Error propagates. Every run event is
+// emitted inside the run's try.
+it('fails a root run whose RunStarted listener throws an Error, on every path, and propagates it', function (string $path): void {
+    sgThrowingStart('chat', new class('SECRET listener failure') extends Error {});
+    $failed = [];
+    Event::listen(RunFailed::class, function (RunFailed $event) use (&$failed): void {
+        $failed[] = $event->exception;
+    });
+    G360::text('Hi.');
+    G360::text('Again.');
+    $schema = new ObjectSchema('doc', 'A document.', [new StringSchema('title', 'The title.')], ['title']);
+
+    $thrown = null;
+    try {
+        match ($path) {
+            'send' => sgRoot()->send('Go'),
+            'structured' => sgRoot()->sendStructured('Go', $schema),
+            'stream' => iterator_to_array(sgRoot()->streamSteps('Go'), false),
+        };
+    } catch (Throwable $caught) {
+        $thrown = $caught;
+    }
+    sgFresh();
+    $run = sgRoot()->run();
+
+    expect($thrown)->toBeInstanceOf(Error::class)
+        ->and($run['status'] ?? null)->toBe('failed')
+        ->and(json_encode($run))->not->toContain('SECRET')
+        ->and(json_encode($run))->not->toContain('anonymous')
+        ->and($failed)->toBe(['Error'])
+        ->and(sgRoot()->send('Next')->response->text)->toBe('Hi.');
+})->with(['send', 'structured', 'stream']);
+
+// Item 7 (TS F2, probe S8; PHP: a listener throwing an Error): a RunStarted
+// listener on the child's run that throws fails the start framed by a named
+// class, ends its run with RunFailed, leaves no run row `running`, keeps the
+// dead approval dead, and leaves the child free for the next delegation.
+it('fails a runner start whose RunStarted listener throws an Error, and leaves the child free', function (string $entry): void {
+    $dead = sgDeadChild();
+    sgThrowingStart('::sub::worker', new class('SECRET listener failure') extends Error {});
+    $failed = [];
+    Event::listen(RunFailed::class, function (RunFailed $event) use (&$failed): void {
+        if (str_contains($event->sessionKey, '::sub::worker')) {
+            $failed[] = $event->exception;
+        }
+    });
+
+    if ($entry === 'tool') {
+        G360::$queue = [];
+        G360::calls([['worker', ['task' => 'Start over']]]);
+        G360::text('Handled.');
+        sgPad(3);
+        sgRoot()->send('Go');
+        $out = implode(' ', G360::outputs());
+        expect($out)->toContain('"outcome":"failed"')
+            ->and($out)->toContain('failed with Error.')
+            ->and($out)->not->toContain('SECRET');
+    } else {
+        G360::$queue = [];
+        sgPad(3);
+        $root = 'run_'.str_repeat('a', 24);
+        $result = sgRunner()->run(sgWorker(3), sgRoot(), RunContext::root($root, new RunBudget(8)), $root, 'Start over');
+        expect($result->outcome->value)->toBe('failed')
+            ->and((string) $result->reason)->not->toContain('SECRET');
+    }
+
+    expect($failed)->toBe(['Error'])
+        ->and(sgRawRun()['status'] ?? null)->not->toBe('running')
+        ->and(sgApproveCode($dead))->toBe('child_binding_missing')
+        ->and(sgRedelegate())->toContain('"outcome":"completed"')
+        ->and($this->ran['weather'])->toBe(0);
+})->with(['tool', 'runner']);
+
+// Item 4 (Py I5): a failed start releases its holds and puts its records
+// back BEFORE RunFailed is emitted, so a RunFailed listener never observes
+// (or races) a hold that is about to be released.
+it('releases a failed start\'s holds before its RunFailed is emitted', function (string $where): void {
+    $on = false;
+    sgFlakyRegistry($on);
+    $dead = sgDeadChild();
+    $records = sgDurable();
+    $mode = sgMode();
+    if ($where === 'a RunStarted listener') {
+        sgThrowingStart('::sub::worker', new RuntimeException('SECRET listener failure'));
+    }
+    $seen = null;
+    Event::listen(RunFailed::class, function (RunFailed $event) use (&$seen): void {
+        if ($seen === null && str_contains($event->sessionKey, '::sub::worker')) {
+            $seen = [
+                'tree hold' => app(RunTrees::class)->holds((string) $event->parentRunId),
+                'records' => sgDurable(),
+                'mode' => sgMode(),
+            ];
+        }
+    });
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::text('Handled.');
+    sgPad(3);
+    $on = $where === 'the tool registry';
+
+    sgRoot()->send('Go');
+    $on = false;
+
+    expect($seen)->not->toBeNull()
+        ->and($seen['tree hold'])->toBeFalse()
+        ->and(sgWithoutLocks($seen['records']))->toBe(sgWithoutLocks($records))
+        ->and($seen['mode'])->toBe($mode)
+        ->and(sgApproveCode($dead))->toBe('child_binding_missing')
+        ->and(sgRedelegate())->toContain('"outcome":"completed"');
+})->with(['the tool registry', 'a RunStarted listener']);
+
+// Item 5 (PHP run14 Info): the start's own view confirms the start's records
+// only on the Session object the RUNTIME entered it on. A host that calls
+// enterStart() itself, naming a provisional run left `running` in the slot
+// (a crash residue), confirms nothing: the dead approval stays dead.
+it('confirms nothing for a start view a host sets, even on a provisional run left running', function (): void {
+    $dead = sgDeadChild();
+    $on = true;
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use (&$on): array {
+        if ($on && str_contains($session->key(), '::sub::worker')) {
+            sgFailChildUndo();
+
+            throw new RuntimeException('provider down');
+        }
+
+        return [];
+    }, name: 'outage');
+    expect(sgRedelegate('Start over'))->toContain('"outcome":"failed"');
+    $on = false;
+    sgUnfailChildUndo();
+    $provisional = (string) (sgRawChild()['child_binding']['provisional'] ?? '');
+    expect($provisional)->not->toBe('');
+
+    // The residue of a crash: the slot still says the start's run is running.
+    $key = sgChild()->key().':ephemeral';
+    $state = json_decode((string) DB::table('harness_session_state')->where('key', $key)->value('payload'), true);
+    $state['run'] = [...$state['run'], 'id' => $provisional, 'status' => 'running'];
+    DB::table('harness_session_state')->where('key', $key)->update(['payload' => json_encode($state)]);
+
+    $forged = sgFreshChild();
+    $forged->enterStart($provisional);
+    $read = [$forged->childBinding(), $forged->childStepCeiling(), $forged->childDelegation()];
+    $code = 'accepted';
+    try {
+        $forged->approve($dead);
+    } catch (RunNotPermitted $e) {
+        $code = $e->code();
+    } catch (Throwable $other) {
+        $code = $other::class;
+    }
+
+    expect($read)->toBe([null, null, null])
         ->and($code)->toBe('child_binding_missing')
         ->and($this->ran['weather'])->toBe(0);
 });

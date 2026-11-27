@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+use Prism\Harness\AgentRuntime;
+use Prism\Harness\Models\Thread;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
@@ -38,6 +40,22 @@ function corpusRow(Message $message): array
 }
 
 /**
+ * @param  list<array<string, mixed>>  $calls
+ * @return list<ToolCall>
+ */
+function corpusToolCalls(array $calls): array
+{
+    return array_map(fn (array $call): ToolCall => new ToolCall(
+        $call['id'],
+        $call['name'],
+        $call['arguments'],
+        $call['result_id'] ?? null,
+        $call['reasoning_id'] ?? null,
+        $call['reasoning_summary'] ?? null,
+    ), $calls);
+}
+
+/**
  * @param  array<string, mixed>  $case
  * @return list<array<string, mixed>>
  */
@@ -55,18 +73,22 @@ function corpusRows(array $case): array
     }
 
     $input = $case['input'];
+    if ($input['write'] === 'ended_by_start') {
+        // The row a runner start records when it ends the calls a child was
+        // parked on (G-387): which calls, with what result, and the mark
+        // naming their approvals, all decided by the harness itself.
+        $step = new AssistantMessage('', corpusToolCalls($input['tool_calls']), [],
+            array_map(fn (array $request): ToolApprovalRequest => new ToolApprovalRequest($request['approval_id'], $request['tool_call_id']), $input['approval_requests']));
+        $ended = AgentRuntime::endedCallsOf([$step]);
+        expect($ended)->not->toBeNull();
+
+        return [['type' => MessageMapper::typeOf($ended['message']), ...Thread::rowPayload($ended['message'], endedApprovals: $ended['approvals'])]];
+    }
 
     return [corpusRow(match ($input['write']) {
         'assistant' => new AssistantMessage(
             $input['content'],
-            array_map(fn (array $call): ToolCall => new ToolCall(
-                $call['id'],
-                $call['name'],
-                $call['arguments'],
-                $call['result_id'] ?? null,
-                $call['reasoning_id'] ?? null,
-                $call['reasoning_summary'] ?? null,
-            ), $input['tool_calls']),
+            corpusToolCalls($input['tool_calls']),
             $input['additional_content'],
             array_map(fn (array $request): ToolApprovalRequest => new ToolApprovalRequest($request['approval_id'], $request['tool_call_id']), $input['approval_requests']),
         ),
@@ -84,7 +106,7 @@ function corpusRows(array $case): array
 }
 
 it('is the whole suite, not a subset someone trimmed to green', function (): void {
-    expect(threadRowsCorpus()['cases'])->toHaveCount(13);
+    expect(threadRowsCorpus()['cases'])->toHaveCount(14);
 });
 
 it('stores and replays every row as the corpus records for the reference', function (array $case): void {

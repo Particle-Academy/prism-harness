@@ -486,27 +486,13 @@ class Thread extends Model implements ThreadContract
             $position = (int) $this->storedMessages()->max('position');
 
             foreach ($messages as $message) {
-                $payload = MessageMapper::toArray($message);
-                if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $toolNames !== null) {
-                    // Harness metadata on the same durable approval record.
-                    // MessageMapper does not send it back to the provider.
-                    $payload['harness_tool_names'] = array_values(array_unique($toolNames));
-                }
-                if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $parked !== null) {
-                    // The steps the parked run used, its children included, and
-                    // what it had left: the count its resume continues (G-387).
-                    $payload['harness_steps_used'] = $parked['harness_steps_used'];
-                    $payload['harness_steps_left'] = $parked['harness_steps_left'];
-                }
+                $endedApprovals = null;
                 foreach ($endedByStart as $ended) {
                     if ($message instanceof ToolResultMessage && $ended['message'] === $message) {
-                        // Harness metadata, beside (never inside) the results:
-                        // these calls were ended, never run, and these are the
-                        // approvals they were asked under. A tool controls only
-                        // its result text, never this key.
-                        $payload[self::ENDED_BY_START] = ['approval_ids' => array_values(array_filter($ended['approvals'], 'is_string'))];
+                        $endedApprovals = $ended['approvals'];
                     }
                 }
+                $payload = self::rowPayload($message, $toolNames, $parked, $endedApprovals);
                 $this->storedMessages()->create([
                     'position' => ++$position,
                     'type' => MessageMapper::typeOf($message),
@@ -517,6 +503,48 @@ class Thread extends Model implements ThreadContract
 
             return $this->afterRecording();
         });
+    }
+
+    /**
+     * The payload {@see self::record()} stores for one message: what
+     * MessageMapper writes, then the harness's own metadata, each key only
+     * on the row it belongs to. Pure, so the cross-language thread-rows
+     * corpus pins the stored shape by driving this rather than a copy of it.
+     *
+     * The ended mark (G-387) is the reference shape every port writes: a
+     * top-level `harness_ended_by_start` AFTER `tool_approval_responses`,
+     * holding `{approval_ids: [...]}` in the order given.
+     *
+     * @internal
+     *
+     * @param  list<string>|null  $toolNames  the actual offer, stored only beside pending approvals
+     * @param  array{harness_steps_used: int, harness_steps_left: int}|null  $parked  stored on the row a run parks on
+     * @param  list<string>|null  $endedApprovals  set when this is the row a runner start ENDED calls with: the approvals those calls were asked under
+     * @return array<string, mixed>
+     */
+    public static function rowPayload(Message $message, ?array $toolNames = null, ?array $parked = null, ?array $endedApprovals = null): array
+    {
+        $payload = MessageMapper::toArray($message);
+        if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $toolNames !== null) {
+            // Harness metadata on the same durable approval record.
+            // MessageMapper does not send it back to the provider.
+            $payload['harness_tool_names'] = array_values(array_unique($toolNames));
+        }
+        if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $parked !== null) {
+            // The steps the parked run used, its children included, and
+            // what it had left: the count its resume continues (G-387).
+            $payload['harness_steps_used'] = $parked['harness_steps_used'];
+            $payload['harness_steps_left'] = $parked['harness_steps_left'];
+        }
+        if ($message instanceof ToolResultMessage && $endedApprovals !== null) {
+            // Harness metadata, beside (never inside) the results: these
+            // calls were ended, never run, and these are the approvals they
+            // were asked under. A tool controls only its result text, never
+            // this key.
+            $payload[self::ENDED_BY_START] = ['approval_ids' => array_values(array_filter($endedApprovals, 'is_string'))];
+        }
+
+        return $payload;
     }
 
     /**
