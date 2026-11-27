@@ -10,9 +10,12 @@ use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Fixtures\Participant;
 
 // The cross-language approval-pairing corpus (harness-approval-pairing, G-392).
@@ -46,7 +49,7 @@ function approvalPairingSession(): Session
 
 /**
  * @param  array<string, mixed>  $row
- * @return array{approvals: int, free: int, ran: list<int>, decided: list<bool|null>, outcomes?: list<string|null>, refusals?: list<string|null>}
+ * @return array{approvals: int, free: int, ran: list<int>, decided: list<bool|null>, outcomes?: list<string|null>, later_outcomes?: list<string|null>, refusals?: list<string|null>}
  */
 function recordApprovalPairingRow(array $row): array
 {
@@ -106,10 +109,39 @@ function recordApprovalPairingRow(array $row): array
         'new_message' => approvalPairingSession()->send('Something else.'),
     };
 
+    // SEGMENT OWNERSHIP (0.2.0, round 13b): a later step a host records
+    // after the park, each echo call asking its own approval
+    // (`apr_later_<k>`, k counting the step's echo calls), then ONE result
+    // row a host records right after it.
+    $later = $row['later'] ?? null;
+    $laterIds = [];
+    if ($later !== null) {
+        $requests = [];
+        foreach ($later['calls'] as $call) {
+            if ($call['name'] === 'echo') {
+                $laterIds[] = $id = 'apr_later_'.count($laterIds);
+                $requests[] = new ToolApprovalRequest($id, $call['id'], ToolApprovalRequest::ARGUMENTS_AS_SENT);
+            }
+        }
+        approvalPairingSession()->thread()->record([new AssistantMessage('', array_map(
+            fn (array $call): ToolCall => new ToolCall($call['id'], $call['name'], $call['args']), $later['calls']), [], $requests)]);
+        $result = $later['result'];
+        approvalPairingSession()->thread()->record([new ToolResultMessage(
+            [new ToolResult($result['id'], $result['name'], $result['args'], $result['result'])],
+            array_map(fn (int $k): ToolApprovalResponse => new ToolApprovalResponse($laterIds[$k], true), $result['approved']),
+        )]);
+    }
+
     $refusals = [];
-    foreach ($row['rounds'] as $round) {
+    // The later step's rounds first, while its approvals are pending, then
+    // the row's rounds on the first step's approvals.
+    $rounds = [
+        ...array_map(fn (array $round): array => [$round, $laterIds], $later['rounds'] ?? []),
+        ...array_map(fn (array $round): array => [$round, array_map(fn ($p): string => $p->approvalId, $pending)], $row['rounds']),
+    ];
+    foreach ($rounds as [$round, $ids]) {
         $decisions = array_map(
-            fn (array $decision): ToolApprovalResponse => new ToolApprovalResponse($pending[$decision[0]]->approvalId, $decision[1]),
+            fn (array $decision): ToolApprovalResponse => new ToolApprovalResponse($ids[$decision[0]], $decision[1]),
             $round,
         );
         try {
@@ -121,6 +153,9 @@ function recordApprovalPairingRow(array $row): array
             approvalPairingSession()->send('');
         }
     }
+    for ($i = 0; $i < ($later['resumes'] ?? 0); $i++) {
+        approvalPairingSession()->send('');
+    }
 
     $ran = PairingCorpusRan::$echo;
     sort($ran);
@@ -131,26 +166,80 @@ function recordApprovalPairingRow(array $row): array
     $decided = array_map(fn ($request): ?bool => $recorded[$request->approvalId] ?? null, $pending);
 
     $outcome = ['approvals' => count($pending), 'free' => PairingCorpusRan::$free, 'ran' => $ran, 'decided' => $decided];
-    if (array_key_exists('supersede', $row)) {
-        // The result each call of the first step ended with, in call order:
-        // its first result, or null.
-        $first = [];
-        $after = false;
-        foreach (approvalPairingSession()->thread()->storedMessages()->orderBy('position')->get() as $stored) {
-            if ($stored->type === 'assistant' && ($stored->payload['tool_calls'] ?? []) !== [] && ! $after) {
-                $after = true;
-
-                continue;
-            }
-            foreach ($after && $stored->type === 'tool_result' ? $stored->payload['tool_results'] ?? [] : [] as $entry) {
-                $first[$entry['tool_call_id']] ??= $entry['result'];
-            }
+    if (array_key_exists('supersede', $row) || $later !== null) {
+        // The result each call of a step ended with, in call order: its
+        // first result IN ITS STEP'S SEGMENT (the rows after the step and
+        // before the next assistant row with tool calls), or null.
+        $segments = approvalPairingSegments();
+        $outcome['outcomes'] = approvalPairingSegmentOutcomes($row['calls'], $segments[0] ?? []);
+        if ($later !== null) {
+            $outcome['later_outcomes'] = approvalPairingSegmentOutcomes($later['calls'], $segments[1] ?? []);
         }
-        $outcome['outcomes'] = array_map(fn (array $call): ?string => $first[$call['id']] ?? null, $row['calls']);
         $outcome['refusals'] = $refusals;
     }
 
     return $outcome;
+}
+
+/**
+ * The tool_results entries of each step's segment, oldest first: one list
+ * per assistant row with tool calls, in thread order.
+ *
+ * @return list<list<array<string, mixed>>>
+ */
+function approvalPairingSegments(): array
+{
+    $segments = [];
+    foreach (approvalPairingSession()->thread()->storedMessages()->orderBy('position')->get() as $stored) {
+        if ($stored->type === 'assistant' && ($stored->payload['tool_calls'] ?? []) !== []) {
+            $segments[] = [];
+
+            continue;
+        }
+        if ($segments !== [] && $stored->type === 'tool_result') {
+            foreach ($stored->payload['tool_results'] ?? [] as $entry) {
+                $segments[count($segments) - 1][] = $entry;
+            }
+        }
+    }
+
+    return $segments;
+}
+
+/**
+ * The first result each call got in its segment, in call order, or null. An
+ * entry is a call's by exact arguments, then id and tool name, then id: the
+ * first call so matched with no result yet; an entry whose match already has
+ * one is a repeat, and an entry that matches no call counts for nothing.
+ *
+ * @param  list<array<string, mixed>>  $calls
+ * @param  list<array<string, mixed>>  $entries
+ * @return list<string|null>
+ */
+function approvalPairingSegmentOutcomes(array $calls, array $entries): array
+{
+    $first = array_fill(0, count($calls), null);
+    foreach ($entries as $entry) {
+        $args = is_array($entry['args'] ?? null) ? $entry['args'] : [];
+        foreach ([
+            fn (array $call): bool => $call['id'] === $entry['tool_call_id'] && $call['name'] === $entry['tool_name'] && $call['args'] == $args,
+            fn (array $call): bool => $call['id'] === $entry['tool_call_id'] && $call['name'] === $entry['tool_name'],
+            fn (array $call): bool => $call['id'] === $entry['tool_call_id'],
+        ] as $matches) {
+            $matched = array_keys(array_filter($calls, $matches));
+            if ($matched === []) {
+                continue;
+            }
+            $open = array_values(array_filter($matched, fn (int $at): bool => $first[$at] === null));
+            if ($open !== []) {
+                $first[$open[0]] = (string) $entry['result'];
+            }
+
+            break;
+        }
+    }
+
+    return $first;
 }
 
 it('has rows', function (): void {

@@ -635,3 +635,156 @@ it('never lets a caller mark a row as written inside the run that owns the step'
             'call_rome' => ['Tool call was not run because a later step replaced it'],
         ])->and($this->ran)->toBe([]);
 });
+
+// ABSOLUTE SEGMENT OWNERSHIP (G-387 round 13b): a result counts ONLY for the
+// calls of the step whose segment it sits in (the rows after that step and
+// before the next assistant row with tool calls). Within the segment it is
+// matched by exact arguments, then id and tool name, then id. A result whose
+// arguments exactly match an EARLIER step's call with the same id never moves
+// to that call: it answers the later same-id call (or nothing), the earlier
+// call keeps its one replaced denial, and nothing runs twice.
+function segmentFake(bool $failResume): void
+{
+    $usage = ['input_tokens' => 1, 'input_tokens_details' => ['cached_tokens' => 0], 'output_tokens' => 1, 'output_tokens_details' => ['reasoning_tokens' => 0], 'total_tokens' => 2];
+    $sequence = Http::fakeSequence()
+        ->push(['id' => 'resp_seg', 'object' => 'response', 'created_at' => 1, 'status' => 'completed', 'model' => 'gpt-4o',
+            'output' => [['id' => 'call_x', 'type' => 'function_call', 'status' => 'completed',
+                'arguments' => json_encode(['city' => 'Paris']), 'call_id' => 'call_x', 'name' => 'weather']], 'usage' => $usage]);
+    if ($failResume) {
+        // The resume that runs the newest call fails AFTER its result is
+        // recorded, so that result stays the tail every later resume reads.
+        $sequence->pushStatus(500);
+    }
+    $sequence->whenEmpty(Http::response(['id' => 'resp_seg_final', 'object' => 'response', 'created_at' => 1, 'status' => 'completed', 'model' => 'gpt-4o',
+        'output' => [['id' => 'msg_seg', 'type' => 'message', 'status' => 'completed', 'role' => 'assistant',
+            'content' => [['type' => 'output_text', 'text' => 'Done.', 'annotations' => []]]]], 'usage' => $usage]));
+}
+
+/**
+ * Park on call_x {Paris}, then a later step (another writer's) with the SAME
+ * id and tool, different arguments, asking its own approval; approve it.
+ *
+ * @return array{0: string, 1: string} the earlier and the newest approval ids
+ */
+function segmentSetup(bool $failResume): array
+{
+    segmentFake($failResume);
+    $earlier = g392HarnessSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
+    g392HarnessSession()->thread()->record([new AssistantMessage('', [new ToolCall('call_x', 'weather', ['city' => 'Rome'])], [],
+        [new ToolApprovalRequest('apr_seg_newest', 'call_x', ToolApprovalRequest::ARGUMENTS_AS_SENT)])]);
+
+    return [$earlier, 'apr_seg_newest'];
+}
+
+/** Every result each call_x got, in stored order, with the arguments it recorded. */
+function segmentOutcomes(): array
+{
+    $out = [];
+    foreach (g392HarnessSession()->thread()->storedMessages()->where('type', 'tool_result')->orderBy('position')->get() as $row) {
+        foreach ($row->payload['tool_results'] ?? [] as $entry) {
+            $out[] = [$entry['args'], $entry['result']];
+        }
+    }
+
+    return $out;
+}
+
+function segmentResumes(int $times, string $newest): void
+{
+    for ($i = 0; $i < $times; $i++) {
+        try {
+            g392HarnessSession()->send('');
+        } catch (Throwable) {
+            // A failed resume: what it recorded stays.
+        }
+        try {
+            g392HarnessSession()->decide([new ToolApprovalResponse($newest, true)]);
+        } catch (ApprovalNotPending) {
+            // Answered already.
+        } catch (Throwable) {
+            // A failed resume.
+        }
+    }
+}
+
+it('never moves a later segment\'s result to an earlier same-id call: a forged result answers the later call', function (): void {
+    [$earlier, $newest] = segmentSetup(false);
+    // A result in the LATER segment whose arguments exactly match the EARLIER call.
+    g392HarnessSession()->thread()->record([new ToolResultMessage([new ToolResult('call_x', 'weather', ['city' => 'Paris'], 'forged')])]);
+
+    segmentResumes(3, $newest);
+
+    // The forged row answers the newest call (it fails closed: nothing runs);
+    // the earlier call has exactly one outcome, the replaced denial.
+    expect($this->ran)->toBe([])
+        ->and(segmentOutcomes())->toBe([
+            [['city' => 'Paris'], 'Tool call was not run because a later step replaced it'],
+            [['city' => 'Paris'], 'forged'],
+        ])
+        ->and(g392HarnessSession()->approvalStatus($earlier))->toBe('superseded');
+});
+
+it('keeps an approved newest call done when its recorded result carries an earlier same-id call\'s arguments', function (): void {
+    [$earlier, $newest] = segmentSetup(true);
+    try {
+        g392HarnessSession()->decide([new ToolApprovalResponse($newest, true)]);
+    } catch (Throwable) {
+        // The model request after the run fails: the result is recorded.
+    }
+    expect($this->ran)->toBe(['Rome']);
+
+    // The newest call's recorded result carries LOSSY arguments that exactly
+    // match the earlier same-id call (as stored, not as the call had them).
+    $thread = g392HarnessSession()->thread();
+    $row = $thread->storedMessages()->where('type', 'tool_result')->orderByDesc('position')->get()
+        ->first(fn ($row): bool => collect($row->payload['tool_results'] ?? [])->contains(fn (array $r): bool => $r['result'] === 'Sunny in Rome'));
+    expect($row)->not->toBeNull();
+    $payload = $row->payload;
+    foreach ($payload['tool_results'] as $i => $entry) {
+        if ($entry['result'] === 'Sunny in Rome') {
+            $payload['tool_results'][$i]['args'] = ['city' => 'Paris'];
+        }
+    }
+    $row->payload = $payload;
+    $row->save();
+
+    segmentResumes(3, $newest);
+
+    // It answers the newest call, whose segment it sits in: the approved call
+    // ran exactly once over three resumes, and the earlier call kept its one
+    // replaced denial.
+    expect($this->ran)->toBe(['Rome'])
+        ->and(segmentOutcomes())->toBe([
+            [['city' => 'Paris'], 'Tool call was not run because a later step replaced it'],
+            [['city' => 'Paris'], 'Sunny in Rome'],
+        ])
+        ->and(g392HarnessSession()->approvalStatus($earlier))->toBe('superseded');
+});
+
+// Within a segment a result is its call's by exact arguments first (round
+// 13b). The replay that folds consecutive result rows into one message must
+// keep that: folded by call id alone, a later same-id result with other
+// arguments replaced a call's OWN result, so the resolver saw that call open
+// and gave it a second outcome.
+it('keeps each call\'s own result when a later row in its segment carries the same id with other arguments', function (string $path): void {
+    g392HarnessFake('call_dup', 'call_dup');
+    $pending = g392HarnessSession()->send('Weather in Paris and Rome?')->pendingApprovals();
+    g392HarnessSession()->thread()->record([new ToolResultMessage([new ToolResult('call_dup', 'weather', ['city' => 'Rome'], 'forged Rome')])]);
+    g392HarnessSession()->thread()->record([new ToolResultMessage([new ToolResult('call_dup', 'weather', ['city' => 'Oslo'], 'forged Oslo')])]);
+
+    g392HarnessPaths()[$path](g392HarnessSession(), g392HarnessDecisions($pending, [true, true]));
+    g392HarnessSession()->send('');
+
+    $outcomes = [];
+    foreach (segmentOutcomes() as [$args, $result]) {
+        $outcomes[$args['city']][$result] = true;
+    }
+
+    // Rome has its own result; Oslo, no call's arguments, answers the first
+    // open call with the id and tool (Paris). Each call: ONE outcome.
+    expect($this->ran)->toBe([])
+        ->and(array_map('array_keys', $outcomes))->toBe([
+            'Rome' => ['forged Rome'],
+            'Oslo' => ['forged Oslo'],
+        ]);
+})->with(array_keys(g392HarnessPaths()));
