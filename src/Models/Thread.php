@@ -27,6 +27,9 @@ use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Throwable;
 
 /**
@@ -518,6 +521,101 @@ class Thread extends Model implements ThreadContract
         }
 
         return false;
+    }
+
+    /**
+     * Give every call still without a result, in a paused step whose call ids
+     * repeat, the denial `$reason` as its result, recorded as one tool result
+     * row. Returns whether a row was written.
+     *
+     * A result names its call only by id, so in such a step a result of one
+     * call reads as the result of every call sharing its id: an ungated call
+     * that ran would make a gated call with the same id look done, and that
+     * call would end with no outcome at all. Results are matched to calls BY
+     * POSITION here instead (each result is used once, by the first call it
+     * fits), so every gated call of the step gets exactly one outcome, and
+     * none of them runs.
+     *
+     * Only a step that asked for approval is touched, and only while it is
+     * the paused step at the tail; calling it again writes nothing.
+     *
+     * @internal Called by every turn before it reads the conversation.
+     */
+    public function endRepeatedIdStep(string $reason, ?string $runId = null): bool
+    {
+        if (! $this->pausedStepRepeatsCallIds()) {
+            return false;
+        }
+
+        $assistant = null;
+        $results = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            if (! is_string($stored->type) || ! is_array($stored->payload)) {
+                continue;
+            }
+            $message = MessageMapper::fromArray($stored->type, $stored->payload);
+            if ($message instanceof AssistantMessage) {
+                $assistant = $message;
+
+                break;
+            }
+            if ($message instanceof ToolResultMessage) {
+                $results = [...$message->toolResults, ...$results];
+            }
+        }
+        if (! $assistant instanceof AssistantMessage || $assistant->toolApprovalRequests === []) {
+            return false;
+        }
+
+        $open = self::callsWithoutResult($assistant->toolCalls, $results);
+        if ($open === []) {
+            return false;
+        }
+
+        $this->record([new ToolResultMessage(array_map(
+            static fn (ToolCall $call): ToolResult => new ToolResult(
+                toolCallId: $call->id,
+                toolName: $call->name,
+                args: $call->argumentsForResult(),
+                result: $reason,
+                toolCallResultId: $call->resultId,
+            ),
+            $open,
+        ))], $runId);
+
+        return true;
+    }
+
+    /**
+     * The calls no result answers, results matched to calls by position: a
+     * result is used once, by the first call with its id, name and arguments,
+     * then by the first with its id and name.
+     *
+     * @param  list<ToolCall>  $calls
+     * @param  list<ToolResult>  $results
+     * @return list<ToolCall>
+     */
+    private static function callsWithoutResult(array $calls, array $results): array
+    {
+        $answered = [];
+        foreach ([true, false] as $exact) {
+            foreach ($calls as $index => $call) {
+                if (isset($answered[$index])) {
+                    continue;
+                }
+                foreach ($results as $position => $result) {
+                    if ($result->toolCallId === $call->id && $result->toolName === $call->name
+                        && (! $exact || $result->args == $call->argumentsForResult())) {
+                        $answered[$index] = true;
+                        unset($results[$position]);
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        return array_values(array_filter($calls, static fn (int $index): bool => ! isset($answered[$index]), ARRAY_FILTER_USE_KEY));
     }
 
     /**
