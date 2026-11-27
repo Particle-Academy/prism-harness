@@ -178,7 +178,7 @@ final class ApprovalToolScopeTest extends TestCase
         self::assertNotContains('scope_late', $row['offers'][1]);
     }
 
-    public function test_legacy_approval_offers_only_approved_pending_names_with_a_constant_diagnostic(): void
+    public function test_legacy_approval_offers_only_the_requested_names_with_a_constant_diagnostic(): void
     {
         Log::spy();
         $row = $this->exercise(null, true, function (Session $session): void {
@@ -189,10 +189,15 @@ final class ApprovalToolScopeTest extends TestCase
         });
         self::assertSame(['scope_safe' => 1, 'scope_ceiling' => 0], $row['counts']);
         self::assertSame(['scope_safe'], $row['offers'][1]);
-        Log::shouldHaveReceived('warning')->once()->with('Pending approval has no valid stored tool scope; offering approved requests only.');
+        Log::shouldHaveReceived('warning')->once()->with('Pending approval has no valid stored tool scope; offering the requested tools only.');
     }
 
-    public function test_a_denied_legacy_approval_has_an_empty_offer(): void
+    /**
+     * Round 17: the requested tools, approved or not, so the resolution can
+     * answer the denied call (an empty offer left it with no result, a
+     * request no provider accepts). The denied call still never runs.
+     */
+    public function test_a_denied_legacy_approval_offers_only_its_requested_tool_and_runs_nothing(): void
     {
         $row = $this->exercise(null, false, function (Session $session): void {
             $pending = $session->thread()->storedMessages()->where('type', 'assistant')->firstOrFail();
@@ -201,7 +206,7 @@ final class ApprovalToolScopeTest extends TestCase
             $pending->update(['payload' => $payload]);
         });
         self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $row['counts']);
-        self::assertSame([], $row['offers'][1]);
+        self::assertSame(['scope_safe'], $row['offers'][1]);
     }
 
     public function test_a_malformed_stored_scope_cannot_restore_the_ceiling(): void
@@ -213,8 +218,9 @@ final class ApprovalToolScopeTest extends TestCase
             $pending->update(['payload' => $payload]);
             $session->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse('not-pending', true)])]);
         });
+        // The requested tool only (round 17), never the ceiling.
         self::assertSame(['scope_safe' => 0, 'scope_ceiling' => 0], $row['counts']);
-        self::assertSame([], $row['offers'][1]);
+        self::assertSame(['scope_safe'], $row['offers'][1]);
     }
 
     public function test_an_empty_stored_scope_is_not_a_missing_scope(): void

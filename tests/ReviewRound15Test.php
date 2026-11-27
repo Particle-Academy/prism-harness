@@ -695,7 +695,7 @@ it('reads a step an earlier version replaced without an outcome as replaced, and
 })->with(['a user row', 'a later step']);
 
 // ---------------------------------------------------------------------------
-// 8. A recorded denial is final (G-401, the recommended option).
+// 8. A recorded denial is final (G-401, decided: DENIAL WINS).
 // ---------------------------------------------------------------------------
 
 it('never runs a call whose denial was stored when its resume was refused, whatever is approved after (a)', function (string $then): void {

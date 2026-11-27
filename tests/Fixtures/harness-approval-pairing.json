@@ -1,9 +1,9 @@
 {
   "suite": "harness-approval-pairing",
   "schema_version": 1,
-  "corpus_version": "0.5.0",
+  "corpus_version": "0.6.0",
   "generated_by": "Hand-written expectations (G-392), written before any language ran. Each language's runner drives its real runtime offline with a fake model and asserts the outcome equals `expected`; `result` records those measured outcomes.",
-  "pins_note": "Whether each approval decision reaches exactly the call it was issued for. Tools: `echo` (gated by mode, integer arg `n`) and `free` (ungated). The fake model's first reply is the row's `calls` in order; every later reply is the text `done`. Each round decides the listed approvals, by index into the parked step's pending approvals in issue order, as one batch where the language has one, then resumes once with an empty prompt; a decision the harness refuses is swallowed and the row continues. Recorded: `approvals` (how many approvals the first step issued), `free` (times the ungated tool ran), `ran` (the sorted `n` of every echo that ran) and (0.2.0) `decided`: the decision the thread RECORDED for each approval the first step issued, in issue order, the first answer or null when none was recorded. On a step whose call ids repeat, every recorded decision is a denial whatever was decided. Rows with `supersede` (0.2.0, DECISION B) first write a row that supersedes the parked step (`assistant_tool_step`, `assistant_text`, `user`, recorded by a host, or `new_message` sent through the harness), then run the rounds, and also record `outcomes`: the first result each call of the first step ended with, in call order, or null. Rows with `later` (0.2.0, SEGMENT OWNERSHIP) record, after the park, a later step with the calls `later.calls` (each `echo` call asking an approval `apr_later_<k>`, k counting that step's echo calls, naming its call id), then ONE result row `later.result` (`id`, `name`, `args`, `result`, plus the approvals of `apr_later_<k>` for each k in `approved`); then `later.rounds` (indexes into the later step's approvals), then the rounds, then `later.resumes` empty-prompt resumes. Every outcome column is read BY SEGMENT: a result counts only for the step whose segment it sits in (the rows after that step and before the next assistant row with tool calls), matched by exact arguments, then id and tool name, then id. Such rows record `outcomes` (the first step's calls), `later_outcomes` (the later step's calls) and `refusals` (each of `later.rounds` then `rounds`).",
+  "pins_note": "Whether each approval decision reaches exactly the call it was issued for. Tools: `echo` (gated by mode, integer arg `n`) and `free` (ungated). The fake model's first reply is the row's `calls` in order; every later reply is the text `done`. Each round decides the listed approvals, by index into the parked step's pending approvals in issue order, as one batch where the language has one, then resumes once with an empty prompt; a decision the harness refuses is swallowed and the row continues. Recorded: `approvals` (how many approvals the first step issued), `free` (times the ungated tool ran), `ran` (the sorted `n` of every echo that ran) and (0.2.0) `decided`: the decision the thread RECORDED for each approval the first step issued, in issue order, the first answer or null when none was recorded. On a step whose call ids repeat, every recorded decision is a denial whatever was decided. Rows with `supersede` (0.2.0, DECISION B) first write a row that supersedes the parked step (`assistant_tool_step`, `assistant_text`, `user`, recorded by a host, or `new_message` sent through the harness), then run the rounds, and also record `outcomes`: the first result each call of the first step ended with, in call order, or null. Rows with `later` (0.2.0, SEGMENT OWNERSHIP) record, after the park, a later step with the calls `later.calls` (each `echo` call asking an approval `apr_later_<k>`, k counting that step's echo calls, naming its call id), then ONE result row `later.result` (`id`, `name`, `args`, `result`, plus the approvals of `apr_later_<k>` for each k in `approved`); then `later.rounds` (indexes into the later step's approvals), then the rounds, then `later.resumes` empty-prompt resumes. Every outcome column is read BY SEGMENT: a result counts only for the step whose segment it sits in (the rows after that step and before the next assistant row with tool calls), matched by exact arguments, then id and tool name, then id. Such rows record `outcomes` (the first step's calls), `later_outcomes` (the later step's calls) and `refusals` (each of `later.rounds` then `rounds`). Rows with `supersede` `concurrent_user` or `concurrent_text` (0.6.0, G-387 round 17) record every pending approval approved, then resume once while, inside the first echo call, a host records a user row (or an assistant text row), then send one more turn with the prompt `later`; they also record `sent`: whether every request the fake model received answers every call of every step it carries, exactly once, in that step's own result run.",
   "cases": [
     {
       "id": "apr-0001",
@@ -2278,6 +2278,110 @@
         }
       },
       "agrees": true
+    },
+    {
+      "id": "apr-0028",
+      "title": "a user row a host writes while an approved call runs: the call keeps its one outcome, and every request sent answers it",
+      "since": "0.6.0",
+      "notes": "G-387 round 17, item 1. Every pending approval is recorded approved and one resume runs the call; WHILE it runs a host records a user row. Then one more turn (`later`). `sent`: whether every request the fake model received answers every call of every step it carries, exactly once, in that step's own result run.",
+      "supersede": "concurrent_user",
+      "calls": [
+        {
+          "id": "c1",
+          "name": "echo",
+          "args": {
+            "n": 1
+          }
+        }
+      ],
+      "rounds": [],
+      "expected": {
+        "approvals": 1,
+        "free": 0,
+        "ran": [
+          1
+        ],
+        "decided": [
+          true
+        ],
+        "outcomes": [
+          "ok"
+        ],
+        "refusals": [],
+        "sent": true
+      },
+      "result": {
+        "php": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [
+            1
+          ],
+          "decided": [
+            true
+          ],
+          "outcomes": [
+            "ok"
+          ],
+          "refusals": [],
+          "sent": true
+        },
+        "ts": null,
+        "py": null
+      },
+      "agrees": false
+    },
+    {
+      "id": "apr-0029",
+      "title": "an assistant text row a host writes while an approved call runs: the call keeps its one outcome, and every request sent answers it",
+      "since": "0.6.0",
+      "notes": "G-387 round 17, item 1. As apr-0028, with an assistant text row.",
+      "supersede": "concurrent_text",
+      "calls": [
+        {
+          "id": "c1",
+          "name": "echo",
+          "args": {
+            "n": 1
+          }
+        }
+      ],
+      "rounds": [],
+      "expected": {
+        "approvals": 1,
+        "free": 0,
+        "ran": [
+          1
+        ],
+        "decided": [
+          true
+        ],
+        "outcomes": [
+          "ok"
+        ],
+        "refusals": [],
+        "sent": true
+      },
+      "result": {
+        "php": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [
+            1
+          ],
+          "decided": [
+            true
+          ],
+          "outcomes": [
+            "ok"
+          ],
+          "refusals": [],
+          "sent": true
+        },
+        "ts": null,
+        "py": null
+      },
+      "agrees": false
     }
   ]
 }

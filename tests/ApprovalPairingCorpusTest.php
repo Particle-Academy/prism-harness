@@ -17,6 +17,7 @@ use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Fixtures\Participant;
+use Tests\Support\SentRequests;
 
 // The cross-language approval-pairing corpus (harness-approval-pairing, G-392).
 // Every row's `expected` was written by hand before any language ran. This
@@ -34,6 +35,9 @@ final class PairingCorpusRan
     public static array $echo = [];
 
     public static int $free = 0;
+
+    /** Run once inside the next echo call's body (0.6.0, round 17): a host writing while it runs. */
+    public static ?Closure $during = null;
 }
 
 /** @return list<array<string, mixed>> */
@@ -55,6 +59,7 @@ function recordApprovalPairingRow(array $row): array
 {
     PairingCorpusRan::$echo = [];
     PairingCorpusRan::$free = 0;
+    PairingCorpusRan::$during = null;
 
     config()->set('prism.providers.openai.api_key', 'sk-test');
     config()->set('prism-harness.agent.provider', 'openai');
@@ -67,6 +72,11 @@ function recordApprovalPairingRow(array $row): array
         (new Tool)->as('echo')->for('Echo.')->withNumberParameter('n', 'A number')
             ->using(function (int|float $n): string {
                 PairingCorpusRan::$echo[] = (int) $n;
+                if (PairingCorpusRan::$during !== null) {
+                    $during = PairingCorpusRan::$during;
+                    PairingCorpusRan::$during = null;
+                    $during();
+                }
 
                 return 'ok';
             }),
@@ -137,6 +147,17 @@ function recordApprovalPairingRow(array $row): array
             approvalPairingSession()->send('');
             approvalPairingSession()->thread()->record([new ToolResultMessage([], array_map(
                 fn ($p): ToolApprovalResponse => new ToolApprovalResponse($p->approvalId, false, 'Too late.'), $pending))]);
+        })(),
+        // 0.6.0 (G-387 round 17, item 1): every pending approval recorded
+        // approved, and WHILE the resume runs the call a host records a user
+        // row (or an assistant text row); then one more turn, `later`.
+        'concurrent_user', 'concurrent_text' => (function () use ($row, $pending): void {
+            $session = approvalPairingSession();
+            (fn () => $this->recordDecisions(array_map(fn ($p): ToolApprovalResponse => new ToolApprovalResponse($p->approvalId, true), $pending)))->call($session);
+            PairingCorpusRan::$during = fn () => approvalPairingSession()->thread()->record([$row['supersede'] === 'concurrent_user'
+                ? new UserMessage('A host row while the call runs.') : new AssistantMessage('A host note while the call runs.')]);
+            approvalPairingSession()->send('');
+            approvalPairingSession()->send('later');
         })(),
         // 0.3.0 (G-404): a new message whose turn then fails.
         'new_message_failed' => (function (): void {
@@ -215,6 +236,12 @@ function recordApprovalPairingRow(array $row): array
             $outcome['later_outcomes'] = approvalPairingSegmentOutcomes($later['calls'], $segments[1] ?? []);
         }
         $outcome['refusals'] = $refusals;
+    }
+    if (in_array($row['supersede'] ?? null, ['concurrent_user', 'concurrent_text'], true)) {
+        // 0.6.0: whether every request the fake model received answers every
+        // call of every step it carries, exactly once, in that step's own
+        // result run.
+        $outcome['sent'] = SentRequests::since() === [];
     }
 
     return $outcome;
