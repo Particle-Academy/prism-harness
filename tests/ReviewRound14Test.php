@@ -14,6 +14,7 @@ use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Schema\BooleanSchema;
@@ -396,4 +397,75 @@ it('never reads a host row recorded inside the runtime\'s own write as inside th
             ->and(r14Session()->thread()->pendingApprovalIds())->toHaveCount(2);
     }
     expect($this->ran)->toBe([]);
+});
+
+// ---------------------------------------------------------------------------
+// New channels the fixes could open, each pinned.
+// ---------------------------------------------------------------------------
+
+// Channel: a host naming the RUNNING run's id to pass for the runtime and
+// skip the lock. A run id proves nothing; only the runtime's claimed token does.
+it('refuses a superseding host row that names the running run\'s own id', function (): void {
+    $approval = r14Park();
+    $host = null;
+    $this->during = function () use (&$host): void {
+        $running = (string) (r14Session()->run()['id'] ?? '');
+        $host = r14Try(fn () => r14Session()->thread()->record([new UserMessage('A host row.')], $running));
+    };
+    G360::text('Done.');
+
+    r14Session()->decide([new ToolApprovalResponse($approval, true)]);
+
+    expect($host)->toBe('locked')
+        ->and(r14Outcomes())->toBe(['call_paris' => ['Sunny in Paris']]);
+});
+
+// Channel: a host claiming the runtime's token itself, from inside the
+// runtime's write. The token was claimed on entry by the runtime's own call,
+// so a later claim gets nothing, and nothing a host records there is inside.
+it('gives a claim made inside the runtime\'s own write nothing', function (): void {
+    $claimed = null;
+    ThreadMessage::created(function (ThreadMessage $row) use (&$claimed): void {
+        if ($claimed === null && is_string($row->run_id)) {
+            $claimed = InRunRecording::claim($row->run_id);
+        }
+    });
+    G360::calls([['weather', ['city' => 'Paris'], 'call_paris']]);
+
+    r14Session()->send('Weather in Paris?');
+
+    expect($claimed)->toBeFalse()
+        ->and(r14Session()->thread()->pendingApprovalIds())->toHaveCount(1);
+});
+
+// Channel: the lock refusing host rows it has no reason to refuse. A row that
+// supersedes nothing takes no lock, even while a run holds it.
+it('records a host row that supersedes nothing while a run holds the lock', function (): void {
+    $host = null;
+    G360::$onRequest = function (int $n) use (&$host): void {
+        if ($n === 1) {
+            $host = r14Try(fn () => r14Session()->thread()->record([new UserMessage('A host row.')]));
+        }
+    };
+    G360::text('Hello.');
+
+    r14Session()->send('Hi.');
+
+    expect($host)->toBe('recorded');
+});
+
+// Channel: the once-per-segment replay leaving out a result that is not a
+// repeat. Results with the same id, tool AND arguments are one call's to the
+// fold whether or not their rows are consecutive, exactly as before; results
+// that differ in any of the three are all replayed.
+it('treats rows across a system row exactly as consecutive rows when it replays them', function (): void {
+    $thread = r14Session()->thread();
+    $step = new AssistantMessage('', [new ToolCall('c', 'echo', ['text' => 'a']), new ToolCall('d', 'echo', ['text' => 'b'])]);
+    $thread->record([new UserMessage('Go.'), $step,
+        new ToolResultMessage([new ToolResult('c', 'echo', ['text' => 'a'], 'first')]),
+        new SystemMessage('A note.'),
+        new ToolResultMessage([new ToolResult('c', 'echo', ['text' => 'a'], 'first'), new ToolResult('d', 'echo', ['text' => 'b'], 'second')]),
+        new AssistantMessage('Done.')]);
+
+    expect(array_map(fn (array $r): string => $r[1].'='.$r[3], r14Replay(r14Session()->thread())))->toBe(['c=first', 'd=second']);
 });
