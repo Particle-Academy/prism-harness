@@ -299,8 +299,10 @@ final class ApprovedTools
         }
         $ids = array_map(static fn (ToolCall $call): string => $call->id, $step[0]->toolCalls);
         $asked = array_map(static fn ($approval): string => $approval->toolCallId, $step[0]->toolApprovalRequests);
+        $approvals = array_map(static fn ($approval): string => $approval->approvalId, $step[0]->toolApprovalRequests);
 
-        return count($ids) !== count(array_unique($ids)) || count($asked) !== count(array_unique($asked));
+        return count($ids) !== count(array_unique($ids)) || count($asked) !== count(array_unique($asked))
+            || count($approvals) !== count(array_unique($approvals));
     }
 
     /**
@@ -334,7 +336,7 @@ final class ApprovedTools
                 return;
             }
             if (! $messages[$i] instanceof ToolResultMessage) {
-                // This turn's own prompt.
+                // This turn's own prompt, or a system row.
                 continue;
             }
             $indexes[] = $i;

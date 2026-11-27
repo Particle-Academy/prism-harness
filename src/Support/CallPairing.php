@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Support;
 
+use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 
@@ -37,8 +38,8 @@ use Prism\Prism\ValueObjects\ToolResult;
 final class CallPairing
 {
     /**
-     * @param  list<array{0: string, 1: string}>  $calls  [id, tool name], in call order
-     * @param  list<list<array{0: string, 1: string}>>  $rows  each result row's [id, tool name], in its order
+     * @param  list<array{0: string, 1: string, 2?: ?string}>  $calls  [id, tool name], in call order
+     * @param  list<list<array{0: string, 1: string, 2?: ?string}>>  $rows  each result row's [id, tool name], in its order
      * @return list<bool> whether each call has a result of its own
      */
     public static function answered(array $calls, array $rows): array
@@ -46,13 +47,18 @@ final class CallPairing
         $answered = array_fill(0, count($calls), false);
         foreach ($rows as $results) {
             $taken = [];
-            foreach ($results as [$id, $name]) {
+            foreach ($results as $result) {
+                [$id, $name] = $result;
+                $args = $result[2] ?? null;
                 // A call no earlier row answered first: a row that adds one
                 // result (an ended call, a resolved approval) adds it to a
                 // call still open, while a row that repeats every result of
                 // the step (a resume) still answers each call once.
                 $open = $taken + array_filter($answered);
-                $at = self::firstFree($calls, $open, $id, $name) ?? self::firstFree($calls, $taken, $id, $name)
+                // Its own call first: the id, the tool name AND the arguments
+                // the result records (the harness copies them from the call).
+                $at = ($args === null ? null : (self::firstFree($calls, $open, $id, $name, $args) ?? self::firstFree($calls, $taken, $id, $name, $args)))
+                    ?? self::firstFree($calls, $open, $id, $name) ?? self::firstFree($calls, $taken, $id, $name)
                     ?? self::firstFree($calls, $open, $id, null) ?? self::firstFree($calls, $taken, $id, null);
                 if ($at !== null) {
                     $taken[$at] = true;
@@ -65,7 +71,7 @@ final class CallPairing
     }
 
     /**
-     * @param  list<array{0: string, 1: string}>  $calls  [id, tool name], in call order
+     * @param  list<array{0: string, 1: string, 2?: ?string}>  $calls  [id, tool name], in call order
      * @param  list<string>  $requestCallIds  each request's tool_call_id, in issue order
      * @param  list<bool>  $ran  which calls a result of the step's own run answered
      * @return list<int|null> the index of the call each request was issued for, or null
@@ -111,20 +117,20 @@ final class CallPairing
 
     /**
      * @param  list<ToolCall>  $calls
-     * @return list<array{0: string, 1: string}>
+     * @return list<array{0: string, 1: string, 2?: ?string}>
      */
     public static function ofCalls(array $calls): array
     {
-        return array_map(static fn (ToolCall $call): array => [$call->id, $call->name], $calls);
+        return array_map(static fn (ToolCall $call): array => [$call->id, $call->name, self::digest($call->argumentsForResult())], $calls);
     }
 
     /**
      * @param  list<ToolResult>  $results
-     * @return list<array{0: string, 1: string}>
+     * @return list<array{0: string, 1: string, 2?: ?string}>
      */
     public static function ofResults(array $results): array
     {
-        return array_map(static fn (ToolResult $result): array => [$result->toolCallId, $result->toolName], $results);
+        return array_map(static fn (ToolResult $result): array => [$result->toolCallId, $result->toolName, self::digest($result->args)], $results);
     }
 
     /**
@@ -132,7 +138,7 @@ final class CallPairing
      * `$name` = tool_name) as [id, tool name]; a missing or odd value reads
      * as the empty string, which is an id like any other.
      *
-     * @return list<array{0: string, 1: string}>
+     * @return list<array{0: string, 1: string, 2?: ?string}>
      */
     public static function ofStored(mixed $entries, string $id, string $name): array
     {
@@ -144,24 +150,34 @@ final class CallPairing
 
                 continue;
             }
-            $out[] = [is_scalar($entry[$id] ?? null) ? (string) $entry[$id] : '', is_string($entry[$name] ?? null) ? $entry[$name] : ''];
+            $arguments = $entry[$id === 'id' ? 'arguments' : 'args'] ?? null;
+            $out[] = [is_scalar($entry[$id] ?? null) ? (string) $entry[$id] : '', is_string($entry[$name] ?? null) ? $entry[$name] : '',
+                self::digest(is_string($arguments) ? json_decode($arguments, true) : $arguments)];
         }
 
         return $out;
     }
 
     /**
-     * @param  list<array{0: string, 1: string}>  $calls
+     * @param  list<array{0: string, 1: string, 2?: ?string}>  $calls
      * @param  array<int, true>  $taken
      */
-    private static function firstFree(array $calls, array $taken, string $id, ?string $name): ?int
+    private static function firstFree(array $calls, array $taken, string $id, ?string $name, ?string $args = null): ?int
     {
-        foreach ($calls as $i => [$callId, $callName]) {
-            if (! isset($taken[$i]) && $callId === $id && ($name === null || $callName === $name)) {
+        foreach ($calls as $i => $call) {
+            [$callId, $callName] = $call;
+            if (! isset($taken[$i]) && $callId === $id && ($name === null || $callName === $name)
+                && ($args === null || ($call[2] ?? null) === $args)) {
                 return $i;
             }
         }
 
         return null;
+    }
+
+    /** A canonical digest of recorded arguments, or null when they are not a map. */
+    private static function digest(mixed $arguments): ?string
+    {
+        return is_array($arguments) ? CanonicalJson::digest($arguments) : null;
     }
 }

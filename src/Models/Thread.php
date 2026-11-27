@@ -742,7 +742,7 @@ class Thread extends Model implements ThreadContract
      * G-397), with the result rows after it, oldest first. Null when the
      * conversation moved on past it, or nothing is paused.
      *
-     * @return array{position: int, run_id: ?string, assistant: array<string, mixed>, results: list<array<string, mixed>>}|null
+     * @return array{position: int, run_id: ?string, assistant: array<string, mixed>, results: list<array<string, mixed>>, result_runs: list<string>}|null
      */
     private function pausedStep(): ?array
     {
@@ -759,6 +759,9 @@ class Thread extends Model implements ThreadContract
             'run_id' => is_string($found['step']->run_id) && $found['step']->run_id !== '' ? $found['step']->run_id : null,
             'assistant' => $found['step']->payload,
             'results' => array_map(static fn ($stored): array => $stored->payload, $found['results']),
+            'result_runs' => array_values(array_unique(array_filter(array_map(
+                static fn ($stored): ?string => ($stored->payload['tool_results'] ?? []) !== [] && is_string($stored->run_id) && $stored->run_id !== '' ? $stored->run_id : null,
+                $found['results'])))),
         ];
     }
 
@@ -948,7 +951,7 @@ class Thread extends Model implements ThreadContract
     public const SUPERSEDED = 'harness_superseded';
 
     /** The result each gated call of a superseded step is given, the same in every language (DECISION B). */
-    public const SUPERSEDED_RESULT = 'Not run: a later step replaced it.';
+    public const SUPERSEDED_RESULT = 'Tool call was not run because a later step replaced it';
 
     /**
      * Supersede the paused step now (DECISION B): record ONE denial for each
@@ -999,8 +1002,10 @@ class Thread extends Model implements ThreadContract
         if ($paused === null) {
             return $messages;
         }
-        $owner = $paused['run_id'];
-        $outside = $inRun === null || $owner === null || $inRun !== $owner;
+        // The runs that own the step: the one that recorded it, and every
+        // run that recorded one of its results (a resume answering it).
+        $owners = array_filter([$paused['run_id'], ...$paused['result_runs']], 'is_string');
+        $outside = $inRun === null || ! in_array($inRun, $owners, true);
         $at = null;
         foreach ($messages as $index => $message) {
             if (($message instanceof AssistantMessage && $message->toolCalls !== [])
@@ -1220,12 +1225,17 @@ class Thread extends Model implements ThreadContract
             $callIds[] = is_array($call) && is_scalar($call['id'] ?? null) ? (string) $call['id'] : '';
         }
         $requestCallIds = [];
+        $approvalIds = [];
         foreach ($paused['assistant']['tool_approval_requests'] ?? [] as $request) {
             $requestCallIds[] = is_array($request) && is_scalar($request['tool_call_id'] ?? null) ? (string) $request['tool_call_id'] : '';
+            $approvalIds[] = is_array($request) && is_scalar($request['approval_id'] ?? null) ? (string) $request['approval_id'] : '';
         }
 
+        // A repeated APPROVAL id across distinct calls fails closed too: one
+        // decision cannot say which call it answers (the release lines' rule).
         return count($callIds) !== count(array_unique($callIds, SORT_STRING))
-            || count($requestCallIds) !== count(array_unique($requestCallIds, SORT_STRING));
+            || count($requestCallIds) !== count(array_unique($requestCallIds, SORT_STRING))
+            || count($approvalIds) !== count(array_unique($approvalIds, SORT_STRING));
     }
 
     /**

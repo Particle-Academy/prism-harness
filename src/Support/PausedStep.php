@@ -7,6 +7,7 @@ namespace Prism\Harness\Support;
 use Closure;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\SystemMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 
 /**
@@ -15,11 +16,11 @@ use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
  * acts on decisions, the decision checks and the plan readers can never pick
  * different steps.
  *
- * Read newest first: result rows (results, decisions) are skipped; the first
- * other row must be an assistant step WITH tool calls, and that step is the
- * paused one. Anything else first (an assistant answer, a user turn, a system
- * row, any row of a kind this does not know) means nothing is paused: the
- * conversation moved on, and no decision applies to any earlier step.
+ * Read newest first: result rows (results, decisions) and system rows are
+ * skipped; the first other row must be an assistant step WITH tool calls, and
+ * that step is the paused one. Anything else first (an assistant answer, a
+ * user turn, any row of a kind this does not know) means nothing is paused:
+ * the conversation moved on, and no decision applies to any earlier step.
  *
  * @internal
  */
@@ -34,7 +35,9 @@ final class PausedStep
     /** The kind of a stored row, from its type and payload. */
     public static function kindOfRow(string $type, mixed $payload): string
     {
-        if ($type === MessageMapper::TYPE_TOOL_RESULT) {
+        // A system row never ends a step, as a result row never does (the
+        // release lines' rule): a decision still applies to the step.
+        if ($type === MessageMapper::TYPE_TOOL_RESULT || $type === MessageMapper::TYPE_SYSTEM) {
             return self::RESULT;
         }
         $calls = is_array($payload) ? ($payload['tool_calls'] ?? null) : null;
@@ -49,7 +52,7 @@ final class PausedStep
      */
     public static function kindOfMessage(Message $message): string
     {
-        if ($message instanceof ToolResultMessage || TurnMessages::isTurn($message)) {
+        if ($message instanceof ToolResultMessage || $message instanceof SystemMessage || TurnMessages::isTurn($message)) {
             return self::RESULT;
         }
 
