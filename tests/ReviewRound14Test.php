@@ -177,7 +177,10 @@ it('gives an approved call that is running when a host row would supersede its s
     if ($when === 'while the tool runs') {
         $this->during = $write;
     } else {
-        // After the tool ran, while the provider answers: its result is not recorded yet.
+        // After the tool ran, while the provider answers. The resolution is
+        // recorded BEFORE that request (one model step per request), so the
+        // call already has its result: the row supersedes nothing and needs
+        // no lock.
         G360::$onRequest = function (int $n) use ($write): void {
             if ($n === 2) {
                 $write();
@@ -188,7 +191,7 @@ it('gives an approved call that is running when a host row would supersede its s
 
     r14Session()->decide([new ToolApprovalResponse($approval, true)]);
 
-    expect($host)->toBe('locked')
+    expect($host)->toBe($when === 'while the tool runs' ? 'locked' : 'recorded')
         ->and($this->ran)->toBe(['Paris'])
         ->and(r14Outcomes())->toBe(['call_paris' => ['Sunny in Paris']])
         ->and(r14Session()->approvalStatus($approval))->not->toBe('superseded')

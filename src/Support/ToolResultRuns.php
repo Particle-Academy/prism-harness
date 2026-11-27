@@ -7,6 +7,7 @@ namespace Prism\Harness\Support;
 use Generator;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Contracts\Message;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolResult;
@@ -30,6 +31,16 @@ use Prism\Prism\ValueObjects\ToolResult;
  * as open and was given a second outcome. Within a step's rows a result is its
  * call's by exact arguments first, and the replay keeps it so. A decision is
  * keyed by its approval id.
+ *
+ * EACH RESULT ONCE, IN ITS OWN SEGMENT (G-387 round 14): a step's segment is
+ * every row after it up to the next step with tool calls, and its result rows
+ * need not be consecutive. A resolution recorded after a row that is not a
+ * result (a system row) carries the step's earlier results again, so a fold
+ * of consecutive rows alone replayed them twice, and a provider can refuse a
+ * duplicate tool result. A later run of the segment therefore leaves out
+ * every result (same key, same occurrence) and decision an earlier run of it
+ * already replayed; the first one stands where it was. A run left with
+ * nothing is not replayed at all.
  */
 class ToolResultRuns
 {
@@ -41,6 +52,10 @@ class ToolResultRuns
     {
         /** @var list<ToolResultMessage> $run */
         $run = [];
+        /** @var array<string, int> $replayed by result key, how many this segment replayed */
+        $replayed = [];
+        /** @var array<string, true> $decided by approval id, the decisions this segment replayed */
+        $decided = [];
 
         foreach ($messages as $message) {
             if ($message instanceof ToolResultMessage) {
@@ -50,16 +65,73 @@ class ToolResultRuns
             }
 
             if ($run !== []) {
-                yield static::merge($run);
+                $merged = static::unreplayed(static::merge($run), $replayed, $decided);
+                if ($merged !== null) {
+                    yield $merged;
+                }
                 $run = [];
+            }
+
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                // A new step: a new segment.
+                $replayed = [];
+                $decided = [];
             }
 
             yield $message;
         }
 
         if ($run !== []) {
-            yield static::merge($run);
+            $merged = static::unreplayed(static::merge($run), $replayed, $decided);
+            if ($merged !== null) {
+                yield $merged;
+            }
         }
+    }
+
+    /**
+     * `$message` without what this segment already replayed, or null when
+     * that leaves nothing of a message that held something. Records what it
+     * replays now.
+     *
+     * @param  array<string, int>  $replayed
+     * @param  array<string, true>  $decided
+     */
+    protected static function unreplayed(ToolResultMessage $message, array &$replayed, array &$decided): ?ToolResultMessage
+    {
+        if ($message->toolResults === [] && $message->toolApprovalResponses === []) {
+            return $message;
+        }
+        $seen = [];
+        $results = [];
+        foreach ($message->toolResults as $result) {
+            $same = static::keyOf($result);
+            $seen[$same] = ($seen[$same] ?? 0) + 1;
+            if ($seen[$same] > ($replayed[$same] ?? 0)) {
+                $results[] = $result;
+            }
+        }
+        foreach ($seen as $same => $count) {
+            $replayed[$same] = max($replayed[$same] ?? 0, $count);
+        }
+        $decisions = [];
+        foreach ($message->toolApprovalResponses as $decision) {
+            if (! isset($decided[$decision->approvalId])) {
+                $decided[$decision->approvalId] = true;
+                $decisions[] = $decision;
+            }
+        }
+        if (count($results) === count($message->toolResults) && count($decisions) === count($message->toolApprovalResponses)) {
+            return $message;
+        }
+
+        return $results === [] && $decisions === [] ? null : new ToolResultMessage($results, $decisions);
+    }
+
+    /** The same call: tool call id, tool name and recorded arguments, length-prefixed. */
+    protected static function keyOf(ToolResult $result): string
+    {
+        return strlen($result->toolCallId).':'.$result->toolCallId.'|'.strlen($result->toolName).':'.$result->toolName.'|'.CanonicalJson::digest($result->args);
     }
 
     /**
@@ -81,7 +153,7 @@ class ToolResultRuns
             foreach ($message->toolResults as $result) {
                 // Length-prefixed, so no id or name can collide with another
                 // pair, and no encoding step can fail on an odd value.
-                $same = strlen($result->toolCallId).':'.$result->toolCallId.'|'.strlen($result->toolName).':'.$result->toolName.'|'.CanonicalJson::digest($result->args);
+                $same = static::keyOf($result);
                 $seen[$same] = ($seen[$same] ?? 0) + 1;
                 $results[$same.'#'.$seen[$same]] = $result;
             }
