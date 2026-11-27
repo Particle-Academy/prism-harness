@@ -115,16 +115,24 @@ it('never runs a later copy\'s call on the approval the first step asked for', f
 })->with(['after the result', 'after a refused resume', 'after the model failed'])->with(['a new id' => ['c2'], 'the same id' => ['c1']])
     ->with(['no decision sent again' => [false], 'the approval sent again' => [true]]);
 
-it('never runs a copy recorded before the decision on the decision for the first step', function (string $id): void {
+it('never runs a copy recorded before the decision on the decision for the first step', function (string $shape): void {
     belongsFake(false);
     $approvalId = belongsSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
 
-    belongsSession()->thread()->record([belongsCopy($approvalId, $id)], null, ['weather']);
+    // Recorded before the person approves what they were shown.
+    $copy = match ($shape) {
+        'a new id' => belongsCopy($approvalId, 'c2'),
+        'the same id, new arguments' => belongsCopy($approvalId, 'c1'),
+        default => new AssistantMessage('', [new ToolCall('c1', 'weather', ['city' => 'Paris']), new ToolCall('c1', 'weather', ['city' => 'Rome'])], [],
+            [new ToolApprovalRequest($approvalId, 'c1', ToolApprovalRequest::ARGUMENTS_AS_SENT)]),
+    };
+    belongsSession()->thread()->record([$copy], null, ['weather']);
     try {
         belongsSession()->decide([new ToolApprovalResponse($approvalId, true)]);
     } catch (Throwable) {
     }
     belongsResume();
 
-    expect($this->ran)->not->toContain('Rome');
-})->with(['a new id' => ['c2'], 'the same id' => ['c1']]);
+    expect($this->ran)->not->toContain('Rome')
+        ->and(count(array_keys($this->ran, 'Paris', true)))->toBeLessThanOrEqual(1);
+})->with(['a new id', 'the same id, new arguments', 'the old and the new call under that id']);
