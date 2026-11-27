@@ -29,25 +29,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      # The parser is tested before it is trusted: a check that reads a
+      # constraint wrongly passes a run whose tests never ran.
+      - name: The core-floor check refuses what it claims to
+        run: python3 tools/core_floor.py --self-test
       - name: Check Packagist for a core matching composer.json
         run: |
           constraint="$(jq -r '.require["particle-academy/prism"]' composer.json)"
           curl -fsS --retry 3 https://repo.packagist.org/p2/particle-academy/prism.json -o "${RUNNER_TEMP}/core.json"
-          python3 - "$constraint" "${RUNNER_TEMP}/core.json" <<'PY'
-          import json, re, sys
-          constraint, path = sys.argv[1], sys.argv[2]
-          match = re.fullmatch(r"\^0\.(\d+)", constraint)
-          if match is None:
-              print(f"::error::Cannot check the core constraint {constraint!r}: this job only reads ^0.N.")
-              sys.exit(1)
-          minor = match.group(1)
-          versions = [v["version"] for v in json.load(open(path))["packages"]["particle-academy/prism"]]
-          found = [v for v in versions if re.fullmatch(rf"v?0\.{minor}\.\d+", v)]
-          if not found:
-              print(f"::error::particle-academy/prism {constraint} is not on Packagist yet, so the tests did NOT run (skipped, not passed). Re-run this workflow once it is published.")
-              sys.exit(1)
-          print(f"particle-academy/prism {constraint}: {', '.join(found)}")
-          PY
+          python3 tools/core_floor.py "$constraint" "${RUNNER_TEMP}/core.json"
 
   test:
     runs-on: ${{ matrix.os }}
