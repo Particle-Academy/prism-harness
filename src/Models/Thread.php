@@ -950,6 +950,9 @@ class Thread extends Model implements ThreadContract
     /** The payload key marking the row that denied a superseded step's calls (DECISION B, G-387 round 13). */
     public const SUPERSEDED = 'harness_superseded';
 
+    /** The mark 0.26.x writes on the same row (release/0.26.x Thread::REPLACED_MARK), read for upgraded threads. */
+    private const REPLACED_026 = 'harness_replaced';
+
     /** The result each gated call of a superseded step is given, the same in every language (DECISION B). */
     public const SUPERSEDED_RESULT = 'Tool call was not run because a later step replaced it';
 
@@ -1142,12 +1145,19 @@ class Thread extends Model implements ThreadContract
             return false;
         }
 
-        return self::markedIn((function () use ($request): Generator {
+        $rows = function () use ($request): Generator {
             yield ['type' => $request->type, ...$request->payload];
             foreach ($this->storedMessages()->where('position', '>', (int) $request->position)->reorder('position')->cursor() as $stored) {
                 yield ['type' => $stored->type, ...$stored->payload];
             }
-        })(), $approvalId, self::SUPERSEDED);
+        };
+
+        // This line's mark, or the one 0.26.x writes on the same row
+        // (`harness_replaced: {approval_ids}`): an upgraded thread reads the
+        // same. 0.26.x rows written before that mark carry none, and read by
+        // the decision recorded, as they did there.
+        return self::markedIn($rows(), $approvalId, self::SUPERSEDED)
+            || self::markedIn($rows(), $approvalId, self::REPLACED_026);
     }
 
     /**
