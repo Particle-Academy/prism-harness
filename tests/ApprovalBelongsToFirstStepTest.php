@@ -83,7 +83,7 @@ function belongsResume(): void
     }
 }
 
-it('never runs a later copy\'s call on the approval the first step asked for', function (string $when, string $id): void {
+it('never runs a later copy\'s call on the approval the first step asked for', function (string $when, string $id, bool $resent): void {
     belongsFake($when === 'after the model failed');
     if ($when === 'after a refused resume') {
         config()->set('prism-harness.agent.modes.chat.max_steps', 1);
@@ -102,10 +102,18 @@ it('never runs a later copy\'s call on the approval the first step asked for', f
             app()->forgetInstance($class);
         }
     }
+    if ($resent) {
+        // The same approval sent again, after the copy.
+        try {
+            belongsSession()->decide([new ToolApprovalResponse($approvalId, true)]);
+        } catch (Throwable) {
+        }
+    }
     belongsResume();
 
     expect($this->ran)->not->toContain('Rome');
-})->with(['after the result', 'after a refused resume', 'after the model failed'])->with(['a new id' => ['c2'], 'the same id' => ['c1']]);
+})->with(['after the result', 'after a refused resume', 'after the model failed'])->with(['a new id' => ['c2'], 'the same id' => ['c1']])
+    ->with(['no decision sent again' => [false], 'the approval sent again' => [true]]);
 
 it('never runs a copy recorded before the decision on the decision for the first step', function (string $id): void {
     belongsFake(false);
