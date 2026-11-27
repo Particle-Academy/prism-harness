@@ -30,6 +30,8 @@ use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
+use Prism\Prism\Providers\Anthropic\Support\ContentBlocks;
+use Prism\Prism\Providers\OpenAI\Support\OutputItems;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
@@ -436,7 +438,7 @@ class Thread extends Model implements ThreadContract
 
                 continue;
             }
-            $messages[] = self::withoutCopiedToolItems($stored->toPrismMessage());
+            $messages[] = self::withOwnProviderContent($stored->toPrismMessage());
             $positions[$position] = count($messages) - 1;
             $mark = $stored->payload[self::ANSWERS_STEP]['position'] ?? null;
             if (is_int($mark)) {
@@ -454,40 +456,128 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * An assistant row with no tool calls, replayed without the provider tool
-     * items its provider content carries (G-415): OpenAI `output_items` of
-     * type function_call / function_call_output, Anthropic `content_blocks`
-     * of type tool_use / tool_result. Core replays that content as it is, so
-     * a host's note carrying a step's content would send the step's calls
-     * again with nothing answering them, in every later request. Text,
-     * reasoning and every other item stay as they are; when nothing is left,
-     * the key is dropped and the row's own text is sent. A row with tool
-     * calls (every step the harness records) is returned unchanged.
+     * An assistant row, replayed with its provider content (OpenAI
+     * `output_items`, Anthropic `content_blocks`) only when that content is
+     * the row's own (G-415): its tool items are exactly the row's tool calls
+     * (ids and names, as a multiset) and its text is the row's text. Core
+     * sends the provider content in place of the row's text and calls, so a
+     * host note or an edited copy carrying another step's content would send
+     * that step's calls, unanswered, in every later request, and never send
+     * the row's own text. Otherwise the provider content is dropped, and the
+     * row is sent from its own text and tool calls. A row the harness records
+     * from a provider response matches, and is replayed unchanged.
      */
-    private static function withoutCopiedToolItems(Message $message): Message
+    private static function withOwnProviderContent(Message $message): Message
     {
-        if (! $message instanceof AssistantMessage || $message->toolCalls !== []) {
+        if (! $message instanceof AssistantMessage) {
             return $message;
         }
+        $calls = array_map(static fn (ToolCall $call): string => strlen($call->id).':'.$call->id.'|'.$call->name, $message->toolCalls);
+        sort($calls);
         $content = $message->additionalContent;
         $changed = false;
-        foreach (['output_items' => ['function_call', 'function_call_output'], 'content_blocks' => ['tool_use', 'tool_result']] as $key => $types) {
-            if (! is_array($content[$key] ?? null)) {
-                continue;
-            }
-            $kept = array_values(array_filter($content[$key], static fn (mixed $item): bool => ! (is_array($item) && in_array($item['type'] ?? null, $types, true))));
-            if (count($kept) === count($content[$key])) {
-                continue;
-            }
+
+        $items = $content['output_items'] ?? null;
+        if (is_array($items) && ! self::outputItemsAreOwn(array_values($items), $calls, $message->content)) {
+            unset($content['output_items']);
             $changed = true;
-            if ($kept === []) {
-                unset($content[$key]);
-            } else {
-                $content[$key] = $kept;
-            }
+        }
+        $blocks = $content['content_blocks'] ?? null;
+        if (is_array($blocks) && ! self::contentBlocksAreOwn(array_values($blocks), $calls, $message->content)) {
+            unset($content['content_blocks']);
+            $changed = true;
+        }
+        if ($message->toolCalls !== [] && $message->content !== '' && ! isset($content['output_items']) && ! isset($content['content_blocks'])) {
+            // With no provider content, core sends an OpenAI row as its
+            // calls, then its text, which parts each call from its output.
+            // The row's own items, in the order a response holds them: its
+            // text, then its calls.
+            $content['output_items'] = [
+                ['type' => 'message', 'role' => 'assistant', 'content' => [['type' => 'output_text', 'text' => $message->content]]],
+                ...array_map(static fn (ToolCall $call): array => ['type' => 'function_call', 'id' => $call->id, 'call_id' => $call->resultId,
+                    'name' => $call->name, 'arguments' => $call->argumentsAsJson()], array_values($message->toolCalls)),
+            ];
+            $changed = true;
         }
 
-        return $changed ? new AssistantMessage($message->content, [], $content, $message->toolApprovalRequests) : $message;
+        return $changed ? new AssistantMessage($message->content, $message->toolCalls, $content, $message->toolApprovalRequests) : $message;
+    }
+
+    /**
+     * Whether OpenAI output items are the row's own: their function calls
+     * are the row's calls, no item answers a call, and their text is the
+     * row's text as core reads it (the final answer, every message, or the
+     * last message).
+     *
+     * @param  list<mixed>  $items
+     * @param  list<string>  $calls  the row's calls, sorted
+     */
+    private static function outputItemsAreOwn(array $items, array $calls, string $text): bool
+    {
+        $tools = [];
+        $texts = [];
+        foreach ($items as $item) {
+            if (! is_array($item)) {
+                return false;
+            }
+            $type = $item['type'] ?? null;
+            if ($type === 'function_call_output') {
+                return false;
+            }
+            if ($type === 'function_call') {
+                $id = (string) ($item['id'] ?? '');
+                $tools[] = strlen($id).':'.$id.'|'.(string) ($item['name'] ?? '');
+            }
+            if ($type === 'message') {
+                $part = '';
+                foreach (is_array($item['content'] ?? null) ? $item['content'] : [] as $piece) {
+                    if (is_array($piece) && ($piece['type'] ?? null) === 'output_text') {
+                        $part .= (string) ($piece['text'] ?? '');
+                    }
+                }
+                $texts[] = $part;
+            }
+        }
+        sort($tools);
+        if ($tools !== $calls) {
+            return false;
+        }
+        $candidates = [implode('', $texts), OutputItems::text($items), OutputItems::finalMessageText($items)];
+
+        return in_array($text, $candidates, true);
+    }
+
+    /**
+     * Whether Anthropic content blocks are the row's own: the tool_use
+     * blocks of the model that served the response are the row's calls, no
+     * block answers a call, and the text blocks are the row's text.
+     *
+     * @param  list<mixed>  $blocks
+     * @param  list<string>  $calls  the row's calls, sorted
+     */
+    private static function contentBlocksAreOwn(array $blocks, array $calls, string $text): bool
+    {
+        $texts = '';
+        foreach ($blocks as $block) {
+            if (! is_array($block) || ($block['type'] ?? null) === 'tool_result') {
+                return false;
+            }
+            if (($block['type'] ?? null) === 'text') {
+                $texts .= (string) ($block['text'] ?? '');
+            }
+        }
+        $tools = [];
+        /** @var array<int, array<string, mixed>> $serving */
+        $serving = $blocks;
+        foreach (ContentBlocks::servingBlocks($serving) as $block) {
+            if (($block['type'] ?? null) === 'tool_use') {
+                $id = (string) ($block['id'] ?? '');
+                $tools[] = strlen($id).':'.$id.'|'.(string) ($block['name'] ?? '');
+            }
+        }
+        sort($tools);
+
+        return $tools === $calls && $texts === $text;
     }
 
     /**
