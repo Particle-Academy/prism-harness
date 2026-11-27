@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
@@ -238,23 +239,33 @@ it('lets a host tool record on its OWN session mid-run without a lock error or a
     config()->set('prism-harness.agent.lock_wait', 5);
     $approval = r15Park();
     $failure = null;
-    $this->during = function () use (&$failure, $kind): void {
+    $lockQueries = 0;
+    $this->during = function () use (&$failure, &$lockQueries, $kind): void {
+        // Deterministic, never a clock: every query the host write makes is
+        // seen, and none of them may touch a lock.
+        DB::listen(function ($query) use (&$lockQueries): void {
+            if (str_contains($query->sql, 'harness_session_state') && in_array(true, array_map(
+                static fn (mixed $binding): bool => is_string($binding) && str_starts_with($binding, 'lock:'), $query->bindings), true)) {
+                $lockQueries++;
+            }
+        });
         try {
             r15Session()->thread()->record([$kind === 'user row' ? new UserMessage('Tool note.')
                 : new AssistantMessage('', [new ToolCall('note', 'echo', ['text' => 'n'])])]);
         } catch (Throwable $thrown) {
             $failure = $thrown;
         }
+        DB::flushQueryLog();
+        app('events')->forget(QueryExecuted::class);
     };
     G360::text('Done.');
 
-    $started = microtime(true);
     r15Session()->decide([new ToolApprovalResponse($approval, true)]);
-    $elapsed = microtime(true) - $started;
 
+    // No lock taken or waited on for the host's write (lock_wait is 5 s here),
+    // and no error thrown into the tool.
     expect($failure)->toBeNull()
-        // No self-wait on its own lock (lock_wait is 5 s here).
-        ->and($elapsed)->toBeLessThan(4.0)
+        ->and($lockQueries)->toBe(0)
         ->and(r15Outcomes()['call_paris'])->toBe(['Sunny in Paris']);
 })->with(['user row', 'tool-call step']);
 

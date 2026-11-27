@@ -488,8 +488,9 @@ budget, the lock, the events — asking the provider for structured output.
 
 **A structured turn can stop for a person.** When a call needs an approval, the
 turn returns with no document: `$response->awaitingApproval()` is true,
-`$response->pendingApprovals()` lists what it waits on, `structured()` is empty
-and `$response->response->structured` is null, and the parked step and its approval
+`$response->pendingApprovals()` lists what it waits on, `structured()` is empty,
+`$response->response->structured` is null and so is every raw step's document
+(`$response->response->steps[...]->structured` is empty), and the parked step and its approval
 requests are in the thread exactly as for `send()`. A provider may write a document on
 the step that stopped; it was never checked against the schema, so it is never returned
 (read `text()` as the transcript, not as a document). It is not a schema failure, so do
@@ -1186,10 +1187,15 @@ none of them. A new message that supersedes a step is recorded together with tho
 one write, before its turn is sent: so a new message denies approved calls that have not run
 yet even when its own turn then fails (its message stays recorded), and no decision can land
 between the two. A host row that would supersede a step (`$session->thread()->record()` of a
-user or assistant row) takes the session's lock, the one every run, resume and decision holds:
-while a run holds it the write is refused with `SessionLocked` and records nothing, because that
-run may be running an approved call of the step; record it again when the run is over. A row
-that supersedes nothing takes no lock. Only the runtime's own record call is inside a run: a
+user or assistant row) is never refused and never waits on a lock, from anywhere, a tool body
+recording on its own session included: before the harness runs an approved call it records a
+`started` row for that call (a harness-only `harness_started` and `harness_answers_step`
+mark), so a call that is running is answered in progress and gets no replaced denial, and its
+real result, which names its step the same way, stays that call's one outcome wherever it lands.
+A call that was started and never got a result (the worker died, the tool threw past the
+runtime) reads `Tool call was interrupted, it may have run`, never "not run": it is never run
+again, `approvalStatus()` reads `interrupted`, and running it again needs a new call and a new
+approval. Only the runtime's own record call is inside a run: a
 row a host records while that write is in progress (from a model event, say) is outside,
 whatever run id it names. A result counts only for the calls of the step whose rows it sits in (the rows
 after that step and before the next assistant row with tool calls), matched there by exact
@@ -1201,7 +1207,24 @@ its own step's rows, even when they are not consecutive (a resolution recorded a
 row carries the step's earlier results again; the replay leaves the repeats out). A system row, like a result row, leaves the step parked. A step whose requests repeat
 an approval id is treated as one whose call ids repeat. The mark is one shape in all three languages, pinned by the
 `harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
-`{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
+`{approval_ids: [...]}`, after `tool_approval_responses`, in call order.
+
+**An approval runs exactly the call it was asked for.** Every stored approval request records the
+call it asks about (its tool name and a digest of its arguments, `harness_call`), and a call runs
+only when its own request matches it; any other call is denied, with exactly one outcome. An
+approval belongs only to the step that first asked for it: a later step that repeats its request
+asks for nothing. An assistant row is a tool-call step only when its `tool_calls` hold at least
+one object, and its calls are those objects, for every reader; any other row is read as text.
+A recorded denial is final: an approval recorded after it is refused, and a denial recorded
+after an approval that no run has acted on yet stands (the call is denied and never runs).
+`Thread::record()`'s `parked` and `endedByStart` arguments belong to the runtime: given by
+anyone else they throw `InvalidArgumentException` and nothing is written. A thread written by an
+earlier version whose step was replaced without an outcome reads that step as replaced: its
+calls get the replaced result when the thread is replayed, its approvals read `superseded`, and
+it never runs. The rows are pinned across the three languages by the `harness-thread-rows` and
+`harness-approval-pairing` corpora.
+
+Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
 parity op `start_gate`; the tool-call limit exists only here.
 

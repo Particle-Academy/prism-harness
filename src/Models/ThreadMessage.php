@@ -20,6 +20,7 @@ use Prism\Prism\Contracts\Message;
  * @property int $thread_id
  * @property int $position
  * @property string $type
+ * @property string|null $run_id
  * @property array<string, mixed> $payload
  */
 class ThreadMessage extends Model

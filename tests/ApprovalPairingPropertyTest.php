@@ -975,7 +975,8 @@ function ppRunCase(array $c): void
     foreach ($batches as $batch) {
         $refused = false;
         try {
-            if ($c['recorder'] === 'streamDecision' && $first === null && ! $batch['refused'] && ($insert['when'] ?? null) !== 'after_decision') {
+            if ($c['recorder'] === 'streamDecision' && $first === null && ! $batch['refused'] && ($insert['when'] ?? null) !== 'after_decision'
+                && ($c['copy']['when'] ?? null) !== 'after_decision') {
                 $first = ppDrain(ppSession($c)->streamDecision($batch['decisions']));
                 $recorded = array_values(array_filter($first['steps'], fn (RunStep $step): bool => $step->type === RunStep::DECISION_RECORDED));
                 ppCheck(array_map(fn (RunStep $step): array => [$step->data['approvalId'], $step->data['verdict']], $recorded)

@@ -43,8 +43,9 @@ final readonly class BudgetedCalls
 
     /** @param Closure(TextResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
+     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
      */
-    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): TextResponse
+    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): TextResponse
     {
         $builder = new TextBuilder;
         $approved = new ApprovedTools;
@@ -53,7 +54,7 @@ final readonly class BudgetedCalls
                 // Not the step limit: a run parked on its last step still acts on
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
-                $approved->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved, $started);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'text', $generation->provider());
@@ -103,8 +104,9 @@ final readonly class BudgetedCalls
 
     /** @param Closure(StructuredResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
+     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
      */
-    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved): StructuredResponse
+    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): StructuredResponse
     {
         $builder = new StructuredBuilder;
         $approved = new ApprovedTools;
@@ -113,7 +115,7 @@ final readonly class BudgetedCalls
                 // Not the step limit: a run parked on its last step still acts on
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
-                $approved->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved, $started);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'structured', $generation->provider());
@@ -184,9 +186,10 @@ final readonly class BudgetedCalls
     /**
      * @param  Closure(list<Message>, TextResponse):void  $record  Each completed call's core-built messages.
      * @param  Closure(list<Message>):void  $resolved
+     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
      * @return Generator<StreamEvent>
      */
-    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): Generator
+    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): Generator
     {
         $approved = new ApprovedTools;
         try {
@@ -194,7 +197,7 @@ final readonly class BudgetedCalls
                 // Not the step limit: a run parked on its last step still acts on
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
-                foreach ($approved->resolve($generation, $resolved) as $event) {
+                foreach ($approved->resolve($generation, $resolved, $started) as $event) {
                     yield $event;
                 }
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);

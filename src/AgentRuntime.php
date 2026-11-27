@@ -74,6 +74,7 @@ use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Facades\Prism;
 use Prism\Prism\Streaming\Events\StreamEvent;
 use Prism\Prism\Structured\Response as StructuredResponse;
+use Prism\Prism\Structured\Step as StructuredStep;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
@@ -107,6 +108,15 @@ final readonly class AgentRuntime
      * @var WeakMap<ToolResultMessage, list<string>>
      */
     private WeakMap $endedByStart;
+
+    /**
+     * The step each run resolves, by run id: the paused step when the run
+     * read its history (G-387 round 15). Its started rows and result rows
+     * name it, wherever they land.
+     *
+     * @var \ArrayObject<string, int|null>
+     */
+    private \ArrayObject $answering;
 
     /**
      * What ends a runner start's own view and, when it failed before its
@@ -154,6 +164,9 @@ final readonly class AgentRuntime
     ) {
         $this->policySlot = new ToolPolicySlot;
         $this->endedByStart = new WeakMap;
+        /** @var \ArrayObject<string, int|null> $answering */
+        $answering = new \ArrayObject;
+        $this->answering = $answering;
         $this->startSettles = new RunSettles;
         $this->enteredStarts = new WeakMap;
         foreach ($agents as $agent => $options) {
@@ -501,6 +514,30 @@ final readonly class AgentRuntime
     }
 
     /**
+     * What the resolver asks right before it runs an approved call (G-387
+     * round 15): record the call's write-ahead STARTED row, under the
+     * private token, in the call's own segment. True: recorded, run it.
+     * False: it must not run (the step this run resolves is unknown, or the
+     * call is no longer open: a superseding write denied it, or it started
+     * already).
+     *
+     * @return Closure(ToolCall): bool
+     */
+    private function starter(Session $session, string $runId): Closure
+    {
+        return function (ToolCall $call) use ($session, $runId): bool {
+            $position = $this->answering[$runId] ?? null;
+            if ($position === null) {
+                return false;
+            }
+            $thread = $session->thread();
+
+            return (bool) self::recordInRun($runId, fn (): bool => $thread->recordStarted($runId, $position, $call->id, $call->name,
+                $call->argumentsForResult()));
+        };
+    }
+
+    /**
      * Record `$record` as the run's OWN rows (DECISION B): the only way a row
      * counts as written inside a run ({@see InRunRecording}). Private, so a
      * run id a caller passes, through Thread::record() or any other public
@@ -509,12 +546,13 @@ final readonly class AgentRuntime
      * @template T
      *
      * @param  Closure(): T  $record
+     * @param  array<string, mixed>  $context  what the one record call is handed (the step its result rows answer)
      * @return T
      */
-    private static function recordInRun(string $runId, Closure $record): mixed
+    private static function recordInRun(string $runId, Closure $record, array $context = []): mixed
     {
         /** @var Closure(): T $during */
-        $during = Closure::bind(static fn (): mixed => InRunRecording::during($runId, $record), null, InRunRecording::class);
+        $during = Closure::bind(static fn (): mixed => InRunRecording::during($runId, $record, $context), null, InRunRecording::class);
 
         return $during();
     }
@@ -730,6 +768,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $prerecorded = ! $committedStart && $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
+            $this->answering[$runId] = $session->thread()->pausedStepPosition();
             $history = iterator_to_array($session->thread()->messages(), false);
             $turn = $prompt === '' || $prerecorded ? [] : [TurnMessages::of(new UserMessage($prompt, $attachments))];
             if ($committedStart && $prompt !== '') {
@@ -778,14 +817,14 @@ final readonly class AgentRuntime
                     }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                         $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                         $history = $messages;
-                    })
+                    }, $this->starter($session, $runId))
                 : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                     function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                         $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
                     }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                         $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                         $history = $messages;
-                    });
+                    }, $this->starter($session, $runId));
             $failed = in_array($response->finishReason, [FinishReason::Error, FinishReason::Unknown], true);
             if ($failed) {
                 $this->settleStart($runId);
@@ -991,6 +1030,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $prerecorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
+            $this->answering[$runId] = $session->thread()->pausedStepPosition();
             $history = iterator_to_array($session->thread()->messages(), false);
             $userMessage = $prompt === '' || $prerecorded ? null : TurnMessages::of(new UserMessage($prompt, $attachments));
 
@@ -1026,7 +1066,7 @@ final readonly class AgentRuntime
                         $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                         $history = $messages;
                         $userMessage = null;
-                    })
+                    }, $this->starter($session, $runId))
                 : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                     function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                         $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -1034,7 +1074,7 @@ final readonly class AgentRuntime
                         $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                         $history = $messages;
                         $userMessage = null;
-                    });
+                    }, $this->starter($session, $runId));
 
             // A turn that stopped for a person has no document yet: it is
             // returned with its pending approvals, never checked against the
@@ -1046,7 +1086,13 @@ final readonly class AgentRuntime
                 // A parked turn has NO document (G-405): a provider may fill
                 // one on the step that stopped for a person, and it was never
                 // checked against the schema. Nothing unchecked is returned.
-                $response = new StructuredResponse($response->steps, $response->text, null, $response->finishReason,
+                // Its raw provider steps carry none either (PHP run17 Info 6a):
+                // each step's document is cleared as the top-level one is.
+                $steps = $response->steps->map(static fn (StructuredStep $step): StructuredStep => new StructuredStep(
+                    $step->text, $step->finishReason, $step->usage, $step->meta, $step->messages, $step->systemPrompts,
+                    $step->additionalContent, [], $step->toolCalls, $step->providerToolCalls, $step->toolResults, $step->raw,
+                    $step->toolApprovalRequests));
+                $response = new StructuredResponse($steps, $response->text, null, $response->finishReason,
                     $response->usage, $response->meta, $response->toolCalls, $response->providerToolCalls,
                     $response->toolResults, $response->additionalContent, $response->raw);
             }
@@ -1426,6 +1472,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $recorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
+            $this->answering[$runId] = $session->thread()->pausedStepPosition();
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' || $recorded ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
@@ -1466,7 +1513,7 @@ final readonly class AgentRuntime
                     $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                     $history = $messages;
                     $recorded = true;
-                }));
+                }, $this->starter($session, $runId)));
         } catch (Throwable $failure) {
             $this->failRunOn($session, $runId, $run, $failure);
 
@@ -1559,6 +1606,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $recorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
+            $this->answering[$runId] = $session->thread()->pausedStepPosition();
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' || $recorded ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
@@ -1592,7 +1640,7 @@ final readonly class AgentRuntime
                     $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                     $history = $messages;
                     $recorded = true;
-                }));
+                }, $this->starter($session, $runId)));
         } catch (Throwable $failure) {
             $this->failRunOn($session, $runId, $run, $failure);
 
@@ -2231,7 +2279,8 @@ final readonly class AgentRuntime
         $thread = $session->thread();
         self::recordInRun($runId, fn () => $thread->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
             app(RunTrees::class)->parkFacts($runId),
-            array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended)));
+            array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended)),
+            ['answers' => $this->answering[$runId] ?? null]);
         // A runner start's task row is written: known in memory from here,
         // so nothing that settles the start needs a store read to keep it
         // (round 13), not even after a listener below throws.
@@ -2798,7 +2847,7 @@ final readonly class AgentRuntime
                 // Not marked by the policy, so it runs only on a person's
                 // recorded approval, and once for each one.
                 $used = $approvedRuns[$digest] ?? 0;
-                if ($used >= $session->thread()->approvedCallsAwaitingResult($tool->name(), $digest)) {
+                if ($used >= $session->thread()->approvedCallsAwaitingResult($tool->name(), $digest, $runId)) {
                     $this->emitToolDecision(ToolDenied::class, $session, $runId, $tool, $tool->name(), $args, 'policy');
 
                     return 'Not run: this call needs approval, and none is recorded.';

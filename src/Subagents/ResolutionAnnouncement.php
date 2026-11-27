@@ -33,6 +33,14 @@ final class ResolutionAnnouncement
     /** Tool executions in progress inside this resolution (a failure inside one is its own, not a refusal). */
     public int $executing = 0;
 
+    /**
+     * Asked, with the call, right before the resolution runs an approved
+     * call (G-387 round 15): true to run it, false when it must not run.
+     *
+     * @var (\Closure(ToolCall): bool)|null
+     */
+    public ?\Closure $starter = null;
+
     private bool $sent = false;
 
     /** @param list<TelemetryOperation> $operations */
