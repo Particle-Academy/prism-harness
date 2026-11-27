@@ -41,8 +41,43 @@ final class ResolutionRecorder
     /** @var list<ToolResult> */
     private array $results = [];
 
+    /**
+     * Asked right before a queued call runs (G-410).
+     *
+     * @var (\Closure(ToolCall): bool)|null
+     */
+    private ?\Closure $starter = null;
+
     /** @param non-empty-list<ToolCall> $queue */
     private function __construct(private readonly array $queue) {}
+
+    /** @param (\Closure(ToolCall): bool)|null $starter */
+    public function startWith(?\Closure $starter): void
+    {
+        $this->starter = $starter;
+    }
+
+    /**
+     * Whether the watched tool's call with `$args` may run: true when it is
+     * no queued call, or when the starter recorded the queued call it is
+     * (G-410). Matched as completed() matches.
+     *
+     * @param  array<int|string, mixed>  $args
+     */
+    public function starting(string $name, array $args): bool
+    {
+        if (! $this->open || $this->starter === null) {
+            return true;
+        }
+        for ($i = $this->next, $count = count($this->queue); $i < $count; $i++) {
+            $call = $this->queue[$i];
+            if ($call->name === $name && $call->arguments() === $args) {
+                return ($this->starter)($call);
+            }
+        }
+
+        return true;
+    }
 
     /**
      * A recorder for the calls core will resolve from $messages, or null when

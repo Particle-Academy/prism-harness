@@ -763,7 +763,7 @@ class Session
      * The session locks this process holds, by session key, with the step
      * position the run holding each one is answering (G-407).
      *
-     * @var array<string, array{answering: ?int}>
+     * @var array<string, array{answering: ?int, readUpTo?: ?int, run?: ?string}>
      */
     private static array $held = [];
 
@@ -785,6 +785,27 @@ class Session
         if (isset(self::$held[$key])) {
             self::$held[$key]['answering'] = $position;
         }
+    }
+
+    /** @internal The newest stored position when the run holding `$key` read the conversation (G-410). */
+    public static function readUpTo(string $key): ?int
+    {
+        return self::$held[$key]['readUpTo'] ?? null;
+    }
+
+    /** @internal Record the newest stored position when the run `$runId` holding `$key` read the conversation. */
+    public static function rememberReadUpTo(string $key, ?int $position, ?string $runId = null): void
+    {
+        if (isset(self::$held[$key])) {
+            self::$held[$key]['readUpTo'] = $position;
+            self::$held[$key]['run'] = $runId;
+        }
+    }
+
+    /** @internal The id of the run holding `$key` that read the conversation, if any (G-410). */
+    public static function heldRun(string $key): ?string
+    {
+        return self::$held[$key]['run'] ?? null;
     }
 
     /**

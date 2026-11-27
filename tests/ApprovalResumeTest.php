@@ -101,9 +101,10 @@ it('runs an approved call once, sends every call its output, and records the tur
             'call_AZkZynIOpPQwJ4fyZETY4eTP' => 'The tigers game is today at 3pm in detroit',
             'call_huHZrdh8RFUy8a8Uqbb2qV1x' => 'The weather will be 75 and sunny',
         ])
-        // The step's results, the decision, the merged results, the reply.
-        // Before the fix the resume recorded the user and assistant rows again.
-        ->and(storedTypes())->toBe(['user', 'assistant', 'tool_result', 'tool_result', 'tool_result', 'assistant']);
+        // The step's results, the decision, the approved call's write-ahead
+        // started row (G-410), the merged results, the reply. Before the fix
+        // the resume recorded the user and assistant rows again.
+        ->and(storedTypes())->toBe(['user', 'assistant', 'tool_result', 'tool_result', 'tool_result', 'tool_result', 'assistant']);
 });
 
 it('sends a denied call the reason, and does not run it', function (): void {

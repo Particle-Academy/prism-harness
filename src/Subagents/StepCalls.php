@@ -36,14 +36,14 @@ final readonly class StepCalls
     /** @param Closure(TextResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
      */
-    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): TextResponse
+    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): TextResponse
     {
         $this->assertUncapped($run);
         $builder = new TextBuilder;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                (new ApprovedTools)->resolve($generation, $resolved, $started);
                 // A resolved approval may itself delegate and consume the remainder.
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
@@ -75,14 +75,14 @@ final readonly class StepCalls
     /** @param Closure(StructuredResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
      */
-    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved): StructuredResponse
+    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): StructuredResponse
     {
         $this->assertUncapped($run);
         $builder = new StructuredBuilder;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                (new ApprovedTools)->resolve($generation, $resolved, $started);
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
                 $request = $generation->toRequest();
@@ -133,12 +133,12 @@ final readonly class StepCalls
      * @param  Closure(list<Message>):void  $resolved
      * @return Generator<StreamEvent>
      */
-    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): Generator
+    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): Generator
     {
         $this->assertUncapped($run);
         do {
             $run->ledger->assertCallAvailable($run->budget);
-            foreach ((new ApprovedTools)->resolve($generation, $resolved) as $event) {
+            foreach ((new ApprovedTools)->resolve($generation, $resolved, $started) as $event) {
                 yield $event;
             }
             $run->ledger->assertCallAvailable($run->budget);

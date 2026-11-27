@@ -43,6 +43,7 @@ use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\TurnAttachments;
+use Prism\Harness\Tools\DelegatingTool;
 use Prism\Harness\Tools\ToolAuthorizer;
 use Prism\Harness\Tools\ToolRefusals;
 use Prism\Harness\Tools\ToolRegistry;
@@ -259,17 +260,17 @@ final readonly class AgentRuntime
                         }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }) : $this->recordingResolution($recorder, $watched !== null, $generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
+                        }, $this->starter($session, $runId)) : $this->recordingResolution($recorder, $watched !== null, $generation, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        }, $session, $history, $runId, $tools, fn (): TextResponse => $generation->asText()))
+                        }, $session, $history, $runId, $tools, fn (): TextResponse => $generation->asText(), $this->starter($session, $runId)))
                     : $this->budgetedCalls($run, $provider, $model)->text($generation, $run,
                         function (TextResponse $response) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
                         }, function (array $messages) use ($session, &$history, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
-                        });
+                        }, $this->starter($session, $runId));
                 if ($budget->maxCostUsd === null && ! $stepOnly) {
                     $this->recordTurn($session, $this->newMessages($response, $history), $runId, $tools);
                 }
@@ -474,11 +475,11 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }) : $this->recordingResolution($recorder, $watched !== null, $generation, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
+                        }, $this->starter($session, $runId)) : $this->recordingResolution($recorder, $watched !== null, $generation, function (array $messages) use ($session, &$history, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        }, $session, $history, $runId, $tools, fn (): StructuredResponse => $generation->asStructured()))
+                        }, $session, $history, $runId, $tools, fn (): StructuredResponse => $generation->asStructured(), $this->starter($session, $runId)))
                     : $this->budgetedCalls($run, $provider, $model)->structured($generation, $run,
                         function (StructuredResponse $response) use ($session, &$userMessage, $runId, $tools): void {
                             $this->recordTurn($session, StructuredTranscript::of($response, $userMessage), $runId, $tools);
@@ -486,7 +487,7 @@ final readonly class AgentRuntime
                             $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                             $history = $messages;
                             $userMessage = null;
-                        });
+                        }, $this->starter($session, $runId));
 
                 if ($budget->maxCostUsd === null && ! $stepOnly) {
                     $this->recordTurn($session, $this->resolvedFirstInTranscript($response, $userMessage, $history), $runId, $tools);
@@ -764,7 +765,7 @@ final readonly class AgentRuntime
         }
 
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        if ($context !== null || $mode->subagents !== []) {
+        if ($context !== null || $mode->subagents !== [] || $this->resumesUnwatchedTool($session, $mode, $toolNames)) {
             yield from $this->streamStepTree($session, $prompt, $toolNames, $context, $attachments, $tagger);
 
             return;
@@ -841,8 +842,18 @@ final readonly class AgentRuntime
             }
             $tools = $this->approvalScopedOffer($session, $tools);
             $tagger->offered($this->toolNames($tools));
+            // Core resolves a resumed run's approved calls inside the stream:
+            // each one's started row is written right before it runs (G-410).
+            // A tool that cannot be watched never reaches here on a resume
+            // (see resumesUnwatchedTool()).
+            $recorder = $session->thread()->approvalToolNames() === null ? null : ResolutionRecorder::for(iterator_to_array($session->thread()->messages(), false));
+            $recorder?->startWith($this->starter($session, $runId));
+            $watched = $recorder?->watch($tools);
+            if ($recorder !== null && $watched === null) {
+                throw new \LogicException('A resumed stream reached a tool it cannot watch.');
+            }
             if ($tools !== []) {
-                $generation->withTools($tools)->withMaxSteps($namedRun === null ? $mode->maxSteps - $pausedSteps : $this->requestSteps($session, $namedRun));
+                $generation->withTools($watched ?? $tools)->withMaxSteps($namedRun === null ? $mode->maxSteps - $pausedSteps : $this->requestSteps($session, $namedRun));
             }
             $maxOutput = $namedRun === null
                 ? $this->nullableIntConfig('max_output_tokens_per_call', $session)
@@ -1035,7 +1046,7 @@ final readonly class AgentRuntime
                     $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                     $history = $messages;
                     $recorded = true;
-                }));
+                }, $this->starter($session, $runId)));
         } catch (Throwable $failure) {
             $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
             event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
@@ -1131,7 +1142,7 @@ final readonly class AgentRuntime
                     $this->recordTurn($session, $this->newMessageObjects($messages, $history), $runId, $tools);
                     $history = $messages;
                     $recorded = true;
-                }));
+                }, $this->starter($session, $runId)));
         } catch (Throwable $failure) {
             $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
             event(new RunFailed($session->key(), $runId, $failure::class, $run->parentRunId, $run->rootRunId()));
@@ -1813,14 +1824,18 @@ final readonly class AgentRuntime
      * @param  list<Message>  $history
      * @param  list<Tool>  $tools
      * @param  Closure(): T  $generate
+     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (G-410)
      * @return T
      */
-    private function recordingResolution(?ResolutionRecorder $recorder, bool $watching, TextPendingRequest|StructuredPendingRequest $generation, Closure $resolved, Session $session, array $history, string $runId, array $tools, Closure $generate): mixed
+    private function recordingResolution(?ResolutionRecorder $recorder, bool $watching, TextPendingRequest|StructuredPendingRequest $generation, Closure $resolved, Session $session, array $history, string $runId, array $tools, Closure $generate, ?Closure $started = null): mixed
     {
         if ($recorder !== null && ! $watching) {
-            (new ApprovedTools)->resolve($generation, $resolved);
+            (new ApprovedTools)->resolve($generation, $resolved, $started);
             $recorder = null;
         }
+        // Core resolves the approved calls inside the generation: each one's
+        // started row is written right before it runs (G-410).
+        $recorder?->startWith($started);
         try {
             return $generate();
         } catch (Throwable $failure) {
@@ -1954,6 +1969,51 @@ final readonly class AgentRuntime
         // host row written from inside this run leaves it to the run.
         Session::rememberAnswering($session->key(), $session->thread()->pausedStepPosition());
         $session->thread()->endRepeatedIdStep(Session::REPEATED_CALL_ID_REASON, $runId);
+        // What the run reads: a denial recorded after this refuses a call it
+        // has not started (G-410).
+        Session::rememberReadUpTo($session->key(), (int) $session->thread()->storedMessages()->max('position'), $runId);
+    }
+
+    /**
+     * Whether a plain stream would resume an approval whose tool cannot be
+     * watched (see ObservedTool): then no started row could be written
+     * right before core runs it, so the stream takes the step path, which
+     * resolves approvals itself (G-410).
+     *
+     * @param  list<string>|null  $toolNames
+     */
+    private function resumesUnwatchedTool(Session $session, AgentMode $mode, ?array $toolNames): bool
+    {
+        $waiting = $session->thread()->approvalToolNames();
+        if ($waiting === null || $waiting === []) {
+            return false;
+        }
+        $names = array_values(array_intersect($this->toolNamesFor($mode, $toolNames), $waiting));
+        foreach ($this->tools->resolve($names, $session) as $tool) {
+            if (! DelegatingTool::canWrap($tool)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * What a resolver asks right before it runs an approved call (G-410):
+     * record the call's write-ahead STARTED row. True: recorded, run it.
+     * False: it must not run (the step this run resolves is unknown, or the
+     * call is no longer open, or its approval was denied after the run read
+     * the conversation).
+     *
+     * @return Closure(ToolCall): bool
+     */
+    private function starter(Session $session, string $runId): Closure
+    {
+        return static function (ToolCall $call) use ($session, $runId): bool {
+            $position = Session::answering($session->key());
+
+            return $position !== null && $session->thread()->recordStarted($runId, $position, $call, Session::readUpTo($session->key()));
+        };
     }
 
     private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run): void

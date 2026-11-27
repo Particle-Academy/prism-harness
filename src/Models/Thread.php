@@ -421,9 +421,23 @@ class Thread extends Model implements ThreadContract
         $messages = [];
         $positions = [];
         $marks = [];
+        $interrupted = $this->interruptedCalls();
         foreach ($this->storedMessages()->lazy() as $stored) {
+            $position = (int) $stored->position;
+            if (($stored->type ?? null) === MessageMapper::TYPE_TOOL_RESULT && self::startedMark($stored) !== null) {
+                // A started row is never replayed (G-410). One the harness
+                // wrote whose call has no result of its own is replayed as
+                // that call's one result, interrupted, with the step.
+                if (! isset($interrupted[$position])) {
+                    continue;
+                }
+                $messages[] = new ToolResultMessage([$interrupted[$position]['result']]);
+                $marks[count($messages) - 1] = $interrupted[$position]['step'];
+
+                continue;
+            }
             $messages[] = $stored->toPrismMessage();
-            $positions[(int) $stored->position] = count($messages) - 1;
+            $positions[$position] = count($messages) - 1;
             $mark = $stored->payload[self::ANSWERS_STEP]['position'] ?? null;
             if (is_int($mark)) {
                 $marks[count($messages) - 1] = $mark;
@@ -773,6 +787,228 @@ class Thread extends Model implements ThreadContract
         return true;
     }
 
+    /** The payload key of a write-ahead started row (G-410). */
+    public const STARTED = 'harness_started';
+
+    /** What a call that was started and never got a result reads (G-410). */
+    public const INTERRUPTED_RESULT = 'Tool call was interrupted, it may have run';
+
+    /**
+     * The stored payload of a started row (G-410): an empty result row, the
+     * call about to run and the approval it runs under, then the step it
+     * answers as the LAST key. Pure.
+     *
+     * @return array<string, mixed>
+     */
+    public static function startedPayload(string $callId, string $toolName, string $approvalId, int $position): array
+    {
+        return [
+            'tool_results' => [],
+            'tool_approval_responses' => [],
+            self::STARTED => ['tool_call_id' => $callId, 'tool_name' => $toolName, 'approval_id' => $approvalId],
+            self::ANSWERS_STEP => ['position' => $position],
+        ];
+    }
+
+    /**
+     * Record the write-ahead STARTED row (G-410) for an approved call of the
+     * step at `$position`, immediately before the call runs, so a call whose
+     * result is never recorded is never run again. Written only while the
+     * call is open in the step this run resolves (no result and no started
+     * row), under its own approval request, with no denial of that approval
+     * recorded after the run read the conversation (a position above
+     * `$readUpTo`). Returns whether it was written: when it was not, the call
+     * must not run.
+     *
+     * @internal The harness runtime only, while its run holds the session.
+     */
+    public function recordStarted(string $runId, int $position, ToolCall $call, ?int $readUpTo = null): bool
+    {
+        $key = $this->sessionKeyOrNull();
+        if ($runId === '' || $key === null || ! Session::holdsLock($key)) {
+            throw new \LogicException('Only the harness runtime records a started row, inside its run.');
+        }
+
+        return DB::transaction(function () use ($runId, $position, $call, $readUpTo): bool {
+            static::query()->whereKey($this->getKey())->lockForUpdate()->first();
+
+            $step = $this->resolvableStep();
+            if ($step === null || $step['position'] !== $position) {
+                return false;
+            }
+            $open = false;
+            foreach (self::callsWithoutResult($step['assistant']->toolCalls, $step['results']) as $candidate) {
+                if ($candidate->id === $call->id && $candidate->name === $call->name) {
+                    $open = true;
+
+                    break;
+                }
+            }
+            $approvalId = null;
+            foreach ($step['assistant']->toolApprovalRequests as $request) {
+                if ($request->toolCallId === $call->id) {
+                    $approvalId = $request->approvalId;
+
+                    break;
+                }
+            }
+            if (! $open || $approvalId === null) {
+                return false;
+            }
+            $after = $this->storedMessages()->where('type', MessageMapper::TYPE_TOOL_RESULT)->where('position', '>', max($position, $readUpTo ?? 0));
+            foreach ($after->cursor() as $stored) {
+                foreach ($stored->payload['tool_approval_responses'] ?? [] as $response) {
+                    if (is_array($response) && ($response['approval_id'] ?? null) === $approvalId && ($response['approved'] ?? null) !== true) {
+                        return false;
+                    }
+                }
+            }
+
+            $this->storedMessages()->create([
+                'position' => (int) $this->storedMessages()->max('position') + 1,
+                'type' => MessageMapper::TYPE_TOOL_RESULT,
+                'run_id' => $runId,
+                'payload' => self::startedPayload($call->id, $call->name, $approvalId, $position),
+            ]);
+            $this->afterRecording();
+
+            return true;
+        });
+    }
+
+    /**
+     * Whether the call this approval was asked for was started and has no
+     * result of its own: it was interrupted, and it may have run (G-410).
+     */
+    public function interrupted(string $approvalId): bool
+    {
+        foreach ($this->interruptedCalls() as $call) {
+            if ($call['approval_id'] === $approvalId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The started rows the harness wrote whose call has no result of its
+     * own, other than the running run's, by the started row's position: the step it answers, its approval,
+     * and the interrupted result the call is replayed with (G-410).
+     *
+     * @return array<int, array{step: int, approval_id: string, result: ToolResult}>
+     */
+    private function interruptedCalls(): array
+    {
+        // The run that started a call still reads it as awaiting its result
+        // while it runs: what it records for the call is that result.
+        $key = $this->sessionKeyOrNull();
+        $running = $key === null ? null : Session::heldRun($key);
+        $rows = [];
+        foreach ($this->storedMessages()->reorder('position')->cursor() as $stored) {
+            $rows[(int) $stored->position] = $stored;
+        }
+        $interrupted = [];
+        foreach ($rows as $at => $stored) {
+            $start = ($stored->type ?? null) === MessageMapper::TYPE_TOOL_RESULT ? self::startedMark($stored) : null;
+            if ($start === null || $start['step'] >= $at || ! isset($rows[$start['step']]) || ($running !== null && $stored->run_id === $running)) {
+                continue;
+            }
+            $step = self::storedMessage($rows[$start['step']]);
+            if (! $step instanceof AssistantMessage || $step->toolCalls === []) {
+                continue;
+            }
+            $call = null;
+            foreach ($step->toolCalls as $candidate) {
+                if ($candidate->id === $start['tool_call_id'] && $candidate->name === $start['tool_name']) {
+                    $call = $candidate;
+
+                    break;
+                }
+            }
+            if ($call === null || $this->hasOwnResult($rows, $start['step'], $call)) {
+                continue;
+            }
+            $interrupted[$at] = ['step' => $start['step'], 'approval_id' => $start['approval_id'], 'result' => self::interruptedResult($call)];
+        }
+
+        return $interrupted;
+    }
+
+    /**
+     * Whether `$call` of the step at `$position` has a result of its own: a
+     * result row after the step whose valid mark names the step, or one with
+     * no mark in the step's own segment.
+     *
+     * @param  array<int, mixed>  $rows
+     */
+    private function hasOwnResult(array $rows, int $position, ToolCall $call): bool
+    {
+        $inSegment = true;
+        foreach ($rows as $at => $stored) {
+            if ($at <= $position) {
+                continue;
+            }
+            $message = self::storedMessage($stored);
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                $inSegment = false;
+
+                continue;
+            }
+            if (! $message instanceof ToolResultMessage || self::startedMark($stored) !== null) {
+                continue;
+            }
+            $mark = $stored->payload[self::ANSWERS_STEP]['position'] ?? null;
+            $mine = is_int($mark) ? $mark === $position && $this->answersStep($message, $mark, $at) : $inSegment;
+            if (! $mine) {
+                continue;
+            }
+            foreach ($message->toolResults as $result) {
+                if ($result->toolCallId === $call->id && $result->toolName === $call->name) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * The started mark of a row the harness wrote, or null. Honoured only on
+     * a row with a run id (no public record() path writes the key) whose
+     * payload is exactly the started shape; any other row carrying the key
+     * is read as if it were absent (G-410).
+     *
+     * @return array{tool_call_id: string, tool_name: string, approval_id: string, step: int}|null
+     */
+    private static function startedMark(mixed $stored): ?array
+    {
+        $payload = is_object($stored) ? ($stored->payload ?? null) : null;
+        $runId = is_object($stored) ? ($stored->run_id ?? null) : null;
+        if (! is_string($runId) || $runId === '' || ! is_array($payload)) {
+            return null;
+        }
+        $start = $payload[self::STARTED] ?? null;
+        $step = $payload[self::ANSWERS_STEP]['position'] ?? null;
+        if (! is_array($start) || ! is_int($step) || ($payload['tool_results'] ?? null) !== [] || ($payload['tool_approval_responses'] ?? null) !== []
+            || ! is_string($start['tool_call_id'] ?? null) || ! is_string($start['tool_name'] ?? null) || ! is_string($start['approval_id'] ?? null)) {
+            return null;
+        }
+
+        return ['tool_call_id' => $start['tool_call_id'], 'tool_name' => $start['tool_name'], 'approval_id' => $start['approval_id'], 'step' => $step];
+    }
+
+    private static function interruptedResult(ToolCall $call): ToolResult
+    {
+        return new ToolResult(
+            toolCallId: $call->id,
+            toolName: $call->name,
+            args: $call->argumentsForResult(),
+            result: self::INTERRUPTED_RESULT,
+            toolCallResultId: $call->resultId,
+        );
+    }
+
     /**
      * The step core resolves approvals for: the newest assistant row with
      * tool calls, not stopping at user, system or text-only assistant rows,
@@ -783,6 +1019,7 @@ class Thread extends Model implements ThreadContract
     private function resolvableStep(): ?array
     {
         $rows = [];
+        $started = [];
         foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
             $message = self::storedMessage($stored);
             if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
@@ -796,8 +1033,29 @@ class Thread extends Model implements ThreadContract
                     }
                     $results = [...$results, ...$row->toolResults];
                 }
+                // A call this step's run started (G-410) is answered: in
+                // progress, or interrupted when it has no result of its own.
+                foreach (array_reverse($started) as $start) {
+                    if ($start['step'] !== $position) {
+                        continue;
+                    }
+                    foreach (self::callsWithoutResult($message->toolCalls, $results) as $call) {
+                        if ($call->id === $start['tool_call_id'] && $call->name === $start['tool_name']) {
+                            $results[] = self::interruptedResult($call);
+
+                            break;
+                        }
+                    }
+                }
 
                 return ['assistant' => $message, 'results' => $results, 'position' => $position];
+            }
+            if (($stored->type ?? null) === MessageMapper::TYPE_TOOL_RESULT && ($start = self::startedMark($stored)) !== null) {
+                // A started row the harness wrote carries no result. On any
+                // other row the key is read as if it were absent (G-410).
+                $started[] = $start;
+
+                continue;
             }
             if ($message instanceof ToolResultMessage) {
                 $mark = is_array($stored->payload ?? null) ? ($stored->payload[self::ANSWERS_STEP]['position'] ?? null) : null;
