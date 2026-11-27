@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
 use Prism\Harness\Exceptions\ApprovalNotPending;
+use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Exceptions\SessionLocked;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\Modes\ModeRegistry;
@@ -190,7 +191,7 @@ it('records a host row written while an approved call runs, and the call keeps i
     };
     G360::text('Done.');
 
-    r15Session()->decide([new ToolApprovalResponse($approval, true)]);
+    $resumed = r15Try(fn () => r15Session()->decide([new ToolApprovalResponse($approval, true)]));
 
     // The host row is recorded (never SessionLocked); the call that ran has
     // exactly one stored outcome, its real result, and no replaced denial.
@@ -199,11 +200,14 @@ it('records a host row written while an approved call runs, and the call keeps i
         ->and(r15Session()->approvalStatus($approval))->toBe('approved');
     if ($kind === 'tool-call step') {
         // The later step that reuses the id is never credited with the
-        // earlier call's result: the run's own answer, recorded from outside
-        // that host step, replaced it, so its one outcome is the denial.
-        expect(r15ByCity())->toBe(['call_paris@Paris' => ['Sunny in Paris'], 'call_paris@Rome' => [R15_REPLACED]])
-            ->and(r15Session()->thread()->pendingApprovalIds())->toBe([]);
+        // earlier call's result. Round 16: the host step waits on approval,
+        // so the run takes no further model step (parked_elsewhere) and
+        // never replaces it; it stays pending, with no outcome yet.
+        expect($resumed)->toBe(RunNotPermitted::class)
+            ->and(r15ByCity())->toBe(['call_paris@Paris' => ['Sunny in Paris']])
+            ->and(r15Session()->thread()->pendingApprovalIds())->toBe(['apr_host']);
     } else {
+        expect($resumed)->toBe('recorded');
         expect(r15Outcomes())->toBe(['call_paris' => ['Sunny in Paris']]);
     }
 })->with(['user row', 'text row', 'tool-call step']);
@@ -215,7 +219,7 @@ it('replays the result of a call that ran while a host step was recorded with it
             [new ToolApprovalRequest('apr_host', 'call_paris')])], toolNames: ['weather']);
     };
     G360::text('Done.');
-    r15Session()->decide([new ToolApprovalResponse($approval, true)]);
+    r15Try(fn () => r15Session()->decide([new ToolApprovalResponse($approval, true)]));
 
     $replay = [];
     $segment = -1;
@@ -230,10 +234,11 @@ it('replays the result of a call that ran while a host step was recorded with it
         }
     }
     // Each step's own outcome, in its own segment: the earlier call's result
-    // with its step (though stored after the host's step), the host step's
-    // replaced denial with that step.
+    // with its step (though stored after the host's step). Round 16: the
+    // host step is the paused one (the run stopped before another model
+    // step, parked_elsewhere), so it has no outcome yet.
     expect($this->ran)->toBe(['Paris'])
-        ->and($replay)->toBe([[0, 'Paris', 'Sunny in Paris'], [1, 'Rome', R15_REPLACED]]);
+        ->and($replay)->toBe([[0, 'Paris', 'Sunny in Paris']]);
 });
 
 it('lets a host tool record on its OWN session mid-run without a lock error or a wait', function (string $kind): void {
@@ -390,9 +395,11 @@ it('pairs a result that lands after a later step to its own call', function (): 
             [new ToolApprovalRequest('apr_host', 'call_paris')])], toolNames: ['weather']);
     };
     G360::text('Done.');
-    r15Session()->decide([new ToolApprovalResponse($approval, true)]);
+    r15Try(fn () => r15Session()->decide([new ToolApprovalResponse($approval, true)]));
+    // The host step is the paused one now (round 16: the run stopped before
+    // another model step); a new message replaces it.
     G360::text('Again.');
-    r15Session()->send('');
+    r15Session()->send('Something else.');
 
     // The result row sits after the host's step, and still answers the call
     // that ran; the host step's call (same id and tool) is not credited with
@@ -456,19 +463,19 @@ it('ignores a forged answers mark on a host result row: segment ownership applie
     expect($this->ran)->toBe([]);
 });
 
-it('fails closed on a harness mark naming a row that is not a step with that call', function (): void {
+it('reads a raw row naming a run id as a host row: its marks change nothing (round 16)', function (): void {
     $approval = r15Park();
-    // A harness-written (run id set) row whose mark names the USER row.
+    // A raw row with a run id whose marks name the USER row. A run id is
+    // never a trust signal (round 16): only the runtime's own write is the
+    // harness's, so both marks read as absent.
     r15RawRow(['tool_results' => [], 'tool_approval_responses' => [],
         'harness_started' => ['tool_call_id' => 'call_paris', 'tool_name' => 'weather', 'approval_id' => $approval],
         'harness_answers_step' => ['position' => 1]], 'run_x');
 
-    // Segment ownership: it sits in call_paris's segment and names that call,
-    // so it reads as started (answered-in-progress), never as runnable.
     G360::text('Done.');
     r15Try(fn () => r15Session()->decide([new ToolApprovalResponse($approval, true)]));
-    expect($this->ran)->toBe([])
-        ->and(r15Session()->approvalStatus($approval))->toBe('interrupted');
+    expect($this->ran)->toBe(['Paris'])
+        ->and(r15Session()->approvalStatus($approval))->toBe('approved');
 });
 
 // ---------------------------------------------------------------------------

@@ -57,11 +57,42 @@ function corpusToolCalls(array $calls): array
 }
 
 /**
+ * Rows AS STORED (0.5.1): each with its `type`, `harness: true` on a row the
+ * harness wrote; a `run_id` on a corpus row is carried and read as nothing
+ * (0.6.0: a run id is never a trust signal). Positions are 1-based.
+ *
+ * @param  list<array<string, mixed>>  $stored
+ * @return list<array{position: int, type: string, run_id: ?string, harness: bool, payload: array<string, mixed>}>
+ */
+function corpusStoredRows(array $stored): array
+{
+    $rows = [];
+    foreach ($stored as $index => $row) {
+        $type = $row['type'];
+        $harness = ($row['harness'] ?? false) === true;
+        $runId = is_string($row['run_id'] ?? null) ? $row['run_id'] : null;
+        unset($row['type'], $row['harness'], $row['run_id']);
+        $rows[] = ['position' => $index + 1, 'type' => $type, 'run_id' => $runId, 'harness' => $harness, 'payload' => $row];
+    }
+
+    return $rows;
+}
+
+/**
  * @param  array<string, mixed>  $case
  * @return list<array<string, mixed>>
  */
 function corpusRows(array $case): array
 {
+    if (($case['read'] ?? null) === 'call_outcomes') {
+        // Whether each call of the step at `step` has an outcome (0.6.0,
+        // G-387 round 16): the reader rule, one boolean per call.
+        return Thread::callOutcomesIn(corpusStoredRows($case['stored']), $case['step']);
+    }
+    if (($case['read'] ?? null) === 'approval_reads') {
+        // What each approval reads (0.6.0): pending, and the decision that stands.
+        return Thread::approvalReadsIn(corpusStoredRows($case['stored']), $case['approvals']);
+    }
     if (($case['read'] ?? null) === 'approval_states') {
         // How each approval READS over rows as stored (0.4.0, G-387 round
         // 13): whether a runner start ended its call, by the harness's mark.
@@ -69,17 +100,10 @@ function corpusRows(array $case): array
             $case['approvals']);
     }
     if (isset($case['place'])) {
-        // Rows as stored, each with its `type` and, for a row the harness
-        // wrote, `harness: true`; positions are 1-based (0.5.1, G-387 round
-        // 15): placed as the replay places them, then folded.
-        $rows = [];
-        foreach ($case['place'] as $index => $stored) {
-            $type = $stored['type'];
-            $harness = ($stored['harness'] ?? false) === true;
-            unset($stored['type'], $stored['harness']);
-            $rows[] = ['position' => $index + 1, 'type' => $type, 'harness' => $harness, 'payload' => $stored];
-        }
-        $messages = array_map(static fn (array $row): Message => MessageMapper::fromArray($row['type'], $row['payload']), Thread::placedRows($rows));
+        // Rows as stored (0.5.1, G-387 round 15): placed as the replay
+        // places them, then folded.
+        $messages = array_map(static fn (array $row): Message => MessageMapper::fromArray($row['type'], $row['payload']),
+            Thread::placedRows(corpusStoredRows($case['place'])));
 
         return array_map(corpusRow(...), iterator_to_array(ToolResultRuns::fold($messages), false));
     }
@@ -105,6 +129,17 @@ function corpusRows(array $case): array
         expect($ended)->not->toBeNull();
 
         return [['type' => MessageMapper::typeOf($ended['message']), ...Thread::rowPayload($ended['message'], endedApprovals: $ended['approvals'])]];
+    }
+    if ($input['write'] === 'answer') {
+        // The row the runtime stores when it answers the step at `position`
+        // (0.6.0, G-387 round 16): only the new results, the mark last.
+        $payload = Thread::answerPayload(corpusStoredRows($input['stored']), $input['position'], new ToolResultMessage(
+            array_map(fn (array $result): ToolResult => new ToolResult($result['tool_call_id'], $result['tool_name'], $result['args'],
+                $result['result'], $result['tool_call_result_id'] ?? null), $input['results']),
+            array_map(fn (array $decision): ToolApprovalResponse => new ToolApprovalResponse($decision['approval_id'], $decision['approved'], $decision['reason']), $input['decisions']),
+        ));
+
+        return $payload === null ? [] : [['type' => MessageMapper::TYPE_TOOL_RESULT, ...$payload]];
     }
     if ($input['write'] === 'started') {
         // The write-ahead started row (0.5.1, G-387 round 15).
@@ -139,7 +174,7 @@ function corpusRows(array $case): array
 }
 
 it('is the whole suite, not a subset someone trimmed to green', function (): void {
-    expect(threadRowsCorpus()['cases'])->toHaveCount(24);
+    expect(threadRowsCorpus()['cases'])->toHaveCount(35);
 });
 
 it('stores and replays every row as the corpus records for the reference', function (array $case): void {

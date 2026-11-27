@@ -33,6 +33,7 @@ use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Support\MessageMapper;
+use Prism\Harness\Support\ThreadReads;
 use Prism\Harness\Tasks\StoreTaskSource;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Streaming\Events\StreamEvent;
@@ -1764,12 +1765,15 @@ class Session
         $previous = $this->writeFence;
         $this->writeFence = fn (array $state): bool => $store->putIfOwned($key, $token, $state, $this->ttlSeconds);
         $released = false;
+        // Read once while held, as fencedLock() does (G-387 round 16).
+        $leave = ThreadReads::enter();
 
-        return function () use ($store, $key, $token, $previous, &$released): void {
+        return function () use ($store, $key, $token, $previous, &$released, $leave): void {
             if ($released) {
                 return;
             }
             $released = true;
+            $leave();
             $this->writeFence = $previous;
             $this->cachedState = null;
             $store->releaseFencedLock($key, $token);
@@ -1800,7 +1804,9 @@ class Session
             try {
                 $owned();
 
-                return $callback($this);
+                // The thread is read once while the lock is held, then only
+                // what was appended since (G-387 round 16, ThreadReads).
+                return ThreadReads::scoped(fn (): mixed => $callback($this));
             } finally {
                 $this->writeFence = $previous;
                 $this->cachedState = null;

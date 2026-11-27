@@ -9,6 +9,7 @@ use Generator;
 use Illuminate\Support\Collection;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Support\CallPairing;
+use Prism\Harness\Support\RunHooks;
 use Prism\Harness\Support\ToolCallArguments;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\FinishReason;
@@ -55,6 +56,8 @@ final readonly class BudgetedCalls
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
                 $approved->resolve($generation, $resolved, $started);
+                // No further model step once a newer step on the session waits on approval (round 16).
+                RunHooks::beforeModelStep($run);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'text', $generation->provider());
@@ -65,9 +68,12 @@ final readonly class BudgetedCalls
                     $run->ledger->recordSteps(1);
                     // The resolution's reports go to THIS call's generation, and only it.
                     $approved->arm();
+                    // Core runs the step's ungated calls inside it (their journal, round 16).
+                    $generating = RunHooks::generating($run);
                     try {
                         $response = $generation->asText();
                     } finally {
+                        $generating();
                         $approved->announce();
                     }
                     $usage = $response->usage;
@@ -116,6 +122,8 @@ final readonly class BudgetedCalls
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
                 $approved->resolve($generation, $resolved, $started);
+                // No further model step once a newer step on the session waits on approval (round 16).
+                RunHooks::beforeModelStep($run);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'structured', $generation->provider());
@@ -126,9 +134,12 @@ final readonly class BudgetedCalls
                     $run->ledger->recordSteps(1);
                     // The resolution's reports go to THIS call's generation, and only it.
                     $approved->arm();
+                    // Core runs the step's ungated calls inside it (their journal, round 16).
+                    $generating = RunHooks::generating($run);
                     try {
                         $response = $generation->asStructured();
                     } finally {
+                        $generating();
                         $approved->announce();
                     }
                     $usage = $response->usage;
@@ -200,6 +211,7 @@ final readonly class BudgetedCalls
                 foreach ($approved->resolve($generation, $resolved, $started) as $event) {
                     yield $event;
                 }
+                RunHooks::beforeModelStep($run);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'stream', $generation->provider());
@@ -225,45 +237,50 @@ final readonly class BudgetedCalls
                     // The resolution's reports go to THIS stream's generation, which starts on
                     // the first advance; they are sent before any event reaches the host.
                     $approved->arm();
-                    foreach ($collector->collect() as $event) {
-                        $approved->announce();
-                        if ($event instanceof StepFinishEvent) {
-                            $billingSteps++;
-                            $billing = $event->additionalContent;
-                        }
-                        if ($event instanceof StreamEndEvent) {
-                            $billingEnds++;
-                        }
-                        if (($event instanceof StreamEndEvent || ($event instanceof StepFinishEvent && ! $this->price->requiresCompleteBilling)) && $event->usage !== null) {
-                            $usage = $event->usage;
-                        }
-                        // Older cores mark a provider error recoverable and still end
-                        // with Stop, so the error event itself is the evidence.
-                        // StepFinishEvent has no finish reason before core 0.132, so
-                        // the stream's end carries the verdict on every core.
-                        if ($event instanceof ErrorEvent || ($event instanceof StreamEndEvent
-                            && in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true))) {
-                            $failed = true;
-                            if ($event instanceof ErrorEvent) {
-                                $failureFinish = FinishReason::Error;
-                            } elseif ($failureFinish !== FinishReason::Error) {
-                                $failureFinish = $event->finishReason;
+                    $generating = RunHooks::generating($run);
+                    try {
+                        foreach ($collector->collect() as $event) {
+                            $approved->announce();
+                            if ($event instanceof StepFinishEvent) {
+                                $billingSteps++;
+                                $billing = $event->additionalContent;
                             }
+                            if ($event instanceof StreamEndEvent) {
+                                $billingEnds++;
+                            }
+                            if (($event instanceof StreamEndEvent || ($event instanceof StepFinishEvent && ! $this->price->requiresCompleteBilling)) && $event->usage !== null) {
+                                $usage = $event->usage;
+                            }
+                            // Older cores mark a provider error recoverable and still end
+                            // with Stop, so the error event itself is the evidence.
+                            // StepFinishEvent has no finish reason before core 0.132, so
+                            // the stream's end carries the verdict on every core.
+                            if ($event instanceof ErrorEvent || ($event instanceof StreamEndEvent
+                                && in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true))) {
+                                $failed = true;
+                                if ($event instanceof ErrorEvent) {
+                                    $failureFinish = FinishReason::Error;
+                                } elseif ($failureFinish !== FinishReason::Error) {
+                                    $failureFinish = $event->finishReason;
+                                }
+                            }
+                            // A stream end without usage is core saying the call's total is
+                            // unknown (no final usage arrived). An earlier step's partial
+                            // usage is evidence, not the cost: never price it.
+                            if ($event instanceof StreamEndEvent && $event->usage === null) {
+                                $failed = true;
+                                $failureFinish ??= FinishReason::Unknown;
+                            }
+                            if ($event instanceof StreamEndEvent) {
+                                $final = ! $failed;
+                            }
+                            if ($event instanceof ToolApprovalRequestEvent) {
+                                $approvals[] = $event->approvalRequest();
+                            }
+                            yield $event;
                         }
-                        // A stream end without usage is core saying the call's total is
-                        // unknown (no final usage arrived). An earlier step's partial
-                        // usage is evidence, not the cost: never price it.
-                        if ($event instanceof StreamEndEvent && $event->usage === null) {
-                            $failed = true;
-                            $failureFinish ??= FinishReason::Unknown;
-                        }
-                        if ($event instanceof StreamEndEvent) {
-                            $final = ! $failed;
-                        }
-                        if ($event instanceof ToolApprovalRequestEvent) {
-                            $approvals[] = $event->approvalRequest();
-                        }
-                        yield $event;
+                    } finally {
+                        $generating();
                     }
                     // Read to the end, but not ended normally: a provider error, a
                     // truncated stream, an Error/Unknown finish. Hosts label these.

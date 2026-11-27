@@ -546,12 +546,16 @@ const G397_026_REPLACED = 'Tool call was not run because a later step replaced i
 function g397WriteRaw(Session $session, string $type, array $payload, ?string $runId = null): void
 {
     $thread = $session->thread();
-    $thread->storedMessages()->create([
+    $row = $thread->storedMessages()->make([
         'position' => (int) $thread->storedMessages()->max('position') + 1,
         'type' => $type,
         'run_id' => $runId,
         'payload' => $payload,
     ]);
+    // A row an older worker wrote with the released line's mark: the
+    // upgrade's migration marks it as the harness's own, once (G-387 round
+    // 16), exactly as it would have been read before.
+    $row->forceFill(['harness_written' => array_key_exists('harness_replaced', $payload)])->save();
 }
 
 it('reads a 0.26.x thread with a replaced step: one outcome per call, nothing runs twice', function (string $shape): void {

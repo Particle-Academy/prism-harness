@@ -98,6 +98,23 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
         return $failure;
     }
 
+    /**
+     * A newer step on this run's session waits on approval: another run (a
+     * tool's own nested send) or the host parked the session after this run
+     * read it (G-387 round 16). This run takes no further model step, so it
+     * never replaces the step a caller was just told is waiting; what it ran
+     * before stopping is recorded. Its own code, `parked_elsewhere`, the same
+     * in every language.
+     */
+    public static function parkedElsewhere(): self
+    {
+        $failure = new self('This run may not take another model step (parked_elsewhere): a newer step on its session is waiting on approval.');
+        $failure->errorCode = 'parked_elsewhere';
+        $failure->reason = 'parked_elsewhere';
+
+        return $failure;
+    }
+
     public static function callBudget(string $code): self
     {
         $failure = new self(match ($code) {

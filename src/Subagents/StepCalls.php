@@ -9,6 +9,7 @@ use Generator;
 use Illuminate\Support\Collection;
 use Prism\Harness\Exceptions\RunNotPermitted;
 use Prism\Harness\Support\CallPairing;
+use Prism\Harness\Support\RunHooks;
 use Prism\Harness\Support\ToolCallArguments;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\FinishReason;
@@ -49,6 +50,8 @@ final readonly class StepCalls
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
                 $approved->resolve($generation, $resolved, $started);
+                // No further model step once a newer step on the session waits on approval (round 16).
+                RunHooks::beforeModelStep($run);
                 // A resolved approval may itself delegate and consume the remainder.
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
@@ -56,9 +59,12 @@ final readonly class StepCalls
                 $run->ledger->recordSteps(1);
                 // The resolution's reports go to THIS call's generation, and only it.
                 $approved->arm();
+                // Core runs the step's ungated calls inside it (their journal, round 16).
+                $generating = RunHooks::generating($run);
                 try {
                     $response = $generation->asText();
                 } finally {
+                    $generating();
                     $approved->announce();
                 }
                 if ($response->steps->isEmpty()) {
@@ -104,15 +110,19 @@ final readonly class StepCalls
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
                 $approved->resolve($generation, $resolved, $started);
+                RunHooks::beforeModelStep($run);
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
                 $request = $generation->toRequest();
                 $run->ledger->recordSteps(1);
                 // The resolution's reports go to THIS call's generation, and only it.
                 $approved->arm();
+                // Core runs the step's ungated calls inside it (their journal, round 16).
+                $generating = RunHooks::generating($run);
                 try {
                     $response = $generation->asStructured();
                 } finally {
+                    $generating();
                     $approved->announce();
                 }
                 $single = $builder->steps->isEmpty() && $response->steps->isEmpty() ? $response : null;
@@ -178,6 +188,7 @@ final readonly class StepCalls
                 foreach ($approved->resolve($generation, $resolved, $started) as $event) {
                     yield $event;
                 }
+                RunHooks::beforeModelStep($run);
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
                 $request = $generation->toRequest();
@@ -194,24 +205,29 @@ final readonly class StepCalls
                 // The resolution's reports go to THIS stream's generation, which starts on
                 // the first advance; they are sent before any event reaches the host.
                 $approved->arm();
-                foreach ($collector->collect() as $event) {
-                    $approved->announce();
-                    if ($event instanceof ErrorEvent) {
-                        $failed = true;
-                        $failureFinish = FinishReason::Error;
-                    } elseif ($event instanceof StreamEndEvent) {
-                        if (in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true)
-                            || $event->usage === null) {
+                $generating = RunHooks::generating($run);
+                try {
+                    foreach ($collector->collect() as $event) {
+                        $approved->announce();
+                        if ($event instanceof ErrorEvent) {
                             $failed = true;
-                            $failureFinish ??= $event->finishReason === FinishReason::Error
-                                ? FinishReason::Error : FinishReason::Unknown;
+                            $failureFinish = FinishReason::Error;
+                        } elseif ($event instanceof StreamEndEvent) {
+                            if (in_array($event->finishReason, [FinishReason::Error, FinishReason::Unknown], true)
+                                || $event->usage === null) {
+                                $failed = true;
+                                $failureFinish ??= $event->finishReason === FinishReason::Error
+                                    ? FinishReason::Error : FinishReason::Unknown;
+                            }
+                            $final = ! $failed;
                         }
-                        $final = ! $failed;
+                        if ($event instanceof ToolApprovalRequestEvent) {
+                            $approvals[] = $event->approvalRequest();
+                        }
+                        yield $event;
                     }
-                    if ($event instanceof ToolApprovalRequestEvent) {
-                        $approvals[] = $event->approvalRequest();
-                    }
-                    yield $event;
+                } finally {
+                    $generating();
                 }
                 if ($collected === null) {
                     return;

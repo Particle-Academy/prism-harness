@@ -122,6 +122,22 @@ function recordApprovalPairingRow(array $row): array
             approvalPairingAlteredCopy($row, $pending);
             approvalPairingSession()->send('');
         })(),
+        // 0.5.0 (G-387 round 16): a host records a result for the first
+        // gated call before any decision: its approval is closed (item 2).
+        'host_result' => (function () use ($row): void {
+            $call = array_values(array_filter($row['calls'], fn (array $call): bool => $call['name'] === 'echo'))[0];
+            approvalPairingSession()->thread()->record([new ToolResultMessage([new ToolResult($call['id'], $call['name'], $call['args'], 'host')])]);
+        })(),
+        // 0.5.0 (G-387 round 16): every pending approval recorded approved,
+        // one resume runs them, then a host records a denial of each: it
+        // never stood (item 1).
+        'denial_after_run' => (function () use ($pending): void {
+            $session = approvalPairingSession();
+            (fn () => $this->recordDecisions(array_map(fn ($p): ToolApprovalResponse => new ToolApprovalResponse($p->approvalId, true), $pending)))->call($session);
+            approvalPairingSession()->send('');
+            approvalPairingSession()->thread()->record([new ToolResultMessage([], array_map(
+                fn ($p): ToolApprovalResponse => new ToolApprovalResponse($p->approvalId, false, 'Too late.'), $pending))]);
+        })(),
         // 0.3.0 (G-404): a new message whose turn then fails.
         'new_message_failed' => (function (): void {
             try {

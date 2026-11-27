@@ -58,6 +58,7 @@ use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\ClassLabel;
 use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Support\PausedStep;
+use Prism\Harness\Support\RunHooks;
 use Prism\Harness\Support\RunSettles;
 use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Support\TurnMessages;
@@ -137,6 +138,18 @@ final readonly class AgentRuntime
      */
     private WeakMap $enteredStarts;
 
+    /**
+     * The journal rows each run wrote for the ungated calls core ran inside
+     * its model steps (G-387 round 16), until the write that stores their
+     * results removes them: by run id, each row's id and its call's key.
+     *
+     * @var \ArrayObject<string, list<array{id: int, key: string}>>
+     */
+    private \ArrayObject $journal;
+
+    /** @var \ArrayObject<string, Closure(): void> by run id, what detaches its loop hooks ({@see RunHooks}) */
+    private \ArrayObject $hooksOff;
+
     /** @param array<string, mixed> $config */
     public function __construct(
         private ModeRegistry $modes,
@@ -167,6 +180,12 @@ final readonly class AgentRuntime
         /** @var \ArrayObject<string, int|null> $answering */
         $answering = new \ArrayObject;
         $this->answering = $answering;
+        /** @var \ArrayObject<string, list<array{id: int, key: string}>> $journal */
+        $journal = new \ArrayObject;
+        $this->journal = $journal;
+        /** @var \ArrayObject<string, Closure(): void> $hooksOff */
+        $hooksOff = new \ArrayObject;
+        $this->hooksOff = $hooksOff;
         $this->startSettles = new RunSettles;
         $this->enteredStarts = new WeakMap;
         foreach ($agents as $agent => $options) {
@@ -214,7 +233,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
-                unset($this->answering[$runId]);
+                $this->endReading($runId);
             }
         }
     }
@@ -245,7 +264,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
-                unset($this->answering[$runId]);
+                $this->endReading($runId);
             }
         }
     }
@@ -532,10 +551,14 @@ final readonly class AgentRuntime
             if ($position === null) {
                 return false;
             }
+            // Every value the record needs, computed BEFORE the window opens
+            // (round 16): nothing but the record call runs inside it.
             $thread = $session->thread();
+            $id = $call->id;
+            $name = $call->name;
+            $arguments = $call->argumentsForResult();
 
-            return (bool) self::recordInRun($runId, fn (): bool => $thread->recordStarted($runId, $position, $call->id, $call->name,
-                $call->argumentsForResult()));
+            return (bool) self::recordInRun($runId, static fn (): bool => $thread->recordStarted($runId, $position, $id, $name, $arguments));
         };
     }
 
@@ -584,7 +607,8 @@ final readonly class AgentRuntime
         if (! $thread->supersedes()) {
             return false;
         }
-        self::recordInRun($runId, fn () => $thread->record([new UserMessage($prompt, $attachments)], $runId));
+        $message = new UserMessage($prompt, $attachments);
+        self::recordInRun($runId, static fn () => $thread->record([$message], $runId));
 
         return true;
     }
@@ -770,7 +794,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $prerecorded = ! $committedStart && $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
-            $this->answering[$runId] = $session->thread()->pausedStepPosition();
+            $this->beginReading($session, $runId, $run);
             $history = iterator_to_array($session->thread()->messages(), false);
             $turn = $prompt === '' || $prerecorded ? [] : [TurnMessages::of(new UserMessage($prompt, $attachments))];
             if ($committedStart && $prompt !== '') {
@@ -934,7 +958,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
-                unset($this->answering[$runId]);
+                $this->endReading($runId);
             }
         }
     }
@@ -1033,7 +1057,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $prerecorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
-            $this->answering[$runId] = $session->thread()->pausedStepPosition();
+            $this->beginReading($session, $runId, $run);
             $history = iterator_to_array($session->thread()->messages(), false);
             $userMessage = $prompt === '' || $prerecorded ? null : TurnMessages::of(new UserMessage($prompt, $attachments));
 
@@ -1454,7 +1478,7 @@ final readonly class AgentRuntime
                 $unwatch();
                 $this->rememberSeq($session, $runId, $tagger);
                 ToolRefusals::forget($runId);
-                unset($this->answering[$runId]);
+                $this->endReading($runId);
             });
         try {
             $this->refuseSpentRun($session, $runId, $run, $run->budget, $prompt);
@@ -1462,7 +1486,7 @@ final readonly class AgentRuntime
             $unwatch();
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
-            unset($this->answering[$runId]);
+            $this->endReading($runId);
 
             throw $refused;
         }
@@ -1477,7 +1501,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $recorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
-            $this->answering[$runId] = $session->thread()->pausedStepPosition();
+            $this->beginReading($session, $runId, $run);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' || $recorded ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
@@ -1531,7 +1555,8 @@ final readonly class AgentRuntime
             if (($session->run()['status'] ?? null) === 'running') {
                 if (! $recorded && $prompt !== '') {
                     $thread = $session->thread();
-                    self::recordInRun($runId, fn () => $thread->record([new UserMessage($prompt, $attachments)], $runId));
+                    $message = new UserMessage($prompt, $attachments);
+                    self::recordInRun($runId, static fn () => $thread->record([$message], $runId));
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
@@ -1544,7 +1569,7 @@ final readonly class AgentRuntime
             }
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
-            unset($this->answering[$runId]);
+            $this->endReading($runId);
         }
     }
 
@@ -1590,7 +1615,7 @@ final readonly class AgentRuntime
                 $unwatch();
                 $this->rememberSeq($session, $runId, $tagger);
                 ToolRefusals::forget($runId);
-                unset($this->answering[$runId]);
+                $this->endReading($runId);
             });
         // The same refusal as every other path, before anything is recorded:
         // no user row, and no result closing an approval still pending.
@@ -1600,7 +1625,7 @@ final readonly class AgentRuntime
             $unwatch();
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
-            unset($this->answering[$runId]);
+            $this->endReading($runId);
 
             throw $refused;
         }
@@ -1614,7 +1639,7 @@ final readonly class AgentRuntime
             // A new message supersedes the paused step (DECISION B): it is
             // recorded now, with its open calls' denials, in one write.
             $recorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
-            $this->answering[$runId] = $session->thread()->pausedStepPosition();
+            $this->beginReading($session, $runId, $run);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' || $recorded ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
@@ -1658,7 +1683,8 @@ final readonly class AgentRuntime
             if (($session->run()['status'] ?? null) === 'running') {
                 if (! $recorded && $prompt !== '') {
                     $thread = $session->thread();
-                    self::recordInRun($runId, fn () => $thread->record([new UserMessage($prompt, $attachments)], $runId));
+                    $message = new UserMessage($prompt, $attachments);
+                    self::recordInRun($runId, static fn () => $thread->record([$message], $runId));
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
@@ -1671,7 +1697,7 @@ final readonly class AgentRuntime
             }
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
-            unset($this->answering[$runId]);
+            $this->endReading($runId);
         }
     }
 
@@ -2273,6 +2299,84 @@ final readonly class AgentRuntime
     }
 
     /**
+     * Mark that the run read its history now (G-387 rounds 15 and 16): the
+     * step it resolves, where the thread ended, and the hooks its model loop
+     * and its ungated tools reach ({@see RunHooks}).
+     */
+    private function beginReading(Session $session, string $runId, RunContext $run): void
+    {
+        $thread = $session->thread();
+        $this->answering[$runId] = $thread->pausedStepPosition();
+        $readAt = $thread->lastPosition();
+        $this->detachHooks($runId);
+        $this->hooksOff[$runId] = RunHooks::attach($run, $runId,
+            function (string $tool, array $arguments) use ($session, $runId): void {
+                // Resolved BEFORE the window: only the record call runs in it.
+                $thread = $session->thread();
+                $id = self::recordInRun($runId, static fn (): int => $thread->recordJournal($runId, $tool, $arguments));
+                $this->journal[$runId] = [...($this->journal[$runId] ?? []), ['id' => (int) $id, 'key' => self::journalKey($tool, $arguments)]];
+            },
+            static fn (): bool => $session->thread()->parkedAfter($readAt, $runId));
+    }
+
+    /** Detach the run's loop hooks, if it has any. */
+    private function detachHooks(string $runId): void
+    {
+        $off = $this->hooksOff[$runId] ?? null;
+        if ($off !== null) {
+            $off();
+        }
+    }
+
+    /** The run ended: forget what its reading kept. */
+    private function endReading(string $runId): void
+    {
+        unset($this->answering[$runId], $this->journal[$runId]);
+        $this->detachHooks($runId);
+        unset($this->hooksOff[$runId]);
+    }
+
+    /**
+     * The run's journal rows whose calls' results `$messages` store, each
+     * matched once, by tool and canonical arguments.
+     *
+     * @param  list<Message>  $messages
+     * @return list<array{id: int, key: string}>
+     */
+    private function journalAnswered(string $runId, array $messages): array
+    {
+        $open = $this->journal[$runId] ?? [];
+        if ($open === []) {
+            return [];
+        }
+        $answered = [];
+        foreach ($messages as $message) {
+            if (! $message instanceof ToolResultMessage) {
+                continue;
+            }
+            foreach ($message->toolResults as $result) {
+                $key = self::journalKey($result->toolName, $result->args);
+                foreach ($open as $i => $entry) {
+                    if ($entry['key'] === $key) {
+                        $answered[] = $entry;
+                        unset($open[$i]);
+
+                        break;
+                    }
+                }
+            }
+        }
+
+        return $answered;
+    }
+
+    /** @param array<array-key, mixed> $arguments */
+    private static function journalKey(string $tool, array $arguments): string
+    {
+        return strlen($tool).':'.$tool.'|'.CanonicalJson::digest($arguments);
+    }
+
+    /**
      * @param  iterable<Message>  $messages
      * @param  list<Tool>  $tools
      */
@@ -2285,11 +2389,22 @@ final readonly class AgentRuntime
         // supersedes a step only when it would from outside, or has tool calls.
         // The thread is resolved BEFORE the window: the token is for the one
         // record call below, and nothing else may run inside it first (G-406).
+        //
+        // Every value the record needs is computed BEFORE the window opens
+        // (round 16): a tool's name() and the container callbacks parkFacts()
+        // resolves through are host code, and none of it may run while the
+        // token is armed. The closure holds nothing but the record call.
         $thread = $session->thread();
-        self::recordInRun($runId, fn () => $thread->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
-            app(RunTrees::class)->parkFacts($runId),
-            array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended)),
-            ['answers' => $this->answering[$runId] ?? null]);
+        $names = array_map(static fn (Tool $tool): string => $tool->name(), $tools);
+        $facts = app(RunTrees::class)->parkFacts($runId);
+        $endedRows = array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended);
+        $journal = $this->journalAnswered($runId, $messages);
+        $removed = array_column($journal, 'id');
+        $context = ['answers' => $this->answering[$runId] ?? null, 'journal' => $removed];
+        self::recordInRun($runId, static fn () => $thread->record($messages, $runId, $names, $facts, $endedRows), $context);
+        // The journal rows this write removed: their results are durable now.
+        $this->journal[$runId] = array_values(array_filter($this->journal[$runId] ?? [],
+            static fn (array $entry): bool => ! in_array($entry['id'], $removed, true)));
         // A runner start's task row is written: known in memory from here,
         // so nothing that settles the start needs a store read to keep it
         // (round 13), not even after a listener below throws.
@@ -3441,7 +3556,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
-                unset($this->answering[$runId]);
+                $this->endReading($runId);
             }
         }
     }
