@@ -2021,10 +2021,36 @@
             "approval_not_pending"
           ]
         },
-        "ts": null,
-        "py": null
+        "ts": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [],
+          "decided": [
+            null
+          ],
+          "outcomes": [
+            "Tool call was not run because a later step replaced it"
+          ],
+          "refusals": [
+            "approval_not_pending"
+          ]
+        },
+        "py": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [],
+          "decided": [
+            null
+          ],
+          "outcomes": [
+            "Tool call was not run because a later step replaced it"
+          ],
+          "refusals": [
+            "approval_not_pending"
+          ]
+        }
       },
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "apr-0025",
@@ -2067,10 +2093,32 @@
           ],
           "refusals": []
         },
-        "ts": null,
-        "py": null
+        "ts": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [],
+          "decided": [
+            true
+          ],
+          "outcomes": [
+            "Tool call was not run because a later step replaced it"
+          ],
+          "refusals": []
+        },
+        "py": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [],
+          "decided": [
+            true
+          ],
+          "outcomes": [
+            "Tool call was not run because a later step replaced it"
+          ],
+          "refusals": []
+        }
       },
-      "agrees": false
+      "agrees": true
     }
   ]
 }
