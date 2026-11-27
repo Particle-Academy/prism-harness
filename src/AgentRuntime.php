@@ -929,8 +929,10 @@ final readonly class AgentRuntime
                 // abandoned before StreamEnd never fires the collector's
                 // callback, so `$collected` is null and only the prompt is
                 // recorded — a partial turn kept rather than a whole one lost,
-                // and honest about how far it got.
-                $messages = [new UserMessage($prompt, $attachments), ...$resolution, ...($collected['messages'] ?? [])];
+                // and honest about how far it got. An empty prompt continues
+                // the turn at the tail, as it does for send(): it records no
+                // user row, so the turn keeps its step count.
+                $messages = [...($prompt === '' ? [] : [new UserMessage($prompt, $attachments)]), ...$resolution, ...($collected['messages'] ?? [])];
 
                 $this->recordTurn($session, $messages, $runId, $tools);
                 $resolution = [];
@@ -1922,12 +1924,14 @@ final readonly class AgentRuntime
     }
 
     /**
-     * Steps the paused run has already taken, when this turn resumes it.
+     * Steps the turn has already taken, when this send continues it.
      *
-     * A resume (an empty prompt with an approval waiting at the tail) is the
-     * same run, so it continues that run's step count and never opens a new
-     * allowance. A new prompt is a new run. A child run is left alone: its
-     * steps are already on the tree ledger its caller passes back in.
+     * An empty prompt records no user row, so it continues the turn at the
+     * tail: a resume with an approval waiting, or a send after the run
+     * stopped at its step limit. Either way it continues that turn's step
+     * count and never opens a new allowance. A new prompt is a new run. A
+     * child run is left alone: its steps are already on the tree ledger its
+     * caller passes back in.
      */
     private function pausedSteps(Session $session, string $prompt, ?RunContext $context): int
     {
@@ -1935,7 +1939,7 @@ final readonly class AgentRuntime
             return 0;
         }
 
-        return $session->thread()->approvalRunSteps() ?? 0;
+        return $session->thread()->turnSteps();
     }
 
     /**
