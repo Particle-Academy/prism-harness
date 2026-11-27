@@ -629,7 +629,7 @@ it('never lets a caller mark a row as written inside the run that owns the step'
 
     expect($public)->not->toContain('recordingInRun')
         ->and((new ReflectionMethod(AgentRuntime::class, 'recordInRun'))->isPublic())->toBeFalse()
-        ->and(array_map(fn (ReflectionMethod $m): string => $m->getName(), (new ReflectionClass(InRunRecording::class))->getMethods(ReflectionMethod::IS_PUBLIC)))->toBe(['active'])
+        ->and(array_map(fn (ReflectionMethod $m): string => $m->getName(), (new ReflectionClass(InRunRecording::class))->getMethods(ReflectionMethod::IS_PUBLIC)))->toBe(['claim'])
         ->and(decisionBDenials())->toBe([
             'call_paris' => ['Tool call was not run because a later step replaced it'],
             'call_rome' => ['Tool call was not run because a later step replaced it'],

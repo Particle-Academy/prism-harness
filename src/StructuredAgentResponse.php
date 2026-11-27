@@ -18,9 +18,10 @@ use Prism\Prism\ValueObjects\ToolApprovalRequest;
  * trusted. When a later turn reads the conversation back, it reads the text.
  *
  * Separate from {@see AgentResponse} because the runs differ in what they can
- * end as. A text run can stop awaiting a human's approval; a structured run
- * returns a document or raises, so there is no pending state to ask about here
- * and no method offering one.
+ * end as. A structured run returns a checked document, raises, or stops for a
+ * person ({@see self::awaitingApproval()}), and then it has NO document yet:
+ * {@see self::structured()} is empty and `$response->structured` is null
+ * (G-405). `text()` is still the transcript, never a checked document.
  */
 final readonly class StructuredAgentResponse
 {
@@ -37,13 +38,22 @@ final readonly class StructuredAgentResponse
      * The parsed document, checked against the schema before it got here.
      *
      * Never null: a run that could not produce one raised
-     * {@see StructuredSchemaViolation} instead of
-     * returning this object.
+     * {@see StructuredSchemaViolation} instead of returning this object.
+     *
+     * EMPTY while the run is stopped for a person ({@see self::awaitingApproval()}):
+     * a parked turn has no document (G-405). A provider may write one on the
+     * step that stopped, and that one was never checked against the schema,
+     * so it is not returned here, and `$response->structured` is null. Only
+     * the turn that answers after the decision returns a document, checked.
      *
      * @return array<mixed>
      */
     public function structured(): array
     {
+        if ($this->awaitingApproval()) {
+            return [];
+        }
+
         return $this->response->structured ?? [];
     }
 

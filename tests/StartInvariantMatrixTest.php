@@ -24,6 +24,7 @@ use Prism\Harness\Subagents\Subagent;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
 
@@ -122,11 +123,17 @@ function imExpected(): array
         'plans' => true, 'delegation' => true, 'policy' => true,
     ];
     $running = ['run' => ['S', 'running'], 'plan_run' => 'S', 'cancel S' => 'ok'];
+    // `host row` (round 14, G-404): a host records a user row on the child's
+    // thread. With nobody holding the child's lock it supersedes A0 (or, once
+    // A0 is ended, supersedes nothing); while a start holds the lock and A0
+    // is still parked it is refused, so a superseding write never races the
+    // run that ends or resolves the step.
     $refused = ['host turn' => 'child_binding_missing', 'resume' => 'child_binding_missing',
-        'recordApproval' => 'child_binding_missing', 'cancel' => 'ok', 'second start' => 'completed'];
+        'recordApproval' => 'child_binding_missing', 'cancel' => 'ok', 'second start' => 'completed', 'host row' => 'ran'];
     // The child's lock is held by the start: every turn and decision waits,
     // a second start included (framed `failed`, nothing written).
-    $locked = ['host turn' => 'locked', 'resume' => 'locked', 'recordApproval' => 'locked', 'cancel' => 'ok', 'second start' => 'failed'];
+    $locked = ['host turn' => 'locked', 'resume' => 'locked', 'recordApproval' => 'locked', 'cancel' => 'ok', 'second start' => 'failed',
+        'host row' => 'locked'];
     $ownLocked = ['own decision' => 'locked', 'own resume' => 'locked', 'own new message' => 'locked'];
     $ownRefused = ['own decision' => 'child_binding_missing', 'own resume' => 'child_binding_missing',
         'own new message' => 'child_binding_missing'];
@@ -135,10 +142,12 @@ function imExpected(): array
     $mark = [['tool_results', 'tool_approval_responses', 'harness_ended_by_start'], ['approval_ids' => ['A0']]];
     $ended = ['approval' => ['superseded', 'undecided', 'not pending'], 'offer' => ['echo', 'probe', 'weather'], 'paused' => 'none',
         'mark' => [$mark]];
+    // Once A0 is ended nothing is parked: a host row supersedes nothing, so it needs no lock.
+    $endedHostRow = ['host row' => 'ran'];
     // Once the start's run has ended, neither the parked run nor the start's own can be cancelled.
     $over = ['cancel' => 'not-running', 'cancel S' => 'not-running'];
     $after = [...$prior, ...$started, ...$ended, 'run' => ['S', 'completed'],
-        'host turn' => 'ran', 'resume' => 'ran', 'recordApproval' => 'not_pending', ...$over, 'second start' => 'completed'];
+        'host turn' => 'ran', 'resume' => 'ran', 'recordApproval' => 'not_pending', ...$over, 'second start' => 'completed', ...$endedHostRow];
     $afterInside = [...$prior, ...$started, ...$ended, 'run' => ['S', 'completed'],
         'own decision' => 'not_pending', 'own resume' => 'ran', 'own new message' => 'ran'];
     // A failed start never happened: its run is not the child's current run
@@ -153,10 +162,10 @@ function imExpected(): array
             'busy' => true, ...$ownLocked, 'reentrant start' => 'failed'],
         'during its run|outside' => [...$prior, ...$running, ...$locked, 'provisional' => true],
         'at ToolDenied(A0)|outside' => [...$prior, ...$started, ...$running, ...$ended, ...$locked,
-            'cancel' => 'not-running', 'busy' => true, 'second start' => 'denied'],
+            'cancel' => 'not-running', 'busy' => true, 'second start' => 'denied', ...$endedHostRow],
         // Round 13: inside a RunFinished listener for the start's run. The
         // run is completed and its records confirmed; the lock is still held.
-        'at RunFinished(S)|outside' => [...$prior, ...$started, ...$ended, 'run' => ['S', 'completed'], ...$locked, ...$over],
+        'at RunFinished(S)|outside' => [...$prior, ...$started, ...$ended, 'run' => ['S', 'completed'], ...$locked, ...$over, ...$endedHostRow],
         'at RunFinished(S)|inside' => [...$prior, ...$started, ...$ended, 'run' => ['S', 'completed'], ...$ownLocked],
         'after the task row|outside' => $after,
         'after the task row|inside' => $afterInside,
@@ -176,7 +185,7 @@ function imExpected(): array
         'after a failed start, undo failed|outside' => [...$prior, ...$refused, 'provisional' => true, ...$unstarted],
         'after a failed start, undo failed|inside' => [...$prior, ...$ownRefused, 'provisional' => true, ...$unstarted],
         // Round 13: a start that fails AFTER its task row happened, and stands.
-        'at RunFailed(S), kept|outside' => [...$prior, ...$started, ...$ended, 'run' => ['S', 'failed'], ...$locked, ...$over],
+        'at RunFailed(S), kept|outside' => [...$prior, ...$started, ...$ended, 'run' => ['S', 'failed'], ...$locked, ...$over, ...$endedHostRow],
         'at RunFailed(S), kept|inside' => [...$prior, ...$started, ...$ended, 'run' => ['S', 'failed'], ...$ownLocked],
         'after a failed start, kept|outside' => [...$after, 'run' => ['S', 'failed']],
         'after a failed start, kept|inside' => [...$afterInside, 'run' => ['S', 'failed']],
@@ -443,6 +452,9 @@ function imOutside(): array
         });
     }
     $read['second start'] = imRolledBack(fn (): string => imSecondStart());
+    $read['host row'] = imRolledBack(function (): void {
+        imChild()->thread()->record([new UserMessage('A host row.')]);
+    });
 
     return $read;
 }

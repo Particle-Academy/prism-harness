@@ -81,6 +81,10 @@ function recordApprovalPairingRow(array $row): array
     $count = 0;
     Http::fake(function (Request $request) use ($row, &$count) {
         $count++;
+        // 0.3.0 (G-404): the new message's own request fails, as a provider outage does.
+        if (($row['supersede'] ?? null) === 'new_message_failed' && $count === 2) {
+            throw new RuntimeException('provider down');
+        }
         $output = $count === 1
             ? array_map(fn (array $call): array => [
                 'id' => $call['id'], 'type' => 'function_call', 'status' => 'completed',
@@ -107,6 +111,14 @@ function recordApprovalPairingRow(array $row): array
         // A caller naming the step's OWN run id: still outside it.
         'user_owning_run_id' => approvalPairingSession()->thread()->record([new UserMessage('A later message.')], $parked->runId),
         'new_message' => approvalPairingSession()->send('Something else.'),
+        // 0.3.0 (G-404): a new message whose turn then fails.
+        'new_message_failed' => (function (): void {
+            try {
+                approvalPairingSession()->send('Something else.');
+            } catch (RuntimeException) {
+                // The turn failed; what it recorded before it stands.
+            }
+        })(),
     };
 
     // SEGMENT OWNERSHIP (0.2.0, round 13b): a later step a host records

@@ -57,6 +57,7 @@ use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\ClassLabel;
 use Prism\Harness\Support\InRunRecording;
+use Prism\Harness\Support\PausedStep;
 use Prism\Harness\Support\RunSettles;
 use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Support\TurnMessages;
@@ -447,14 +448,9 @@ final readonly class AgentRuntime
      */
     public static function endedCallsOf(array $history): ?array
     {
-        $index = null;
-        for ($i = count($history) - 1; $i >= 0; $i--) {
-            if ($history[$i] instanceof AssistantMessage && $history[$i]->toolCalls !== []) {
-                $index = $i;
-
-                break;
-            }
-        }
+        // The paused step, chosen by the ONE rule every paused-step reader
+        // uses (G-397; round 14): never merely the newest step with calls.
+        $index = PausedStep::indexIn($history);
         if ($index === null) {
             return null;
         }
@@ -521,6 +517,36 @@ final readonly class AgentRuntime
         $during = Closure::bind(static fn (): mixed => InRunRecording::during($runId, $record), null, InRunRecording::class);
 
         return $during();
+    }
+
+    /**
+     * Record a NEW message that supersedes the paused step (DECISION B) now,
+     * before its turn is sent, in ONE write with the replaced denials of that
+     * step's open calls (G-404, round 14). Whether it did: false when the
+     * prompt is empty or nothing is open, and the turn records its prompt
+     * with its answer, as always.
+     *
+     * One write, so no decision can land between the denials and the message
+     * (every decision path holds this run's session lock as well), and a
+     * thread never holds the denials without the message that caused them.
+     * A turn that fails after it, its provider down say, leaves the step
+     * replaced and the message recorded: a new message denies approved calls
+     * that had not run yet, even when its own turn then fails.
+     *
+     * @param  array<array-key, mixed>  $attachments
+     */
+    private function recordSupersedingPrompt(Session $session, string $runId, string $prompt, array $attachments): bool
+    {
+        if ($prompt === '') {
+            return false;
+        }
+        $thread = $session->thread();
+        if (! $thread->supersedes()) {
+            return false;
+        }
+        self::recordInRun($runId, fn () => $thread->record([new UserMessage($prompt, $attachments)], $runId));
+
+        return true;
     }
 
     /**
@@ -701,13 +727,11 @@ final readonly class AgentRuntime
             // The history is read HERE, once, and handed to Prism as
             // messages rather than as a Thread. See newMessages() for why
             // this run has to know exactly which message objects it sent.
-            // A new message supersedes the paused step (DECISION B): its open
-            // gated calls are denied first, so nothing from it runs.
-            if ($prompt !== '' && ! $committedStart) {
-                $session->thread()->supersedePausedStep();
-            }
+            // A new message supersedes the paused step (DECISION B): it is
+            // recorded now, with its open calls' denials, in one write.
+            $prerecorded = ! $committedStart && $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
             $history = iterator_to_array($session->thread()->messages(), false);
-            $turn = $prompt === '' ? [] : [TurnMessages::of(new UserMessage($prompt, $attachments))];
+            $turn = $prompt === '' || $prerecorded ? [] : [TurnMessages::of(new UserMessage($prompt, $attachments))];
             if ($committedStart && $prompt !== '') {
                 // A runner start acts on NO recorded decision (G-387): the
                 // calls the child was parked on are ended with its task row,
@@ -964,13 +988,11 @@ final readonly class AgentRuntime
         try {
             $run = $this->observedRun($run);
             $this->assertMeteredCompaction($run);
-            // A new message supersedes the paused step (DECISION B): its open
-            // gated calls are denied first, so nothing from it runs.
-            if ($prompt !== '') {
-                $session->thread()->supersedePausedStep();
-            }
+            // A new message supersedes the paused step (DECISION B): it is
+            // recorded now, with its open calls' denials, in one write.
+            $prerecorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
             $history = iterator_to_array($session->thread()->messages(), false);
-            $userMessage = $prompt === '' ? null : TurnMessages::of(new UserMessage($prompt, $attachments));
+            $userMessage = $prompt === '' || $prerecorded ? null : TurnMessages::of(new UserMessage($prompt, $attachments));
 
             $generation = Prism::structured()
                 ->using($provider, $model)
@@ -1020,6 +1042,14 @@ final readonly class AgentRuntime
             // discard what the person was asked about.
             $parked = (new StructuredAgentResponse($runId, $response))->awaitingApproval();
             $violation = $parked ? null : $this->violationIn($schema, $response);
+            if ($parked) {
+                // A parked turn has NO document (G-405): a provider may fill
+                // one on the step that stopped for a person, and it was never
+                // checked against the schema. Nothing unchecked is returned.
+                $response = new StructuredResponse($response->steps, $response->text, null, $response->finishReason,
+                    $response->usage, $response->meta, $response->toolCalls, $response->providerToolCalls,
+                    $response->toolResults, $response->additionalContent, $response->raw);
+            }
 
             if ($violation instanceof StructuredSchemaViolation) {
                 throw $violation;
@@ -1393,14 +1423,12 @@ final readonly class AgentRuntime
         $completedCall = false;
         try {
             $run = $this->observedRun($run);
-            // A new message supersedes the paused step (DECISION B): its open
-            // gated calls are denied first, so nothing from it runs.
-            if ($prompt !== '') {
-                $session->thread()->supersedePausedStep();
-            }
+            // A new message supersedes the paused step (DECISION B): it is
+            // recorded now, with its open calls' denials, in one write.
+            $recorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
-                ->withMessages($prompt === '' ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
+                ->withMessages($prompt === '' || $recorded ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
                 ->withTelemetryMetadata(sessionId: $session->key());
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);
@@ -1450,7 +1478,8 @@ final readonly class AgentRuntime
             }
             if (($session->run()['status'] ?? null) === 'running') {
                 if (! $recorded && $prompt !== '') {
-                    $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
+                    $thread = $session->thread();
+                    self::recordInRun($runId, fn () => $thread->record([new UserMessage($prompt, $attachments)], $runId));
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
@@ -1527,14 +1556,12 @@ final readonly class AgentRuntime
         try {
             $run = $this->observedRun($run);
             $this->assertMeteredCompaction($run);
-            // A new message supersedes the paused step (DECISION B): its open
-            // gated calls are denied first, so nothing from it runs.
-            if ($prompt !== '') {
-                $session->thread()->supersedePausedStep();
-            }
+            // A new message supersedes the paused step (DECISION B): it is
+            // recorded now, with its open calls' denials, in one write.
+            $recorded = $this->recordSupersedingPrompt($session, $runId, $prompt, $attachments);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
-                ->withMessages($prompt === '' ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
+                ->withMessages($prompt === '' || $recorded ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
                 ->withTelemetryMetadata(sessionId: $session->key());
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);
@@ -1574,7 +1601,8 @@ final readonly class AgentRuntime
             $unwatch();
             if (($session->run()['status'] ?? null) === 'running') {
                 if (! $recorded && $prompt !== '') {
-                    $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
+                    $thread = $session->thread();
+                    self::recordInRun($runId, fn () => $thread->record([new UserMessage($prompt, $attachments)], $runId));
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
@@ -2198,7 +2226,10 @@ final readonly class AgentRuntime
         $ended = array_values(array_filter($messages, fn (Message $message): bool => $message instanceof ToolResultMessage && isset($this->endedByStart[$message])));
         // Recorded as the run's own rows (DECISION B): a row this run writes
         // supersedes a step only when it would from outside, or has tool calls.
-        self::recordInRun($runId, fn () => $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
+        // The thread is resolved BEFORE the window: the token is for the one
+        // record call below, and nothing else may run inside it first (G-406).
+        $thread = $session->thread();
+        self::recordInRun($runId, fn () => $thread->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
             app(RunTrees::class)->parkFacts($runId),
             array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended)));
         // A runner start's task row is written: known in memory from here,

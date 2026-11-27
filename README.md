@@ -488,10 +488,13 @@ budget, the lock, the events — asking the provider for structured output.
 
 **A structured turn can stop for a person.** When a call needs an approval, the
 turn returns with no document: `$response->awaitingApproval()` is true,
-`$response->pendingApprovals()` lists what it waits on, `structured()` is empty,
-and the parked step and its approval requests are in the thread exactly as for
-`send()`. It is not a schema failure, so do not retry it: answer the approvals
-with `decide()` / `approve()`, and the run continues.
+`$response->pendingApprovals()` lists what it waits on, `structured()` is empty
+and `$response->response->structured` is null, and the parked step and its approval
+requests are in the thread exactly as for `send()`. A provider may write a document on
+the step that stopped; it was never checked against the schema, so it is never returned
+(read `text()` as the transcript, not as a document). It is not a schema failure, so do
+not retry it: answer the approvals with `decide()` / `approve()`, and the run continues.
+Only a turn that answers returns a document, and only once it passed the schema.
 
 **The thread keeps the text, with the parsed object beside it.** The assistant
 message is the raw document, and `structured` rides along in the message's
@@ -1179,12 +1182,23 @@ step replaced it`, marked by the harness, and `approvalStatus()` reads its appro
 `superseded`. The runs that own a step are the one that recorded it and every run that recorded
 one of its results. A decision on a superseded step, or on an approval already decided, is refused
 with `ApprovalNotPending` (code `approval_not_pending`), and a batch with one such decision records
-none of them. A result counts only for the calls of the step whose rows it sits in (the rows
+none of them. A new message that supersedes a step is recorded together with those denials, in
+one write, before its turn is sent: so a new message denies approved calls that have not run
+yet even when its own turn then fails (its message stays recorded), and no decision can land
+between the two. A host row that would supersede a step (`$session->thread()->record()` of a
+user or assistant row) takes the session's lock, the one every run, resume and decision holds:
+while a run holds it the write is refused with `SessionLocked` and records nothing, because that
+run may be running an approved call of the step; record it again when the run is over. A row
+that supersedes nothing takes no lock. Only the runtime's own record call is inside a run: a
+row a host records while that write is in progress (from a model event, say) is outside,
+whatever run id it names. A result counts only for the calls of the step whose rows it sits in (the rows
 after that step and before the next assistant row with tool calls), matched there by exact
 arguments, then by id and tool name, then by id: a result recorded after a later step is never
 an earlier step's, even when its arguments are an earlier call's, so every call has exactly one
 outcome and nothing runs twice. Replaying the stored rows to the model keeps each call's own
-result the same way, never keying results by call id alone. A system row, like a result row, leaves the step parked. A step whose requests repeat
+result the same way, never keying results by call id alone, and replays each result once, in
+its own step's rows, even when they are not consecutive (a resolution recorded after a system
+row carries the step's earlier results again; the replay leaves the repeats out). A system row, like a result row, leaves the step parked. A step whose requests repeat
 an approval id is treated as one whose call ids repeat. The mark is one shape in all three languages, pinned by the
 `harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
 `{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
