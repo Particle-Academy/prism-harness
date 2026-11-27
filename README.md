@@ -486,6 +486,13 @@ $response->text();         // the document as the model wrote it
 It is the same run as `send()` — the mode's system prompt, its tools, the step
 budget, the lock, the events — asking the provider for structured output.
 
+**A structured turn can stop for a person.** When a call needs an approval, the
+turn returns with no document: `$response->awaitingApproval()` is true,
+`$response->pendingApprovals()` lists what it waits on, `structured()` is empty,
+and the parked step and its approval requests are in the thread exactly as for
+`send()`. It is not a schema failure, so do not retry it: answer the approvals
+with `decide()` / `approve()`, and the run continues.
+
 **The thread keeps the text, with the parsed object beside it.** The assistant
 message is the raw document, and `structured` rides along in the message's
 metadata. A later turn replays the conversation as messages and reads the text,
@@ -1156,7 +1163,9 @@ and approval requests are matched to the calls of a step by position, never by a
 call id: when two calls in one step share an id, the result of the one that ran is never read as
 the other's, so a gated call sharing its id with an ungated one still waits for its approval
 (every decision on such a step is recorded as a denial, and nothing gated in it runs) and a
-start still ends it. The mark is one shape in all three languages, pinned by the
+start still ends it. When such a step is resumed, the harness resolves it itself rather than
+core's resolver, which keys by id: every gated call in it gets exactly one result, the
+repeated-id denial, and an ungated call that ran is never given an approval or a denial. The mark is one shape in all three languages, pinned by the
 `harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
 `{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the

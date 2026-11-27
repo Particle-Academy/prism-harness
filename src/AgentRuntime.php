@@ -983,7 +983,12 @@ final readonly class AgentRuntime
                         $userMessage = null;
                     });
 
-            $violation = $this->violationIn($schema, $response);
+            // A turn that stopped for a person has no document yet: it is
+            // returned with its pending approvals, never checked against the
+            // schema (round 13). Retrying a turn read as a failure would
+            // discard what the person was asked about.
+            $parked = (new StructuredAgentResponse($runId, $response))->awaitingApproval();
+            $violation = $parked ? null : $this->violationIn($schema, $response);
 
             if ($violation instanceof StructuredSchemaViolation) {
                 throw $violation;
@@ -1008,9 +1013,9 @@ final readonly class AgentRuntime
                     runId: $runId,
                     finishReason: $response->finishReason->value,
                     steps: count($response->steps),
-                    // A structured run returns a document or raises, so it has
-                    // no state in which somebody has to decide something.
-                    awaitingApproval: false,
+                    // A structured run returns a document, raises, or stops
+                    // for a person with no document yet.
+                    awaitingApproval: $parked,
                     parentRunId: $run->parentRunId,
                     rootRunId: $run->rootRunId(),
                     harnessAgent: $session->agent(),
@@ -1156,7 +1161,7 @@ final readonly class AgentRuntime
      * @internal Called by Session::streamDecision().
      *
      * @param  list<ToolApprovalResponse>  $decisions
-     * @param  Closure(): array{?string, int}  $record  runs inside the lock
+     * @param  Closure(): array{0: ?string, 1: int, 2?: list<ToolApprovalResponse>}  $record  runs inside the lock
      * @return Generator<int, RunStep>
      */
     public function streamDecisionSteps(Session $session, array $decisions, Closure $record, ?RunContext $context): Generator
@@ -1178,7 +1183,7 @@ final readonly class AgentRuntime
 
     /**
      * @param  list<ToolApprovalResponse>  $decisions
-     * @param  Closure(): array{?string, int}  $record
+     * @param  Closure(): array{0: ?string, 1: int, 2?: list<ToolApprovalResponse>}  $record
      * @return Generator<int, RunStep>
      */
     private function resumeLocked(Session $session, array $decisions, Closure $record, ?RunContext $context): Generator
@@ -1191,7 +1196,11 @@ final readonly class AgentRuntime
             $decidedPlan = true;
         });
         try {
-            [$parkedRunId, $lastSeq] = $record();
+            $recorded = $record();
+            [$parkedRunId, $lastSeq] = $recorded;
+            // The decisions as RECORDED (round 13): on a step whose call ids
+            // repeat every one is a denial, and the stream says so.
+            $decisions = $recorded[2] ?? $decisions;
         } finally {
             $capture();
         }

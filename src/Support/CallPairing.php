@@ -24,8 +24,10 @@ use Prism\Prism\ValueObjects\ToolResult;
  *   an earlier one (a resume records every result of the step again).
  * - A request is issued for ONE call: the first call not yet paired that has
  *   its id and that no result of the step's own run answered (a call that
- *   ran was never waiting on a person), else the first not yet paired that
- *   has its id. Core issues requests in call order, one per gated call.
+ *   ran was never waiting on a person, so an ungated call is never given an
+ *   approval). Only a call whose id no other call shares may be paired
+ *   although it has a result, which is the pairing by id. A request left over
+ *   pairs with nothing. Core issues requests in call order, one per gated call.
  *
  * Calls with distinct ids pair exactly as they did by id. Two calls with the
  * same id AND the same tool name are told apart by order only.
@@ -68,7 +70,11 @@ final class CallPairing
         $taken = [];
         foreach ($requestCallIds as $want) {
             $at = null;
-            foreach ([true, false] as $waitingOnly) {
+            // A call that ran was never waiting on a person. Only when no
+            // other call shares the id may the request name a call that has
+            // a result (the pairing is then the same as by id).
+            $sharing = count(array_filter($calls, static fn (array $call): bool => $call[0] === $want));
+            foreach ($sharing === 1 ? [true, false] : [true] as $waitingOnly) {
                 foreach ($calls as $i => [$id]) {
                     if (! isset($taken[$i]) && $id === $want && (! $waitingOnly || ! ($ran[$i] ?? false))) {
                         $at = $i;
