@@ -6,6 +6,7 @@ namespace Prism\Harness\Support;
 
 use Generator;
 use Prism\Prism\Contracts\Message;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolResult;
@@ -35,6 +36,15 @@ class ToolResultRuns
      */
     public static function fold(iterable $messages): Generator
     {
+        yield from self::oncePerSegment(iterator_to_array(self::foldRuns($messages), false));
+    }
+
+    /**
+     * @param  iterable<int, Message>  $messages
+     * @return Generator<int, Message>
+     */
+    private static function foldRuns(iterable $messages): Generator
+    {
         /** @var list<ToolResultMessage> $run */
         $run = [];
 
@@ -56,6 +66,78 @@ class ToolResultRuns
         if ($run !== []) {
             yield static::merge($run);
         }
+    }
+
+    /**
+     * Each call's result EXACTLY ONCE in its step's segment (the rows after
+     * an assistant step with tool calls, up to the next one), also across
+     * result rows that other rows separate, such as a new message's user
+     * row before core's resolution row. A later result for the same call
+     * replaces the earlier one in the earlier one's position, as within a
+     * run. A result that answers none of the step's calls (by id and tool
+     * name) is not replayed: a result counts only for the step whose rows it
+     * sits in. A row left with no result and no decision is dropped.
+     *
+     * @param  list<Message>  $messages
+     * @return list<Message>
+     */
+    private static function oncePerSegment(array $messages): array
+    {
+        /** @var array<string, array{0: int, 1: int}> $placed  call key => [message index, result index] */
+        $placed = [];
+        /** @var array<int, list<ToolResult>> $results */
+        $results = [];
+        /** @var array<string, true>|null $owners  the segment's calls, by id and tool name */
+        $owners = null;
+        foreach ($messages as $index => $message) {
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                $placed = [];
+                $owners = [];
+                foreach ($message->toolCalls as $call) {
+                    $owners[self::ownerKey($call->id, $call->name)] = true;
+                }
+
+                continue;
+            }
+            if (! $message instanceof ToolResultMessage) {
+                continue;
+            }
+            $results[$index] = [];
+            $seen = [];
+            foreach ($message->toolResults as $result) {
+                if ($owners !== null && ! isset($owners[self::ownerKey($result->toolCallId, $result->toolName)])) {
+                    // Not a result of this step's calls: it is not replayed.
+                    continue;
+                }
+                $same = self::callKey($result);
+                $seen[$same] = ($seen[$same] ?? 0) + 1;
+                $key = $same.'#'.$seen[$same];
+                if (isset($placed[$key])) {
+                    [$at, $position] = $placed[$key];
+                    $results[$at][$position] = $result;
+
+                    continue;
+                }
+                $placed[$key] = [$index, count($results[$index])];
+                $results[$index][] = $result;
+            }
+        }
+
+        $out = [];
+        foreach ($messages as $index => $message) {
+            if (! $message instanceof ToolResultMessage) {
+                $out[] = $message;
+
+                continue;
+            }
+            $kept = $results[$index];
+            if ($kept === [] && $message->toolApprovalResponses === []) {
+                continue;
+            }
+            $out[] = $kept === $message->toolResults ? $message : new ToolResultMessage($kept, $message->toolApprovalResponses);
+        }
+
+        return $out;
     }
 
     /**
@@ -89,6 +171,12 @@ class ToolResultRuns
         }
 
         return new ToolResultMessage(array_values($results), array_values($decisions));
+    }
+
+    /** A call's id and tool name, length-prefixed. */
+    private static function ownerKey(string $id, string $name): string
+    {
+        return strlen($id).':'.$id.'|'.strlen($name).':'.$name;
     }
 
     /**
