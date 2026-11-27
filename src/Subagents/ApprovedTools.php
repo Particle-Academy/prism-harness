@@ -8,6 +8,7 @@ use Closure;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\PausedStep;
+use Prism\Harness\Support\StepRows;
 use Prism\Prism\Concerns\CallsTools;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\TelemetryOperation;
@@ -115,6 +116,7 @@ final class ApprovedTools
         $this->announcement = $announcement;
 
         $events = [];
+        $before = $request->messages();
         try {
             $this->collect($request, $announcement, $events);
         } catch (Throwable $failure) {
@@ -132,7 +134,9 @@ final class ApprovedTools
 
             throw $failure;
         }
-        if ($events !== []) {
+        // Recorded when anything resolved, or when the request now answers
+        // a call it did not (round 17: a host's unanswered ungated call).
+        if ($events !== [] || $request->messages() !== $before) {
             $messages = $request->messages();
             $record($messages);
             $generation->withMessages($messages);
@@ -209,13 +213,18 @@ final class ApprovedTools
             // every paused-step reader uses (G-397): a step the conversation
             // moved past (an answer, a user turn, a system row after it) has
             // nothing a decision can still apply to, so nothing resolves it.
-            $resolution = PausedStep::indexIn($request->messages()) === null
+            $paused = PausedStep::indexIn($request->messages());
+            $resolution = $paused === null
                 ? []
                 : (self::repeatsCallIds($request)
                     ? $this->resolveRepeatedStep($request, EventID::generate())
                     : $this->resolveToolApprovalsAndYieldEvents($request, EventID::generate()));
             foreach ($resolution as $event) {
                 $events[] = $event;
+            }
+            if ($paused !== null) {
+                self::answerUngated($request, $paused);
+                self::answerInPlace($request, $paused);
             }
         } finally {
             self::$resolving = array_values(array_filter(self::$resolving,
@@ -224,6 +233,84 @@ final class ApprovedTools
                 app()->instance(ContextStack::class, $previous);
             }
         }
+    }
+
+    /**
+     * Answer the paused step's UNGATED calls that still have no result
+     * (G-387 round 17, item 1): the resolver answers every gated call (run,
+     * denied, or denied by default) and skips an ungated one, which the
+     * runtime always stores with its step. A step a host recorded can carry
+     * an ungated call it never answered; resuming it would send that call
+     * with no output, a request no provider accepts. Nothing ran it here, and
+     * it may have run where the host runs its own calls: it is answered
+     * `interrupted`, recorded with the resolution as its one outcome.
+     */
+    private static function answerUngated(TextRequest|StructuredRequest $request, int $paused): void
+    {
+        $messages = $request->messages();
+        $step = $messages[$paused] ?? null;
+        if (! $step instanceof AssistantMessage || $step->toolCalls === []) {
+            return;
+        }
+        $results = [];
+        for ($i = $paused + 1, $n = count($messages); $i < $n; $i++) {
+            if ($messages[$i] instanceof ToolResultMessage) {
+                $results[] = CallPairing::ofResults($messages[$i]->toolResults);
+            }
+        }
+        $calls = array_values($step->toolCalls);
+        $answered = CallPairing::answered(CallPairing::ofCalls($calls), $results);
+        // Only a call of a tool this request offers that needs no approval:
+        // any other call is the resolver's (gated) or not this run's to
+        // answer (a tool it does not offer), as before.
+        $ungated = collect($request->tools())->reject(fn (Tool $tool): bool => $tool->hasApprovalConfigured())
+            ->map(fn (Tool $tool): string => $tool->name())->values()->all();
+        $missing = [];
+        foreach ($calls as $at => $call) {
+            if (! $answered[$at] && in_array($call->name, $ungated, true)) {
+                $missing[] = new ToolResult($call->id, $call->name, $call->argumentsForResult(), StepRows::INTERRUPTED_RESULT, $call->resultId);
+            }
+        }
+        if ($missing === []) {
+            return;
+        }
+        $last = array_key_last($messages);
+        if ($messages[$last] instanceof ToolResultMessage && $last > $paused) {
+            $merged = $messages[$last];
+            $messages[$last] = new ToolResultMessage([...$merged->toolResults, ...$missing], $merged->toolApprovalResponses);
+        } else {
+            $messages[] = new ToolResultMessage($missing, []);
+        }
+        $request->setMessages(array_values($messages));
+    }
+
+    /**
+     * Place the resolution's result message directly after the paused step
+     * (G-387 round 17, item 1). The resolver drops the step's result
+     * messages and appends ONE merged message at the END of the request; a
+     * row the replay keeps after the step (a system row, or any other row
+     * that does not move the conversation past it) would then sit between
+     * the step and its results, a request no provider accepts. Only the
+     * resolver's own message moves; every other message keeps its order.
+     */
+    private static function answerInPlace(TextRequest|StructuredRequest $request, int $paused): void
+    {
+        $messages = $request->messages();
+        $last = array_key_last($messages);
+        if ($last === null || $last <= $paused + 1 || ! $messages[$last] instanceof ToolResultMessage) {
+            return;
+        }
+        for ($i = $paused + 1; $i < $last; $i++) {
+            if ($messages[$i] instanceof ToolResultMessage) {
+                // Not the resolver's merge (it leaves no result message
+                // after the step but its own): leave the request as it is.
+                return;
+            }
+        }
+        $answer = $messages[$last];
+        array_splice($messages, $last, 1);
+        array_splice($messages, $paused + 1, 0, [$answer]);
+        $request->setMessages(array_values($messages));
     }
 
     /**
@@ -242,11 +329,13 @@ final class ApprovedTools
         // The write-ahead started row (G-387 round 15), recorded before the
         // call runs. A call that is no longer open (a superseding write
         // denied it first, or it already started) does not run.
-        if ($announcement->starter !== null && ! ($announcement->starter)($toolCall)) {
-            $refused = new ToolResult($toolCall->id, $toolCall->name, $toolCall->argumentsForResult(), self::NOT_OPEN, $toolCall->resultId);
+        $started = $announcement->starter === null ? true : ($announcement->starter)($toolCall);
+        if ($started !== true) {
+            $text = is_string($started) ? $started : self::NOT_OPEN;
+            $refused = new ToolResult($toolCall->id, $toolCall->name, $toolCall->argumentsForResult(), $text, $toolCall->resultId);
 
             return ['toolResult' => $refused, 'events' => [new ToolResultEvent(id: EventID::generate(), timestamp: time(),
-                toolResult: $refused, messageId: $messageId, success: false, error: self::NOT_OPEN)],
+                toolResult: $refused, messageId: $messageId, success: false, error: $text)],
                 'durationMs' => 0.0, 'failed' => true, 'failure' => 'tool_error'];
         }
         $announcement->executing++;
@@ -484,6 +573,7 @@ final class ApprovedTools
             return null;
         }
         $kept = [];
+        $after = [];
         $results = [];
         $responses = [];
         foreach ($messages as $index => $message) {
@@ -493,10 +583,14 @@ final class ApprovedTools
 
                 continue;
             }
-            $kept[] = $message;
+            if ($index > $assistant) {
+                $after[] = $message;
+            } else {
+                $kept[] = $message;
+            }
         }
-        $kept[] = new ToolResultMessage([...$results, ...$resolved], $responses);
 
-        return $kept;
+        // Directly after the step (round 17), whatever rows follow it.
+        return [...$kept, new ToolResultMessage([...$results, ...$resolved], $responses), ...$after];
     }
 }

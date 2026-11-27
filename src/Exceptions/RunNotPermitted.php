@@ -115,6 +115,24 @@ final class RunNotPermitted extends RuntimeException implements HasErrorCode
         return $failure;
     }
 
+    /**
+     * The database has not run the migration that adds the trust column
+     * (G-387 round 17, item 2; `harness_thread_messages.harness_written`).
+     * Without it no row can be told to be the runtime's own, and the marks a
+     * run relies on (a started call, a replaced step) could be neither
+     * trusted nor safely ignored, so NO run starts until it has run: fail
+     * closed, never a fallback to the run id. Its own code,
+     * `schema_not_migrated`.
+     */
+    public static function notMigrated(): self
+    {
+        $failure = new self('This run may not start (schema_not_migrated): the harness_thread_messages.harness_written column is missing. Run the prism-harness migrations.');
+        $failure->errorCode = 'schema_not_migrated';
+        $failure->reason = 'schema_not_migrated';
+
+        return $failure;
+    }
+
     public static function callBudget(string $code): self
     {
         $failure = new self(match ($code) {

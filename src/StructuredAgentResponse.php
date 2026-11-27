@@ -32,6 +32,15 @@ final readonly class StructuredAgentResponse
         public ?string $parentRunId = null,
         /** The run at the top of the tree. Equals `$runId` for a root. */
         public ?string $rootRunId = null,
+        /**
+         * The approval ids still pending when the run returned (G-387 round
+         * 17), read from the thread after the run's end events: a host or a
+         * listener may have moved the conversation past the step since. Null:
+         * every request on the steps is listed.
+         *
+         * @var list<string>|null
+         */
+        public ?array $stillPending = null,
     ) {}
 
     /**
@@ -104,7 +113,10 @@ final readonly class StructuredAgentResponse
         $pending = [];
         foreach ($this->response->steps as $step) {
             foreach ($step->toolApprovalRequests as $request) {
-                $pending[] = $request;
+                // Never one that is no longer pending (round 17).
+                if ($this->stillPending === null || in_array($request->approvalId, $this->stillPending, true)) {
+                    $pending[] = $request;
+                }
             }
         }
 

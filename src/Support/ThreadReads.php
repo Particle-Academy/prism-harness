@@ -90,6 +90,27 @@ final class ThreadReads
     }
 
     /**
+     * Check what is kept of a thread from `$position` on against the store,
+     * and forget it when they differ (G-387 round 17; PHP run19 Info 5b). A
+     * row changed in place by raw SQL in the same second as the latest update
+     * is invisible to the fingerprint; a read that decides whether a call
+     * runs (the start gate) calls this first, so it never decides on such a
+     * row. Bounded: it reads the rows of one step's segment and after, never
+     * the whole thread, and it adds one query whatever the thread's length.
+     */
+    public static function verifyFrom(Connection $connection, int $threadId, int $position): void
+    {
+        $kept = self::$kept[$threadId] ?? null;
+        if (self::$depth === 0 || $kept === null) {
+            return;
+        }
+        $mine = array_values(array_filter($kept['rows'], static fn (array $row): bool => $row['position'] >= $position));
+        if (self::read($connection, $threadId, null, $position) !== $mine) {
+            self::forget($threadId);
+        }
+    }
+
+    /**
      * Rows of a thread a write just removed (the journal rows its results
      * answer): dropped from what is kept, so the next read reads only what
      * the write appended.
@@ -148,22 +169,26 @@ final class ThreadReads
     /**
      * @return list<array{id: int, position: int, type: string, run_id: ?string, harness: bool, updated: ?string, payload: array<array-key, mixed>}>
      */
-    private static function read(Connection $connection, int $threadId, ?int $afterId = null): array
+    private static function read(Connection $connection, int $threadId, ?int $afterId = null, ?int $fromPosition = null): array
     {
         $query = $connection->table('harness_thread_messages')->where('thread_id', $threadId);
         if ($afterId !== null) {
             $query->where('id', '>', $afterId);
         }
+        if ($fromPosition !== null) {
+            $query->where('position', '>=', $fromPosition);
+        }
         $rows = [];
-        // A schema that has not run the trust column's migration reads a row
-        // as the harness's own by its run id, as before it existed.
         $trusted = ThreadMessage::hasTrustColumn($connection->getName());
         $columns = ['id', 'position', 'type', 'run_id', 'payload', 'updated_at', ...($trusted ? ['harness_written'] : [])];
         foreach ($query->orderBy('position')->get($columns) as $row) {
             $payload = is_string($row->payload) ? json_decode($row->payload, true) : null;
             $rows[] = ['id' => (int) $row->id, 'position' => (int) $row->position, 'type' => (string) $row->type,
                 'run_id' => is_string($row->run_id) ? $row->run_id : null,
-                'harness' => $trusted ? (bool) $row->harness_written : (is_string($row->run_id) && $row->run_id !== ''),
+                // FAIL CLOSED (round 17): without the trust column no row is
+                // the runtime's own, whatever run id it carries (and no run
+                // starts there: Session::beginRun()).
+                'harness' => $trusted && (bool) $row->harness_written,
                 'updated' => is_string($row->updated_at) ? $row->updated_at : null, 'payload' => is_array($payload) ? $payload : []];
         }
 

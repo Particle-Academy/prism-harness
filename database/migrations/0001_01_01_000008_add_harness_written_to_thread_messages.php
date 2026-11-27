@@ -19,16 +19,20 @@ use Illuminate\Support\Facades\Schema;
  * mass-assignable, and Thread::record() never sets it), and every reader
  * reads a mark only on a row that carries it.
  *
- * Rows stored before this column existed are read as they were read before:
- * a row already carrying one of the harness's marks is marked as the
- * harness's own here, once (the only mark a released version wrote is
- * `harness_replaced`). Every row written from now on is the runtime's only if
- * the runtime wrote it.
+ * Rows stored before this column existed: the ONLY mark a released version
+ * wrote is `harness_replaced`, on the tool_result row that denies a replaced
+ * step's calls. Exactly those rows are marked as the harness's own here,
+ * once (G-387 round 17, item 2): a `tool_result` row whose payload has
+ * `harness_replaced` as a TOP-LEVEL key, read by JSON path. Never a text
+ * match over the payload, which would also match a key inside a tool's
+ * arguments or results (chosen by a model) or a host row carrying any other
+ * mark name. Every other row written before, and every row written from now
+ * on that the runtime did not write, is a host row.
  */
 return new class extends Migration
 {
-    /** The marks a row the harness wrote may carry. */
-    private const MARKS = ['harness_answers_step', 'harness_started', 'harness_ended_by_start', 'harness_superseded', 'harness_replaced', 'harness_journal'];
+    /** The one mark a released version wrote. */
+    private const RELEASED_MARK = 'harness_replaced';
 
     public function up(): void
     {
@@ -37,12 +41,17 @@ return new class extends Migration
         });
 
         $connection = DB::connection(Schema::getConnection()->getName());
-        $text = $connection->getDriverName() === 'pgsql' ? 'payload::text' : 'payload';
-        foreach (self::MARKS as $mark) {
-            $connection->table('harness_thread_messages')
-                ->whereRaw("{$text} like ?", ['%"'.$mark.'"%'])
-                ->update(['harness_written' => true]);
-        }
+        $rows = $connection->table('harness_thread_messages')->where('type', 'tool_result');
+        $key = self::RELEASED_MARK;
+        match ($connection->getDriverName()) {
+            // The key at the top level of the JSON object only, present
+            // whatever its value (a JSON null included).
+            'sqlite' => $rows->whereRaw("json_type(payload, '$.{$key}') is not null"),
+            'pgsql' => $rows->whereRaw("(payload::jsonb -> '{$key}') is not null"),
+            'mysql', 'mariadb' => $rows->whereRaw("json_contains_path(payload, 'one', '$.{$key}') = 1"),
+            default => $rows->whereNotNull('payload->'.$key),
+        };
+        $rows->update(['harness_written' => true]);
     }
 
     public function down(): void
