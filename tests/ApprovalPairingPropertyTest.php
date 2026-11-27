@@ -153,7 +153,8 @@ beforeEach(function (): void {
     config()->set('prism.providers.anthropic.api_key', 'sk-test');
     config()->set('prism-harness.agent.provider', 'anthropic');
     config()->set('prism-harness.agent.model', 'claude-sonnet-5-5');
-    config()->set('prism-harness.agent.modes.chat.tools', ['gated', 'free']);
+    // `phantom` is listed and never registered (G-412).
+    config()->set('prism-harness.agent.modes.chat.tools', ['gated', 'free', 'phantom']);
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['gated']);
     config()->set('prism-harness.agent.modes.chat.max_steps', 8);
 
@@ -278,6 +279,11 @@ function pairingWithProvider(array $case, int $seed): array
     // tool offer (G-412).
     if (($case['insert']['kind'] ?? null) === 'assistant_call' && $g->chance(0.5)) {
         $case['insert']['kind'] = 'assistant_request';
+    }
+    // Its request for a tool that takes no approval, or for a listed tool
+    // that is not registered (G-412).
+    if (($case['insert']['kind'] ?? null) === 'assistant_request') {
+        $case['insert']['tool'] = ['gated', 'free', 'phantom'][($seed >> 1) % 3];
     }
     if ($case['provider'] === 'openai') {
         $case['entry'] = 'send';
@@ -861,7 +867,7 @@ function pairingInsertedRow(array $case, Session $session): Message
         'assistant_content' => new AssistantMessage('A note.', [], pairingNewestStepContent($session)),
         // A copy whose call is its own, carrying the newest step's provider
         // content, whose tool items are another step's (G-415).
-        'assistant_request' => new AssistantMessage('', [new ToolCall('h900', 'gated', ['token' => 'x902'], pairingResultId('h900'))], [], [new ToolApprovalRequest('apr_h900', 'h900')]),
+        'assistant_request' => new AssistantMessage('', [new ToolCall('h900', $case['insert']['tool'] ?? 'gated', ['token' => 'x902'], pairingResultId('h900'))], [], [new ToolApprovalRequest('apr_h900', 'h900')]),
         'assistant_mismatch' => new AssistantMessage('A copy.', [new ToolCall('q900', 'free', ['token' => 'x901'], pairingResultId('q900'))], pairingNewestStepContent($session)),
         'assistant_call' => new AssistantMessage('', [new ToolCall($call['id'], 'free', ['token' => 'x900'], pairingResultId($call['id']))]),
         'user' => new UserMessage('Something else.'),
@@ -1667,6 +1673,9 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         }
         if ($case['insert'] !== null) {
             $seen['insert '.$case['insert']['kind'].' '.$case['insert']['when']] = true;
+            if (isset($case['insert']['tool'])) {
+                $seen['a host request for the '.$case['insert']['tool'].' tool'] = true;
+            }
             if ($case['mode'] === 'spent' && $case['repeats'] !== []) {
                 $seen['a row after the park, then a resume with no step left, then repeat resumes'] = true;
             }
@@ -1708,6 +1717,7 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
     expect(array_keys($seen))->toEqualCanonicalizing([
         'entry send', 'entry stream', '1 steps', '2 steps',
         'provider anthropic', 'provider openai',
+        'a host request for the gated tool', 'a host request for the free tool', 'a host request for the phantom tool',
         'insert assistant_content before_decision', 'insert assistant_content after_decision',
         'insert assistant_mismatch before_decision', 'insert assistant_mismatch after_decision',
         'insert assistant_request before_decision', 'insert assistant_request after_decision',

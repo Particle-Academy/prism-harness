@@ -24,7 +24,8 @@ beforeEach(function (): void {
     Http::preventStrayRequests();
     config()->set('prism.providers.openai.api_key', 'sk-test');
     config()->set('prism.providers.anthropic.api_key', 'sk-test');
-    config()->set('prism-harness.agent.modes.chat.tools', ['weather']);
+    // `clock` is offered and takes no approval; `phantom` is listed and never registered.
+    config()->set('prism-harness.agent.modes.chat.tools', ['weather', 'clock', 'phantom']);
     config()->set('prism-harness.agent.modes.chat.requires_approval', ['weather']);
 
     $this->ran = [];
@@ -34,14 +35,29 @@ beforeEach(function (): void {
             $ran[] = $city;
 
             return "Sunny in {$city}";
-        })]);
+        }),
+        (new Tool)->as('clock')->for('Clock.')->withStringParameter('city', 'City')
+            ->using(function (string $city) use (&$ran): string {
+                $ran[] = 'clock:'.$city;
+
+                return 'noon';
+            })]);
 
     $this->requests = [];
+    $this->rejected = 0;
     $requests = &$this->requests;
-    Http::fake(function (Request $request) use (&$requests) {
+    $rejected = &$this->rejected;
+    Http::fake(function (Request $request) use (&$requests, &$rejected) {
         $body = json_decode((string) $request->body(), true);
         $requests[] = $body;
         $n = count($requests);
+        // Strict, as the providers are: a request with a tool call that is
+        // not answered right after it is refused.
+        if (hostOfferOrphans([$body]) !== []) {
+            $rejected++;
+
+            return Http::response(['error' => ['type' => 'invalid_request_error', 'message' => 'tool call without its result']], 400);
+        }
         if (str_contains($request->url(), 'anthropic')) {
             $content = $n === 1
                 ? [['type' => 'tool_use', 'id' => 'toolu_paris', 'name' => 'weather', 'input' => ['city' => 'Paris']]]
@@ -119,7 +135,12 @@ function hostOfferRecord(string $shape): string
 
         return $step->toolApprovalRequests[0]->approvalId;
     }
-    $tool = $shape === 'a step naming a tool not offered' ? 'ghost' : 'weather';
+    $tool = match ($shape) {
+        'a step naming a tool not offered' => 'ghost',
+        'a step naming a listed tool that is not registered' => 'phantom',
+        'a step requesting a tool that takes no approval' => 'clock',
+        default => 'weather',
+    };
     $thread->record([new AssistantMessage('', [new ToolCall('h1', $tool, ['city' => 'Rome'], 'h1')], [], [new ToolApprovalRequest('apr_host', 'h1')])]);
 
     return 'apr_host';
@@ -144,7 +165,9 @@ it('answers every call of a host step recorded without its tool offer', function
     $expected = $shape === 'a new step with its own request' && $resume === 'approve' ? ['Paris', 'Rome'] : ['Paris'];
 
     expect(hostOfferOrphans($this->requests))->toBe([])
+        ->and($this->rejected)->toBe(0)
         ->and($this->ran)->toBe($expected);
 })->with(['OpenAI' => 'openai', 'Anthropic' => 'anthropic'])
-    ->with(['a new step with its own request', 'a copy of the resolved step', 'a step naming a tool not offered'])
+    ->with(['a new step with its own request', 'a copy of the resolved step', 'a step naming a tool not offered',
+        'a step naming a listed tool that is not registered', 'a step requesting a tool that takes no approval'])
     ->with(['an empty resume' => 'empty', 'an approval' => 'approve']);
