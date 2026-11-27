@@ -23,16 +23,21 @@ def satisfying(constraint, versions):
     """The published versions that satisfy `constraint`, or None when the
     constraint cannot be read."""
     # ^0.N: any 0.N.P. ^0.N.M: 0.N.P with P >= M (a caret on 0.N allows
-    # patch releases only). Stable releases only; anything else is unread.
-    match = re.fullmatch(r"\^0\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?", constraint)
+    # patch releases only), and ^0.0.M is exactly 0.0.M, as in Composer.
+    # Stable releases only, ASCII digits only; anything else is unread.
+    match = re.fullmatch(r"\^0\.(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?", constraint, re.ASCII)
     if match is None:
         return None
     minor = int(match.group(1))
     floor = int(match.group(2)) if match.group(2) is not None else 0
+    exact = minor == 0 and match.group(2) is not None
     found = []
     for version in versions:
-        release = re.fullmatch(r"v?0\.(\d+)\.(\d+)", version)
-        if release is not None and int(release.group(1)) == minor and int(release.group(2)) >= floor:
+        release = re.fullmatch(r"v?0\.([0-9]+)\.([0-9]+)", version, re.ASCII)
+        if release is None or int(release.group(1)) != minor:
+            continue
+        patch = int(release.group(2))
+        if (patch == floor) if exact else (patch >= floor):
             found.append(version)
     return found
 
