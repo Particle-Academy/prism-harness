@@ -79,7 +79,9 @@ class ToolResultRuns
         foreach ($run as $message) {
             $seen = [];
             foreach ($message->toolResults as $result) {
-                $same = json_encode([$result->toolCallId, $result->toolName, CanonicalJson::digest($result->args)], JSON_THROW_ON_ERROR);
+                // Length-prefixed, so no id or name can collide with another
+                // pair, and no encoding step can fail on an odd value.
+                $same = strlen($result->toolCallId).':'.$result->toolCallId.'|'.strlen($result->toolName).':'.$result->toolName.'|'.CanonicalJson::digest($result->args);
                 $seen[$same] = ($seen[$same] ?? 0) + 1;
                 $results[$same.'#'.$seen[$same]] = $result;
             }
