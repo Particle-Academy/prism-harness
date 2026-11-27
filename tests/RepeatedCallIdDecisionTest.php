@@ -527,3 +527,78 @@ it('refuses a second decision on an approval already decided', function (string 
         ->and(g392HarnessSession()->thread()->approvalDecisions())->toBe([$pending[0]->approvalId => false])
         ->and($this->ran)->toBe([]);
 })->with(['decide', 'streamDecision'])->with(['approve it' => [true], 'deny it again' => [false]]);
+
+// Upgrade (DECIDED, G-387 round 13): 0.27 main reads a thread that 0.26.x
+// wrote with a REPLACED step, in that line's exact rows, taken from its own
+// writer (release/0.26.x Thread::withReplacedStepsEnded):
+//  - 6cf2804: a later tool-call step replaced the parked one; the replaced
+//    calls' row has NO mark;
+//  - 9820779 (the line's head): also a user or assistant text row from
+//    outside the run; the row carries `harness_replaced: {approval_ids}`.
+// The text is the same in both, and in main. Main resumes the thread: each
+// gated call keeps exactly ONE outcome (no second denial), nothing runs, a
+// decision on the replaced step is refused.
+const G397_026_REPLACED = 'Tool call was not run because a later step replaced it';
+
+/** Write rows exactly as stored, bypassing this line's writer (as an older worker wrote them). */
+function g397WriteRaw(Session $session, string $type, array $payload, ?string $runId = null): void
+{
+    $thread = $session->thread();
+    $thread->storedMessages()->create([
+        'position' => (int) $thread->storedMessages()->max('position') + 1,
+        'type' => $type,
+        'run_id' => $runId,
+        'payload' => $payload,
+    ]);
+}
+
+it('reads a 0.26.x thread with a replaced step: one outcome per call, nothing runs twice', function (string $shape): void {
+    g392HarnessFake('call_paris', 'call_rome');
+    $pending = g392HarnessSession()->send('Weather in Paris and Rome?')->pendingApprovals();
+    $ids = array_map(fn (ToolApprovalRequest $p): string => $p->approvalId, $pending);
+    // A decision recorded before the step was replaced (0.26.x accepted it).
+    $session = g392HarnessSession();
+    (fn () => $this->recordDecisions([new ToolApprovalResponse($ids[0], true)]))->call($session);
+
+    $denials = ['tool_results' => [
+        ['tool_call_id' => 'call_paris', 'tool_name' => 'weather', 'args' => ['city' => 'Paris'], 'result' => G397_026_REPLACED, 'tool_call_result_id' => 'call_paris', 'artifacts' => []],
+        ['tool_call_id' => 'call_rome', 'tool_name' => 'weather', 'args' => ['city' => 'Rome'], 'result' => G397_026_REPLACED, 'tool_call_result_id' => 'call_rome', 'artifacts' => []],
+    ], 'tool_approval_responses' => []];
+    if ($shape !== 'later step, unmarked (6cf2804)') {
+        $denials['harness_replaced'] = ['approval_ids' => $ids];
+    }
+    g397WriteRaw(g392HarnessSession(), 'tool_result', $denials);
+    match ($shape) {
+        'later step, unmarked (6cf2804)', 'later step, marked (9820779)' => g397WriteRaw(g392HarnessSession(), 'assistant', [
+            'content' => '', 'tool_calls' => [['id' => 'later', 'name' => 'weather', 'arguments' => ['city' => 'Oslo'], 'result_id' => null, 'reasoning_id' => null, 'reasoning_summary' => null]],
+            'additional_content' => [], 'tool_approval_requests' => []]),
+        'user row, marked (9820779)' => g397WriteRaw(g392HarnessSession(), 'user', ['content' => 'Something else.', 'additional_content' => [], 'additional_attributes' => []]),
+    };
+
+    $refused = false;
+    try {
+        g392HarnessSession()->decide([new ToolApprovalResponse($ids[1], true)]);
+    } catch (ApprovalNotPending) {
+        $refused = true;
+    }
+    g392HarnessSession()->send('');
+    iterator_to_array(g392HarnessSession()->streamSteps(''), false);
+    g392HarnessSession()->send('And now?');
+
+    $outcomes = [];
+    foreach (g392HarnessSession()->thread()->storedMessages()->where('type', 'tool_result')->orderBy('position')->get() as $row) {
+        foreach ($row->payload['tool_results'] ?? [] as $entry) {
+            if (in_array($entry['tool_call_id'], ['call_paris', 'call_rome'], true)) {
+                $outcomes[$entry['tool_call_id']][] = $entry['result'];
+            }
+        }
+    }
+    expect($this->ran)->toBe([])
+        ->and($refused)->toBeTrue()
+        ->and($outcomes)->toBe(['call_paris' => [G397_026_REPLACED], 'call_rome' => [G397_026_REPLACED]]);
+    if ($shape !== 'later step, unmarked (6cf2804)') {
+        // The released line's mark is read: the approved decision reads replaced, never approved.
+        expect(g392HarnessSession()->approvalStatus($ids[0]))->toBe('superseded')
+            ->and(g392HarnessSession()->approvalStatus($ids[1]))->toBe('superseded');
+    }
+})->with(['later step, unmarked (6cf2804)', 'later step, marked (9820779)', 'user row, marked (9820779)']);
