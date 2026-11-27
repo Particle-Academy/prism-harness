@@ -1127,6 +1127,27 @@ class Thread extends Model implements ThreadContract
         return $paused === true ? $steps : null;
     }
 
+    /**
+     * The model steps the turn at the transcript tail has taken: one
+     * assistant row per step since the turn's user row, read from the raw
+     * stored rows like {@see self::approvalRunSteps()}.
+     *
+     * An empty prompt records no user row, so it continues this turn whether
+     * or not an approval is waiting, and its step count must too.
+     */
+    public function turnSteps(): int
+    {
+        $steps = 0;
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            if ($stored->type === MessageMapper::TYPE_USER) {
+                break;
+            }
+            $steps += $stored->type === MessageMapper::TYPE_ASSISTANT ? 1 : 0;
+        }
+
+        return $steps;
+    }
+
     private function afterRecording(): self
     {
 

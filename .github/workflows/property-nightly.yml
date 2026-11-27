@@ -1,6 +1,7 @@
 name: Property tests (nightly)
 
-# The approval-pairing property tests (tests/ApprovalPairingPropertyTest.php)
+# The approval-pairing and step-budget property tests
+# (tests/ApprovalPairingPropertyTest.php, tests/StepBudgetPropertyTest.php)
 # with a LARGE example count. The normal Tests workflow runs a small fixed-seed
 # set on every push; this runs thousands of examples from a base seed taken
 # from the run, printed in the log, so a failure can be replayed with
@@ -154,4 +155,4 @@ jobs:
           fi
           export PRISM_PROPERTY_EXAMPLES="${examples}"
           echo "base seed ${PRISM_PROPERTY_BASE_SEED}, ${PRISM_PROPERTY_EXAMPLES} examples"
-          vendor/bin/pest tests/ApprovalPairingPropertyTest.php
+          vendor/bin/pest tests/ApprovalPairingPropertyTest.php tests/StepBudgetPropertyTest.php
