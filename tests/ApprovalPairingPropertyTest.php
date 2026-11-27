@@ -917,10 +917,10 @@ function pairingViolations(array $case, array $observed): array
 }
 
 /**
- * 5, as REPLAYED: a call with a stored outcome keeps its own result in the
- * thread replay of its step's segment, never more than once in one replayed
- * row. A later result with the same call id and other arguments never stands
- * in for it.
+ * 5, as REPLAYED: a call with a stored outcome has its own result exactly
+ * once in the thread replay of its step's segment, across every replayed row
+ * of it, and no result occurrence is replayed twice anywhere. A later result
+ * with the same call id and other arguments never stands in for it.
  *
  * @param  array<string, mixed>  $case
  * @param  array<string, mixed>  $observed
@@ -966,15 +966,43 @@ function pairingReplayViolations(array $case, array $observed): array
         foreach ($step['calls'] as $call) {
             $distinct = count(array_unique($stored[$s][$call['token']] ?? []));
             $times = count($replayed[$s][$call['token']] ?? []);
-            $inOneRow = $replayed[$s]['@most'][$call['token']] ?? 0;
-            // Never lost from the replay, and never twice in one replayed row.
-            // (A row the harness's own new-message turn writes after a user
-            // row is a separate replayed row: core resolves it there.)
-            if ($distinct === 1 && $times === 0) {
-                $violations[] = "inv5: {$call['token']}'s own result is missing from the replay";
+            // Never lost from the replay, and exactly once in its segment,
+            // across every replayed row of it.
+            if ($distinct === 1 && $times !== 1) {
+                $violations[] = "inv5: {$call['token']}'s own result is replayed {$times} times";
             }
-            if ($inOneRow > 1) {
-                $violations[] = "inv5: {$call['token']}'s result is replayed {$inOneRow} times in one row";
+            if ($distinct === 0 && $times > 1) {
+                $violations[] = "inv5: {$call['token']} has no stored outcome and is replayed {$times} times";
+            }
+        }
+    }
+
+    // In each step's segment of the replay no result occurrence (id, tool
+    // name, arguments) appears twice, and every result answers one of that
+    // step's calls by id and tool name: a result is replayed only for the
+    // step whose rows it sits in.
+    $key = fn (string $id, string $name, array $args): string => (string) json_encode([$id, $name, $args]);
+    $owners = null;
+    $seen = [];
+    foreach ($observed['replay'] as $message) {
+        if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+            $owners = array_map(fn ($call): string => (string) json_encode([$call->id, $call->name]), $message->toolCalls);
+            $seen = [];
+
+            continue;
+        }
+        if (! $message instanceof ToolResultMessage) {
+            continue;
+        }
+        foreach ($message->toolResults as $result) {
+            $occurrence = $key($result->toolCallId, $result->toolName, $result->args);
+            $seen[$occurrence] = ($seen[$occurrence] ?? 0) + 1;
+            $own = $owners === null ? 1 : count(array_keys($owners, (string) json_encode([$result->toolCallId, $result->toolName]), true));
+            if ($seen[$occurrence] > max(1, $own)) {
+                $violations[] = "inv5: the result {$occurrence} is replayed {$seen[$occurrence]} times in one step's rows";
+            }
+            if ($owners !== null && $own === 0) {
+                $violations[] = "inv5: the result {$occurrence} is replayed in the rows of a step with no such call";
             }
         }
     }
