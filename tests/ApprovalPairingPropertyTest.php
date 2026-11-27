@@ -123,8 +123,10 @@ final class PairingPropertyWorld
 
     public static int $item = 0;
 
-    /** @var list<list<array<string, mixed>>> the messages of every provider request sent */
+    /** @var list<array<string, mixed>> the body of every provider request sent */
     public static array $requests = [];
+
+    public static string $provider = 'anthropic';
 
     public static int $participant = 0;
 }
@@ -172,8 +174,23 @@ beforeEach(function (): void {
 
     Http::fake(['*' => function (HttpRequest $request) {
         $sent = json_decode((string) $request->body(), true);
-        PairingPropertyWorld::$requests[] = is_array($sent['messages'] ?? null) ? $sent['messages'] : [];
+        PairingPropertyWorld::$requests[] = is_array($sent) ? $sent : [];
         $next = array_shift(PairingPropertyWorld::$queue) ?? ['kind' => 'text'];
+        if (PairingPropertyWorld::$provider === 'openai') {
+            if ($next['kind'] === 'calls') {
+                PairingPropertyWorld::$served[] = $next['step'];
+            }
+            $output = $next['kind'] === 'calls'
+                // The call's id is both the item id and the call_id, so it is
+                // the id the harness reads, as on the other provider.
+                ? array_map(fn (array $call): array => ['id' => $call['id'], 'type' => 'function_call', 'status' => 'completed',
+                    'arguments' => json_encode(['token' => $call['token']]), 'call_id' => $call['id'], 'name' => $call['gated'] ? 'gated' : 'free'], $next['calls'])
+                : [['id' => 'msg_'.(++PairingPropertyWorld::$item), 'type' => 'message', 'status' => 'completed', 'role' => 'assistant',
+                    'content' => [['type' => 'output_text', 'text' => '{"ok":true}', 'annotations' => []]]]];
+
+            return Http::response(['id' => 'resp_'.(++PairingPropertyWorld::$item), 'object' => 'response', 'created_at' => 1, 'status' => 'completed', 'model' => 'gpt-4o',
+                'output' => $output, 'usage' => ['input_tokens' => 1, 'input_tokens_details' => ['cached_tokens' => 0], 'output_tokens' => 1, 'output_tokens_details' => ['reasoning_tokens' => 0], 'total_tokens' => 2]]);
+        }
         $content = [['type' => 'text', 'text' => '{"ok":true}']];
         if ($next['kind'] === 'calls') {
             PairingPropertyWorld::$served[] = $next['step'];
@@ -228,6 +245,50 @@ function pairingSse(array $content, string $stop): string
  * @return array<string, mixed>
  */
 function pairingGenerate(int $seed): array
+{
+    return pairingWithProvider(pairingGenerateBase($seed), $seed);
+}
+
+/**
+ * G-415: the provider a case runs against, and a host note carrying the
+ * parked step's provider content (in place of a plain note), from a
+ * generator of their own so every
+ * seed's case above is what it was before. OpenAI cases are driven without
+ * streams (the faked Responses API answers in JSON), and record no system
+ * row (the oracle's system-row refusal is the faked Anthropic API's).
+ *
+ * @param  array<string, mixed>  $case
+ * @return array<string, mixed>
+ */
+function pairingWithProvider(array $case, int $seed): array
+{
+    $g = new PairingPropertyRng(($seed ^ 0x415415) & 0xFFFFFFFF);
+    $case['provider'] = $g->chance(0.3) ? 'openai' : 'anthropic';
+    // Half the assistant notes carry the step's provider content.
+    if (($case['insert']['kind'] ?? null) === 'assistant_text' && $g->chance(0.4)) {
+        $case['insert']['kind'] = 'assistant_content';
+    }
+    if ($case['provider'] === 'openai') {
+        $case['entry'] = 'send';
+        foreach ($case['steps'] as $s => $step) {
+            if ($step['resume'] === 'streamDecision') {
+                $case['steps'][$s]['resume'] = 'decide';
+            }
+        }
+        if (($case['recorded']['resume'] ?? null) === 'streamDecision') {
+            $case['recorded']['resume'] = 'decide';
+        }
+        $case['repeats'] = array_map(fn (string $repeat): string => $repeat === 'stream' ? 'send' : $repeat, $case['repeats']);
+        if (($case['insert']['kind'] ?? null) === 'system') {
+            $case['insert']['kind'] = 'assistant_content';
+        }
+    }
+
+    return $case;
+}
+
+/** @return array<string, mixed> */
+function pairingGenerateBase(int $seed): array
 {
     $rng = new PairingPropertyRng($seed);
     $steps = [];
@@ -438,7 +499,7 @@ function pairingOracle(array $case): array
         // A row that supersedes the parked step (an assistant row, with or
         // without a call, or a user row) runs none of its gated calls; a
         // forged result is its call's only outcome, and that call never runs.
-        $superseded = in_array($insert, ['assistant_text', 'assistant_call', 'user'], true);
+        $superseded = in_array($insert, ['assistant_text', 'assistant_content', 'assistant_call', 'user'], true);
         $forged = ($case['insert']['kind'] ?? null) === 'tool_result' && $steps === [] && $insert !== null
             && ($case['insert']['segment'] ?? 'earlier') === 'earlier' ? $case['insert']['call'] : null;
         $runs = [];
@@ -478,7 +539,7 @@ function pairingOracle(array $case): array
         // the provider refuse the turn.
         $kind = pairingInsertBefore($case);
         $later = ($case['insert']['segment'] ?? null) === 'later';
-        $supersededR = $later && in_array($kind, ['assistant_text', 'assistant_call', 'user'], true);
+        $supersededR = $later && in_array($kind, ['assistant_text', 'assistant_content', 'assistant_call', 'user'], true);
         $refusedR = $kind === 'system';
         $forgedK = null;
         if ($later && $kind === 'tool_result') {
@@ -560,6 +621,10 @@ function pairingRun(array $case): array
     PairingPropertyWorld::$served = [];
     PairingPropertyWorld::$ran = [];
     PairingPropertyWorld::$requests = [];
+    PairingPropertyWorld::$provider = $case['provider'] ?? 'anthropic';
+    config()->set('prism.providers.openai.api_key', 'sk-test');
+    config()->set('prism-harness.agent.provider', PairingPropertyWorld::$provider);
+    config()->set('prism-harness.agent.model', PairingPropertyWorld::$provider === 'openai' ? 'gpt-4o' : 'claude-sonnet-5-5');
     foreach ($case['steps'] as $s => $step) {
         PairingPropertyWorld::$queue[] = ['kind' => 'calls', 'step' => $s, 'calls' => $step['calls']];
     }
@@ -612,7 +677,7 @@ function pairingRun(array $case): array
             }
         }
         if ($s === 0 && pairingInsertBefore($case) !== null && ($case['mode'] ?? 'normal') !== 'replaced') {
-            $session()->thread()->record([pairingInsertedRow($case)]);
+            $session()->thread()->record([pairingInsertedRow($case, $session())]);
         }
         if (($case['mode'] ?? 'normal') === 'replaced') {
             pairingReplace($session(), $case, $requestFor, $step, $observed);
@@ -651,7 +716,7 @@ function pairingRun(array $case): array
     $observed['lateFrom'] = count(PairingPropertyWorld::$ran);
     $observed['lateRow'] = $session()->thread()->storedMessages()->count();
     if (($case['insert']['when'] ?? null) === 'after_decision') {
-        $session()->thread()->record([pairingInsertedRow($case)]);
+        $session()->thread()->record([pairingInsertedRow($case, $session())]);
     }
     $schema = new ObjectSchema('answer', 'Answer', [new BooleanSchema('ok', 'Done')], ['ok']);
     foreach ($case['repeats'] as $repeat) {
@@ -727,11 +792,11 @@ function pairingReplace(Session $session, array $case, array $requestFor, array 
     }
     $before = pairingInsertBefore($case) !== null;
     if ($before && $case['insert']['segment'] === 'earlier') {
-        $session->thread()->record([pairingInsertedRow($case)]);
+        $session->thread()->record([pairingInsertedRow($case, $session)]);
     }
     $session->thread()->record([new AssistantMessage('', array_map(
         fn (array $call): ToolCall => new ToolCall($call['id'], 'gated', ($recorded['stringArgs'] ?? false)
-            ? (string) json_encode(['token' => $call['token']]) : ['token' => $call['token']]),
+            ? (string) json_encode(['token' => $call['token']]) : ['token' => $call['token']], pairingResultId($call['id'])),
         $recorded['calls'],
     ), [], array_map(
         fn (array $call, string $approvalId): ToolApprovalRequest => new ToolApprovalRequest($approvalId, $call['id'], ToolApprovalRequest::ARGUMENTS_AS_SENT),
@@ -739,7 +804,7 @@ function pairingReplace(Session $session, array $case, array $requestFor, array 
         $recorded['approvals'],
     ))], null, ['gated', 'free']);
     if ($before && $case['insert']['segment'] === 'later') {
-        $session->thread()->record([pairingInsertedRow($case)]);
+        $session->thread()->record([pairingInsertedRow($case, $session)]);
     }
 
     $batch = [];
@@ -774,18 +839,31 @@ function pairingInsertBefore(array $case): ?string
 }
 
 /** The row a host records after the park (G-397 / G-399). Its own call's token is never a step call's. */
-function pairingInsertedRow(array $case): Message
+function pairingInsertedRow(array $case, Session $session): Message
 {
     $call = $case['steps'][0]['calls'][$case['insert']['call']];
 
     return match ($case['insert']['kind']) {
         'assistant_text' => new AssistantMessage('A note.'),
-        'assistant_call' => new AssistantMessage('', [new ToolCall($call['id'], 'free', ['token' => 'x900'])]),
+        // A note with no tool calls carrying the newest step's provider
+        // content (output_items / content_blocks), as a host can copy it (G-415).
+        'assistant_content' => new AssistantMessage('A note.', [], pairingNewestStepContent($session)),
+        'assistant_call' => new AssistantMessage('', [new ToolCall($call['id'], 'free', ['token' => 'x900'], pairingResultId($call['id']))]),
         'user' => new UserMessage('Something else.'),
         'system' => new SystemMessage('A system note.'),
         'tool_empty' => new ToolResultMessage([]),
-        default => new ToolResultMessage([new ToolResult($call['id'], 'gated', ['token' => $call['token']], 'forged:'.$call['token'])]),
+        default => new ToolResultMessage([new ToolResult($call['id'], 'gated', ['token' => $call['token']], 'forged:'.$call['token'], pairingResultId($call['id']))]),
     };
+}
+
+/**
+ * The provider's result id for a call a host records: OpenAI pairs a
+ * function_call_output with its call by call_id, which the harness keeps as
+ * the call's result id; Anthropic uses the call id alone.
+ */
+function pairingResultId(string $id): ?string
+{
+    return PairingPropertyWorld::$provider === 'openai' ? $id : null;
 }
 
 /** @return list<array{approvalId: string, toolCallId: string}> */
@@ -1041,9 +1119,23 @@ function pairingViolations(array $case, array $observed): array
     return $violations;
 }
 
+/** @return array<string, mixed> the provider content of the newest stored tool-call step */
+function pairingNewestStepContent(Session $session): array
+{
+    foreach ($session->thread()->storedMessages()->where('type', 'assistant')->reorder('position', 'desc')->get() as $row) {
+        $message = $row->toPrismMessage();
+        if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+            return $message->additionalContent;
+        }
+    }
+
+    return [];
+}
+
 /**
  * 7, as SENT: in every provider request, each tool_use block is answered by
- * a tool_result block in the very next message. A provider rejects a
+ * a tool_result block in the very next message (Anthropic), and each run of
+ * function_call items by function_call_output items right after it (OpenAI). A provider rejects a
  * request that is not, so a thread replayed out of that order fails every
  * later turn.
  *
@@ -1053,7 +1145,35 @@ function pairingViolations(array $case, array $observed): array
 function pairingSentViolations(array $requests): array
 {
     $violations = [];
-    foreach ($requests as $r => $messages) {
+    foreach ($requests as $r => $body) {
+        if (isset($body['input']) && is_array($body['input'])) {
+            // OpenAI Responses: a run of function_call items is answered by
+            // the function_call_output items right after it.
+            $items = array_values($body['input']);
+            for ($i = 0, $n = count($items); $i < $n; $i++) {
+                if (($items[$i]['type'] ?? null) !== 'function_call') {
+                    continue;
+                }
+                $calls = [];
+                for (; $i < $n && ($items[$i]['type'] ?? null) === 'function_call'; $i++) {
+                    $calls[] = $items[$i]['call_id'] ?? null;
+                }
+                $outputs = [];
+                for ($j = $i; $j < $n && ($items[$j]['type'] ?? null) === 'function_call_output'; $j++) {
+                    $outputs[] = $items[$j]['call_id'] ?? null;
+                }
+                foreach ($calls as $call) {
+                    // Paired by id: an empty id is left out, as below.
+                    if (($call ?? '') !== '' && ! in_array($call, $outputs, true)) {
+                        $violations[] = "inv7: request {$r} sends function_call ".json_encode($call).' with no function_call_output right after it';
+                    }
+                }
+                $i--;
+            }
+
+            continue;
+        }
+        $messages = is_array($body['messages'] ?? null) ? $body['messages'] : [];
         foreach ($messages as $i => $message) {
             $content = is_array($message['content'] ?? null) ? $message['content'] : [];
             $uses = array_values(array_filter($content, fn (mixed $block): bool => is_array($block) && ($block['type'] ?? null) === 'tool_use'));
@@ -1480,6 +1600,7 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
     foreach (range(0, PAIRING_FAST_EXAMPLES - 1) as $i) {
         $case = pairingGenerate(pairingSeed(392, $i));
         $seen['entry '.$case['entry']] = true;
+        $seen['provider '.$case['provider']] = true;
         foreach ($case['repeats'] as $repeat) {
             $seen['repeat '.$repeat] = true;
         }
@@ -1554,6 +1675,9 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
 
     expect(array_keys($seen))->toEqualCanonicalizing([
         'entry send', 'entry stream', '1 steps', '2 steps',
+        'provider anthropic', 'provider openai',
+        'insert assistant_content before_decision', 'insert assistant_content after_decision',
+        'replaced, then insert assistant_content before_decision', 'replaced, then insert assistant_content after_decision',
         'repeat send', 'repeat stream', 'repeat structured', 'repeat redecide', 'repeat lateApprove', 'repeat lateDeny',
         'a pair of decision rows, approve first', 'a pair of decision rows, deny first',
         'resume decide', 'resume streamDecision', 'resume approveOne', 'resume newMessage',

@@ -436,7 +436,7 @@ class Thread extends Model implements ThreadContract
 
                 continue;
             }
-            $messages[] = $stored->toPrismMessage();
+            $messages[] = self::withoutCopiedToolItems($stored->toPrismMessage());
             $positions[$position] = count($messages) - 1;
             $mark = $stored->payload[self::ANSWERS_STEP]['position'] ?? null;
             if (is_int($mark)) {
@@ -451,6 +451,43 @@ class Thread extends Model implements ThreadContract
         }
 
         yield from ToolResultRuns::fold($messages, $answers);
+    }
+
+    /**
+     * An assistant row with no tool calls, replayed without the provider tool
+     * items its provider content carries (G-415): OpenAI `output_items` of
+     * type function_call / function_call_output, Anthropic `content_blocks`
+     * of type tool_use / tool_result. Core replays that content as it is, so
+     * a host's note carrying a step's content would send the step's calls
+     * again with nothing answering them, in every later request. Text,
+     * reasoning and every other item stay as they are; when nothing is left,
+     * the key is dropped and the row's own text is sent. A row with tool
+     * calls (every step the harness records) is returned unchanged.
+     */
+    private static function withoutCopiedToolItems(Message $message): Message
+    {
+        if (! $message instanceof AssistantMessage || $message->toolCalls !== []) {
+            return $message;
+        }
+        $content = $message->additionalContent;
+        $changed = false;
+        foreach (['output_items' => ['function_call', 'function_call_output'], 'content_blocks' => ['tool_use', 'tool_result']] as $key => $types) {
+            if (! is_array($content[$key] ?? null)) {
+                continue;
+            }
+            $kept = array_values(array_filter($content[$key], static fn (mixed $item): bool => ! (is_array($item) && in_array($item['type'] ?? null, $types, true))));
+            if (count($kept) === count($content[$key])) {
+                continue;
+            }
+            $changed = true;
+            if ($kept === []) {
+                unset($content[$key]);
+            } else {
+                $content[$key] = $kept;
+            }
+        }
+
+        return $changed ? new AssistantMessage($message->content, [], $content, $message->toolApprovalRequests) : $message;
     }
 
     /**
