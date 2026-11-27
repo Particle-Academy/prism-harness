@@ -130,6 +130,12 @@ const PAIRING_REPEATED_REASON = 'Tool call was not run because another call in t
 
 const PAIRING_REPLACED_REASON = 'Tool call was not run because a later step replaced it';
 
+/**
+ * G-401: which recorded decision for an approval counts. `first`: the first
+ * one. `deny`: any denial is final, otherwise the first approval.
+ */
+const PAIRING_DECISION_RULE = 'first';
+
 /** The fixed-seed set every CI run checks, and the coverage test reads. */
 const PAIRING_FAST_EXAMPLES = 160;
 
@@ -331,6 +337,12 @@ function pairingGenerate(int $seed): array
         $case['steps'] = [$steps[0]];
         $case['repeats'] = $repeats === [] ? [$g->pick(['send', 'stream', 'redecide', 'lateApprove'])] : $repeats;
     }
+    // G-401: two decision rows already in the thread for one call, as two
+    // writers leave them; and a late denial among the repeat resumes.
+    $case['pair'] = $gated !== [] && $g->chance(0.3) ? ['call' => $g->pick($gated), 'first' => $g->chance(0.5)] : null;
+    if ($g->chance(0.3)) {
+        $case['repeats'][] = 'lateDeny';
+    }
     // Two IDENTICAL gated calls (same id, tool and arguments): a copy of one
     // of the first step's gated calls, right after it.
     if ($gated !== [] && $g->chance(0.2)) {
@@ -362,9 +374,29 @@ function pairingWithTwin(array $case, int $k): array
     if (($case['insert'] ?? null) !== null) {
         $case['insert']['call'] = $shift($case['insert']['call']);
     }
+    if (($case['pair'] ?? null) !== null) {
+        $case['pair']['call'] = $shift($case['pair']['call']);
+    }
     $case['twin'] = $k;
 
     return $case;
+}
+
+/**
+ * The decisions that count for step `$s`'s calls: the resume's, and for the
+ * call a decision pair names, the pair's under the G-401 rule (a decision the
+ * person sends for it later is recorded as nothing).
+ *
+ * @return array<int, string>
+ */
+function pairingEffectiveFor(array $case, int $s): array
+{
+    $effective = pairingEffectiveDecisions($case['steps'][$s]);
+    if ($s === 0 && ($case['pair'] ?? null) !== null) {
+        $effective[$case['pair']['call']] = PAIRING_DECISION_RULE === 'first' && $case['pair']['first'] ? 'approve' : 'deny';
+    }
+
+    return $effective;
 }
 
 /**
@@ -387,7 +419,7 @@ function pairingOracle(array $case): array
     foreach ($case['steps'] as $step) {
         $ids = array_column($step['calls'], 'id');
         $repeated = count($ids) !== count(array_unique($ids));
-        $effective = pairingEffectiveDecisions($step);
+        $effective = pairingEffectiveFor($case, count($steps));
         $parks = array_filter($step['calls'], fn (array $call): bool => $call['gated']) !== [];
         $unserved = $refused;
         $mode = $case['mode'] ?? 'normal';
@@ -567,6 +599,12 @@ function pairingRun(array $case): array
             }
         }
         $resume = pairingResume($step);
+        if ($s === 0 && ($case['pair'] ?? null) !== null && $requestFor[$case['pair']['call']] !== null) {
+            $approvalId = (string) $requestFor[$case['pair']['call']];
+            foreach ([$case['pair']['first'], ! $case['pair']['first']] as $approved) {
+                $session()->thread()->record([new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse($approvalId, $approved)])]);
+            }
+        }
         if ($s === 0 && pairingInsertBefore($case) !== null && ($case['mode'] ?? 'normal') !== 'replaced') {
             $session()->thread()->record([pairingInsertedRow($case)]);
         }
@@ -621,6 +659,17 @@ function pairingRun(array $case): array
                     break;
                 case 'structured':
                     $session()->sendStructured('', $schema);
+                    break;
+                case 'lateDeny':
+                    $denials = [];
+                    foreach ($observed['parks'] as $parked) {
+                        foreach ($parked as $request) {
+                            $denials[] = new ToolApprovalResponse($request['approvalId'], false);
+                        }
+                    }
+                    if ($denials !== []) {
+                        $session()->decide($denials);
+                    }
                     break;
                 case 'redecide':
                 case 'lateApprove':
@@ -813,9 +862,10 @@ function pairingViolations(array $case, array $observed): array
 
     foreach ($case['steps'] as $s => $step) {
         $expected = $oracle['steps'][$s];
-        $effective = pairingEffectiveDecisions($step);
+        $effective = pairingEffectiveFor($case, $s);
         $gated = array_keys(array_filter($step['calls'], fn (array $call): bool => $call['gated']));
         $parked = $observed['parks'][$s] ?? null;
+        $pairCall = $s === 0 ? ($case['pair']['call'] ?? null) : null;
 
         foreach ($step['calls'] as $k => $call) {
             $didRun = in_array($call['token'], $ran, true);
@@ -831,8 +881,8 @@ function pairingViolations(array $case, array $observed): array
 
         // 2. One decision decides at most one call.
         $approves = [];
-        foreach ($step['order'] as $k) {
-            if (($effective[$k] ?? 'none') === 'approve') {
+        foreach ($effective as $k => $decision) {
+            if ($decision === 'approve') {
                 $approves[$k] = true;
             }
         }
@@ -938,6 +988,10 @@ function pairingViolations(array $case, array $observed): array
         // 6. The decision rows say what happened: a run call was approved by
         // its own request; a repeated-id step's rows are all denials.
         foreach ($gated as $k) {
+            if ($k === $pairCall) {
+                // Its decision rows are the pair's, written past the harness.
+                continue;
+            }
             $token = $step['calls'][$k]['token'];
             $rowsFor = pairingDecisionRows($observed)[$approvalOf[$k]] ?? [];
             if (($expected['superseded'] || ($case['mode'] ?? 'normal') === 'replaced') && in_array(true, array_column($rowsFor, 0), true)) {
@@ -951,6 +1005,9 @@ function pairingViolations(array $case, array $observed): array
             }
         }
         foreach ($observed['recorded'][$s] ?? [] as [$approvalId, $verdict]) {
+            if ($pairCall !== null && $approvalId === ($approvalOf[$pairCall] ?? null)) {
+                continue;
+            }
             $stored = pairingDecisionRows($observed)[$approvalId] ?? [];
             $storedVerdicts = array_values(array_unique(array_map(fn (array $r): string => $r[0] ? 'approved' : 'denied', $stored)));
             if ($storedVerdicts !== [$verdict]) {
@@ -1271,6 +1328,9 @@ function pairingWithoutCall(array $case, int $s, int $k): array
         if (($case['insert'] ?? null) !== null) {
             $case['insert'] = isset($map[$case['insert']['call']]) ? [...$case['insert'], 'call' => $map[$case['insert']['call']]] : null;
         }
+        if (($case['pair'] ?? null) !== null) {
+            $case['pair'] = isset($map[$case['pair']['call']]) ? [...$case['pair'], 'call' => $map[$case['pair']['call']]] : null;
+        }
         if (isset($case['recorded'])) {
             $mix = [];
             foreach ($case['recorded']['mix'] as [$which, $i]) {
@@ -1404,6 +1464,9 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         if (($case['twin'] ?? null) !== null) {
             $seen['two identical gated calls in one step'] = true;
         }
+        if (($case['pair'] ?? null) !== null) {
+            $seen['a pair of decision rows, '.($case['pair']['first'] ? 'approve' : 'deny').' first'] = true;
+        }
         if ($case['insert'] !== null) {
             $seen['insert '.$case['insert']['kind'].' '.$case['insert']['when']] = true;
             if ($case['mode'] === 'spent' && $case['repeats'] !== []) {
@@ -1446,7 +1509,8 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
 
     expect(array_keys($seen))->toEqualCanonicalizing([
         'entry send', 'entry stream', '1 steps', '2 steps',
-        'repeat send', 'repeat stream', 'repeat structured', 'repeat redecide', 'repeat lateApprove',
+        'repeat send', 'repeat stream', 'repeat structured', 'repeat redecide', 'repeat lateApprove', 'repeat lateDeny',
+        'a pair of decision rows, approve first', 'a pair of decision rows, deny first',
         'resume decide', 'resume streamDecision', 'resume approveOne', 'resume newMessage',
         'distinct ids', 'repeated ids', 'gated calls sharing an id', 'a gated and an ungated call sharing an id',
         'an empty gated id', 'a decision sent twice', 'decision approve', 'decision deny', 'decision none',
