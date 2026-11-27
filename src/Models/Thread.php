@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Prism\Harness\Models;
 
-use Closure;
 use Generator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
@@ -25,6 +24,7 @@ use Prism\Harness\Sessions\DatabaseAddressIndex;
 use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Subagents\RunBudgets;
 use Prism\Harness\Support\CallPairing;
+use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Support\PausedStep;
 use Prism\Harness\Support\ToolResultRuns;
@@ -510,7 +510,7 @@ class Thread extends Model implements ThreadContract
             // in this batch or before it. A runner start ends them itself.
             $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
             if ($endedByStart === []) {
-                $messages = $this->withSupersededDenials($messages, self::$recordingInRun === $runId ? $runId : null);
+                $messages = $this->withSupersededDenials($messages, $runId !== null && InRunRecording::active($runId) ? $runId : null);
             }
 
             foreach ($messages as $message) {
@@ -992,9 +992,10 @@ class Thread extends Model implements ThreadContract
      * user row recorded OUTSIDE the run that owns the step. The harness's own
      * rows inside that run (a structured turn's own answer) do not. Inside is
      * `$inRun`, the run the RUNTIME says it is recording for
-     * ({@see self::recordingInRun()}): a run id a caller passes to record()
-     * itself proves nothing, so a host row reads as outside whatever run id
-     * it names.
+     * ({@see InRunRecording}, set only by the runtime's own,
+     * private recording): a run id a caller passes to record(), or any other
+     * public route, proves nothing, so a host row reads as outside whatever
+     * run id it names.
      *
      * @param  list<Message>  $messages
      * @return list<Message>
@@ -1033,31 +1034,6 @@ class Thread extends Model implements ThreadContract
 
     /** @var \WeakMap<ToolResultMessage, list<string>>|null */
     private ?\WeakMap $supersededRows = null;
-
-    /** The run the runtime is recording rows for, set only around its own record() call. */
-    private static ?string $recordingInRun = null;
-
-    /**
-     * Record rows as the harness's own, inside `$runId` (DECISION B): the
-     * only way a row counts as written inside the run that owns a step.
-     *
-     * @internal Called by the runtime when it records a run's turn.
-     *
-     * @template T
-     *
-     * @param  Closure(): T  $record
-     * @return T
-     */
-    public static function recordingInRun(string $runId, Closure $record): mixed
-    {
-        $previous = self::$recordingInRun;
-        self::$recordingInRun = $runId;
-        try {
-            return $record();
-        } finally {
-            self::$recordingInRun = $previous;
-        }
-    }
 
     /**
      * The denials the paused step's open gated calls get when it is

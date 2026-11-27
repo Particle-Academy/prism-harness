@@ -56,6 +56,7 @@ use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\ClassLabel;
+use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Support\RunSettles;
 use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Support\TurnMessages;
@@ -501,6 +502,25 @@ final readonly class AgentRuntime
         }
 
         return ['message' => new ToolResultMessage($ended), 'approvals' => array_values(array_unique($approvals))];
+    }
+
+    /**
+     * Record `$record` as the run's OWN rows (DECISION B): the only way a row
+     * counts as written inside a run ({@see InRunRecording}). Private, so a
+     * run id a caller passes, through Thread::record() or any other public
+     * route, is always outside.
+     *
+     * @template T
+     *
+     * @param  Closure(): T  $record
+     * @return T
+     */
+    private static function recordInRun(string $runId, Closure $record): mixed
+    {
+        /** @var Closure(): T $during */
+        $during = Closure::bind(static fn (): mixed => InRunRecording::during($runId, $record), null, InRunRecording::class);
+
+        return $during();
     }
 
     /**
@@ -2178,7 +2198,7 @@ final readonly class AgentRuntime
         $ended = array_values(array_filter($messages, fn (Message $message): bool => $message instanceof ToolResultMessage && isset($this->endedByStart[$message])));
         // Recorded as the run's own rows (DECISION B): a row this run writes
         // supersedes a step only when it would from outside, or has tool calls.
-        Thread::recordingInRun($runId, fn () => $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
+        self::recordInRun($runId, fn () => $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
             app(RunTrees::class)->parkFacts($runId),
             array_map(fn (ToolResultMessage $message): array => ['message' => $message, 'approvals' => $this->endedByStart[$message]], $ended)));
         // A runner start's task row is written: known in memory from here,
