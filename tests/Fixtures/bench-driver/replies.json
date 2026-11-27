@@ -1,0 +1,70 @@
+[
+  {
+    "id": "msg_bench_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-haiku-5-5",
+    "content": [
+      {
+        "type": "text",
+        "text": "Listing the directory."
+      },
+      {
+        "type": "tool_use",
+        "id": "toolu_bench_1",
+        "name": "bash",
+        "input": {
+          "command": "ls"
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 100,
+      "output_tokens": 20,
+      "cache_creation_input_tokens": 40,
+      "cache_read_input_tokens": 0
+    }
+  },
+  {
+    "id": "msg_bench_2",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-haiku-5-5",
+    "content": [
+      {
+        "type": "text",
+        "text": "done"
+      }
+    ],
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 30,
+      "output_tokens": 5,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 140
+    }
+  },
+  {
+    "id": "msg_bench_3",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-haiku-5-5",
+    "content": [
+      {
+        "type": "text",
+        "text": "Stopped."
+      }
+    ],
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 12,
+      "output_tokens": 3,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 180
+    }
+  }
+]
