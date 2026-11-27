@@ -34,9 +34,76 @@ class ToolResultRuns
      * @param  iterable<int, Message>  $messages
      * @return Generator<int, Message>
      */
-    public static function fold(iterable $messages): Generator
+    /**
+     * @param  iterable<int, Message>  $messages
+     * @param  array<int, int>  $answers  message index => index of the step that
+     *                                    harness result row answers (G-407)
+     * @return Generator<int, Message>
+     */
+    public static function fold(iterable $messages, array $answers = []): Generator
     {
-        yield from self::oncePerSegment(iterator_to_array(self::foldRuns($messages), false));
+        $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
+
+        yield from self::oncePerSegment(iterator_to_array(self::foldRuns(self::withAnswersInPlace($messages, $answers)), false));
+    }
+
+    /**
+     * `$messages` with each harness result row that names an earlier step
+     * moved to the end of that step's rows, so it is read as that step's,
+     * not as a later step's (G-407). A mark that does not name an earlier
+     * tool-call step with a call of each of its results' ids and tool names
+     * is ignored: the row stays where it is.
+     *
+     * @param  list<Message>  $messages
+     * @param  array<int, int>  $answers
+     * @return list<Message>
+     */
+    private static function withAnswersInPlace(array $messages, array $answers): array
+    {
+        $moved = [];
+        foreach ($answers as $index => $target) {
+            $row = $messages[$index] ?? null;
+            $step = $messages[$target] ?? null;
+            if (! $row instanceof ToolResultMessage || ! $step instanceof AssistantMessage || $step->toolCalls === [] || $target >= $index) {
+                continue;
+            }
+            $calls = [];
+            foreach ($step->toolCalls as $call) {
+                $calls[self::ownerKey($call->id, $call->name)] = true;
+            }
+            foreach ($row->toolResults as $result) {
+                if (! isset($calls[self::ownerKey($result->toolCallId, $result->toolName)])) {
+                    continue 2;
+                }
+            }
+            // The end of the step's rows: just before the next tool-call step.
+            $end = null;
+            for ($i = $target + 1; $i < $index; $i++) {
+                if ($messages[$i] instanceof AssistantMessage && $messages[$i]->toolCalls !== []) {
+                    $end = $i;
+
+                    break;
+                }
+            }
+            if ($end !== null) {
+                $moved[$index] = $end;
+            }
+        }
+        if ($moved === []) {
+            return $messages;
+        }
+
+        $out = [];
+        foreach ($messages as $index => $message) {
+            foreach (array_keys($moved, $index, true) as $from) {
+                $out[] = $messages[$from];
+            }
+            if (! isset($moved[$index])) {
+                $out[] = $message;
+            }
+        }
+
+        return $out;
     }
 
     /**
