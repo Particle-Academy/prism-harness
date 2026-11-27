@@ -987,6 +987,11 @@ rather than leaving a listener to infer it from a finish reason, and `RunFailed`
 the exception **class**, because a provider message can contain a request URL with a key in it
 and an event may end up on a screen.
 
+A listener that throws does not leave a run behind it. A `RunStarted` (or `RunResumed`)
+listener runs once the run has begun, on every path (send, structured, stream): whatever it
+throws, an `Error` as much as an `Exception`, fails the run by its class name, fires
+`RunFailed`, and then propagates to the caller.
+
 Every event carries `run_id`, `parent_run_id` and `root_run_id` — the same identifiers on the
 stored rows — so an existing live stream can be joined to this record without adopting it.
 
@@ -1124,7 +1129,8 @@ cancel, `mode()`) treats them as absent until that row exists. The start's own r
 exception: from the commit until its run ends, the session it runs on (and every read-only
 view of it a tool provider is handed) reads the mode, binding, run tree, depth and ceiling the
 start committed, so a host provider or tool that decides from `mode()` sees the mode the child
-is actually running in. A start that fails before its
+is actually running in. Only the runtime's own view counts: a view host code sets itself with
+`enterStart()` confirms nothing, even for a run the session's run slot still says is running. A start that fails before its
 task row therefore needs no second write to be undone: the child reads as it did before, a
 linked child with no binding is refused, an approval nobody could answer stays that way, its
 mode reads as the mode before the start, and the run the child was parked on can still be
@@ -1133,14 +1139,17 @@ belonging to are the ones it was last confirmed in, kept beside the provisional 
 failed start cannot detach the child from the tree a person can cancel or the plan budget it
 spends from. These reads are reads: a host tool provider may make them from the read-only
 tool-resolution view while a start is running. The child's binding, count, mode and thread link are also put back
-(each only if no later writer changed it) and the tree hold is returned, but that is
-housekeeping, and its failure changes nothing. A start acts on no decision recorded on the
+(each only if no later writer changed it) and the tree hold is returned, BEFORE the run is
+failed and `RunFailed` fires, so a `RunFailed` listener never sees a hold about to be released;
+but that is housekeeping, and its failure changes nothing. A start acts on no decision recorded on the
 child: the calls the child was parked on are ended with its task row, with a fixed result, and
 never run. Each one is announced as `ToolDenied` (decided by `policy`) only once that row is
 recorded, and `approvalStatus()` reads it as `superseded`, never `approved`. That reading is
 decided only by the harness's own mark on that row, which names the approvals it ended, and
 only for the result that follows the approval's own request: a tool's result text cannot end a
-call, and a tool-call id a provider reuses (some name ids by function) cannot end or un-end one. Once a start has committed, a stop that lands later (a cancel, say) stops its model
+call, and a tool-call id a provider reuses (some name ids by function) cannot end or un-end one. The mark is one shape in all three languages, pinned by the
+`harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
+`{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
 parity op `start_gate`; the tool-call limit exists only here.
 

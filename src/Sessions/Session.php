@@ -569,12 +569,18 @@ class Session
      * another, keeps the provisional rule: absent until the task row exists.
      * In memory only; nothing is written to set or clear it.
      *
+     * Only a view the RUNTIME entered confirms anything: it keeps the views
+     * it entered, and a view host code makes by calling this itself is not
+     * one of them, so it confirms nothing, even for a run the slot still
+     * says is running (a crash residue).
+     *
      * @internal Set by the runtime once a runner start's commit (b) succeeds.
      */
-    public function enterStart(string $runId): void
+    public function enterStart(string $runId): StartView
     {
         $this->leaveStart();
-        $this->startView = new StartView($runId);
+
+        return $this->startView = new StartView($runId);
     }
 
     /**
@@ -593,15 +599,17 @@ class Session
 
     /**
      * Whether this Session object is running the runner start that wrote
-     * `$runId`'s records (G-387): its view names that run, AND the run slot
+     * `$runId`'s records (G-387): its view is one the runtime entered and
+     * names that run, AND the run slot
      * holds that run, still running. A view set on a session whose start is
      * not running (one that failed, or that a host named by hand) confirms
      * nothing, so it can never make a dead approval answerable.
      */
     private function ownsStart(string $runId): bool
     {
-        $run = $this->startView?->run;
-        if ($run === null || $run !== $runId) {
+        $view = $this->startView;
+        $run = $view?->run;
+        if ($view === null || $run === null || $run !== $runId || ! ($this->runtime ?? app(AgentRuntime::class))->enteredStart($view)) {
             return false;
         }
         $stored = $this->storedRun();
