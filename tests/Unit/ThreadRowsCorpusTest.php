@@ -102,11 +102,12 @@ it('stores and replays every row as the corpus records for the reference', funct
 
 it('folds thr-0009 as G-401 decides: the later result replaces, the first decision stands', function (): void {
     $case = array_values(array_filter(threadRowsCorpus()['cases'], fn (array $case): bool => $case['id'] === 'thr-0009'))[0];
-    $expected = json_decode($case['rows']['php'], true, 512, JSON_THROW_ON_ERROR);
+    $expected = json_decode($case['rows']['php'], false, 512, JSON_THROW_ON_ERROR);
     // The corpus row with only its decision changed: the first one, a denial.
-    $expected[1]['tool_approval_responses'] = [['approval_id' => 'apr_1', 'approved' => false, 'reason' => 'no']];
+    $expected[1]->tool_approval_responses = [(object) ['approval_id' => 'apr_1', 'approved' => false, 'reason' => 'no']];
+    $flags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
 
-    expect(corpusRows($case))->toBe($expected);
+    expect(json_encode(corpusRows($case), $flags))->toBe(json_encode($expected, $flags));
 });
 
 it('agrees with both ports on every row', function (): void {

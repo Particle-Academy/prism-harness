@@ -25,8 +25,9 @@ use Prism\Prism\ValueObjects\ToolResult;
  * earlier one's position. The same call is the same tool call id, tool name
  * AND arguments (the n-th such result of a row replacing the n-th of an
  * earlier row), never the call id alone: a provider may give two calls of one
- * step the same id, and each keeps its own result. A decision is
- * keyed by its approval id, the same way.
+ * step the same id, and each keeps its own result. A decision is keyed by its
+ * approval id, but the FIRST one stands: a later decision for an approval
+ * that already has one never replaces it (G-401).
  */
 class ToolResultRuns
 {
@@ -213,7 +214,7 @@ class ToolResultRuns
     protected static function merge(array $run): ToolResultMessage
     {
         if (count($run) === 1) {
-            return $run[0];
+            return self::firstDecisions($run[0]);
         }
 
         /** @var array<string, ToolResult> $results */
@@ -233,7 +234,9 @@ class ToolResultRuns
             }
 
             foreach ($message->toolApprovalResponses as $decision) {
-                $decisions[$decision->approvalId] = $decision;
+                // The FIRST decision for an approval is the one that counts
+                // (G-401): a later one never replaces it.
+                $decisions[$decision->approvalId] ??= $decision;
             }
         }
 
@@ -269,5 +272,21 @@ class ToolResultRuns
         }
 
         return $value;
+    }
+
+    /**
+     * `$message` with only the first decision for each approval (G-401).
+     */
+    private static function firstDecisions(ToolResultMessage $message): ToolResultMessage
+    {
+        $decisions = [];
+        foreach ($message->toolApprovalResponses as $decision) {
+            $decisions[$decision->approvalId] ??= $decision;
+        }
+        if (count($decisions) === count($message->toolApprovalResponses)) {
+            return $message;
+        }
+
+        return new ToolResultMessage($message->toolResults, array_values($decisions));
     }
 }
