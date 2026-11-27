@@ -88,9 +88,27 @@ it('is the whole suite, not a subset someone trimmed to green', function (): voi
 });
 
 it('stores and replays every row as the corpus records for the reference', function (array $case): void {
+    if ($case['id'] === 'thr-0009') {
+        // CHANGED BY G-401 (pending the owner's decision and the parity
+        // corpus that follows it): a denial recorded for an approval is
+        // final, so a later approval row no longer replaces an earlier denial. The
+        // expected rows are pinned in the next test; the vendored corpus is
+        // not edited here.
+        $this->markTestSkipped('thr-0009 changed by G-401: a later approval row no longer replaces an earlier denial.');
+    }
     expect(json_encode(corpusRows($case), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR))
         ->toBe($case['rows']['php']);
 })->with(fn (): array => array_map(fn (array $case): array => [$case], threadRowsCorpus()['cases']));
+
+it('folds thr-0009 as G-401 decides: the later result replaces, the denial stands', function (): void {
+    $case = array_values(array_filter(threadRowsCorpus()['cases'], fn (array $case): bool => $case['id'] === 'thr-0009'))[0];
+    $expected = json_decode($case['rows']['php'], false, 512, JSON_THROW_ON_ERROR);
+    // The corpus row with only its decision changed: the denial stands.
+    $expected[1]->tool_approval_responses = [(object) ['approval_id' => 'apr_1', 'approved' => false, 'reason' => 'no']];
+    $flags = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR;
+
+    expect(json_encode(corpusRows($case), $flags))->toBe(json_encode($expected, $flags));
+});
 
 it('agrees with both ports on every row', function (): void {
     foreach (threadRowsCorpus()['cases'] as $case) {

@@ -577,10 +577,10 @@ class Session
             array_fill_keys($this->thread()->repeatedIdApprovalIds(), true),
             array_fill_keys($this->thread()->replacedApprovalIds(), true),
         );
-        $decisions = $this->deniedWhenCallIdsRepeat(array_values(array_filter(
+        $decisions = $this->deniedWhenCallIdsRepeat($this->standingDecisions(array_values(array_filter(
             $decisions,
             static fn (ToolApprovalResponse $decision): bool => ! isset($answered[$decision->approvalId]),
-        )));
+        ))));
         if ($decisions === []) {
             return [];
         }
@@ -590,6 +590,40 @@ class Session
         ], $this->run()['id'] ?? null);
 
         return $decisions;
+    }
+
+    /**
+     * The decisions that change what stands (G-401). A denial is final: once
+     * one is recorded for an approval, nothing more is recorded for it. An
+     * approval is recorded only for an approval with no decision yet, and
+     * not when this batch also denies it. The same decision sent again
+     * records nothing.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @return list<ToolApprovalResponse>
+     */
+    protected function standingDecisions(array $decisions): array
+    {
+        $recorded = $this->thread()->recordedDecisions();
+        $denied = [];
+        foreach ($decisions as $decision) {
+            if (! $decision->approved) {
+                $denied[$decision->approvalId] = true;
+            }
+        }
+        $kept = [];
+        foreach ($decisions as $decision) {
+            $id = $decision->approvalId;
+            if (($recorded[$id] ?? null) === false || isset($kept[$id])) {
+                continue;
+            }
+            if ($decision->approved && (isset($recorded[$id]) || isset($denied[$id]))) {
+                continue;
+            }
+            $kept[$id] = $decision;
+        }
+
+        return array_values($kept);
     }
 
     /**
