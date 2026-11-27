@@ -581,21 +581,30 @@ class Session
      * Every decision for a step whose call ids repeat, as a denial.
      *
      * A decision reaches a call through the call id its request names, and a
-     * provider can give two calls in one step the same id. Such a step is
-     * denied whatever was decided, so no gated call in it runs and the
-     * recorded decisions say so.
+     * provider can give two calls in one step the same id. A decision naming
+     * an approval of such a step is recorded as a denial whatever was
+     * decided, wherever that step sits in the thread, so no gated call in it
+     * runs and the recorded decisions say so. So is a decision for a step a
+     * later tool-call step replaced: core never resolves that step again
+     * (G-392/G-397).
      *
      * @param  list<ToolApprovalResponse>  $decisions
      * @return list<ToolApprovalResponse>
      */
     protected function deniedWhenCallIdsRepeat(array $decisions): array
     {
-        if (! $this->thread()->pausedStepRepeatsCallIds()) {
+        $repeated = array_fill_keys($this->thread()->repeatedIdApprovalIds(), true);
+        $replaced = array_fill_keys($this->thread()->replacedApprovalIds(), true);
+        if ($repeated === [] && $replaced === []) {
             return $decisions;
         }
 
         return array_map(
-            static fn (ToolApprovalResponse $decision): ToolApprovalResponse => new ToolApprovalResponse($decision->approvalId, false, self::REPEATED_CALL_ID_REASON),
+            static fn (ToolApprovalResponse $decision): ToolApprovalResponse => match (true) {
+                isset($replaced[$decision->approvalId]) => new ToolApprovalResponse($decision->approvalId, false, Thread::REPLACED_REASON),
+                isset($repeated[$decision->approvalId]) => new ToolApprovalResponse($decision->approvalId, false, self::REPEATED_CALL_ID_REASON),
+                default => $decision,
+            },
             $decisions,
         );
     }
