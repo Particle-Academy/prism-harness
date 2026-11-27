@@ -36,8 +36,9 @@ final readonly class StepCalls
 {
     /** @param Closure(TextResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
+     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
      */
-    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): TextResponse
+    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): TextResponse
     {
         $this->assertUncapped($run);
         $builder = new TextBuilder;
@@ -47,7 +48,7 @@ final readonly class StepCalls
                 // Not the step limit: a run parked on its last step still acts on
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
-                $approved->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved, $started);
                 // A resolved approval may itself delegate and consume the remainder.
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
@@ -86,8 +87,9 @@ final readonly class StepCalls
 
     /** @param Closure(StructuredResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
+     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
      */
-    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved): StructuredResponse
+    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): StructuredResponse
     {
         $this->assertUncapped($run);
         $builder = new StructuredBuilder;
@@ -101,7 +103,7 @@ final readonly class StepCalls
                 // Not the step limit: a run parked on its last step still acts on
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
-                $approved->resolve($generation, $resolved);
+                $approved->resolve($generation, $resolved, $started);
                 $run->ledger->assertCallAvailable($run->budget);
                 $generation->withMaxSteps(1);
                 $request = $generation->toRequest();
@@ -161,9 +163,10 @@ final readonly class StepCalls
     /**
      * @param  Closure(list<Message>, TextResponse):void  $record
      * @param  Closure(list<Message>):void  $resolved
+     * @param  (Closure(ToolCall): bool)|null  $started  asked right before an approved call runs (round 15)
      * @return Generator<StreamEvent>
      */
-    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): Generator
+    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): Generator
     {
         $this->assertUncapped($run);
         $approved = new ApprovedTools;
@@ -172,7 +175,7 @@ final readonly class StepCalls
                 // Not the step limit: a run parked on its last step still acts on
                 // the person's decisions, and the check after them stops it.
                 $run->ledger->assertResolutionAvailable($run->budget);
-                foreach ($approved->resolve($generation, $resolved) as $event) {
+                foreach ($approved->resolve($generation, $resolved, $started) as $event) {
                     yield $event;
                 }
                 $run->ledger->assertCallAvailable($run->budget);

@@ -264,6 +264,6 @@ final class PlanTools
     /** A person approved exactly this call, and it has not run yet. Read from the thread. */
     private function approved(string $tool, string $digest): bool
     {
-        return $this->session->thread()->approvedCallsAwaitingResult($tool, $digest) > 0;
+        return $this->session->thread()->approvedCallsAwaitingResult($tool, $digest, $this->plans->runId($this->session)) > 0;
     }
 }

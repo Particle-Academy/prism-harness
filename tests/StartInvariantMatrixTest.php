@@ -24,7 +24,11 @@ use Prism\Harness\Subagents\Subagent;
 use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
+use Prism\Prism\ValueObjects\ToolCall;
 use Tests\Fixtures\Participant;
 use Tests\Support\G360;
 
@@ -123,27 +127,32 @@ function imExpected(): array
         'plans' => true, 'delegation' => true, 'policy' => true,
     ];
     $running = ['run' => ['S', 'running'], 'plan_run' => 'S', 'cancel S' => 'ok'];
-    // `host row` (round 14, G-404): a host records a user row on the child's
-    // thread. With nobody holding the child's lock it supersedes A0 (or, once
-    // A0 is ended, supersedes nothing); while a start holds the lock and A0
-    // is still parked it is refused, so a superseding write never races the
-    // run that ends or resolves the step.
+    // `host row` (round 14, G-404; round 15): a host records a user row on the
+    // child's thread. It is NEVER refused (round 15, the write-ahead started
+    // row): it supersedes A0, or, once A0 is ended, supersedes nothing; a
+    // call a run has started is answered-in-progress, so no lock is needed.
+    // `host step` is the same with an assistant row with a tool call, and
+    // `host row eb` the same user row through record()'s public
+    // `endedByStart` parameter, which is runtime-only (PHP run17 #1).
+    $hostRows = ['host row' => 'ran', 'host step' => 'ran', 'host row eb' => 'InvalidArgumentException'];
     $refused = ['host turn' => 'child_binding_missing', 'resume' => 'child_binding_missing',
-        'recordApproval' => 'child_binding_missing', 'cancel' => 'ok', 'second start' => 'completed', 'host row' => 'ran'];
+        'recordApproval' => 'child_binding_missing', 'cancel' => 'ok', 'second start' => 'completed', ...$hostRows];
     // The child's lock is held by the start: every turn and decision waits,
     // a second start included (framed `failed`, nothing written).
     $locked = ['host turn' => 'locked', 'resume' => 'locked', 'recordApproval' => 'locked', 'cancel' => 'ok', 'second start' => 'failed',
-        'host row' => 'locked'];
+        ...$hostRows];
     $ownLocked = ['own decision' => 'locked', 'own resume' => 'locked', 'own new message' => 'locked'];
     $ownRefused = ['own decision' => 'child_binding_missing', 'own resume' => 'child_binding_missing',
         'own new message' => 'child_binding_missing'];
     // The RAW stored mark (round 13): the row's keys in order, and the mark,
     // byte for byte the thr-0014 shape, naming the approvals in call order.
-    $mark = [['tool_results', 'tool_approval_responses', 'harness_ended_by_start'], ['approval_ids' => ['A0']]];
+    // Round 15: the runtime's own result row then names the step it answers
+    // (`harness_answers_step`, last).
+    $mark = [['tool_results', 'tool_approval_responses', 'harness_ended_by_start', 'harness_answers_step'], ['approval_ids' => ['A0']]];
     $ended = ['approval' => ['superseded', 'undecided', 'not pending'], 'offer' => ['echo', 'probe', 'weather'], 'paused' => 'none',
         'mark' => [$mark]];
     // Once A0 is ended nothing is parked: a host row supersedes nothing, so it needs no lock.
-    $endedHostRow = ['host row' => 'ran'];
+    $endedHostRow = $hostRows;
     // Once the start's run has ended, neither the parked run nor the start's own can be cancelled.
     $over = ['cancel' => 'not-running', 'cancel S' => 'not-running'];
     $after = [...$prior, ...$started, ...$ended, 'run' => ['S', 'completed'],
@@ -454,6 +463,14 @@ function imOutside(): array
     $read['second start'] = imRolledBack(fn (): string => imSecondStart());
     $read['host row'] = imRolledBack(function (): void {
         imChild()->thread()->record([new UserMessage('A host row.')]);
+    });
+    $read['host step'] = imRolledBack(function (): void {
+        imChild()->thread()->record([new AssistantMessage('', [new ToolCall('host_call', 'echo', ['text' => 'h'])], [],
+            [new ToolApprovalRequest('host_apr', 'host_call')])]);
+    });
+    $read['host row eb'] = imRolledBack(function (): void {
+        $ended = new ToolResultMessage([]);
+        imChild()->thread()->record([new UserMessage('A host row.'), $ended], endedByStart: [['message' => $ended, 'approvals' => []]]);
     });
 
     return $read;

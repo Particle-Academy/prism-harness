@@ -108,7 +108,9 @@ final class MessageMapper
             ),
             self::TYPE_ASSISTANT => new AssistantMessage(
                 (string) ($payload['content'] ?? ''),
-                array_map(self::toolCall(...), self::arr($payload, 'tool_calls')),
+                // One rule for what is a step (G-408): only the objects of a
+                // tool_calls list are calls, here as for every reader.
+                array_map(self::toolCall(...), StepRows::objectCalls($payload['tool_calls'] ?? null) ?? []),
                 ValueObjectMapper::decode(self::arr($payload, 'additional_content')),
                 array_map(self::approvalRequest(...), self::arr($payload, 'tool_approval_requests')),
             ),

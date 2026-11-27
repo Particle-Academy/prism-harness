@@ -1169,8 +1169,12 @@ class Session
     {
         $thread = $this->thread();
         $pending = array_fill_keys($thread->pendingApprovalIds(), true);
+        // A DENIAL may still revoke an approval no run has acted on yet (G-401,
+        // the recommended option): its call has no outcome and was never
+        // started. A later APPROVAL never stands over any decision.
+        $revocable = array_fill_keys($thread->approvedIdsAwaitingRun(), true);
         foreach ($decisions as $decision) {
-            if (! isset($pending[$decision->approvalId])) {
+            if (! isset($pending[$decision->approvalId]) && ! (! $decision->approved && isset($revocable[$decision->approvalId]))) {
                 throw ApprovalNotPending::forId($decision->approvalId);
             }
             // Settled-cancelled, never pending: a cancelled run never resumes (G-285).
@@ -1421,7 +1425,9 @@ class Session
      * `cancelled` (its run was cancelled before anyone decided), `superseded`
      * (never decided, and a later turn ended it; or decided, and a subagent
      * runner start ended the call before any resume acted on it, so it never
-     * ran), or `unknown` (this thread never issued it). An approval in a
+     * ran), `interrupted` (approved, and its call was started but never got
+     * a result: it may have run, and it is never run again; G-387 round 15),
+     * or `unknown` (this thread never issued it). An approval in a
      * cancelled run never reads `pending`.
      */
     public function approvalStatus(string $approvalId): string
@@ -1437,6 +1443,16 @@ class Session
             // A runner start ended the call, and it never ran (G-387): the
             // decision was never acted on, so the call reads as ended.
             if ($thread->endedByStart($approvalId) || $thread->supersededByLaterStep($approvalId)) {
+                return 'superseded';
+            }
+            // Started, and no result of its own (G-387 round 15): it was
+            // interrupted and may have run. Never re-run; never "not run".
+            if ($decided[$approvalId] && $thread->interrupted($approvalId)) {
+                return 'interrupted';
+            }
+            // Replaced, under an earlier version, with no outcome written:
+            // it never runs (round 15).
+            if ($thread->replacedWithoutOutcome($approvalId)) {
                 return 'superseded';
             }
 

@@ -111,6 +111,17 @@ function recordApprovalPairingRow(array $row): array
         // A caller naming the step's OWN run id: still outside it.
         'user_owning_run_id' => approvalPairingSession()->thread()->record([new UserMessage('A later message.')], $parked->runId),
         'new_message' => approvalPairingSession()->send('Something else.'),
+        // 0.4.0 (G-387 round 15): a host records a COPY of the parked step
+        // that keeps its approval requests but alters each call's arguments
+        // (n + 100), before any decision; or, `_after_approval`, after every
+        // pending approval was recorded approved and before the resume.
+        'altered_copy' => approvalPairingAlteredCopy($row, $pending),
+        'altered_copy_after_approval' => (function () use ($row, $pending): void {
+            $session = approvalPairingSession();
+            (fn () => $this->recordDecisions(array_map(fn ($p): ToolApprovalResponse => new ToolApprovalResponse($p->approvalId, true), $pending)))->call($session);
+            approvalPairingAlteredCopy($row, $pending);
+            approvalPairingSession()->send('');
+        })(),
         // 0.3.0 (G-404): a new message whose turn then fails.
         'new_message_failed' => (function (): void {
             try {
@@ -191,6 +202,22 @@ function recordApprovalPairingRow(array $row): array
     }
 
     return $outcome;
+}
+
+/**
+ * The host's copy of the parked step (0.4.0): every call again under its id
+ * and tool, its `n` + 100, and every request kept, under the same approval id
+ * and call id.
+ *
+ * @param  array<string, mixed>  $row
+ * @param  list<ToolApprovalRequest>  $pending
+ */
+function approvalPairingAlteredCopy(array $row, array $pending): void
+{
+    approvalPairingSession()->thread()->record([new AssistantMessage('', array_map(
+        fn (array $call): ToolCall => new ToolCall($call['id'], $call['name'], ['n' => ($call['args']['n'] ?? 0) + 100]), $row['calls']), [],
+        array_map(fn (ToolApprovalRequest $p): ToolApprovalRequest => new ToolApprovalRequest($p->approvalId, $p->toolCallId, ToolApprovalRequest::ARGUMENTS_AS_SENT), $pending))],
+        toolNames: ['echo', 'free']);
 }
 
 /**

@@ -28,7 +28,7 @@ use Closure;
  */
 final class InRunRecording
 {
-    /** @var array<string, true> by run id: an unclaimed token */
+    /** @var array<string, array<string, mixed>> by run id: an unclaimed token, and what the runtime hands its one record call */
     private static array $armed = [];
 
     /**
@@ -38,26 +38,40 @@ final class InRunRecording
      */
     public static function claim(string $runId): bool
     {
+        return self::take($runId) !== null;
+    }
+
+    /**
+     * Claim the token for `$runId` and receive what the runtime handed that
+     * one record call (round 15: the step its result rows answer), or null:
+     * not the runtime's own call.
+     *
+     * @return array<string, mixed>|null
+     */
+    public static function take(string $runId): ?array
+    {
         if (! isset(self::$armed[$runId])) {
-            return false;
+            return null;
         }
+        $context = self::$armed[$runId];
         unset(self::$armed[$runId]);
 
-        return true;
+        return $context;
     }
 
     /**
      * @template T
      *
      * @param  Closure(): T  $record
+     * @param  array<string, mixed>  $context
      * @return T
      *
      * Reached only by the runtime, bound into this class: no public setter exists.
      */
-    private static function during(string $runId, Closure $record): mixed // @phpstan-ignore method.unused
+    private static function during(string $runId, Closure $record, array $context = []): mixed // @phpstan-ignore method.unused
     {
         $previous = self::$armed[$runId] ?? null;
-        self::$armed[$runId] = true;
+        self::$armed[$runId] = $context;
         try {
             return $record();
         } finally {

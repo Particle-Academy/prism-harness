@@ -40,9 +40,11 @@ final class PausedStep
         if ($type === MessageMapper::TYPE_TOOL_RESULT || $type === MessageMapper::TYPE_SYSTEM) {
             return self::RESULT;
         }
-        $calls = is_array($payload) ? ($payload['tool_calls'] ?? null) : null;
 
-        return $type === MessageMapper::TYPE_ASSISTANT && is_array($calls) && $calls !== [] ? self::STEP : self::OTHER;
+        // A step only when its calls are a non-empty list of objects (G-408),
+        // the rule MessageMapper reads calls by: a copy whose calls are a
+        // string, a number, null or a list of strings is not a step.
+        return StepRows::isStep($type, $payload) ? self::STEP : self::OTHER;
     }
 
     /**

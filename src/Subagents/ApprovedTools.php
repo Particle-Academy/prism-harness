@@ -60,6 +60,9 @@ use WeakMap;
  */
 final class ApprovedTools
 {
+    /** What a call that may not run reads: one that is no longer open (the thread keeps the outcome it has), or one no request of its own binds. */
+    public const NOT_OPEN = 'Not run: this call is not the one that was approved, or it is no longer open.';
+
     use CallsTools {
         executeToolCall as private coreExecuteToolCall;
         failedToolExecution as private coreFailedToolExecution;
@@ -98,7 +101,7 @@ final class ApprovedTools
      * @param  Closure(list<Message>):void  $record
      * @return list<StreamEvent>
      */
-    public function resolve(TextPending|StructuredPending $generation, Closure $record): array
+    public function resolve(TextPending|StructuredPending $generation, Closure $record, ?Closure $started = null): array
     {
         $this->announce();
         $request = $generation->toRequest();
@@ -108,6 +111,7 @@ final class ApprovedTools
             $generation->providerKey(),
             $request->model(),
         );
+        $announcement->starter = $started;
         $this->announcement = $announcement;
 
         $events = [];
@@ -234,6 +238,16 @@ final class ApprovedTools
         $announcement = self::$resolving[array_key_last(self::$resolving) ?? -1] ?? null;
         if ($announcement === null) {
             return self::coreExecuteToolCall($tools, $toolCall, $messageId, $deferClassification);
+        }
+        // The write-ahead started row (G-387 round 15), recorded before the
+        // call runs. A call that is no longer open (a superseding write
+        // denied it first, or it already started) does not run.
+        if ($announcement->starter !== null && ! ($announcement->starter)($toolCall)) {
+            $refused = new ToolResult($toolCall->id, $toolCall->name, $toolCall->argumentsForResult(), self::NOT_OPEN, $toolCall->resultId);
+
+            return ['toolResult' => $refused, 'events' => [new ToolResultEvent(id: EventID::generate(), timestamp: time(),
+                toolResult: $refused, messageId: $messageId, success: false, error: self::NOT_OPEN)],
+                'durationMs' => 0.0, 'failed' => true, 'failure' => 'tool_error'];
         }
         $announcement->executing++;
         $startedAt = microtime(true);

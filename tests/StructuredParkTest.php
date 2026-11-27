@@ -77,6 +77,12 @@ it('returns no document from a structured turn that parks, whatever the model wr
         ->and($response->structured())->toBe([])
         ->and($response->response->structured)->toBeNull()
         ->and($this->ran)->toBe(0);
+    // Round 15 (PHP run17 Info 6a): the raw provider steps of a parked turn
+    // carry no unchecked document either, as the top-level response does not.
+    expect($response->response->steps)->not->toBeEmpty();
+    foreach ($response->response->steps as $step) {
+        expect($step->structured)->toBe([]);
+    }
 })->with(['native output format', 'tool mode']);
 
 it('still checks the document of the turn that answers after the person decided', function (): void {

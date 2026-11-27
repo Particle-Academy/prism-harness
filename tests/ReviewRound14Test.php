@@ -32,11 +32,10 @@ use Tests\Support\G360;
 
 // G-387 round 14: the round-13 reviews' findings, in PHP.
 //
-//  - G-404: a SUPERSEDING write and the path that resolves a parked step are
-//    serialised by ONE lock, the session lock the resolver holds. A host row
-//    that would supersede a step while a run holds that lock is refused
-//    (SessionLocked), so an approved call that is running never also gets a
-//    "replaced" denial (PR1, PR2). A new message writes the replaced denials
+//  - G-404: an approved call that is running never also gets a "replaced"
+//    denial (PR1, PR2). Round 14 refused the superseding host row with the
+//    session lock; round 15 replaced that lock with the write-ahead started
+//    row, so the host row is recorded and the call is answered-in-progress. A new message writes the replaced denials
 //    and its own user row in ONE write (W1), and no decision lands in
 //    between (W2). Every pending reader honours the harness's marks.
 //  - G-403: the replay keeps every result of calls that share an id.
@@ -192,7 +191,10 @@ it('gives an approved call that is running when a host row would supersede its s
 
     r14Session()->decide([new ToolApprovalResponse($approval, true)]);
 
-    expect($host)->toBe($when === 'while the tool runs' ? 'locked' : 'recorded')
+    // Round 15 (the write-ahead started row): the host row is RECORDED, never
+    // refused; the running call is answered-in-progress, so it gets no
+    // replaced denial and keeps its one outcome.
+    expect($host)->toBe('recorded')
         ->and($this->ran)->toBe(['Paris'])
         ->and(r14Outcomes())->toBe(['call_paris' => ['Sunny in Paris']])
         ->and(r14Session()->approvalStatus($approval))->not->toBe('superseded')
@@ -403,9 +405,11 @@ it('never reads a host row recorded inside the runtime\'s own write as inside th
 // New channels the fixes could open, each pinned.
 // ---------------------------------------------------------------------------
 
-// Channel: a host naming the RUNNING run's id to pass for the runtime and
-// skip the lock. A run id proves nothing; only the runtime's claimed token does.
-it('refuses a superseding host row that names the running run\'s own id', function (): void {
+// Channel: a host naming the RUNNING run's id to pass for the runtime. A run
+// id proves nothing; only the runtime's claimed token does. Round 15: the row
+// is recorded (no lock any more), as a host row, and the call that runs keeps
+// its one outcome.
+it('records as outside a superseding host row that names the running run\'s own id', function (): void {
     $approval = r14Park();
     $host = null;
     $this->during = function () use (&$host): void {
@@ -416,8 +420,9 @@ it('refuses a superseding host row that names the running run\'s own id', functi
 
     r14Session()->decide([new ToolApprovalResponse($approval, true)]);
 
-    expect($host)->toBe('locked')
-        ->and(r14Outcomes())->toBe(['call_paris' => ['Sunny in Paris']]);
+    expect($host)->toBe('recorded')
+        ->and(r14Outcomes())->toBe(['call_paris' => ['Sunny in Paris']])
+        ->and(r14Rows())->not->toContain('replaced');
 });
 
 // Channel: a host claiming the runtime's token itself, from inside the
