@@ -23,6 +23,7 @@ use Prism\Harness\Exceptions\SessionLockLost;
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
 use Prism\Harness\Exceptions\ToolNotAvailable;
 use Prism\Harness\Flow\FlowToolset;
+use Prism\Harness\Models\Thread;
 use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\Sessions\Session;
@@ -221,6 +222,7 @@ final readonly class AgentRuntime
             try {
                 $run = $this->observedRun($run);
                 $this->assertMeteredCompaction($budget);
+                $this->endRepeatedIdStep($session, $runId);
                 // The history is read HERE, once, and handed to Prism as
                 // messages rather than as a Thread. See newMessages() for why
                 // this run has to know exactly which message objects it sent.
@@ -435,6 +437,7 @@ final readonly class AgentRuntime
             try {
                 $run = $this->observedRun($run);
                 $this->assertMeteredCompaction($budget);
+                $this->endRepeatedIdStep($session, $runId);
                 $history = iterator_to_array($session->thread()->messages(), false);
                 $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
 
@@ -649,7 +652,7 @@ final readonly class AgentRuntime
      * @internal Called by Session::streamDecision().
      *
      * @param  list<ToolApprovalResponse>  $decisions
-     * @param  Closure(): array{?string, int}  $record  runs inside the lock
+     * @param  Closure(): array{0: ?string, 1: int, 2?: list<ToolApprovalResponse>}  $record  runs inside the lock
      * @return Generator<int, RunStep>
      */
     public function streamDecisionSteps(Session $session, array $decisions, Closure $record, ?RunContext $context): Generator
@@ -671,12 +674,16 @@ final readonly class AgentRuntime
 
     /**
      * @param  list<ToolApprovalResponse>  $decisions
-     * @param  Closure(): array{?string, int}  $record
+     * @param  Closure(): array{0: ?string, 1: int, 2?: list<ToolApprovalResponse>}  $record
      * @return Generator<int, RunStep>
      */
     private function resumeLocked(Session $session, array $decisions, Closure $record, ?RunContext $context): Generator
     {
-        [$parkedRunId, $lastSeq] = $record();
+        $written = $record();
+        [$parkedRunId, $lastSeq] = $written;
+        // Report what was RECORDED, which is what the run acts on: a step
+        // whose call ids repeat records every decision as a denial (G-392).
+        $decisions = $written[2] ?? $decisions;
         $tagger = new RunStepTagger($context?->turnId, buffered: true, seq: $lastSeq, resumeRunId: $parkedRunId);
         $actor = $context?->actor;
         $context = $this->executionContext($context);
@@ -801,6 +808,7 @@ final readonly class AgentRuntime
         $resolvedFirst = [];
 
         try {
+            $this->endRepeatedIdStep($session, $runId);
             $generation = Prism::text()
                 ->using($provider, $model)
                 ->withThread($session->thread())
@@ -984,6 +992,7 @@ final readonly class AgentRuntime
         $completedCall = false;
         try {
             $run = $this->observedRun($run);
+            $this->endRepeatedIdStep($session, $runId);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
@@ -1086,6 +1095,7 @@ final readonly class AgentRuntime
         try {
             $run = $this->observedRun($run);
             $this->assertMeteredCompaction($run->budget);
+            $this->endRepeatedIdStep($session, $runId);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
                 ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
@@ -1926,6 +1936,17 @@ final readonly class AgentRuntime
         }
 
         return $session->thread()->approvalRunSteps() ?? 0;
+    }
+
+    /**
+     * Before a turn reads the conversation: a paused step whose call ids
+     * repeat gives each of its calls still without a result the G-392 denial
+     * as its result, matched by position, so none of them runs and each has
+     * exactly one outcome (see {@see Thread::endRepeatedIdStep()}).
+     */
+    private function endRepeatedIdStep(Session $session, string $runId): void
+    {
+        $session->thread()->endRepeatedIdStep(Session::REPEATED_CALL_ID_REASON, $runId);
     }
 
     private function continuePausedSteps(Session $session, string $prompt, ?RunContext $context, RunContext $run): void

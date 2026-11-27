@@ -556,9 +556,7 @@ class Session
                 ? $parked['id'] : null;
             $lastSeq = $parkedId !== null && is_int($parked['last_seq'] ?? null) ? $parked['last_seq'] : 0;
 
-            $this->recordDecisions($decisions);
-
-            return [$parkedId, $lastSeq];
+            return [$parkedId, $lastSeq, $this->recordDecisions($decisions)];
         }, $context);
     }
 
@@ -566,14 +564,17 @@ class Session
      * Where decisions are made durable, for every path that takes them.
      *
      * @param  list<ToolApprovalResponse>  $decisions
+     * @return list<ToolApprovalResponse> the decisions as recorded
      */
-    protected function recordDecisions(array $decisions): void
+    protected function recordDecisions(array $decisions): array
     {
         $decisions = $this->deniedWhenCallIdsRepeat($decisions);
 
         $this->thread()->record([
             new ToolResultMessage(toolApprovalResponses: $decisions),
         ], $this->run()['id'] ?? null);
+
+        return $decisions;
     }
 
     /**
