@@ -58,6 +58,7 @@ use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\ClassLabel;
 use Prism\Harness\Support\RunSettles;
 use Prism\Harness\Support\TurnAttachments;
+use Prism\Harness\Support\TurnMessages;
 use Prism\Harness\Tools\CancelGuardedTool;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolAuthorizer;
@@ -681,7 +682,7 @@ final readonly class AgentRuntime
             // messages rather than as a Thread. See newMessages() for why
             // this run has to know exactly which message objects it sent.
             $history = iterator_to_array($session->thread()->messages(), false);
-            $turn = $prompt === '' ? [] : [new UserMessage($prompt, $attachments)];
+            $turn = $prompt === '' ? [] : [TurnMessages::of(new UserMessage($prompt, $attachments))];
             if ($committedStart && $prompt !== '') {
                 // A runner start acts on NO recorded decision (G-387): the
                 // calls the child was parked on are ended with its task row,
@@ -939,7 +940,7 @@ final readonly class AgentRuntime
             $run = $this->observedRun($run);
             $this->assertMeteredCompaction($run);
             $history = iterator_to_array($session->thread()->messages(), false);
-            $userMessage = $prompt === '' ? null : new UserMessage($prompt, $attachments);
+            $userMessage = $prompt === '' ? null : TurnMessages::of(new UserMessage($prompt, $attachments));
 
             $generation = Prism::structured()
                 ->using($provider, $model)
@@ -1364,7 +1365,7 @@ final readonly class AgentRuntime
             $run = $this->observedRun($run);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
-                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
+                ->withMessages($prompt === '' ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
                 ->withTelemetryMetadata(sessionId: $session->key());
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);
@@ -1493,7 +1494,7 @@ final readonly class AgentRuntime
             $this->assertMeteredCompaction($run);
             $history = iterator_to_array($session->thread()->messages(), false);
             $generation = Prism::text()->using($provider, $model)
-                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
+                ->withMessages($prompt === '' ? $history : [...$history, TurnMessages::of(new UserMessage($prompt, $attachments))])
                 ->withTelemetryMetadata(sessionId: $session->key());
             if ($mode->providerOptions !== []) {
                 $generation->withProviderOptions($mode->providerOptions);

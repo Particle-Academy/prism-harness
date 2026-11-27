@@ -25,6 +25,7 @@ use Prism\Harness\Sessions\SessionAddress;
 use Prism\Harness\Subagents\RunBudgets;
 use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\MessageMapper;
+use Prism\Harness\Support\PausedStep;
 use Prism\Harness\Support\ToolResultRuns;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Contracts\Message;
@@ -571,54 +572,37 @@ class Thread extends Model implements ThreadContract
      */
     public function approvalToolNames(): ?array
     {
-        $decisions = [];
-        $after = [];
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            $payload = $stored->payload;
-            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
-                array_unshift($after, $payload);
-                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
-                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                        $decisions[$response['approval_id']] ??= ($response['approved'] ?? false) === true;
-                    }
-                }
-
-                continue;
-            }
-            if ($stored->type === MessageMapper::TYPE_USER) {
-                return null;
-            }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                continue;
-            }
-            $requests = $payload['tool_approval_requests'] ?? [];
-            if (! is_array($requests) || $requests === []) {
-                return null;
-            }
-            $scope = $payload['harness_tool_names'] ?? null;
-            if (is_array($scope) && array_is_list($scope) && array_filter($scope, static fn (mixed $name): bool => ! is_string($name) || $name === '' || $name === '*') === []) {
-                /** @var list<string> $scope */
-                return array_values(array_unique($scope));
-            }
-
-            // Older workers did not persist the offer. Never reconstruct the
-            // whole mode: only approved requests on this record are knowable.
-            // Constant diagnostic: no arguments, tool names or participant ids.
-            Log::warning('Pending approval has no valid stored tool scope; offering approved requests only.');
-            $names = [];
-            $step = self::pairedStep($payload, $after);
-            foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
-                $call = $at === null ? null : ($step['calls'][$at] ?? null);
-                if (is_string($request['approval_id'] ?? null) && ($decisions[$request['approval_id']] ?? false)
-                    && is_array($call) && is_string($call['name'] ?? null) && $call['name'] !== '' && $call['name'] !== '*') {
-                    $names[] = $call['name'];
-                }
-            }
-
-            return array_values(array_unique($names));
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return null;
+        }
+        $payload = $paused['assistant'];
+        $decisions = self::decisionsIn($paused['results']);
+        $requests = $payload['tool_approval_requests'] ?? [];
+        if (! is_array($requests) || $requests === []) {
+            return null;
+        }
+        $scope = $payload['harness_tool_names'] ?? null;
+        if (is_array($scope) && array_is_list($scope) && array_filter($scope, static fn (mixed $name): bool => ! is_string($name) || $name === '' || $name === '*') === []) {
+            /** @var list<string> $scope */
+            return array_values(array_unique($scope));
         }
 
-        return null;
+        // Older workers did not persist the offer. Never reconstruct the
+        // whole mode: only approved requests on this record are knowable.
+        // Constant diagnostic: no arguments, tool names or participant ids.
+        Log::warning('Pending approval has no valid stored tool scope; offering approved requests only.');
+        $names = [];
+        $step = self::pairedStep($payload, $paused['results']);
+        foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
+            $call = $at === null ? null : ($step['calls'][$at] ?? null);
+            if (is_string($request['approval_id'] ?? null) && ($decisions[$request['approval_id']] ?? false)
+                && is_array($call) && is_string($call['name'] ?? null) && $call['name'] !== '' && $call['name'] !== '*') {
+                $names[] = $call['name'];
+            }
+        }
+
+        return array_values(array_unique($names));
     }
 
     /**
@@ -721,36 +705,66 @@ class Thread extends Model implements ThreadContract
      */
     public function decidedApprovalIdsAwaitingResult(): array
     {
-        $answered = [];
-        $after = [];
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            $payload = $stored->payload;
-            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
-                array_unshift($after, $payload);
-                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
-                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                        $answered[$response['approval_id']] = true;
-                    }
-                }
-
-                continue;
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return [];
+        }
+        $answered = self::decisionsIn($paused['results']);
+        $step = self::pairedStep($paused['assistant'], $paused['results']);
+        $ids = [];
+        foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
+            if (is_string($request['approval_id'] ?? null) && isset($answered[$request['approval_id']])
+                && is_string($request['tool_call_id'] ?? null) && $at !== null && ! $step['answered'][$at]) {
+                $ids[] = $request['approval_id'];
             }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                return [];
-            }
-            $step = self::pairedStep($payload, $after);
-            $ids = [];
-            foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
-                if (is_string($request['approval_id'] ?? null) && isset($answered[$request['approval_id']])
-                    && is_string($request['tool_call_id'] ?? null) && $at !== null && ! $step['answered'][$at]) {
-                    $ids[] = $request['approval_id'];
-                }
-            }
-
-            return array_values(array_unique($ids));
         }
 
-        return [];
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * The step a decision can apply to: the run paused at the transcript
+     * tail, chosen by the ONE rule every such reader uses ({@see PausedStep},
+     * G-397), with the result rows after it, oldest first. Null when the
+     * conversation moved on past it, or nothing is paused.
+     *
+     * @return array{position: int, assistant: array<string, mixed>, results: list<array<string, mixed>>}|null
+     */
+    private function pausedStep(): ?array
+    {
+        $found = PausedStep::find(
+            $this->storedMessages()->reorder('position', 'desc')->cursor(),
+            static fn ($stored): string => PausedStep::kindOfRow((string) $stored->type, $stored->payload),
+        );
+        if ($found === null) {
+            return null;
+        }
+
+        return [
+            'position' => (int) $found['step']->position,
+            'assistant' => $found['step']->payload,
+            'results' => array_map(static fn ($stored): array => $stored->payload, $found['results']),
+        ];
+    }
+
+    /**
+     * The decisions in result rows, by approval id: the FIRST recorded answer.
+     *
+     * @param  list<array<string, mixed>>  $results  oldest first
+     * @return array<string, bool>
+     */
+    private static function decisionsIn(array $results): array
+    {
+        $decisions = [];
+        foreach ($results as $payload) {
+            foreach ($payload['tool_approval_responses'] ?? [] as $response) {
+                if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                    $decisions[$response['approval_id']] ??= ($response['approved'] ?? false) === true;
+                }
+            }
+        }
+
+        return $decisions;
     }
 
     /**
@@ -912,39 +926,24 @@ class Thread extends Model implements ThreadContract
      */
     public function unansweredApprovals(): array
     {
-        $answered = [];
-        $after = [];
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            $payload = $stored->payload;
-            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
-                array_unshift($after, $payload);
-                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
-                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                        $answered[$response['approval_id']] = true;
-                    }
-                }
-
-                continue;
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return [];
+        }
+        $answered = self::decisionsIn($paused['results']);
+        // Each request's OWN call, by position (round 13): never the last
+        // call that happens to share its id.
+        $step = self::pairedStep($paused['assistant'], $paused['results']);
+        $unanswered = [];
+        foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
+            $call = $at === null ? null : ($step['calls'][$at] ?? null);
+            if (is_string($request['approval_id'] ?? null) && ! isset($answered[$request['approval_id']])
+                && is_string($request['tool_call_id'] ?? null) && is_array($call) && is_string($call['id'] ?? null) && is_string($call['name'] ?? null)) {
+                $unanswered[] = ['name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
             }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                return [];
-            }
-            // Each request's OWN call, by position (round 13): never the last
-            // call that happens to share its id.
-            $step = self::pairedStep($payload, $after);
-            $unanswered = [];
-            foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
-                $call = $at === null ? null : ($step['calls'][$at] ?? null);
-                if (is_string($request['approval_id'] ?? null) && ! isset($answered[$request['approval_id']])
-                    && is_string($request['tool_call_id'] ?? null) && is_array($call) && is_string($call['id'] ?? null) && is_string($call['name'] ?? null)) {
-                    $unanswered[] = ['name' => $call['name'], 'arguments' => $call['arguments'] ?? []];
-                }
-            }
-
-            return $unanswered;
         }
 
-        return [];
+        return $unanswered;
     }
 
     /**
@@ -959,37 +958,20 @@ class Thread extends Model implements ThreadContract
      */
     public function pendingApprovalIds(): array
     {
-        $answered = [];
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            $payload = $stored->payload;
-            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
-                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
-                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                        $answered[$response['approval_id']] = true;
-                    }
-                }
-
-                continue;
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return [];
+        }
+        $answered = self::decisionsIn($paused['results']);
+        $pending = [];
+        foreach ($paused['assistant']['tool_approval_requests'] ?? [] as $request) {
+            if (is_array($request) && is_string($request['approval_id'] ?? null) && $request['approval_id'] !== ''
+                && ! array_key_exists($request['approval_id'], $answered)) {
+                $pending[] = $request['approval_id'];
             }
-            if ($stored->type === MessageMapper::TYPE_USER) {
-                return [];
-            }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                continue;
-            }
-
-            $pending = [];
-            foreach ($payload['tool_approval_requests'] ?? [] as $request) {
-                if (is_array($request) && is_string($request['approval_id'] ?? null) && $request['approval_id'] !== ''
-                    && ! isset($answered[$request['approval_id']])) {
-                    $pending[] = $request['approval_id'];
-                }
-            }
-
-            return array_values(array_unique($pending));
         }
 
-        return [];
+        return array_values(array_unique($pending));
     }
 
     /**
@@ -1002,28 +984,21 @@ class Thread extends Model implements ThreadContract
      */
     public function pausedStepRepeatsCallIds(): bool
     {
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            if ($stored->type === MessageMapper::TYPE_USER) {
-                return false;
-            }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                continue;
-            }
-
-            $callIds = [];
-            foreach ($stored->payload['tool_calls'] ?? [] as $call) {
-                $callIds[] = is_array($call) && is_scalar($call['id'] ?? null) ? (string) $call['id'] : '';
-            }
-            $requestCallIds = [];
-            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
-                $requestCallIds[] = is_array($request) && is_scalar($request['tool_call_id'] ?? null) ? (string) $request['tool_call_id'] : '';
-            }
-
-            return count($callIds) !== count(array_unique($callIds, SORT_STRING))
-                || count($requestCallIds) !== count(array_unique($requestCallIds, SORT_STRING));
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return false;
+        }
+        $callIds = [];
+        foreach ($paused['assistant']['tool_calls'] ?? [] as $call) {
+            $callIds[] = is_array($call) && is_scalar($call['id'] ?? null) ? (string) $call['id'] : '';
+        }
+        $requestCallIds = [];
+        foreach ($paused['assistant']['tool_approval_requests'] ?? [] as $request) {
+            $requestCallIds[] = is_array($request) && is_scalar($request['tool_call_id'] ?? null) ? (string) $request['tool_call_id'] : '';
         }
 
-        return false;
+        return count($callIds) !== count(array_unique($callIds, SORT_STRING))
+            || count($requestCallIds) !== count(array_unique($requestCallIds, SORT_STRING));
     }
 
     /**
@@ -1038,24 +1013,14 @@ class Thread extends Model implements ThreadContract
      */
     public function pausedApprovalIds(): array
     {
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            if ($stored->type === MessageMapper::TYPE_USER) {
-                return [];
+        $ids = [];
+        foreach ($this->pausedStep()['assistant']['tool_approval_requests'] ?? [] as $request) {
+            if (is_array($request) && is_string($request['approval_id'] ?? null) && $request['approval_id'] !== '') {
+                $ids[] = $request['approval_id'];
             }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                continue;
-            }
-            $ids = [];
-            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
-                if (is_array($request) && is_string($request['approval_id'] ?? null) && $request['approval_id'] !== '') {
-                    $ids[] = $request['approval_id'];
-                }
-            }
-
-            return array_values(array_unique($ids));
         }
 
-        return [];
+        return array_values(array_unique($ids));
     }
 
     /**
@@ -1118,47 +1083,35 @@ class Thread extends Model implements ThreadContract
      */
     public function approvedCallsAwaitingResult(string $name, string $argumentsDigest): int
     {
-        /** @var array<string, bool> $answers by approval id; read newest first, so the last write is the first answer */
-        $answers = [];
-        $after = [];
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            $payload = $stored->payload;
-            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
-                array_unshift($after, $payload);
-                foreach (array_reverse($payload['tool_approval_responses'] ?? []) as $response) {
-                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
-                        $answers[$response['approval_id']] = ($response['approved'] ?? false) === true;
-                    }
-                }
-
+        $paused = $this->pausedStep();
+        if ($paused === null) {
+            return 0;
+        }
+        // A step whose call ids repeat runs none of its gated calls, whatever
+        // was decided or however the decision reached the thread (G-392,
+        // G-397): it gives no gated tool any approval evidence.
+        if ($this->pausedStepRepeatsCallIds()) {
+            return 0;
+        }
+        $approved = array_filter(self::decisionsIn($paused['results']));
+        // Each approved request's OWN call, and a result of its own
+        // (round 13): a same-id sibling's result finishes nothing.
+        $step = self::pairedStep($paused['assistant'], $paused['results']);
+        $count = 0;
+        foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
+            $call = $at === null ? null : ($step['calls'][$at] ?? null);
+            if (! is_string($request['approval_id'] ?? null) || ! isset($approved[$request['approval_id']])
+                || ! is_string($request['tool_call_id'] ?? null) || ! is_array($call) || ! is_string($call['id'] ?? null)
+                || $step['answered'][$at] || ($call['name'] ?? null) !== $name) {
                 continue;
             }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                return 0;
+            $arguments = $call['arguments'] ?? [];
+            if (CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments) === $argumentsDigest) {
+                $count++;
             }
-            $approved = array_filter($answers);
-            // Each approved request's OWN call, and a result of its own
-            // (round 13): a same-id sibling's result finishes nothing.
-            $step = self::pairedStep($payload, $after);
-
-            $count = 0;
-            foreach ($step['requests'] as ['request' => $request, 'call' => $at]) {
-                $call = $at === null ? null : ($step['calls'][$at] ?? null);
-                if (! is_string($request['approval_id'] ?? null) || ! isset($approved[$request['approval_id']])
-                    || ! is_string($request['tool_call_id'] ?? null) || ! is_array($call) || ! is_string($call['id'] ?? null)
-                    || $step['answered'][$at] || ($call['name'] ?? null) !== $name) {
-                    continue;
-                }
-                $arguments = $call['arguments'] ?? [];
-                if (CanonicalJson::digest(is_string($arguments) ? (json_decode($arguments, true) ?? []) : $arguments) === $argumentsDigest) {
-                    $count++;
-                }
-            }
-
-            return $count;
         }
 
-        return 0;
+        return $count;
     }
 
     /**

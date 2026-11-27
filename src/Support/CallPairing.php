@@ -18,10 +18,10 @@ use Prism\Prism\ValueObjects\ToolResult;
  * its id, so the gated call looked finished: the step did not park on it, a
  * runner start never ended it, and its approval was handed to the wrong call.
  *
- * - A result answers ONE call: the first call not yet answered in the same
- *   row that has its id and its tool name, else the first that has its id.
- *   Each row is matched on its own, because a row may repeat the results of
- *   an earlier one (a resume records every result of the step again).
+ * - A result answers ONE call: the first call with its id (and its tool
+ *   name, when one matches) that no earlier row answered, else the first not
+ *   yet taken in the same row. A row may add one result to a step (an ended
+ *   call) or repeat every result of it (a resume records them all again).
  * - A request is issued for ONE call: the first call not yet paired that has
  *   its id and that no result of the step's own run answered (a call that
  *   ran was never waiting on a person, so an ungated call is never given an
@@ -47,7 +47,13 @@ final class CallPairing
         foreach ($rows as $results) {
             $taken = [];
             foreach ($results as [$id, $name]) {
-                $at = self::firstFree($calls, $taken, $id, $name) ?? self::firstFree($calls, $taken, $id, null);
+                // A call no earlier row answered first: a row that adds one
+                // result (an ended call, a resolved approval) adds it to a
+                // call still open, while a row that repeats every result of
+                // the step (a resume) still answers each call once.
+                $open = $taken + array_filter($answered);
+                $at = self::firstFree($calls, $open, $id, $name) ?? self::firstFree($calls, $taken, $id, $name)
+                    ?? self::firstFree($calls, $open, $id, null) ?? self::firstFree($calls, $taken, $id, null);
                 if ($at !== null) {
                     $taken[$at] = true;
                     $answered[$at] = true;

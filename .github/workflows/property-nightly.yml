@@ -6,9 +6,10 @@ name: Property tests (long set)
 # examples and a seed taken from the run, so each run explores new cases and
 # logs the seed to replay them (PRISM_PROPERTY_SEED=<seed>).
 #
-# `schedule` fires only from the default branch. The matrix names main only:
-# a release line that does not carry the property file would fail here for
-# that reason alone, so a line is added once it carries the file.
+# `schedule` fires only from the default branch, and the job checks out the
+# commit the run is for (the default branch on a schedule, the chosen ref on
+# a dispatch), never a ref named in the workflow: a release line runs its own
+# dispatch-only copy once it carries the property file.
 #
 # Actions are pinned to full commit SHAs: actions/checkout v4.2.2 (the pin
 # used elsewhere in this estate) and shivammathur/setup-php 2.40.0 (the
@@ -31,18 +32,16 @@ permissions:
 
 jobs:
   property:
-    name: property / ${{ matrix.ref }} / ${{ matrix.os }}
+    name: property / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        ref: [main]
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ matrix.ref }}
           persist-credentials: false
       # A dispatch passes its input as given, even empty: an invalid value
       # fails here, never falls back to a default. A schedule has no input.

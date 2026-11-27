@@ -7,6 +7,7 @@ namespace Prism\Harness\Subagents;
 use Closure;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Support\CallPairing;
+use Prism\Harness\Support\PausedStep;
 use Prism\Prism\Concerns\CallsTools;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\TelemetryOperation;
@@ -199,9 +200,16 @@ final class ApprovedTools
             // resolver, which keys results and requests by call id (G-387
             // round 13): every gated call in it gets ONE recorded outcome, the
             // repeated-id denial, and none of them runs.
-            $resolution = self::repeatsCallIds($request)
-                ? $this->resolveRepeatedStep($request, EventID::generate())
-                : $this->resolveToolApprovalsAndYieldEvents($request, EventID::generate());
+            //
+            // And only the PAUSED step is resolved, chosen by the one rule
+            // every paused-step reader uses (G-397): a step the conversation
+            // moved past (an answer, a user turn, a system row after it) has
+            // nothing a decision can still apply to, so nothing resolves it.
+            $resolution = PausedStep::indexIn($request->messages()) === null
+                ? []
+                : (self::repeatsCallIds($request)
+                    ? $this->resolveRepeatedStep($request, EventID::generate())
+                    : $this->resolveToolApprovalsAndYieldEvents($request, EventID::generate()));
             foreach ($resolution as $event) {
                 $events[] = $event;
             }
@@ -273,14 +281,13 @@ final class ApprovedTools
      */
     private static function lastStep(TextRequest|StructuredRequest $request): ?array
     {
+        // The paused step, by the shared rule (G-397), never merely the
+        // newest step with tool calls.
         $messages = $request->messages();
-        for ($i = count($messages) - 1; $i >= 0; $i--) {
-            if ($messages[$i] instanceof AssistantMessage && $messages[$i]->toolCalls !== []) {
-                return [$messages[$i], $i];
-            }
-        }
+        $at = PausedStep::indexIn($messages);
+        $step = $at === null ? null : $messages[$at];
 
-        return null;
+        return $step instanceof AssistantMessage ? [$step, $at] : null;
     }
 
     /** Whether the step being resumed repeats a call id among its calls or its approval requests (G-392). */
@@ -320,11 +327,15 @@ final class ApprovedTools
         $results = [];
         $responses = [];
         for ($i = $at + 1, $n = count($messages); $i < $n; $i++) {
-            if (! $messages[$i] instanceof ToolResultMessage) {
+            if (PausedStep::kindOfMessage($messages[$i]) !== PausedStep::RESULT) {
                 // The conversation moved on past this step: it was settled
                 // (and the replay folds its same-id results into one, so they
                 // can no longer be counted). Nothing here is open.
                 return;
+            }
+            if (! $messages[$i] instanceof ToolResultMessage) {
+                // This turn's own prompt.
+                continue;
             }
             $indexes[] = $i;
             $rows[] = CallPairing::ofResults($messages[$i]->toolResults);

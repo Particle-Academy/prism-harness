@@ -1165,7 +1165,12 @@ the other's, so a gated call sharing its id with an ungated one still waits for 
 (every decision on such a step is recorded as a denial, and nothing gated in it runs) and a
 start still ends it. When such a step is resumed, the harness resolves it itself rather than
 core's resolver, which keys by id: every gated call in it gets exactly one result, the
-repeated-id denial, and an ungated call that ran is never given an approval or a denial. The mark is one shape in all three languages, pinned by the
+repeated-id denial, and an ungated call that ran is never given an approval or a denial.
+A decision applies only to the step that asked for it: the paused step is the newest assistant
+step with tool calls when only result rows follow it, chosen by one rule for every reader (the
+decision checks, the repeated-id guard, the resolver and the plan's readers). Any other row
+written after it (an answer, a user turn, a system row) ends that step's approvals: a decision is
+refused, nothing resolves the step, and no gated tool there counts as approved. The mark is one shape in all three languages, pinned by the
 `harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
 `{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
