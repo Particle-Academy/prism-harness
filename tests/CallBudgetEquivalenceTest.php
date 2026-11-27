@@ -177,7 +177,9 @@ it('bounds approved tool results before the resumed model call and never execute
     Http::preventStrayRequests();
     for ($attempt = 0; $attempt < 2; $attempt++) {
         try {
-            callBudgetRun($shape, $session, $run);
+            // A resume (no new message): a new message would supersede the
+            // parked step and deny the call instead (DECISION B).
+            callBudgetRun($shape, $session, $run, prompt: '');
             $this->fail('The approved result makes the actual input exceed the cap.');
         } catch (RunNotPermitted $failure) {
             expect($failure->code())->toBe('call_budget_exceeded');
@@ -187,7 +189,7 @@ it('bounds approved tool results before the resumed model call and never execute
     // A later, deliberately larger allowance admits the already-resolved
     // input. Core must skip the persisted result, not re-run the side effect.
     callBudgetRun($shape, $session, new RunContext($run->ledger,
-        new RunBudget(10, 1.0, maxOutputTokensPerCall: 10), pricing: $run->pricing));
+        new RunBudget(10, 1.0, maxOutputTokensPerCall: 10), pricing: $run->pricing), prompt: '');
     Http::assertSentCount(1);
     $results = $session->thread()->storedMessages()->where('type', 'tool_result')->get()
         ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])
@@ -218,14 +220,15 @@ it('writes approved stream results before yielding resolution events and survive
     Http::fakeSequence()->push(budgetSseReply(2, true));
     Http::preventStrayRequests();
     $run = callBudgetContext();
-    $stream = $session->stream('go', context: $run);
+    // A resume: a new message would supersede the parked step (DECISION B).
+    $stream = $session->stream('', context: $run);
     expect($stream->current())->toBeInstanceOf(ToolResultEvent::class);
     Http::assertSentCount(0);
     expect($invoked)->toBe(1)
         ->and(json_encode($session->thread()->storedMessages()->get()->pluck('payload')->all()))->toContain('resolved');
     unset($stream);
     expect($run->ledger->reservedCostUsd())->toBe(0.0)->and($run->ledger->unmeteredRuns())->toBe(0);
-    foreach ($session->stream('go', context: $run) as $event) {
+    foreach ($session->stream('', context: $run) as $event) {
     }
     Http::assertSentCount(1);
     expect($invoked)->toBe(1)->and($run->ledger->reservedCostUsd())->toBe(0.0);
@@ -251,7 +254,7 @@ it('honors tree cancellation before executing an already-approved side effect', 
     $run = callBudgetContext();
     $run->ledger->cancel('cancelled');
     $fake = Prism::fake([TextResponseFake::make()]);
-    expect(fn () => callBudgetRun($shape, $session, $run))->toThrow(RunNotPermitted::class);
+    expect(fn () => callBudgetRun($shape, $session, $run, prompt: ''))->toThrow(RunNotPermitted::class);
     $fake->assertCallCount(0);
     expect($invoked)->toBe(0)->and($run->ledger->reservedCostUsd())->toBe(0.0);
 })->with(['send', 'structured', 'stream']);

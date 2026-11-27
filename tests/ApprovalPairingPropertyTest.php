@@ -69,6 +69,7 @@ use Tests\Support\G360;
 const PP_REPEATED = 'Tool call was not run because another call in this step has the same id';
 const PP_NO_RESPONSE = 'No approval response provided';
 const PP_DENIED = 'User denied tool execution';
+const PP_SUPERSEDED = 'Not run: a later step replaced it.';
 const PP_ID_POOL = ['a', 'b', 'c', ''];
 const PP_PATHS = ['send', 'structured', 'streamSteps'];
 
@@ -305,12 +306,15 @@ function ppExpected(array $c): array
 
     if (in_array($c['between'] ?? 'none', ['assistant', 'user', 'system'], true)) {
         // The conversation moved on past the parked step (G-397): no decision
-        // applies to it, so no gated call runs, and a gated call with no result
-        // gets at most the default refusal, never a run.
+        // applies to it and no gated call runs. An assistant or a user row
+        // SUPERSEDES it (DECISION B): each gated call with no result gets
+        // exactly one denial. A system row only ends it: at most the default
+        // refusal, never a run.
         $runs = [];
+        $supersedes = in_array($c['between'], ['assistant', 'user'], true);
         foreach ($c['calls'] as $index => $call) {
             if ($call['tool'] === 'echo' && ! in_array($index, $c['prior'], true)) {
-                $outcome[$call['token']] = null;
+                $outcome[$call['token']] = $supersedes ? PP_SUPERSEDED : null;
             }
         }
     }

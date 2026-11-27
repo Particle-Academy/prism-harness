@@ -9,7 +9,10 @@ use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
+use Prism\Prism\ValueObjects\ToolCall;
 use Tests\Fixtures\Participant;
 
 // The cross-language approval-pairing corpus (harness-approval-pairing, G-392).
@@ -43,7 +46,7 @@ function approvalPairingSession(): Session
 
 /**
  * @param  array<string, mixed>  $row
- * @return array{approvals: int, free: int, ran: list<int>, decided: list<bool|null>}
+ * @return array{approvals: int, free: int, ran: list<int>, decided: list<bool|null>, outcomes?: list<string|null>}
  */
 function recordApprovalPairingRow(array $row): array
 {
@@ -90,6 +93,16 @@ function recordApprovalPairingRow(array $row): array
 
     $pending = approvalPairingSession()->send('go')->pendingApprovals();
 
+    // DECISION B (0.2.0): a row that supersedes the parked step, recorded by
+    // a host (outside the run that owns the step), or a new message.
+    match ($row['supersede'] ?? null) {
+        null => null,
+        'assistant_tool_step' => approvalPairingSession()->thread()->record([new AssistantMessage('', [new ToolCall('later', 'free', [])])]),
+        'assistant_text' => approvalPairingSession()->thread()->record([new AssistantMessage('A later answer.')]),
+        'user' => approvalPairingSession()->thread()->record([new UserMessage('A later message.')]),
+        'new_message' => approvalPairingSession()->send('Something else.'),
+    };
+
     foreach ($row['rounds'] as $round) {
         $decisions = array_map(
             fn (array $decision): ToolApprovalResponse => new ToolApprovalResponse($pending[$decision[0]]->approvalId, $decision[1]),
@@ -110,7 +123,26 @@ function recordApprovalPairingRow(array $row): array
     $recorded = approvalPairingSession()->thread()->approvalDecisions();
     $decided = array_map(fn ($request): ?bool => $recorded[$request->approvalId] ?? null, $pending);
 
-    return ['approvals' => count($pending), 'free' => PairingCorpusRan::$free, 'ran' => $ran, 'decided' => $decided];
+    $outcome = ['approvals' => count($pending), 'free' => PairingCorpusRan::$free, 'ran' => $ran, 'decided' => $decided];
+    if (array_key_exists('supersede', $row)) {
+        // The result each call of the first step ended with, in call order:
+        // its first result, or null.
+        $first = [];
+        $after = false;
+        foreach (approvalPairingSession()->thread()->storedMessages()->orderBy('position')->get() as $stored) {
+            if ($stored->type === 'assistant' && ($stored->payload['tool_calls'] ?? []) !== [] && ! $after) {
+                $after = true;
+
+                continue;
+            }
+            foreach ($after && $stored->type === 'tool_result' ? $stored->payload['tool_results'] ?? [] : [] as $entry) {
+                $first[$entry['tool_call_id']] ??= $entry['result'];
+            }
+        }
+        $outcome['outcomes'] = array_map(fn (array $call): ?string => $first[$call['id']] ?? null, $row['calls']);
+    }
+
+    return $outcome;
 }
 
 it('has rows', function (): void {

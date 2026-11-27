@@ -92,14 +92,14 @@ function callBudgetResponses(string $shape, bool $finish = false, array $costs =
     return $responses;
 }
 
-function callBudgetRun(string $shape, Session $session, ?RunContext $context, array $attachments = []): void
+function callBudgetRun(string $shape, Session $session, ?RunContext $context, array $attachments = [], string $prompt = 'go'): void
 {
     if ($shape === 'structured') {
-        $session->sendStructured('go', callBudgetSchema(), additionalContent: $attachments, context: $context);
+        $session->sendStructured($prompt, callBudgetSchema(), additionalContent: $attachments, context: $context);
     } elseif ($shape === 'stream') {
-        foreach ($session->stream('go', additionalContent: $attachments, context: $context) as $event) {
+        foreach ($session->stream($prompt, additionalContent: $attachments, context: $context) as $event) {
         }
     } else {
-        $session->send('go', additionalContent: $attachments, context: $context);
+        $session->send($prompt, additionalContent: $attachments, context: $context);
     }
 }

@@ -301,7 +301,9 @@ final class ApprovalToolScopeTest extends TestCase
         }
         self::assertSame(0, $ceilingCalls);
         Http::assertSentCount(1);
-        self::assertSame($rows + 3, $fresh->thread()->storedMessages()->count());
+        // The concurrent turn's three rows, and the one denial its user row
+        // gave the call it superseded (DECISION B, G-387 round 13).
+        self::assertSame($rows + 4, $fresh->thread()->storedMessages()->count());
     }
 
     /** @return iterable<string, array{string, bool, bool}> */
