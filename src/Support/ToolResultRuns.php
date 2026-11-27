@@ -37,16 +37,17 @@ class ToolResultRuns
      * @param  iterable<int, Message>  $messages
      * @param  array<int, int>  $answers  message index => index of the step that
      *                                    harness result row answers (G-407)
+     * @param  array<int, true>  $additive  the rows of new outcomes, by object id: they restate no earlier result (G-412)
      * @return Generator<int, Message>
      */
-    public static function fold(iterable $messages, array $answers = []): Generator
+    public static function fold(iterable $messages, array $answers = [], array $additive = []): Generator
     {
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
         $final = self::finalDecisions($messages);
 
         yield from self::oncePerSegment(array_map(
             static fn (Message $message): Message => $message instanceof ToolResultMessage ? self::withFinalDecisions($message, $final) : $message,
-            self::earlierStepsAnswered(iterator_to_array(self::foldRuns(self::resultsAfterTheirStep(self::withAnswersInPlace($messages, $answers))), false)),
+            self::earlierStepsAnswered(iterator_to_array(self::foldRuns(self::resultsAfterTheirStep(self::withAnswersInPlace($messages, $answers)), $additive), false)),
         ));
     }
 
@@ -204,9 +205,10 @@ class ToolResultRuns
 
     /**
      * @param  iterable<int, Message>  $messages
+     * @param  array<int, true>  $additive
      * @return Generator<int, Message>
      */
-    private static function foldRuns(iterable $messages): Generator
+    private static function foldRuns(iterable $messages, array $additive = []): Generator
     {
         /** @var list<ToolResultMessage> $run */
         $run = [];
@@ -219,7 +221,7 @@ class ToolResultRuns
             }
 
             if ($run !== []) {
-                yield static::merge($run);
+                yield static::merge($run, $additive);
                 $run = [];
             }
 
@@ -227,7 +229,7 @@ class ToolResultRuns
         }
 
         if ($run !== []) {
-            yield static::merge($run);
+            yield static::merge($run, $additive);
         }
     }
 
@@ -350,8 +352,9 @@ class ToolResultRuns
 
     /**
      * @param  list<ToolResultMessage>  $run
+     * @param  array<int, true>  $additive
      */
-    protected static function merge(array $run): ToolResultMessage
+    protected static function merge(array $run, array $additive = []): ToolResultMessage
     {
         if (count($run) === 1) {
             return $run[0];
@@ -364,12 +367,14 @@ class ToolResultRuns
 
         foreach ($run as $message) {
             $seen = [];
+            $adds = isset($additive[spl_object_id($message)]);
             foreach ($message->toolResults as $result) {
                 // The same call is the same id, tool name and arguments, the
                 // n-th such result of a row replacing the n-th of an earlier
-                // row; never the id alone.
+                // row; never the id alone. A row of new outcomes (G-412)
+                // restates nothing: its results come after those held.
                 $same = self::callKey($result);
-                $seen[$same] = ($seen[$same] ?? 0) + 1;
+                $seen[$same] = ($seen[$same] ?? ($adds ? count(array_filter(array_keys($results), static fn (string $key): bool => str_starts_with($key, $same.'#'))) : 0)) + 1;
                 $results[$same.'#'.$seen[$same]] = $result;
             }
 

@@ -423,6 +423,7 @@ class Thread extends Model implements ThreadContract
         $messages = [];
         $positions = [];
         $marks = [];
+        $additive = [];
         $interrupted = $this->interruptedCalls();
         foreach ($this->storedMessages()->lazy() as $stored) {
             $position = (int) $stored->position;
@@ -435,11 +436,15 @@ class Thread extends Model implements ThreadContract
                 }
                 $messages[] = new ToolResultMessage([$interrupted[$position]['result']]);
                 $marks[count($messages) - 1] = $interrupted[$position]['step'];
+                $additive[spl_object_id($messages[count($messages) - 1])] = true;
 
                 continue;
             }
             $messages[] = self::withOwnProviderContent($stored->toPrismMessage());
             $positions[$position] = count($messages) - 1;
+            if (($stored->payload[self::NEW_OUTCOMES] ?? null) === true) {
+                $additive[spl_object_id($messages[count($messages) - 1])] = true;
+            }
             $mark = $stored->payload[self::ANSWERS_STEP]['position'] ?? null;
             if (is_int($mark)) {
                 $marks[count($messages) - 1] = $mark;
@@ -452,7 +457,7 @@ class Thread extends Model implements ThreadContract
             }
         }
 
-        yield from ToolResultRuns::fold($messages, $answers);
+        yield from ToolResultRuns::fold($messages, $answers, $additive);
     }
 
     /**
@@ -813,7 +818,7 @@ class Thread extends Model implements ThreadContract
      * @param  list<Message>  $messages
      * @param  list<string>|null  $toolNames
      */
-    private function writeRows(array $messages, ?string $runId, ?array $toolNames, bool $outside, ?int $answers = null, bool $endSteps = true): self
+    private function writeRows(array $messages, ?string $runId, ?array $toolNames, bool $outside, ?int $answers = null, bool $endSteps = true, bool $newOutcomes = false): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
@@ -832,7 +837,7 @@ class Thread extends Model implements ThreadContract
         // A turn that half-writes leaves a tool call with no result, which
         // replays to the model as an unanswered question rather than as an
         // error anyone can see.
-        return DB::transaction(function () use ($messages, $runId, $toolNames, $outside, $answers, $endSteps): self {
+        return DB::transaction(function () use ($messages, $runId, $toolNames, $outside, $answers, $endSteps, $newOutcomes): self {
             // Locks the thread ROW so a concurrent recorder waits instead of
             // reading the same max. A no-op on SQLite, which is why the suite
             // cannot exercise this and why the guarantee lives in the database.
@@ -867,6 +872,12 @@ class Thread extends Model implements ThreadContract
                     // ended because their step was superseded, under these
                     // approvals. MessageMapper does not send it back.
                     $payload[self::REPLACED_MARK] = ['approval_ids' => $marks[$message]];
+                }
+                if ($message instanceof ToolResultMessage && ($newOutcomes || isset($marks[$message]))) {
+                    // Only new outcomes, for calls with none: the replay
+                    // adds them to the results held, never in their place,
+                    // even for a call identical to one answered (G-412).
+                    $payload[self::NEW_OUTCOMES] = true;
                 }
                 if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== []) {
                     // Harness metadata on the same durable approval record.
@@ -1018,7 +1029,7 @@ class Thread extends Model implements ThreadContract
                 toolCallResultId: $call->resultId,
             ),
             $open,
-        ))], $runId, null, false, $step['position'], false);
+        ))], $runId, null, false, $step['position'], false, true);
 
         return true;
     }
@@ -1394,7 +1405,7 @@ class Thread extends Model implements ThreadContract
                 toolCallResultId: $call->resultId,
             ),
             $open,
-        ))], $runId, null, false, $step['position'], false);
+        ))], $runId, null, false, $step['position'], false, true);
 
         return true;
     }
@@ -1455,7 +1466,7 @@ class Thread extends Model implements ThreadContract
             return false;
         }
 
-        $this->writeRows([new ToolResultMessage($results)], $runId, null, false, $step['position'], false);
+        $this->writeRows([new ToolResultMessage($results)], $runId, null, false, $step['position'], false, true);
 
         return true;
     }
@@ -1471,6 +1482,9 @@ class Thread extends Model implements ThreadContract
     {
         return $this->resolvableStep()['position'] ?? null;
     }
+
+    /** The payload key marking a harness row of new outcomes only: it restates no earlier result (G-412). */
+    public const NEW_OUTCOMES = 'harness_new_outcomes';
 
     /** The payload key naming the step a harness result row answers (G-407). */
     public const ANSWERS_STEP = 'harness_answers_step';
