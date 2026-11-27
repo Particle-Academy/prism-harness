@@ -1,0 +1,55 @@
+name: Property tests (long set)
+
+# The long run of the approval pairing property tests (G-392 QC), the same
+# shape as prism-harness-ts. The fast, fixed-seed set runs in Tests on every
+# push and pull request; this runs only the property file, with many more
+# examples and a seed taken from the run, so each run explores new cases and
+# logs the seed to replay them (PRISM_PROPERTY_SEED=<seed>).
+#
+# `schedule` fires only from the default branch. The matrix names main only:
+# a release line that does not carry the property file would fail here for
+# that reason alone, so a line is added once it carries the file.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      examples:
+        description: Examples per property
+        required: false
+        default: '2000'
+
+permissions:
+  contents: read
+
+jobs:
+  property:
+    name: property / ${{ matrix.ref }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [main]
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, bcmath, fileinfo
+          coverage: none
+      - name: Install dependencies
+        run: composer update --prefer-stable --prefer-dist --no-interaction --no-progress
+      - name: Property tests
+        shell: bash
+        env:
+          PRISM_PROPERTY_EXAMPLES: ${{ inputs.examples || '2000' }}
+          PRISM_PROPERTY_BASE_SEED: ${{ github.run_id }}
+        run: |
+          echo "PRISM_PROPERTY_BASE_SEED=$PRISM_PROPERTY_BASE_SEED PRISM_PROPERTY_EXAMPLES=$PRISM_PROPERTY_EXAMPLES"
+          vendor/bin/pest tests/ApprovalPairingPropertyTest.php

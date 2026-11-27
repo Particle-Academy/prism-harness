@@ -2943,3 +2943,30 @@ it('finishes a run an Error stopped through the path that runs the plan after-tu
         ->and($planReadAfter)->toBeGreaterThan(0)
         ->and(sgRoot()->run()['status'] ?? null)->toBe('failed');
 });
+
+// Brief item (Py send_structured AssertionError; PHP checked): a structured
+// turn whose FIRST step stops for approval returns the structured response
+// type with its pending approvals and no document. It used to reach document
+// validation and raise a schema violation over a turn that was waiting on a
+// person, so a caller that retries discards what the person was asked about.
+it('returns a structured response with its pending approvals when the first step parks', function (): void {
+    sgParkingRoot();
+    G360::calls([['weather', ['city' => 'Paris']]]);
+    G360::text('{"title":"Never read"}');
+    $schema = new ObjectSchema('doc', 'A document.', [new StringSchema('title', 'The title.')], ['title']);
+    $finished = [];
+    Event::listen(RunFinished::class, function (RunFinished $event) use (&$finished): void {
+        $finished[] = $event->awaitingApproval;
+    });
+
+    $response = sgRoot()->sendStructured('Go', $schema);
+    $pending = sgRoot()->thread()->pendingApprovalIds();
+
+    expect($response->awaitingApproval())->toBeTrue()
+        ->and(array_map(fn (ToolApprovalRequest $request): string => $request->approvalId, $response->pendingApprovals()))->toBe($pending)
+        ->and($pending)->toHaveCount(1)
+        ->and($response->structured())->toBe([])
+        ->and($finished)->toBe([true])
+        ->and($this->ran['weather'])->toBe(0)
+        ->and(sgRoot()->run()['status'] ?? null)->toBe('completed');
+});

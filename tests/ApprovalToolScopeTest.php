@@ -343,9 +343,12 @@ final class ApprovalToolScopeTest extends TestCase
         };
         $sequence = Http::fakeSequence();
         // Shared streams now preserve the native approval identity at each
-        // one-call boundary, including on the minimum supported core. Initial
-        // structured transcript gaps remain separately recorded in G-229.2.
-        $knownGap = $initial && $surface === 'structured';
+        // one-call boundary, including on the minimum supported core. An
+        // initial structured turn records its parked step's approval requests
+        // too (G-387 round 13; the structured part of G-229.2), so no surface
+        // here is a known gap any more. The branch stays for a surface that
+        // becomes one: it must still prove the dropped call fails closed.
+        $knownGap = false;
         $sequence->push($reply(1, 'scope_safe', $initial && $surface === 'stream'), 200,
             $initial && $surface === 'stream' ? ['Content-Type' => 'text/event-stream'] : []);
         foreach ([2, 3] as $index) {
@@ -369,8 +372,9 @@ final class ApprovalToolScopeTest extends TestCase
             try {
                 $session->sendStructured('A test turn.', callBudgetSchema(), ['scope_safe'], context: $context);
             } catch (StructuredSchemaViolation) {
-                // Pending structured responses currently reach document
-                // validation after recording. Scope must survive that path.
+                // A structured turn that parks now returns its pending
+                // approvals (G-387 round 13); a document failure elsewhere in
+                // this setup must still leave the scope intact.
             }
         } else {
             $session->send('A test turn.', ['scope_safe'], context: $context);
