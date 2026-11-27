@@ -8,9 +8,12 @@ use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
+use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
+use Prism\Prism\ValueObjects\ToolCall;
 use Tests\Fixtures\Participant;
 
 // G-392/G-397/G-404: a write that would supersede a parked step, made WHILE a
@@ -129,6 +132,50 @@ it('refuses a new message while the approved call runs, and keeps one outcome', 
     supersedeRunningResumes()[$resume](supersedeRunningSession(), $approvalId);
 
     expect($this->refused)->toBe(SessionLocked::class)
+        ->and($this->ran)->toBe(['Paris'])
+        ->and(supersedeRunningOutcomes())->toBe(['Sunny in Paris']);
+})->with(array_keys(supersedeRunningResumes()));
+
+it('serialises a host tool-call step written while the approved call runs, and keeps one outcome', function (string $resume, string $laterId): void {
+    $approvalId = supersedeRunningSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
+    $this->refused = null;
+    $this->during = function () use ($laterId): void {
+        $this->during = null;
+        try {
+            // A later step, with its own gated call (its id sometimes the
+            // running call's), recorded by the host while the call runs.
+            supersedeRunningSession()->thread()->record([new AssistantMessage('', [new ToolCall($laterId, 'weather', ['city' => 'Rome'])], [],
+                [new ToolApprovalRequest('apr_later', $laterId, ToolApprovalRequest::ARGUMENTS_AS_SENT)])], null, ['weather']);
+        } catch (SessionLocked $e) {
+            $this->refused = $e::class;
+        }
+    };
+
+    supersedeRunningResumes()[$resume](supersedeRunningSession(), $approvalId);
+
+    expect($this->refused)->toBe(SessionLocked::class)
+        ->and($this->ran)->toBe(['Paris'])
+        ->and(supersedeRunningOutcomes())->toBe(['Sunny in Paris']);
+})->with(array_keys(supersedeRunningResumes()))->with(['its own id' => ['later'], 'the running call\'s id' => ['c1']]);
+
+it('refuses another run on the same session while the approved call runs', function (string $resume): void {
+    $approvalId = supersedeRunningSession()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
+    $this->refused = [];
+    $this->during = function (): void {
+        $this->during = null;
+        $other = app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
+        foreach ([fn () => $other->send(''), fn () => iterator_to_array($other->stream('Go on.'), false)] as $turn) {
+            try {
+                $turn();
+            } catch (SessionLocked $e) {
+                $this->refused[] = $e::class;
+            }
+        }
+    };
+
+    supersedeRunningResumes()[$resume](supersedeRunningSession(), $approvalId);
+
+    expect($this->refused)->toBe([SessionLocked::class, SessionLocked::class])
         ->and($this->ran)->toBe(['Paris'])
         ->and(supersedeRunningOutcomes())->toBe(['Sunny in Paris']);
 })->with(array_keys(supersedeRunningResumes()));

@@ -327,6 +327,38 @@ function pairingGenerate(int $seed): array
         $case['steps'] = [$steps[0]];
         $case['repeats'] = $repeats === [] ? [$g->pick(['send', 'stream', 'redecide', 'lateApprove'])] : $repeats;
     }
+    // Two IDENTICAL gated calls (same id, tool and arguments): a copy of one
+    // of the first step's gated calls, right after it.
+    if ($gated !== [] && $g->chance(0.2)) {
+        $case = pairingWithTwin($case, $g->pick($gated));
+    }
+
+    return $case;
+}
+
+/** `$case` with an identical copy of the first step's gated call `$k` right after it. */
+function pairingWithTwin(array $case, int $k): array
+{
+    $step = $case['steps'][0];
+    $shift = fn (int $i): int => $i > $k ? $i + 1 : $i;
+    $calls = [];
+    foreach ($step['calls'] as $i => $call) {
+        $calls[] = $call;
+        if ($i === $k) {
+            $calls[] = $call;
+        }
+    }
+    $decisions = [];
+    foreach ($step['decisions'] as $i => $decision) {
+        $decisions[$shift($i)] = $decision;
+    }
+    $decisions[$k + 1] = $step['decisions'][$k];
+    ksort($decisions);
+    $case['steps'][0] = [...$step, 'calls' => $calls, 'decisions' => $decisions, 'order' => array_map($shift, $step['order'])];
+    if (($case['insert'] ?? null) !== null) {
+        $case['insert']['call'] = $shift($case['insert']['call']);
+    }
+    $case['twin'] = $k;
 
     return $case;
 }
@@ -847,6 +879,22 @@ function pairingViolations(array $case, array $observed): array
                 ($case['mode'] ?? 'normal') === 'replaced' || $expected['superseded'] => PAIRING_REPLACED_REASON,
                 default => null,
             };
+            $sharing = count(array_keys(array_column($step['calls'], 'token'), $token, true));
+            if ($fixed !== null && $sharing > 1) {
+                // Identical calls: one outcome each. A forged result answers
+                // one of them; the others end as the step's ids repeat.
+                $want = $expected['forged'] === $k
+                    ? [...array_fill(0, $sharing - 1, Session::REPEATED_CALL_ID_REASON), 'forged:'.$token]
+                    : array_fill(0, $sharing, $fixed);
+                $sorted = $got;
+                sort($sorted);
+                sort($want);
+                if ($sorted !== $want) {
+                    $violations[] = "inv5: identical gated calls {$token} should end with ".json_encode($want).', recorded '.json_encode($got);
+                }
+
+                continue;
+            }
             if ($fixed !== null) {
                 if (array_values(array_unique($got)) !== [$fixed]) {
                     $violations[] = "inv5: gated {$token} should end with only ".json_encode($fixed).', recorded '.json_encode($got);
@@ -857,14 +905,16 @@ function pairingViolations(array $case, array $observed): array
             if ($expected['refused']) {
                 // The provider refused the turn: at most one outcome, and a
                 // run only for a call its own approval approved.
-                if (count($got) > 1 || (in_array('ran:'.$token, $got, true) && ! in_array($token, $oracle['may'], true))) {
+                if (count($got) > count(array_keys(array_column($step['calls'], 'token'), $token, true)) || (in_array('ran:'.$token, $got, true) && ! in_array($token, $oracle['may'], true))) {
                     $violations[] = "inv5: gated {$token} in a refused turn recorded ".json_encode($got);
                 }
 
                 continue;
             }
-            if (count($got) !== 1) {
-                $violations[] = "inv5: gated {$token} has ".count($got).' recorded outcomes '.json_encode($got);
+            // One outcome per CALL, counted: identical calls each have one.
+            $calls = count(array_keys(array_column($step['calls'], 'token'), $token, true));
+            if (count($got) !== $calls) {
+                $violations[] = "inv5: gated {$token} has ".count($got)." recorded outcomes for {$calls} calls ".json_encode($got);
 
                 continue;
             }
@@ -968,7 +1018,8 @@ function pairingReplayViolations(array $case, array $observed): array
             $times = count($replayed[$s][$call['token']] ?? []);
             // Never lost from the replay, and exactly once in its segment,
             // across every replayed row of it.
-            if ($distinct === 1 && $times !== 1) {
+            $calls = count(array_keys(array_column($step['calls'], 'token'), $call['token'], true));
+            if ($distinct === 1 && $times !== $calls) {
                 $violations[] = "inv5: {$call['token']}'s own result is replayed {$times} times";
             }
             if ($distinct === 0 && $times > 1) {
@@ -1339,6 +1390,9 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
                 $seen['decision '.$decision] = true;
             }
         }
+        if (($case['twin'] ?? null) !== null) {
+            $seen['two identical gated calls in one step'] = true;
+        }
         if ($case['insert'] !== null) {
             $seen['insert '.$case['insert']['kind'].' '.$case['insert']['when']] = true;
             if ($case['mode'] === 'spent' && $case['repeats'] !== []) {
@@ -1397,7 +1451,7 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'replaced, then insert tool_empty before_decision', 'replaced, then insert tool_empty after_decision',
         'replaced, then insert tool_result before_decision', 'replaced, then insert tool_result after_decision',
         'a forged result in the earlier step\'s segment', 'a forged result in the later step\'s segment',
-        'an id reused in a later step', 'a later step with its arguments stored as a string',
+        'an id reused in a later step', 'a later step with its arguments stored as a string', 'two identical gated calls in one step',
         'results sharing a call id, with other arguments, in later rows of one segment',
         'a later call with the id and arguments of an earlier call that ran',
     ]);
