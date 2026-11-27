@@ -123,6 +123,9 @@ final class PairingPropertyWorld
 
     public static int $item = 0;
 
+    /** @var list<list<array<string, mixed>>> the messages of every provider request sent */
+    public static array $requests = [];
+
     public static int $participant = 0;
 }
 
@@ -168,6 +171,8 @@ beforeEach(function (): void {
     ]);
 
     Http::fake(['*' => function (HttpRequest $request) {
+        $sent = json_decode((string) $request->body(), true);
+        PairingPropertyWorld::$requests[] = is_array($sent['messages'] ?? null) ? $sent['messages'] : [];
         $next = array_shift(PairingPropertyWorld::$queue) ?? ['kind' => 'text'];
         $content = [['type' => 'text', 'text' => '{"ok":true}']];
         if ($next['kind'] === 'calls') {
@@ -554,6 +559,7 @@ function pairingRun(array $case): array
     PairingPropertyWorld::$queue = [];
     PairingPropertyWorld::$served = [];
     PairingPropertyWorld::$ran = [];
+    PairingPropertyWorld::$requests = [];
     foreach ($case['steps'] as $s => $step) {
         PairingPropertyWorld::$queue[] = ['kind' => 'calls', 'step' => $s, 'calls' => $step['calls']];
     }
@@ -1021,6 +1027,7 @@ function pairingViolations(array $case, array $observed): array
     }
 
     array_push($violations, ...pairingReplayViolations($case, $observed));
+    array_push($violations, ...pairingSentViolations(PairingPropertyWorld::$requests));
 
     // Full equality: what ran is what the oracle says runs (plus, in a turn
     // the provider refused, any call its own approval approved).
@@ -1032,6 +1039,44 @@ function pairingViolations(array $case, array $observed): array
     }
 
     return $violations;
+}
+
+/**
+ * 7, as SENT: in every provider request, each tool_use block is answered by
+ * a tool_result block in the very next message. A provider rejects a
+ * request that is not, so a thread replayed out of that order fails every
+ * later turn.
+ *
+ * @param  list<list<array<string, mixed>>>  $requests
+ * @return list<string>
+ */
+function pairingSentViolations(array $requests): array
+{
+    $violations = [];
+    foreach ($requests as $r => $messages) {
+        foreach ($messages as $i => $message) {
+            $content = is_array($message['content'] ?? null) ? $message['content'] : [];
+            $uses = array_values(array_filter($content, fn (mixed $block): bool => is_array($block) && ($block['type'] ?? null) === 'tool_use'));
+            if ($uses === []) {
+                continue;
+            }
+            $next = is_array($messages[$i + 1]['content'] ?? null) ? $messages[$i + 1]['content'] : [];
+            $answered = array_map(fn (array $block): mixed => $block['tool_use_id'] ?? null,
+                array_values(array_filter($next, fn (mixed $block): bool => is_array($block) && ($block['type'] ?? null) === 'tool_result')));
+            foreach ($uses as $use) {
+                // An empty id cannot be paired by id at all: core sends its
+                // result with no tool_use_id. Not what this checks.
+                if (($use['id'] ?? '') === '') {
+                    continue;
+                }
+                if (! in_array($use['id'], $answered, true)) {
+                    $violations[] = "inv7: request {$r} sends tool_use ".json_encode($use['id'] ?? null)." at message {$i} with no tool_result in the next message";
+                }
+            }
+        }
+    }
+
+    return array_values(array_unique($violations));
 }
 
 /**
