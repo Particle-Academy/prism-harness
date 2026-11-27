@@ -7,7 +7,9 @@ on:
       - "*.x"
       # A release line: the publish guard needs a Tests run for the exact
       # commit a tag names, and "*.x" does not match across the slash.
-      - "release/*.x"
+      # Every release branch, not only `release/*.x`: a patch line such as
+      # release/0.26.8 matched nothing before (G-387 round 13).
+      - "release/**"
   pull_request:
 
 permissions:
@@ -282,6 +284,19 @@ jobs:
           node .third-party-allowlist/third-party/check.mjs --repo tools/engine-fixture/fancy-formula-real
           node .third-party-allowlist/third-party/check.mjs --repo tools/engine-fixture/fancy-flow
           node -e "require('node:fs').rmSync('.third-party-allowlist',{recursive:true,force:true})"
+
+  # The property nightly's example count is validated by a script (G-392 QC):
+  # it must refuse every value that is not a whole number from 1 to 100000.
+  property-examples:
+    name: Property example count validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: tools/property-examples.sh must refuse what it claims to
+        run: sh tools/property-examples.test.sh
 
   release-notes:
     name: Release-notes check

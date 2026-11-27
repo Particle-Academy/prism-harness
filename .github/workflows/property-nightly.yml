@@ -9,6 +9,12 @@ name: Property tests (long set)
 # `schedule` fires only from the default branch. The matrix names main only:
 # a release line that does not carry the property file would fail here for
 # that reason alone, so a line is added once it carries the file.
+#
+# Actions are pinned to full commit SHAs: actions/checkout v4.2.2 (the pin
+# used elsewhere in this estate) and shivammathur/setup-php 2.40.0 (the
+# commit its v2 and 2.40.0 tags both dereference to, read with
+# `gh api repos/shivammathur/setup-php/git/ref/tags/<tag>` and then
+# `git/tags/<sha>` for the annotated tag).
 
 on:
   schedule:
@@ -16,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       examples:
-        description: Examples per property
+        description: Examples per property (a whole number from 1 to 100000)
         required: false
         default: '2000'
 
@@ -34,11 +40,23 @@ jobs:
         ref: [main]
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ matrix.ref }}
           persist-credentials: false
-      - uses: shivammathur/setup-php@v2
+      # A dispatch passes its input as given, even empty: an invalid value
+      # fails here, never falls back to a default. A schedule has no input.
+      - name: Validate the example count
+        id: examples
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          GIVEN: ${{ inputs.examples }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then value="$GIVEN"; else value=2000; fi
+          count="$(sh tools/property-examples.sh "$value")"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: '8.4'
           extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, bcmath, fileinfo
@@ -48,7 +66,7 @@ jobs:
       - name: Property tests
         shell: bash
         env:
-          PRISM_PROPERTY_EXAMPLES: ${{ inputs.examples || '2000' }}
+          PRISM_PROPERTY_EXAMPLES: ${{ steps.examples.outputs.count }}
           PRISM_PROPERTY_BASE_SEED: ${{ github.run_id }}
         run: |
           echo "PRISM_PROPERTY_BASE_SEED=$PRISM_PROPERTY_BASE_SEED PRISM_PROPERTY_EXAMPLES=$PRISM_PROPERTY_EXAMPLES"

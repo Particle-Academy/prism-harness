@@ -73,9 +73,21 @@ const PP_PATHS = ['send', 'structured', 'streamSteps'];
 /** The seeds that broke the rule on prism-harness-ts main 63ccf38 (BRIEF-R13). */
 const PP_REGRESSION_SEEDS = [2034523272, 232174035, 2060958372];
 
-function ppPositive(string|false $value, int $fallback): int
+/**
+ * A whole number read from the environment, or `$fallback` when the variable
+ * is NOT SET. A value that is set and is not a whole number in range fails:
+ * a run never explores a different count, or seed, than the one asked for.
+ */
+function ppPositive(string|false $value, int $fallback, int $min = 0, int $max = PHP_INT_MAX): int
 {
-    return is_string($value) && preg_match('/\A\d+\z/', $value) === 1 ? (int) $value : $fallback;
+    if ($value === false) {
+        return $fallback;
+    }
+    if (preg_match('/\A(0|[1-9]\d{0,17})\z/', $value) !== 1 || (int) $value < $min || (int) $value > $max) {
+        throw new InvalidArgumentException("Property test setting '{$value}' must be a whole number from {$min} to {$max}.");
+    }
+
+    return (int) $value;
 }
 
 // ---------------------------------------------------------------------------
@@ -767,10 +779,10 @@ it('holds for the seeds that broke the rule on TS main', function (int $seed): v
 
 it('holds over generated steps', function (): void {
     $replay = getenv('PRISM_PROPERTY_SEED');
-    $examples = ppPositive(getenv('PRISM_PROPERTY_EXAMPLES'), 150);
+    $examples = ppPositive(getenv('PRISM_PROPERTY_EXAMPLES'), 150, 1, 100000);
     $base = ppPositive(getenv('PRISM_PROPERTY_BASE_SEED'), 0x6392);
-    $seeds = is_string($replay) && $replay !== ''
-        ? [ppU32((int) $replay)]
+    $seeds = $replay !== false
+        ? [ppU32(ppPositive($replay, 0))]
         : array_map(fn (int $index): int => ppCaseSeed($base, $index), range(0, $examples - 1));
     $started = microtime(true);
     ppHolds($seeds);
@@ -779,7 +791,7 @@ it('holds over generated steps', function (): void {
 });
 
 it('the generator reaches every shape the brief asks for', function (): void {
-    $examples = max(ppPositive(getenv('PRISM_PROPERTY_EXAMPLES'), 150), 150);
+    $examples = max(ppPositive(getenv('PRISM_PROPERTY_EXAMPLES'), 150, 1, 100000), 150);
     $base = ppPositive(getenv('PRISM_PROPERTY_BASE_SEED'), 0x6392);
     $cases = array_map(fn (int $index): array => ppGenerate(ppCaseSeed($base, $index)), range(0, $examples - 1));
     $has = fn (Closure $predicate): bool => array_filter($cases, $predicate) !== [];
@@ -793,4 +805,14 @@ it('the generator reaches every shape the brief asks for', function (): void {
     foreach (PP_PATHS as $path) {
         expect($has(fn (array $c): bool => $c['resume'] === $path))->toBeTrue();
     }
+});
+
+it('refuses a property setting that is set but is not a whole number in range', function (string $value): void {
+    expect(fn () => ppPositive($value, 150, 1, 100000))->toThrow(InvalidArgumentException::class);
+})->with(['', '0', '-1', '1.5', '1e3', 'abc', ' 5', '+5', '007', '100001', '99999999999999999999']);
+
+it('reads a property setting only when it is set', function (): void {
+    expect(ppPositive(false, 150, 1, 100000))->toBe(150)
+        ->and(ppPositive('2000', 150, 1, 100000))->toBe(2000)
+        ->and(ppPositive('25490', 0))->toBe(25490);
 });
