@@ -916,7 +916,9 @@ class Thread extends Model implements ThreadContract
                         && ($digest === null || StepRows::argsDigest($paired['calls'][$at]['arguments'] ?? []) === $digest) ? $request['approval_id'] : false;
                 }
             }
-            if (! is_string($approval)) {
+            // The decision that stands for it, read now: a denial recorded
+            // since the run read its history stops the call (G-401).
+            if (! is_string($approval) || ($this->approvalDecisions()[$approval] ?? false) !== true) {
                 return false;
             }
             $this->storedMessages()->create([

@@ -15,6 +15,7 @@ use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Tool;
@@ -333,7 +334,7 @@ it('records a started row for the approved call before it runs, in its own segme
         ->and($result->payload['harness_answers_step'])->toBe(['position' => (int) $step->position]);
 });
 
-it('reads a started call that never got a result as interrupted, and never runs it again', function (): void {
+it('reads a started call that never got a result as interrupted, and never runs it again', function (string $path): void {
     $approval = r15Park();
     $kept = null;
     // The worker dies while the tool runs: everything written after the
@@ -353,7 +354,7 @@ it('reads a started call that never got a result as interrupted, and never runs 
     // interrupted (never "not run").
     for ($i = 0; $i < 3; $i++) {
         G360::text('Resumed.');
-        r15Session()->send('');
+        $path === 'send' ? r15Session()->send('') : iterator_to_array(r15Session()->streamSteps(''), false);
     }
     expect($this->ran)->toBe(['Paris'])
         ->and(r15SentOutputs())->toBe(['call_paris' => [R15_INTERRUPTED]])
@@ -363,7 +364,7 @@ it('reads a started call that never got a result as interrupted, and never runs 
     // A second decision on it is refused: running it again needs a fresh approval.
     expect(r15Try(fn () => r15Session()->decide([new ToolApprovalResponse($approval, true)])))->not->toBe('recorded')
         ->and($this->ran)->toBe(['Paris']);
-});
+})->with(['send', 'streamSteps']);
 
 it('gives an interrupted call no replaced denial when a later row supersedes its step', function (): void {
     $approval = r15Park();
@@ -780,4 +781,29 @@ it('reads a parked step whose tool_calls mix an object call with non-objects as 
 
     expect($this->ran)->toBe(['Paris'])
         ->and(r15Outcomes())->toBe(['call_paris' => ['Sunny in Paris']]);
+});
+
+it('refuses to start a call whose standing decision is no longer an approval', function (bool $denied): void {
+    $approval = r15Park();
+    $session = r15Session();
+    (fn () => $this->recordDecisions([new ToolApprovalResponse($approval, true)]))->call($session);
+    if ($denied) {
+        // A denial that landed after the run read its history.
+        r15RawRow(['tool_results' => [], 'tool_approval_responses' => [['approval_id' => $approval, 'approved' => false, 'reason' => 'No.']]]);
+    }
+    $thread = r15Session()->thread();
+    $position = (int) $thread->storedMessages()->where('type', 'assistant')->max('position');
+    $start = fn (): bool => $thread->recordStarted('run_gate', $position, 'call_paris', 'weather', ['city' => 'Paris']);
+
+    $started = (Closure::bind(static fn (): mixed => InRunRecording::during('run_gate', $start), null, InRunRecording::class))();
+
+    expect($started)->toBe(! $denied);
+})->with([true, false]);
+
+it('refuses a started row from anyone but the runtime', function (): void {
+    r15Park();
+    $thread = r15Session()->thread();
+
+    expect(r15Try(fn () => $thread->recordStarted('run_x', 2, 'call_paris', 'weather', ['city' => 'Paris'])))->toBe(LogicException::class)
+        ->and(r15Rows())->not->toContain('started');
 });

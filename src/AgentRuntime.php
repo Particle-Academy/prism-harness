@@ -214,6 +214,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
+                unset($this->answering[$runId]);
             }
         }
     }
@@ -244,6 +245,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
+                unset($this->answering[$runId]);
             }
         }
     }
@@ -932,6 +934,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
+                unset($this->answering[$runId]);
             }
         }
     }
@@ -1451,6 +1454,7 @@ final readonly class AgentRuntime
                 $unwatch();
                 $this->rememberSeq($session, $runId, $tagger);
                 ToolRefusals::forget($runId);
+                unset($this->answering[$runId]);
             });
         try {
             $this->refuseSpentRun($session, $runId, $run, $run->budget, $prompt);
@@ -1458,6 +1462,7 @@ final readonly class AgentRuntime
             $unwatch();
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
+            unset($this->answering[$runId]);
 
             throw $refused;
         }
@@ -1539,6 +1544,7 @@ final readonly class AgentRuntime
             }
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
+            unset($this->answering[$runId]);
         }
     }
 
@@ -1584,6 +1590,7 @@ final readonly class AgentRuntime
                 $unwatch();
                 $this->rememberSeq($session, $runId, $tagger);
                 ToolRefusals::forget($runId);
+                unset($this->answering[$runId]);
             });
         // The same refusal as every other path, before anything is recorded:
         // no user row, and no result closing an approval still pending.
@@ -1593,6 +1600,7 @@ final readonly class AgentRuntime
             $unwatch();
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
+            unset($this->answering[$runId]);
 
             throw $refused;
         }
@@ -1663,6 +1671,7 @@ final readonly class AgentRuntime
             }
             $this->rememberSeq($session, $runId, $tagger);
             ToolRefusals::forget($runId);
+            unset($this->answering[$runId]);
         }
     }
 
@@ -3432,6 +3441,7 @@ final readonly class AgentRuntime
         } finally {
             if ($runId !== null) {
                 ToolRefusals::forget($runId);
+                unset($this->answering[$runId]);
             }
         }
     }
