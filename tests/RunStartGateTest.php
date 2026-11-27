@@ -7,6 +7,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentRuntime;
+use Prism\Harness\Contracts\HasErrorCode;
 use Prism\Harness\Events\RunFailed;
 use Prism\Harness\Events\RunStarted;
 use Prism\Harness\Exceptions\RunNotPermitted;
@@ -1067,4 +1068,438 @@ it('keeps a start whose run failed after its task row was recorded', function ()
         ->and(sgChild()->childBinding())->not->toBeNull()
         ->and(sgChild()->childDelegation())->not->toBeNull()
         ->and(sgChild()->thread()->storedMessages()->where('type', 'user')->count())->toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// G-387 round 9: a runner start's records are PROVISIONAL until its task row
+// exists in the child's thread. Every reader treats a provisional record whose
+// task row is missing as absent, so no second write is needed to undo a
+// failed start, and a runner start acts on no recorded decision.
+// ---------------------------------------------------------------------------
+
+/** Make every write that would undo the child's binding record fail, as a store outage would. */
+function sgFailChildUndo(): void
+{
+    foreach (['UPDATE', 'DELETE'] as $op) {
+        DB::statement("CREATE TRIGGER sg_undo_{$op} BEFORE {$op} ON harness_session_state
+            WHEN OLD.key LIKE '%::sub::worker:child'
+            BEGIN SELECT RAISE(ABORT, 'SECRET outage'); END");
+    }
+}
+
+function sgUnfailChildUndo(): void
+{
+    DB::statement('DROP TRIGGER IF EXISTS sg_undo_UPDATE');
+    DB::statement('DROP TRIGGER IF EXISTS sg_undo_DELETE');
+}
+
+/** The code a decision on the child is refused with, or `accepted`. */
+function sgApproveCode(string $approval): string
+{
+    try {
+        sgChild()->approve($approval);
+    } catch (RunNotPermitted $e) {
+        return $e->code();
+    }
+
+    return 'accepted';
+}
+
+/** The code a host turn on the child is refused with, or `ran`. */
+function sgHostTurnCode(string $prompt): string
+{
+    try {
+        sgChild()->send($prompt);
+    } catch (RunNotPermitted $e) {
+        return $e->code();
+    }
+
+    return 'ran';
+}
+
+/** The raw binding record of the child, as stored. */
+function sgRawChild(): ?array
+{
+    $row = DB::table('harness_session_state')->where('key', sgChild()->key().':child')->first();
+
+    return $row === null ? null : json_decode((string) $row->payload, true);
+}
+
+/** Rewrite the child's stored binding record. */
+function sgWriteChild(Closure $edit): void
+{
+    $key = sgChild()->key().':child';
+    $payload = $edit(sgRawChild());
+    DB::table('harness_session_state')->where('key', $key)->update(['payload' => json_encode($payload)]);
+}
+
+/** One re-delegation through the subagent tool; returns the tool output text. */
+function sgRedelegate(string $task = 'Again'): string
+{
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => $task]]]);
+    G360::text('Done again.');
+    G360::text('Handled.');
+    sgPad(3);
+    $before = count(G360::outputs());
+    sgRoot()->send('Go again');
+
+    return implode(' ', array_slice(G360::outputs(), $before));
+}
+
+// R12-1: the start fails after commit (b) AND its undo fails. No second
+// write is needed: the start's records are provisional, and with no task
+// row they read as absent.
+it('keeps a dead approval dead when a failed start cannot be undone either', function (string $where, string $entry): void {
+    $on = false;
+    sgFlakyRegistry($on);
+    $dead = sgDeadChild();
+    if ($where === 'tool registry') {
+        $on = true;
+    } else {
+        sgFailRunBegin();
+    }
+    sgFailChildUndo();
+
+    if ($entry === 'tool') {
+        G360::$queue = [];
+        G360::calls([['worker', ['task' => 'Start over']]]);
+        G360::text('Handled.');
+        sgPad(3);
+        sgRoot()->send('Go');
+        expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"');
+    } else {
+        G360::$queue = [];
+        sgPad(3);
+        $root = 'run_'.str_repeat('a', 24);
+        $result = sgRunner()->run(sgWorker(3), sgRoot(), RunContext::root($root, new RunBudget(8)), $root, 'Start over');
+        expect($result->outcome->value)->toBe('failed');
+    }
+    $on = false;
+    sgUnfailRunBegin();
+    sgUnfailChildUndo();
+
+    // The undo did fail: the start's own record is still stored.
+    expect(sgRawChild())->not->toBeNull();
+    $requests = sgRequests();
+    expect(sgApproveCode($dead))->toBe('child_binding_missing')
+        ->and(sgHostTurnCode('Hello'))->toBe('child_binding_missing')
+        ->and(sgRequests())->toBe($requests)
+        ->and($this->ran['weather'])->toBe(0)
+        ->and(sgChild()->childBinding())->toBeNull();
+
+    // Not blocked: the next delegation starts the child.
+    expect(sgRedelegate())->toContain('"outcome":"completed"')
+        ->and($this->ran['weather'])->toBe(0);
+})->with(['tool registry', 'run begin'])->with(['tool', 'runner']);
+
+// R12-2: a decision recorded on the child between commit (b) and its task
+// row is never acted on: not by this start, not by the next delegation, not
+// by a host resume.
+it('never acts on a decision recorded between commit (b) and the task row', function (bool $fails): void {
+    $on = false;
+    sgFlakyRegistry($on);
+    $dead = sgDeadChild();
+    $recorded = false;
+    Event::listen(RunStarted::class, function (RunStarted $event) use (&$recorded, $dead, $fails, &$on): void {
+        if ($recorded || ! str_contains($event->sessionKey, '::sub::worker')) {
+            return;
+        }
+        $recorded = true;
+        // Another process records a decision in the window.
+        $child = sgChild();
+        (fn () => $this->recordDecisions([new ToolApprovalResponse($dead, true)]))->call($child);
+        $on = $fails;
+    });
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::text('Child done.');
+    G360::text('Handled.');
+    sgPad(3);
+
+    sgRoot()->send('Go');
+    $on = false;
+
+    expect($recorded)->toBeTrue()
+        ->and($this->ran['weather'])->toBe(0);
+    if ($fails) {
+        expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+            ->and(sgHostTurnCode(''))->toBe('child_binding_missing');
+    }
+    expect(sgRedelegate())->toContain('"outcome":"completed"')
+        ->and($this->ran['weather'])->toBe(0);
+    // And a host resume afterwards runs nothing of it either.
+    G360::$queue = [];
+    sgPad(3);
+    try {
+        sgChild()->send('');
+    } catch (Throwable) {
+    }
+    expect($this->ran['weather'])->toBe(0);
+})->with(['start succeeds' => [false], 'start fails' => [true]]);
+
+// Item 5 (P3): a person approved while the binding was alive; the binding
+// was then lost. A bare resume is refused, and a re-delegation runs nothing
+// of it, through the tool and through the runner.
+it('never runs on a re-delegation an approval a bare resume would refuse', function (string $entry): void {
+    sgParkedChild();
+    sgAnswered();
+    DB::table('harness_session_state')->where('key', sgChild()->key().':child')->delete();
+    expect(sgHostTurnCode(''))->toBe('child_binding_missing');
+
+    if ($entry === 'tool') {
+        expect(sgRedelegate())->toContain('"outcome":"completed"');
+    } else {
+        G360::$queue = [];
+        G360::text('Child done.');
+        sgPad(3);
+        $root = 'run_'.str_repeat('b', 24);
+        $result = sgRunner()->run(sgWorker(3), sgRoot(), RunContext::root($root, new RunBudget(8)), $root, 'Start over');
+        expect($result->outcome->value)->toBe('completed');
+    }
+    expect($this->ran['weather'])->toBe(0);
+    // The call is closed for good: a later host turn does not run it.
+    G360::$queue = [];
+    G360::text('Later.');
+    sgPad(3);
+    sgChild()->send('Later');
+    expect($this->ran['weather'])->toBe(0);
+})->with(['tool', 'runner']);
+
+// The normal path: a provisional record whose task row exists is the
+// record, exactly. A crash right after the task row (no housekeeping clear
+// ever runs) changes nothing.
+it('reads a provisional record whose task row exists exactly like a confirmed one', function (): void {
+    sgParkedChild();
+    $raw = sgRawChild();
+    $child = sgChild();
+    $pending = $child->thread()->pendingApprovalIds();
+    $runId = $child->thread()->approvalRunId($pending[0]);
+
+    expect($raw['child_binding']['provisional'] ?? null)->toBe($runId)
+        ->and($child->childBinding())->not->toBeNull()
+        ->and($child->childDelegation())->not->toBeNull()
+        ->and($child->childStepCeiling())->toBe(3);
+    G360::text('Done.');
+    sgChild()->approve($pending[0]);
+    expect($this->ran['weather'])->toBe(1);
+});
+
+it('reads a garbage provisional mark as absent, and a record without one as before', function (mixed $mark): void {
+    sgParkedChild();
+    $pending = sgChild()->thread()->pendingApprovalIds();
+    sgWriteChild(function (array $payload) use ($mark): array {
+        if ($mark === '(legacy)') {
+            unset($payload['child_binding']['provisional']);
+        } else {
+            $payload['child_binding']['provisional'] = $mark;
+        }
+
+        return $payload;
+    });
+
+    if ($mark === '(legacy)') {
+        expect(sgChild()->childBinding())->not->toBeNull();
+        G360::text('Done.');
+        sgChild()->approve($pending[0]);
+        expect($this->ran['weather'])->toBe(1);
+
+        return;
+    }
+    $child = sgChild();
+    expect($child->childBinding())->toBeNull()
+        ->and($child->childDepth())->toBe(0)
+        ->and($child->childTree())->toBeNull()
+        ->and($child->childPlanLedger())->toBeNull()
+        ->and($child->childStepCeiling())->toBeNull()
+        ->and($child->childDelegation())->toBeNull()
+        ->and(sgApproveCode($pending[0]))->toBe('child_binding_missing')
+        ->and($this->ran['weather'])->toBe(0);
+})->with([
+    'legacy' => ['(legacy)'],
+    'a number' => [123],
+    'an empty string' => [''],
+    'not a run id' => ['garbage'],
+    'a list' => [['run_cccccccccccccccccccccccc']],
+    'null' => [null],
+]);
+
+// New channels: what confirms a provisional record is the task row of THAT
+// run, a user row recorded with its run id.
+it('confirms a provisional record only by a user row recorded under its run id', function (string $case): void {
+    sgParkedChild();
+    $child = sgChild();
+    $pending = $child->thread()->pendingApprovalIds();
+    $parkedRun = $child->thread()->approvalRunId($pending[0]);
+    $other = 'run_'.str_repeat('d', 24);
+    // A host forging the id of an old task row gains no more than a record
+    // with no mark at all, which a host-written record already is.
+    $mark = $case === 'an old task row' ? $parkedRun : $other;
+    expect($child->thread()->storedMessages()->where('type', 'user')->exists())->toBeTrue();
+    sgWriteChild(function (array $payload) use ($mark): array {
+        $payload['child_binding']['provisional'] = $mark;
+
+        return $payload;
+    });
+
+    if ($case === 'an old task row') {
+        expect(sgChild()->childBinding())->not->toBeNull();
+
+        return;
+    }
+    expect(sgChild()->childBinding())->toBeNull()
+        ->and(sgApproveCode($pending[0]))->toBe('child_binding_missing');
+})->with(['an old task row', 'another run id']);
+
+it('does not count an assistant or tool row of the run as its task row', function (): void {
+    sgParkedChild();
+    $child = sgChild();
+    $pending = $child->thread()->pendingApprovalIds();
+    $runId = $child->thread()->approvalRunId($pending[0]);
+    // Only the user row of that run confirms it: remove it, keep the rest.
+    $child->thread()->storedMessages()->where('type', 'user')->where('run_id', $runId)->delete();
+    expect(sgChild()->thread()->storedMessages()->where('run_id', $runId)->exists())->toBeTrue()
+        ->and(sgChild()->childBinding())->toBeNull();
+});
+
+// New channel: a decision or host turn on the child racing the start's task
+// row (in the window between commit (b) and the task row) runs nothing and
+// takes no model step.
+it('refuses a decision on the child that races the start\'s task row', function (): void {
+    $dead = sgDeadChild();
+    $raced = null;
+    Event::listen(RunStarted::class, function (RunStarted $event) use (&$raced, $dead): void {
+        if ($raced !== null || ! str_contains($event->sessionKey, '::sub::worker')) {
+            return;
+        }
+        $requests = sgRequests();
+        $outcome = 'ran';
+        try {
+            sgChild()->approve($dead);
+        } catch (Throwable $e) {
+            $outcome = $e::class;
+        }
+        $raced = ['outcome' => $outcome, 'requests' => sgRequests() - $requests];
+    });
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::text('Child done.');
+    G360::text('Handled.');
+    sgPad(3);
+
+    sgRoot()->send('Go');
+
+    expect($raced)->not->toBeNull()
+        ->and($raced['outcome'])->not->toBe('ran')
+        ->and($raced['requests'])->toBe(0)
+        ->and($this->ran['weather'])->toBe(0);
+});
+
+// Item 7 (R3): an attempted run with no task row is absent from the run
+// state: the parked run can still be cancelled after a failed start.
+it('lets a person cancel the parked run after a failed start', function (bool $undoFails): void {
+    $on = false;
+    sgFlakyRegistry($on);
+    $dead = sgDeadChild();
+    $parked = sgChild()->thread()->approvalRunId($dead);
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::text('Handled.');
+    sgPad(3);
+    $on = true;
+    if ($undoFails) {
+        sgFailChildUndo();
+    }
+
+    sgRoot()->send('Go');
+    $on = false;
+    sgUnfailChildUndo();
+
+    expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+        ->and(sgChild()->run()['id'] ?? null)->toBe($parked)
+        ->and(sgChild()->cancel($parked)->value)->toBe('ok')
+        ->and(sgChild()->approvalStatus($dead))->toBe('cancelled');
+})->with(['undo succeeds' => [false], 'undo fails' => [true]]);
+
+// Item 4: a failure handler cleans up first and reads nothing of the
+// exception but its class. A host exception whose code() or context()
+// throws still fails the run, emits RunFailed, leaves no live hold and
+// keeps a dead approval dead.
+it('cleans up a failed start whatever the host exception does when read', function (string $kind): void {
+    $failure = match ($kind) {
+        'code throws' => new class('SECRET host failure') extends RuntimeException implements HasErrorCode
+        {
+            public function code(): string
+            {
+                throw new LogicException('SECRET code getter');
+            }
+        },
+        'context throws' => new class('SECRET host failure') extends RuntimeException
+        {
+            /** @return array<string, mixed> */
+            public function context(): array
+            {
+                throw new LogicException('SECRET context');
+            }
+        },
+    };
+    $dead = sgDeadChild();
+    app(ToolRegistry::class)->registerProvider(function (Session $session) use (&$failure): array {
+        if ($failure !== null && str_contains($session->key(), '::sub::worker')) {
+            throw $failure;
+        }
+
+        return [];
+    }, name: 'hostile');
+    $events = [];
+    Event::listen(RunFailed::class, function (RunFailed $event) use (&$events): void {
+        if (str_contains($event->sessionKey, '::sub::worker')) {
+            $events[] = $event->exception;
+        }
+    });
+    G360::$queue = [];
+    G360::calls([['worker', ['task' => 'Start over']]]);
+    G360::text('Handled.');
+    sgPad(3);
+
+    sgRoot()->send('Go');
+    $failure = null;
+
+    expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+        ->and(implode(' ', G360::outputs()))->not->toContain('SECRET')
+        ->and($events)->toHaveCount(1)
+        ->and(sgApproveCode($dead))->toBe('child_binding_missing')
+        ->and(sgRedelegate())->toContain('"outcome":"completed"');
+})->with(['code throws', 'context throws']);
+
+// Item 8: a limit that is present but not a finite non-negative number is
+// a configuration error, never "no limit"; a numeric string is its number.
+it('refuses a cost or time limit in config that is not a finite non-negative number', function (string $key, mixed $value): void {
+    expect(fn () => RunBudget::fromArray([$key => $value]))->toThrow(InvalidArgumentException::class);
+
+    config()->set('prism-harness.agent.'.$key, $value);
+    sgFresh();
+    G360::text('Done.');
+    $requests = sgRequests();
+    expect(fn () => sgRoot()->send('Go'))->toThrow(InvalidArgumentException::class)
+        ->and(sgRequests())->toBe($requests);
+})->with([
+    'cost NAN' => ['max_cost_usd', 'NAN'],
+    'cost INF' => ['max_cost_usd', 'INF'],
+    'cost -INF' => ['max_cost_usd', '-INF'],
+    'cost comma' => ['max_cost_usd', '0,50'],
+    'cost word' => ['max_cost_usd', 'none'],
+    'cost empty' => ['max_cost_usd', ''],
+    'cost bool' => ['max_cost_usd', true],
+    'seconds NAN' => ['max_seconds', 'NAN'],
+    'seconds INF' => ['max_seconds', 'INF'],
+    'seconds -INF' => ['max_seconds', '-INF'],
+    'seconds comma' => ['max_seconds', '0,50'],
+    'seconds word' => ['max_seconds', 'soon'],
+]);
+
+it('reads a quoted number in config as that number, never as no limit', function (): void {
+    $budget = RunBudget::fromArray(['max_cost_usd' => '0.50', 'max_seconds' => '60']);
+    expect($budget->maxCostUsd)->toBe(0.5)
+        ->and($budget->maxSeconds)->toBe(60);
 });
