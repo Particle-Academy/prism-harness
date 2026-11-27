@@ -1996,8 +1996,9 @@ final readonly class AgentRuntime
      *  - offered but taking no approval: neither the mode nor the tool asks
      *    for it.
      * The skill builtin and subagents are left to the resolution. A static
-     * tool is read without building it; a factory's or provider's tool is
-     * built only here, for a requested call that has no outcome yet.
+     * tool is read without building it. A factory's or provider's tool the
+     * mode does not gate is built only here, for a requested call that has
+     * no outcome yet, and a build that fails leaves the call to the run.
      *
      * @return Closure(string): ?string
      */
@@ -2013,12 +2014,20 @@ final readonly class AgentRuntime
             if (! in_array('*', $mode->tools, true) && ! in_array($name, $mode->tools, true)) {
                 return Thread::NOT_OFFERED_RESULT;
             }
+            // A tool the mode gates is the resolution's: nothing is built
+            // for it here, so a build that fails fails the run's own turn,
+            // and the next resume runs an approved call.
+            if ($mode->needsApproval($name)) {
+                return null;
+            }
             $configured = $registry->approvalConfigured($name);
             if ($configured === null) {
                 try {
                     $tool = $registry->resolve([$name], $session)[$name] ?? null;
                 } catch (Throwable) {
-                    $tool = null;
+                    // A build that fails says nothing about the tool: the
+                    // run's own resolution surfaces the error.
+                    return null;
                 }
                 if (! $tool instanceof Tool) {
                     return Thread::NOT_OFFERED_RESULT;
@@ -2026,7 +2035,7 @@ final readonly class AgentRuntime
                 $configured = $tool->hasApprovalConfigured();
             }
 
-            return $mode->needsApproval($name) || $configured ? null : Thread::NOT_GATED_RESULT;
+            return $configured ? null : Thread::NOT_GATED_RESULT;
         };
     }
 
