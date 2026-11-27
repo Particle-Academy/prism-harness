@@ -299,6 +299,16 @@ function pairingGenerate(int $seed): array
         $case['insert'] = ['kind' => $kind, 'when' => $g->chance(0.6) ? 'before_decision' : 'after_decision',
             'segment' => $g->chance(0.5) ? 'earlier' : 'later',
             'call' => $kind === 'tool_result' ? $g->pick($gated) : $g->int(count($steps[0]['calls']))];
+        // The later step's calls stored with their arguments as a JSON
+        // string, as other providers' rows hold them; and sometimes its first
+        // call copies the id and arguments of an earlier call that already
+        // ran (an ungated one).
+        $case['recorded']['stringArgs'] = $g->chance(0.5);
+        $ungated = array_keys(array_filter($steps[0]['calls'], fn (array $call): bool => ! $call['gated']));
+        if ($ungated !== [] && $g->chance(0.5)) {
+            $u = $steps[0]['calls'][$g->pick($ungated)];
+            $case['recorded']['calls'][0] = ['id' => $u['id'], 'gated' => true, 'token' => $u['token'], 'copy' => true];
+        }
 
         return $case;
     }
@@ -620,7 +630,8 @@ function pairingReplace(Session $session, array $case, array $requestFor, array 
         $session->thread()->record([pairingInsertedRow($case)]);
     }
     $session->thread()->record([new AssistantMessage('', array_map(
-        fn (array $call): ToolCall => new ToolCall($call['id'], 'gated', ['token' => $call['token']]),
+        fn (array $call): ToolCall => new ToolCall($call['id'], 'gated', ($recorded['stringArgs'] ?? false)
+            ? (string) json_encode(['token' => $call['token']]) : ['token' => $call['token']]),
         $recorded['calls'],
     ), [], array_map(
         fn (array $call, string $approvalId): ToolApprovalRequest => new ToolApprovalRequest($approvalId, $call['id'], ToolApprovalRequest::ARGUMENTS_AS_SENT),
@@ -703,9 +714,22 @@ function pairingViolations(array $case, array $observed): array
     $ran = $observed['ran'];
 
     // 3. A call runs at most once, across every resume.
+    // A copied call runs as itself and, when its copy runs, once more.
+    $allowed = [];
+    $mayCopy = [];
+    foreach ($case['recorded']['calls'] ?? [] as $k => $call) {
+        if (($call['copy'] ?? false) && ($oracle['recorded']['runs'][$k] ?? false)) {
+            $allowed[$call['token']] = 2;
+        } elseif (($call['copy'] ?? false) && in_array($call['token'], $oracle['may'], true)) {
+            $mayCopy[$call['token']] = true;
+        }
+    }
     foreach (array_count_values($ran) as $token => $times) {
-        if ($times > 1) {
+        if ($times > ($allowed[$token] ?? (isset($mayCopy[$token]) ? 2 : 1))) {
             $violations[] = "inv3: {$token} ran {$times} times";
+        }
+        if (isset($allowed[$token]) && $times !== $allowed[$token]) {
+            $violations[] = "equality: the copied call {$token} ran {$times} times, expected {$allowed[$token]}";
         }
     }
     foreach (array_slice($ran, $observed['lateFrom']) as $token) {
@@ -924,8 +948,20 @@ function pairingReplacedViolations(array $case, array $observed, array $expected
     $violations = [];
     $outcomes = [];
     $decisions = [];
+    $tokens = array_column($case['recorded']['calls'], 'token');
+    $from = null;
     foreach ($observed['rows'] as $index => $row) {
-        if ($index >= $observed['lateRow'] || ! $row['message'] instanceof ToolResultMessage) {
+        $message = $row['message'];
+        if ($message instanceof AssistantMessage && $message->toolCalls !== []
+            && array_map(fn ($call): ?string => pairingToken($call->arguments()), $message->toolCalls) === $tokens) {
+            $from = $index;
+        }
+    }
+    if ($from === null) {
+        return ['inv6: the recorded step has no assistant row'];
+    }
+    foreach ($observed['rows'] as $index => $row) {
+        if ($index <= $from || $index >= $observed['lateRow'] || ! $row['message'] instanceof ToolResultMessage) {
             continue;
         }
         foreach ($row['message']->toolResults as $result) {
@@ -1024,7 +1060,24 @@ function pairingSmaller(array $case): array
         }
     }
 
-    return $out;
+    // A smaller case must still be one the generator could make: a replaced
+    // case parks on a gated call, and a copied call's original is still there.
+    return array_values(array_filter($out, fn (array $smaller): bool => pairingValid($smaller)));
+}
+
+/** Whether `$case` is one the generator could make. */
+function pairingValid(array $case): bool
+{
+    if (($case['mode'] ?? 'normal') !== 'replaced') {
+        return true;
+    }
+    $first = $case['steps'][0]['calls'];
+    if (array_filter($first, fn (array $call): bool => $call['gated']) === []) {
+        return false;
+    }
+    $copy = $case['recorded']['calls'][0];
+
+    return ! ($copy['copy'] ?? false) || in_array(['id' => $copy['id'], 'gated' => false, 'token' => $copy['token']], $first, true);
 }
 
 /** $case without call $k of step $s, the decisions renumbered. */
@@ -1052,6 +1105,24 @@ function pairingWithoutCall(array $case, int $s, int $k): array
         }
     }
     $case['steps'][$s] = [...$step, 'calls' => $calls, 'decisions' => $decisions, 'order' => $order];
+    if ($s === 0) {
+        // The first step's inserted row and the replaced batch name its calls
+        // by index too.
+        if (($case['insert'] ?? null) !== null) {
+            $case['insert'] = isset($map[$case['insert']['call']]) ? [...$case['insert'], 'call' => $map[$case['insert']['call']]] : null;
+        }
+        if (isset($case['recorded'])) {
+            $mix = [];
+            foreach ($case['recorded']['mix'] as [$which, $i]) {
+                if ($which === 'new') {
+                    $mix[] = [$which, $i];
+                } elseif ($i !== $k) {
+                    $mix[] = [$which, $map[$i]];
+                }
+            }
+            $case['recorded']['mix'] = $mix;
+        }
+    }
 
     return $case;
 }
@@ -1176,7 +1247,16 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
                 $seen['a row after the park, then a resume with no step left, then repeat resumes'] = true;
             }
         }
+        if (count($case['steps']) > 1 && array_intersect(array_column($case['steps'][1]['calls'], 'id'), array_column($case['steps'][0]['calls'], 'id')) !== []) {
+            $seen['an id reused in a later step'] = true;
+        }
         if ($case['mode'] === 'replaced') {
+            if ($case['recorded']['stringArgs']) {
+                $seen['a later step with its arguments stored as a string'] = true;
+            }
+            if ($case['recorded']['calls'][0]['copy'] ?? false) {
+                $seen['a later call with the id and arguments of an earlier call that ran'] = true;
+            }
             $seen['an older parked step replaced by a later tool-call step'] = true;
             $seen['replaced, then insert '.$case['insert']['kind'].' '.$case['insert']['when']] = true;
             if ($case['insert']['kind'] === 'tool_result' && $case['insert']['when'] === 'before_decision') {
@@ -1209,5 +1289,7 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'replaced, then insert tool_empty before_decision', 'replaced, then insert tool_empty after_decision',
         'replaced, then insert tool_result before_decision', 'replaced, then insert tool_result after_decision',
         'a forged result in the earlier step\'s segment', 'a forged result in the later step\'s segment',
+        'an id reused in a later step', 'a later step with its arguments stored as a string',
+        'a later call with the id and arguments of an earlier call that ran',
     ]);
 });
