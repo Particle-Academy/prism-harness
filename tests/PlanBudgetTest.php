@@ -15,6 +15,8 @@ use Prism\Harness\Plans\Plans;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Subagents\RunBudget;
 use Prism\Harness\Subagents\RunContext;
+use Prism\Harness\Subagents\Subagent;
+use Prism\Harness\Subagents\SubagentRunner;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
@@ -489,4 +491,58 @@ it('settles the run tree hold when a streamed child resume fails on the plan bud
         ->toThrow(QueryException::class);
     $record = $child->planStore()->get($tree['session'].':run-tree:'.$tree['run']);
     expect($record['holds'])->toBe([]);
+});
+
+// G-387 round 10 item 1 (Py F1): a child whose runner start failed after
+// commit (b), with its undo failing too, still reads the plan ledger it was
+// last CONFIRMED with, so a later host-driven start keeps it and the child's
+// host turns keep spending from that plan's shared budget.
+it('keeps a child on its confirmed shared plan budget after a failed start whose undo failed', function (): void {
+    [$child, $id] = g366PausedChild(10);
+    G360::text('Child answer.');
+    $child->approve($id);
+    $fresh = fn () => app(PrismHarness::class)
+        ->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat::sub::research');
+    $ledger = $fresh()->childPlanLedger();
+    $tree = $fresh()->childTree();
+    expect($ledger)->not->toBeNull()->and($tree)->not->toBeNull();
+
+    // A direct start under a context the host built fails after (b); its undo fails too.
+    $failing = true;
+    app(ToolRegistry::class)->registerProvider(function ($session) use (&$failing): array {
+        if ($failing && str_contains($session->key(), '::sub::research')) {
+            // The outage begins once (b) has written: its undo fails too.
+            foreach (['UPDATE', 'DELETE'] as $op) {
+                DB::statement("CREATE TRIGGER IF NOT EXISTS g387_undo_{$op} BEFORE {$op} ON harness_session_state
+                    WHEN OLD.key LIKE '%::sub::research:child' BEGIN SELECT RAISE(ABORT, 'store down'); END");
+            }
+
+            throw new RuntimeException('provider down');
+        }
+
+        return [];
+    }, name: 'g387-flaky');
+    $research = new Subagent('research', 'Research something.', 'research', new RunBudget(3));
+    $host = 'run_'.str_repeat('f', 24);
+    $failed = app(SubagentRunner::class)->run($research, G360::session(), RunContext::root($host, new RunBudget(8)), $host, 'Again');
+    $failing = false;
+    DB::statement('DROP TRIGGER IF EXISTS g387_undo_UPDATE');
+    DB::statement('DROP TRIGGER IF EXISTS g387_undo_DELETE');
+    expect($failed->outcome->value)->toBe('failed')
+        ->and($fresh()->childBinding())->toBeNull()
+        ->and($fresh()->childPlanLedger())->toBe($ledger)
+        ->and($fresh()->childTree())->toBe($tree);
+
+    // The next host-driven start keeps both.
+    G360::text('Again answer.');
+    $again = app(SubagentRunner::class)->run($research, G360::session(), RunContext::root($host, new RunBudget(8)), $host, 'Again');
+    expect($again->outcome->value)->toBe('completed')
+        ->and($fresh()->childPlanLedger())->toBe($ledger)
+        ->and($fresh()->childTree())->toBe($tree);
+
+    // A host turn on the child spends from the same plan ledger.
+    $steps = G360::session()->plan()->budget()['steps'];
+    G360::text('Child answer 2.');
+    $fresh()->send('New question');
+    expect(G360::session()->plan()->budget()['steps'])->toBe($steps + 1);
 });

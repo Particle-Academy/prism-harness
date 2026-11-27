@@ -185,14 +185,20 @@ it('refuses to stream on a store that cannot hold its lock across yields', funct
     }
 })->with(['stream', 'streamSteps', 'streamDecision'])->with(['plain' => false, 'indexed' => true]);
 
+// The lease lapses at a point the test chooses, not on the wall clock: it
+// used to be a 1 s lease against a 2.2 s sleep, and the store's clock has
+// whole seconds, so a lease taken late in a second could lapse before the
+// run even began (G-387 round 10). The tool now makes it lapse, mid-stream,
+// by moving the lease's expiry into the past, as time passing would.
 it('rejects the write, rather than writing unfenced, when the lease lapses mid-stream', function (): void {
-    config()->set('prism-harness.agent.lock_ttl', 1);
     config()->set('prism.providers.anthropic.api_key', 'synthetic-offline');
     config()->set('prism-harness.agent.provider', 'anthropic');
     config()->set('prism-harness.agent.model', 'budget-model');
     config()->set('prism-harness.agent.modes.chat.tools', ['tick']);
-    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Count')->using(function (): string {
-        usleep(2_200_000);
+    $lapsed = 0;
+    app(ToolRegistry::class)->register((new Tool)->as('tick')->for('Count')->using(function () use (&$lapsed): string {
+        $lapsed = DB::table('harness_session_state')->where('key', 'lock:'.lockedSession('lapsing')->key())
+            ->update(['expires_at' => '2000-01-01 00:00:00']);
 
         return 'ticked';
     }));
@@ -208,7 +214,8 @@ it('rejects the write, rather than writing unfenced, when the lease lapses mid-s
         $caught = $failure;
     }
 
-    expect($caught)->toBeInstanceOf(SessionLockLost::class)
+    expect($lapsed)->toBe(1)
+        ->and($caught)->toBeInstanceOf(SessionLockLost::class)
         // The terminal write was refused, so the stale holder never closed the run.
         ->and(lockedSession('lapsing')->run()['status'])->toBe('running');
 });

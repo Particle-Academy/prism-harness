@@ -141,14 +141,55 @@ class Session
         if ($this->resolvedMode !== null) {
             return $this->resolvedMode;
         }
-        $mode = $this->state()['mode'] ?? null;
+        $state = $this->state();
+        $mode = $state['mode'] ?? null;
+        if (array_key_exists(self::MODE_MARK, $state)) {
+            // Written by a runner start (G-387): its mode only once that
+            // start's task row exists; until then the mode before it. A mark
+            // this runtime could not have written reads as no mode.
+            $mark = $state[self::MODE_MARK];
+            $run = is_array($mark) ? ($mark['run'] ?? null) : null;
+            if (! is_string($run) || ! self::isRunId($run)) {
+                return null;
+            }
+            if (! $this->taskRowExists($run)) {
+                $mode = $mark['prior'] ?? null;
+            }
+        }
 
         return is_string($mode) ? $mode : null;
     }
 
     public function usingMode(string $mode): self
     {
-        return $this->write('mode', $mode);
+        // The host's own choice: no runner start's mark stands over it.
+        $this->assertWritableResolution();
+        $state = $this->state();
+        unset($state[self::MODE_MARK]);
+        $state['mode'] = $mode;
+
+        return $this->putState($state);
+    }
+
+    /** The mark beside a mode a runner start wrote (G-387). */
+    private const MODE_MARK = 'mode_provisional';
+
+    /**
+     * The mode a runner start's commit (b) writes (G-387): PROVISIONAL like
+     * the rest of (b), read as the mode before it until the start's task row
+     * exists ({@see self::mode()}).
+     *
+     * @internal Written by the runtime when the subagent runner starts a child run.
+     */
+    public function usingProvisionalMode(string $mode, string $runId): self
+    {
+        $this->assertWritableResolution();
+        $prior = $this->mode();
+        $state = $this->state();
+        $state['mode'] = $mode;
+        $state[self::MODE_MARK] = ['run' => $runId, 'prior' => $prior];
+
+        return $this->putState($state);
     }
 
     public function model(): ?string
@@ -222,7 +263,7 @@ class Session
      */
     public function childPlanLedger(): ?array
     {
-        $ledger = $this->savedChild()['plan_ledger'] ?? null;
+        $ledger = $this->savedRefs()['plan_ledger'] ?? null;
 
         return is_array($ledger) && is_string($ledger['session'] ?? null) && is_string($ledger['plan'] ?? null)
             ? ['session' => $ledger['session'], 'plan' => $ledger['plan']] : null;
@@ -240,7 +281,7 @@ class Session
      */
     public function childTree(): ?array
     {
-        $tree = $this->savedChild()['tree'] ?? null;
+        $tree = $this->savedRefs()['tree'] ?? null;
 
         return is_array($tree) && is_string($tree['session'] ?? null) && is_string($tree['run'] ?? null)
             ? ['session' => $tree['session'], 'run' => $tree['run']] : null;
@@ -297,7 +338,9 @@ class Session
         // The runner's address for a child, whatever was or was not saved
         // with it (an earlier release saved less).
         return str_contains($this->scope(), '::sub::')
-            || $this->savedChild() !== null || $this->thread()->parent_thread_id !== null;
+            || $this->savedChild() !== null
+            // Read, never created: this is a read the tool-resolution view allows.
+            || Thread::existingAt($this->address())?->parent_thread_id !== null;
     }
 
     /**
@@ -305,8 +348,9 @@ class Session
      *
      * @param  array{session: string, plan: string}|null  $planLedger
      * @param  array{session: string, run: string}|null  $tree
+     * @param  array{tree: array{session: string, run: string}|null, plan_ledger: array{session: string, plan: string}|null}|null  $confirmedRefs  the refs a provisional record reads as until it is confirmed
      */
-    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null, ?int $stepCeiling = null, ?string $delegation = null, ?string $provisional = null): self
+    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null, ?int $stepCeiling = null, ?string $delegation = null, ?string $provisional = null, ?array $confirmedRefs = null): self
     {
         $this->assertWritableResolution();
         $child = [
@@ -332,6 +376,14 @@ class Session
             // The runner start that wrote it (G-387): read as absent until
             // that run's task row exists ({@see self::savedChild()}).
             $child['provisional'] = $provisional;
+            // The run tree and plan ledger the child was last CONFIRMED in
+            // (G-387): what the refs read as until this start's task row
+            // exists, so an unconfirmed start never detaches the child from
+            // the tree and plan budget that bound it.
+            $child['confirmed_refs'] = [
+                'tree' => $confirmedRefs['tree'] ?? null,
+                'plan_ledger' => $confirmedRefs['plan_ledger'] ?? null,
+            ];
         }
         // Under a key of its own (G-381): the session's durable record holds
         // host state, such as capabilities, that another process may change
@@ -373,17 +425,19 @@ class Session
     }
 
     /**
-     * The session's mode slot as stored: whether it is set, and its value.
+     * The session's mode slot as stored: whether it is set, and its value,
+     * then the same for the mark a runner start keeps beside it.
      *
      * @internal
      *
-     * @return array{0: bool, 1: mixed}
+     * @return array{0: bool, 1: mixed, 2: bool, 3: mixed}
      */
     public function modeSlot(): array
     {
         $state = $this->state();
 
-        return [array_key_exists('mode', $state), $state['mode'] ?? null];
+        return [array_key_exists('mode', $state), $state['mode'] ?? null,
+            array_key_exists(self::MODE_MARK, $state), $state[self::MODE_MARK] ?? null];
     }
 
     /**
@@ -392,18 +446,19 @@ class Session
      *
      * @internal
      *
-     * @param  array{0: bool, 1: mixed}  $slot
+     * @param  array{0: bool, 1: mixed, 2: bool, 3: mixed}  $slot
      */
     public function restoreModeSlot(array $slot): void
     {
-        if ($slot[0]) {
-            $this->writeAll(['mode' => $slot[1]]);
-
-            return;
-        }
         $this->assertWritableResolution();
         $state = $this->state();
-        unset($state['mode']);
+        unset($state['mode'], $state[self::MODE_MARK]);
+        if ($slot[0]) {
+            $state['mode'] = $slot[1];
+        }
+        if ($slot[2]) {
+            $state[self::MODE_MARK] = $slot[3];
+        }
         $this->putState($state);
     }
 
@@ -429,20 +484,53 @@ class Session
      */
     private function savedChild(): ?array
     {
+        [$saved, $confirmed] = $this->storedChild();
+
+        return $confirmed ? $saved : null;
+    }
+
+    /**
+     * The run tree and plan ledger the child reads as: those of its record
+     * once confirmed; for a record not yet confirmed, the refs it was last
+     * CONFIRMED with, kept beside it (G-387). Only ever narrowing: a start
+     * that never recorded its task row cannot detach the child from the tree
+     * and plan budget that bound it, nor move it into a fresh one. A garbage
+     * mark reads as no record, and no refs.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function savedRefs(): ?array
+    {
+        [$saved, $confirmed] = $this->storedChild();
+        if ($saved === null || $confirmed) {
+            return $saved;
+        }
+        $refs = $saved['confirmed_refs'] ?? null;
+
+        return is_string($saved['provisional'] ?? null) && self::isRunId($saved['provisional']) && is_array($refs) ? $refs : null;
+    }
+
+    /**
+     * The child record as stored, and whether it is confirmed.
+     *
+     * @return array{0: array<string, mixed>|null, 1: bool}
+     */
+    private function storedChild(): array
+    {
         $saved = $this->durable->get($this->childKey())['child_binding'] ?? null;
         // A binding saved before it had a key of its own.
         $saved ??= ($this->durable->get($this->durableKey()) ?? [])['child_binding'] ?? null;
         if (! is_array($saved)) {
-            return null;
+            return [null, false];
         }
         if (array_key_exists('provisional', $saved)) {
             $run = $saved['provisional'];
             if (! is_string($run) || ! self::isRunId($run) || ! $this->taskRowExists($run)) {
-                return null;
+                return [$saved, false];
             }
         }
 
-        return $saved;
+        return [$saved, true];
     }
 
     /**
@@ -1233,18 +1321,27 @@ class Session
     /**
      * Where an approval stands (G-285): `pending`, `approved`, `denied`,
      * `cancelled` (its run was cancelled before anyone decided), `superseded`
-     * (never decided, and a later turn ended it), or `unknown` (this thread
-     * never issued it). An approval in a cancelled run never reads `pending`.
+     * (never decided, and a later turn ended it; or decided, and a subagent
+     * runner start ended the call before any resume acted on it, so it never
+     * ran), or `unknown` (this thread never issued it). An approval in a
+     * cancelled run never reads `pending`.
      */
     public function approvalStatus(string $approvalId): string
     {
-        $thread = $this->thread();
-        $runId = $thread->approvalRunId($approvalId);
-        if ($runId === null) {
+        // Read, never created: a read the tool-resolution view allows.
+        $thread = Thread::existingAt($this->address());
+        $runId = $thread?->approvalRunId($approvalId);
+        if ($thread === null || $runId === null) {
             return 'unknown';
         }
         $decided = $thread->approvalDecisions();
         if (array_key_exists($approvalId, $decided)) {
+            // A runner start ended the call, and it never ran (G-387): the
+            // decision was never acted on, so the call reads as ended.
+            if ($thread->endedByStart($approvalId)) {
+                return 'superseded';
+            }
+
             return $decided[$approvalId] ? 'approved' : 'denied';
         }
         if ($this->cancelRequestedFor($runId)) {

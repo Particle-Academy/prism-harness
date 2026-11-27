@@ -1106,8 +1106,9 @@ exception's class; its message goes to the application log, never to the model.
 the start depends on, then asks one gate (`RunStarts::gate`), in this order: the task, the
 nesting depth, a cancel, the time limit, the steps the child would have, a spent cost limit
 (the context's cap or the agent's `spend_ceiling`), a cost cap that cannot be metered, a spent
-tool-call limit, a turn running on the child, an approval a person can still answer, then what
-the run tree and the shared plan budget would grant. The first that holds is the refusal, and
+tool-call limit, a turn running on the child, an approval a person can still answer (or one a
+person already decided that a resume of the child could still act on: a delegation never
+voids a person's decision), then what the run tree and the shared plan budget would grant. The first that holds is the refusal, and
 the parent model gets a fixed, harness-written reason. A refused start writes nothing: no
 session mode, no thread link or row, no count, binding or hold, no run state. A start the gate
 allows commits in one order: the run tree hold, then the child's records (its binding, count
@@ -1117,27 +1118,35 @@ an approval that lands between the read and the write refuses the start with the
 records unchanged, and the tree hold is returned. The start is held to the step count the gate
 read: steps the context spends after the read count against it. What the start writes on the
 child is provisional until the child's task row (the start's user row in the child's thread)
-is recorded: its binding record and its run state name the start's run, and every other reader
-(a decision, a host turn or resume on the child, the next start's checks, a cancel) treats them
-as absent until that row exists. A start that fails before its task row therefore needs no
-second write to be undone: the child reads as it did before, a linked child with no binding is
-refused, an approval nobody could answer stays that way, and the run the child was parked on
-can still be cancelled. The child's binding, count, mode and thread link are also put back
+is recorded: its binding record, its session mode and its run state name the start's run, and
+every other reader (a decision, a host turn or resume on the child, the next start's checks, a
+cancel, `mode()`) treats them as absent until that row exists. A start that fails before its
+task row therefore needs no second write to be undone: the child reads as it did before, a
+linked child with no binding is refused, an approval nobody could answer stays that way, its
+mode reads as the mode before the start, and the run the child was parked on can still be
+cancelled. Absent never widens anything: the run tree and shared plan budget the child reads as
+belonging to are the ones it was last confirmed in, kept beside the provisional record, so a
+failed start cannot detach the child from the tree a person can cancel or the plan budget it
+spends from. These reads are reads: a host tool provider may make them from the read-only
+tool-resolution view while a start is running. The child's binding, count, mode and thread link are also put back
 (each only if no later writer changed it) and the tree hold is returned, but that is
 housekeeping, and its failure changes nothing. A start acts on no decision recorded on the
 child: the calls the child was parked on are ended with its task row, with a fixed result, and
-never run. Once a start has committed, a stop that lands later (a cancel, say) stops its model
+never run. Each one is announced as `ToolDenied` (decided by `policy`) only once that row is
+recorded, and `approvalStatus()` reads it as `superseded`, never `approved`. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
 parity op `start_gate`; the tool-call limit exists only here.
 
 **What the parent model reads about a child is harness-written.** The runner chooses the
 outcome (`denied`, `cancelled`, `exhausted`, else `failed`) and the reason from the refusal's
-code, from a fixed set; a failure names only the exception's class. An exception's message is
+code, from a fixed set; a failure names only the exception's class, and only a named class: an
+anonymous class is named by the class it extends (or the interface it implements), never by
+the file path and line PHP gives it. An exception's message is
 never passed on, and a host's cancel reason (`RunLedger::cancel($reason)`) never becomes an
 exception message or a stored total: the host reads it back from `cancelReason()` and
 `exhaustion()`, and refusals say "run stopped by the host". The same holds for `RunFailed`
 and every run record (the run state's `failure`, the run history): they carry the exception's
-class, a fixed harness description or a harness code, never exception text, whatever
+named class, a fixed harness description or a harness code, never exception text, whatever
 `prism.telemetry.capture_content` is set to.
 
 **A budget that cannot bound anything is refused.** `RunBudget` refuses a negative, fractional

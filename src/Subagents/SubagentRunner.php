@@ -11,6 +11,7 @@ use Prism\Harness\Modes\AgentMode;
 use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Support\ClassLabel;
 use Prism\Harness\Tools\ToolRefusals;
 use Prism\Prism\Tool;
 use Throwable;
@@ -75,7 +76,8 @@ final readonly class SubagentRunner
         try {
             return $this->delegate($subagent, $parent, $context, $parentRunId, $task, $parentMode, $childRunId);
         } catch (Throwable $e) {
-            // ONLY THE CLASS NAME TRAVELS. A provider, store or database
+            // ONLY THE CLASS NAME TRAVELS, and only a NAMED one (G-387): an
+            // anonymous class's name carries the server's path and line. A provider, store or database
             // exception's message can carry a URL, a host, SQL, headers or a
             // key, and whatever goes in `reason` is read by a model and may be
             // shown to a user. The full message goes to the log, and a
@@ -91,7 +93,7 @@ final readonly class SubagentRunner
                 $subagent->name,
                 $childRunId,
                 $parentRunId,
-                sprintf('The subagent failed with %s. The details are in the application log.', $e::class),
+                sprintf('The subagent failed with %s. The details are in the application log.', ClassLabel::of($e)),
             );
         }
     }
@@ -213,7 +215,7 @@ final readonly class SubagentRunner
                 report($e);
 
                 return SubagentResult::failed($subagent->name, $childRunId, $parentRunId,
-                    sprintf('The subagent failed with %s. The details are in the application log.', $e::class));
+                    sprintf('The subagent failed with %s. The details are in the application log.', ClassLabel::of($e)));
             }
 
             return SubagentResult::refused($subagent->name, $childRunId, $parentRunId, $refusal[0], $refusal[1]);
