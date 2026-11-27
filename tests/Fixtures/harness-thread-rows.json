@@ -423,10 +423,10 @@
       ],
       "rows": {
         "php": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":false,\"reason\":\"no\"}]}]",
-        "ts": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]",
-        "py": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]"
+        "ts": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":false,\"reason\":\"no\"}]}]",
+        "py": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":false,\"reason\":\"no\"}]}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "The order a fold keeps when the same call or approval appears twice: the later value wins, in the position the first one had. If languages disagreed, the same stored thread would show a model a different result, or a spoofed later decision, in PHP than in TypeScript."
     },
     {
@@ -1632,10 +1632,10 @@
       },
       "rows": {
         "php": "[{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"echo\",\"args\":{\"n\":1},\"result\":\"Tool call was not run because another call in this step has the same id\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[],\"harness_answers_step\":{\"position\":2}}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"echo\",\"args\":{\"n\":1},\"result\":\"Tool call was not run because another call in this step has the same id\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[],\"harness_answers_step\":{\"position\":2}}]",
+        "py": "[{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"echo\",\"args\":{\"n\":1},\"result\":\"Tool call was not run because another call in this step has the same id\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[],\"harness_answers_step\":{\"position\":2}}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 9). A step with two IDENTICAL calls (same id, tool and arguments); a host row already answered one of them. The runtime's answer row carries every result of the step again (the held one, then the repeated-id denial). It writes ONLY the results beyond what any one row of the step already holds of the same key (call id, tool name, canonical arguments), occurrence by occurrence: the denial alone, with the step mark last. Both calls then have exactly one stored outcome."
     },
     {
@@ -1714,10 +1714,10 @@
       ],
       "rows": {
         "php": "[true,true]",
-        "ts": "",
-        "py": ""
+        "ts": "[true,true]",
+        "py": "[true,true]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 9), the reader rule. A result answers the FIRST call of its step that has no outcome (by id, tool and arguments, then id and tool, then id), else the first call not yet taken in its own row. It never prefers a call that already holds the same result text. So two rows each holding the same result answer both identical calls. Output: one boolean per call of the step at `step`, in call order: whether it has an outcome."
     },
     {
@@ -1780,10 +1780,10 @@
       ],
       "rows": {
         "php": "[true,false]",
-        "ts": "",
-        "py": ""
+        "ts": "[true,false]",
+        "py": "[true,false]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 9). The companion of thr-0026: one row with one result answers the first identical call only; the second has no outcome."
     },
     {
@@ -1880,10 +1880,10 @@
       ],
       "rows": {
         "php": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_paris\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Paris\"},\"result\":\"Sunny in Paris\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_paris\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Paris\"},\"result\":\"Sunny in Paris\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]",
+        "py": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_paris\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Paris\"},\"result\":\"Sunny in Paris\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (items 1 and 10). A decision counts only while its call has no outcome (no result, no started row) in the rows before it. The approval stood when the call was started; a host row denying it afterwards (here naming a run id, which is never a trust signal) never stood: the replay carries the approval wherever a decision for apr_1 appears."
     },
     {
@@ -1946,10 +1946,10 @@
       ],
       "rows": {
         "php": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"ran\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"ran\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]",
+        "py": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"ran\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 10). The fold replays the decision that STOOD when the call was resolved: the approval in the row that holds the call's result counts, the denial recorded after it does not, so the replay carries only the approval (thr-0009 is the other order)."
     },
     {
@@ -2032,10 +2032,10 @@
       ],
       "rows": {
         "php": "[{\"type\":\"user\",\"content\":\"Go.\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"u1\",\"name\":\"echo\",\"arguments\":{\"text\":\"a\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"c1\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_c1\",\"tool_call_id\":\"c1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Rome\"},\"result\":\"Sunny in Rome\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"u1\",\"tool_name\":\"echo\",\"args\":{\"text\":\"a\"},\"result\":\"Tool call was interrupted, it may have run\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_c1\",\"approved\":true,\"reason\":null}]},{\"type\":\"assistant\",\"content\":\"Done.\",\"tool_calls\":[],\"additional_content\":{},\"tool_approval_requests\":[]}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"type\":\"user\",\"content\":\"Go.\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"u1\",\"name\":\"echo\",\"arguments\":{\"text\":\"a\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"c1\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_c1\",\"tool_call_id\":\"c1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Rome\"},\"result\":\"Sunny in Rome\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"u1\",\"tool_name\":\"echo\",\"args\":{\"text\":\"a\"},\"result\":\"Tool call was interrupted, it may have run\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_c1\",\"approved\":true,\"reason\":null}]},{\"type\":\"assistant\",\"content\":\"Done.\",\"tool_calls\":[],\"additional_content\":{},\"tool_approval_requests\":[]}]",
+        "py": "[{\"type\":\"user\",\"content\":\"Go.\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"u1\",\"name\":\"echo\",\"arguments\":{\"text\":\"a\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"c1\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_c1\",\"tool_call_id\":\"c1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"c1\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Rome\"},\"result\":\"Sunny in Rome\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"u1\",\"tool_name\":\"echo\",\"args\":{\"text\":\"a\"},\"result\":\"Tool call was interrupted, it may have run\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_c1\",\"approved\":true,\"reason\":null}]},{\"type\":\"assistant\",\"content\":\"Done.\",\"tool_calls\":[],\"additional_content\":{},\"tool_approval_requests\":[]}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 3). Every call of a step that is not the paused step and has no outcome gets ONE synthesised result: replaced when a request of the step was issued for it, else interrupted (it was not gated, so it ran, or may have, when the step was taken). The provider request stays valid: every tool call has a result."
     },
     {
@@ -2100,10 +2100,10 @@
       ],
       "rows": {
         "php": "[{\"type\":\"user\",\"content\":\"Go.\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"u1\",\"name\":\"echo\",\"arguments\":{\"text\":\"a\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"c1\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_c1\",\"tool_call_id\":\"c1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"u1\",\"tool_name\":\"echo\",\"args\":{\"text\":\"a\"},\"result\":\"Tool call was interrupted, it may have run\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[]}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"type\":\"user\",\"content\":\"Go.\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"u1\",\"name\":\"echo\",\"arguments\":{\"text\":\"a\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"c1\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_c1\",\"tool_call_id\":\"c1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"u1\",\"tool_name\":\"echo\",\"args\":{\"text\":\"a\"},\"result\":\"Tool call was interrupted, it may have run\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[]}]",
+        "py": "[{\"type\":\"user\",\"content\":\"Go.\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"u1\",\"name\":\"echo\",\"arguments\":{\"text\":\"a\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"c1\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_c1\",\"tool_call_id\":\"c1\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"u1\",\"tool_name\":\"echo\",\"args\":{\"text\":\"a\"},\"result\":\"Tool call was interrupted, it may have run\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[]}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 3). The write-ahead started row before the UNGATED batch: the gated row's shape with approval_id null. A started call with no result reads interrupted, on the paused step too; the gated call is still open (no synthesised result), so a resume can answer it."
     },
     {
@@ -2213,10 +2213,10 @@
       ],
       "rows": {
         "php": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_paris\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Paris\"},\"result\":\"Sunny in Paris\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_inner\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_inner\",\"tool_call_id\":\"call_inner\"}]}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_paris\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Paris\"},\"result\":\"Sunny in Paris\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_inner\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_inner\",\"tool_call_id\":\"call_inner\"}]}]",
+        "py": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_paris\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Paris\"},\"result\":\"Sunny in Paris\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_inner\",\"name\":\"weather\",\"arguments\":{\"city\":\"Rome\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_inner\",\"tool_call_id\":\"call_inner\"}]}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 3, a nested park). A tool's own nested send parked a newer step while the approved call ran; the outer run stopped before another model step (parked_elsewhere), so nothing replaces the newer step. The outer call's result row is placed with its own step; the newer step is the paused one and its call has no synthesised result."
     },
     {
@@ -2314,10 +2314,10 @@
       ],
       "rows": {
         "php": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[],\"tool_approval_responses\":[]}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[],\"tool_approval_responses\":[]}]",
+        "py": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[],\"tool_approval_responses\":[]}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 4). Only a row the runtime wrote (\"harness\": true) carries harness marks; a run id is never a trust signal. Each host row here carries one mark (started, ended_by_start, superseded, the 0.26.x replaced mark, the PHP journal) with no run id, the step's run id or another run's: every mark reads as absent, so the paused call is still open (no interrupted, replaced or journal outcome)."
     },
     {
@@ -2384,10 +2384,10 @@
       ],
       "rows": {
         "php": "[{\"approval_id\":\"apr_1\",\"ended_by_start\":false}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"approval_id\":\"apr_1\",\"ended_by_start\":false}]",
+        "py": "[{\"approval_id\":\"apr_1\",\"ended_by_start\":false}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (item 4). The ended mark is read only on a row the runtime wrote; this one is a host row (it names a run id, which proves nothing)."
     },
     {
@@ -2578,10 +2578,10 @@
       ],
       "rows": {
         "php": "[{\"approval_id\":\"apr_1\",\"pending\":false,\"decision\":null},{\"approval_id\":\"apr_2\",\"pending\":false,\"decision\":true},{\"approval_id\":\"apr_3\",\"pending\":true,\"decision\":null},{\"approval_id\":\"apr_4\",\"pending\":true,\"decision\":null}]",
-        "ts": "",
-        "py": ""
+        "ts": "[{\"approval_id\":\"apr_1\",\"pending\":false,\"decision\":null},{\"approval_id\":\"apr_2\",\"pending\":false,\"decision\":true},{\"approval_id\":\"apr_3\",\"pending\":true,\"decision\":null},{\"approval_id\":\"apr_4\",\"pending\":true,\"decision\":null}]",
+        "py": "[{\"approval_id\":\"apr_1\",\"pending\":false,\"decision\":null},{\"approval_id\":\"apr_2\",\"pending\":false,\"decision\":true},{\"approval_id\":\"apr_3\",\"pending\":true,\"decision\":null},{\"approval_id\":\"apr_4\",\"pending\":true,\"decision\":null}]"
       },
-      "agrees": false,
+      "agrees": true,
       "notes": "G-387 round 16 (items 1, 2 and 4). For each approval in `approvals`: {approval_id, pending, decision} where decision is the one that STANDS (true, false, or null for none). apr_1: its call has a host result, so it is not pending (a decision on it is refused) and nothing was decided. apr_2: approved, started and ran; the denial after it never stood. apr_3: a forged started row on a host row is ignored: still pending. apr_4: forged ended and superseded marks on a host row are ignored: still pending."
     }
   ],

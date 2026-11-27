@@ -1724,7 +1724,7 @@
             "forged"
           ],
           "refusals": [
-            null,
+            "approval_not_pending",
             "approval_not_pending"
           ]
         },
@@ -1742,12 +1742,12 @@
             "forged"
           ],
           "refusals": [
-            null,
+            "approval_not_pending",
             "approval_not_pending"
           ]
         }
       },
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "apr-0022",
@@ -2172,10 +2172,36 @@
             "approval_not_pending"
           ]
         },
-        "ts": null,
-        "py": null
+        "ts": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [],
+          "decided": [
+            null
+          ],
+          "outcomes": [
+            "host"
+          ],
+          "refusals": [
+            "approval_not_pending"
+          ]
+        },
+        "py": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [],
+          "decided": [
+            null
+          ],
+          "outcomes": [
+            "host"
+          ],
+          "refusals": [
+            "approval_not_pending"
+          ]
+        }
       },
-      "agrees": false
+      "agrees": true
     },
     {
       "id": "apr-0027",
@@ -2222,10 +2248,36 @@
           ],
           "refusals": []
         },
-        "ts": null,
-        "py": null
+        "ts": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [
+            1
+          ],
+          "decided": [
+            true
+          ],
+          "outcomes": [
+            "ok"
+          ],
+          "refusals": []
+        },
+        "py": {
+          "approvals": 1,
+          "free": 0,
+          "ran": [
+            1
+          ],
+          "decided": [
+            true
+          ],
+          "outcomes": [
+            "ok"
+          ],
+          "refusals": []
+        }
       },
-      "agrees": false
+      "agrees": true
     }
   ]
 }
