@@ -22,11 +22,19 @@ import sys
 def satisfying(constraint, versions):
     """The published versions that satisfy `constraint`, or None when the
     constraint cannot be read."""
-    match = re.fullmatch(r"\^0\.(\d+)", constraint)
+    # ^0.N: any 0.N.P. ^0.N.M: 0.N.P with P >= M (a caret on 0.N allows
+    # patch releases only). Stable releases only; anything else is unread.
+    match = re.fullmatch(r"\^0\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?", constraint)
     if match is None:
         return None
-    minor = match.group(1)
-    return [v for v in versions if re.fullmatch(rf"v?0\.{minor}\.\d+", v)]
+    minor = int(match.group(1))
+    floor = int(match.group(2)) if match.group(2) is not None else 0
+    found = []
+    for version in versions:
+        release = re.fullmatch(r"v?0\.(\d+)\.(\d+)", version)
+        if release is not None and int(release.group(1)) == minor and int(release.group(2)) >= floor:
+            found.append(version)
+    return found
 
 
 def main(argv):
