@@ -91,7 +91,8 @@ function recordApprovalPairingRow(array $row): array
             'usage' => ['input_tokens' => 1, 'input_tokens_details' => ['cached_tokens' => 0], 'output_tokens' => 1, 'output_tokens_details' => ['reasoning_tokens' => 0], 'total_tokens' => 2]]);
     });
 
-    $pending = approvalPairingSession()->send('go')->pendingApprovals();
+    $parked = approvalPairingSession()->send('go');
+    $pending = $parked->pendingApprovals();
 
     // DECISION B (0.2.0): a row that supersedes the parked step, recorded by
     // a host (outside the run that owns the step), or a new message.
@@ -100,6 +101,8 @@ function recordApprovalPairingRow(array $row): array
         'assistant_tool_step' => approvalPairingSession()->thread()->record([new AssistantMessage('', [new ToolCall('later', 'free', [])])]),
         'assistant_text' => approvalPairingSession()->thread()->record([new AssistantMessage('A later answer.')]),
         'user' => approvalPairingSession()->thread()->record([new UserMessage('A later message.')]),
+        // A caller naming the step's OWN run id: still outside it.
+        'user_owning_run_id' => approvalPairingSession()->thread()->record([new UserMessage('A later message.')], $parked->runId),
         'new_message' => approvalPairingSession()->send('Something else.'),
     };
 

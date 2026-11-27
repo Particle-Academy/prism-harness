@@ -3,10 +3,12 @@
 declare(strict_types=1);
 
 use Illuminate\Support\Facades\Http;
+use Prism\Harness\AgentRuntime;
 use Prism\Harness\Exceptions\ApprovalNotPending;
 use Prism\Harness\Models\Thread;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
+use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Tools\CanonicalJson;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Contracts\Message;
@@ -389,7 +391,7 @@ it('does not supersede a step with the harness\'s own row inside the run that ow
     $owner = $response->runId;
     $message = $row === 'assistant text' ? new AssistantMessage('The run\'s own answer.') : new UserMessage('The run\'s own row.');
 
-    Thread::recordingInRun($owner, fn () => g392HarnessSession()->thread()->record([$message], $owner));
+    g397AsRuntime($owner, fn () => g392HarnessSession()->thread()->record([$message], $owner));
 
     expect(decisionBDenials())->toBe([])->and($this->ran)->toBe([]);
 })->with(['assistant text', 'user']);
@@ -421,7 +423,7 @@ it('always supersedes a step with a later assistant step that has tool calls, ev
     g392HarnessFake('call_paris', 'call_rome');
     $owner = g392HarnessSession()->send('Weather in Paris and Rome?')->runId;
 
-    Thread::recordingInRun($owner, fn () => g392HarnessSession()->thread()->record(
+    g397AsRuntime($owner, fn () => g392HarnessSession()->thread()->record(
         [new AssistantMessage('', [new ToolCall('later', 'weather', ['city' => 'Oslo'])])], $owner));
 
     expect(decisionBDenials())->toBe([
@@ -469,10 +471,10 @@ it('reads the runs that recorded a step\'s results as owning it', function (stri
     g392HarnessSession()->send('Weather in Paris and Rome?');
     $resumer = 'run_'.str_repeat('b', 24);
     $thread = g392HarnessSession()->thread();
-    Thread::recordingInRun($resumer, fn () => $thread->record(
+    g397AsRuntime($resumer, fn () => $thread->record(
         [new ToolResultMessage([new ToolResult('call_paris', 'weather', ['city' => 'Paris'], 'Sunny in Paris')])], $resumer));
     $run = $writer === 'the run that recorded a result' ? $resumer : 'run_'.str_repeat('c', 24);
-    Thread::recordingInRun($run, fn () => g392HarnessSession()->thread()->record([new AssistantMessage('An answer.')], $run));
+    g397AsRuntime($run, fn () => g392HarnessSession()->thread()->record([new AssistantMessage('An answer.')], $run));
 
     expect(decisionBDenials())->toBe($writer === 'the run that recorded a result' ? []
         : ['call_rome' => ['Tool call was not run because a later step replaced it']])
@@ -602,3 +604,34 @@ it('reads a 0.26.x thread with a replaced step: one outcome per call, nothing ru
             ->and(g392HarnessSession()->approvalStatus($ids[1]))->toBe('superseded');
     }
 })->with(['later step, unmarked (6cf2804)', 'later step, marked (9820779)', 'user row, marked (9820779)']);
+
+/**
+ * Record as the RUNTIME records a run's own rows. Only the runtime can: its
+ * marker is private, so a test reaches it the way no host can, by binding
+ * into the class.
+ */
+function g397AsRuntime(string $runId, Closure $record): mixed
+{
+    return Closure::bind(static fn (): mixed => AgentRuntime::recordInRun($runId, $record), null, AgentRuntime::class)();
+}
+
+// A run id a CALLER passes is always outside the runs that own a step: the
+// run id argument of Thread::record(), and any other public route. Only the
+// runtime's own recording of a run counts as inside it, and nothing public
+// sets that.
+it('never lets a caller mark a row as written inside the run that owns the step', function (): void {
+    g392HarnessFake('call_paris', 'call_rome');
+    $owner = g392HarnessSession()->send('Weather in Paris and Rome?')->runId;
+
+    $public = array_map(fn (ReflectionMethod $m): string => $m->getName(),
+        (new ReflectionClass(Thread::class))->getMethods(ReflectionMethod::IS_PUBLIC));
+    g392HarnessSession()->thread()->record([new UserMessage('A host row under the owning run id.')], $owner);
+
+    expect($public)->not->toContain('recordingInRun')
+        ->and((new ReflectionMethod(AgentRuntime::class, 'recordInRun'))->isPublic())->toBeFalse()
+        ->and(array_map(fn (ReflectionMethod $m): string => $m->getName(), (new ReflectionClass(InRunRecording::class))->getMethods(ReflectionMethod::IS_PUBLIC)))->toBe(['active'])
+        ->and(decisionBDenials())->toBe([
+            'call_paris' => ['Tool call was not run because a later step replaced it'],
+            'call_rome' => ['Tool call was not run because a later step replaced it'],
+        ])->and($this->ran)->toBe([]);
+});
