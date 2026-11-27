@@ -291,7 +291,18 @@ function ppGenerate(int $seed): array
             ? array_keys(array_filter($calls, fn (array $call): bool => $call['tool'] === 'echo'))
             : array_keys(array_filter($laterCalls, fn (array $call): bool => $call['tool'] === 'echo'));
         $case['forge'] = $segment === null || $pool === [] ? null : ['segment' => $segment, 'call' => $laterRng->pick(array_values($pool))];
+        // SEGMENT OWNERSHIP (round 13b), from a stream of its own so every
+        // draw above is unchanged: a result recorded in the LATER segment
+        // whose id, tool and arguments are exactly an EARLIER gated call's.
+        // It counts only for the later step: it answers the later call it
+        // matches there (id and tool, then id), or nothing.
+        $crossRng = new PpRng(ppU32($seed ^ 0x5E6A0B13));
+        $earlierGated = array_keys(array_filter($calls, fn (array $call): bool => $call['tool'] === 'echo'));
+        if ($crossRng->chance(0.5)) {
+            $case['cross'] = ['call' => $crossRng->pick($earlierGated)];
+        }
     }
+    $case['cross'] ??= null;
     $case['insert'] = ppInsertion($seed, $calls, $prior, $case['later'] !== null);
 
     return $case;
@@ -366,12 +377,24 @@ function ppExpected(array $c): array
     // The forged results, by step.
     $forgedOld = [];
     if ($insert !== null && $insert['kind'] === 'tool_result') {
-        $forgedOld[] = $insert['call'];
+        $forgedOld[$insert['call']] = 'forged:'.$c['calls'][$insert['call']]['token'];
     }
     if (($forge['segment'] ?? null) === 'earlier') {
-        $forgedOld[] = $forge['call'];
+        $forgedOld[$forge['call']] = 'forged:'.$c['calls'][$forge['call']]['token'];
     }
-    $forgedLater = ($forge['segment'] ?? null) === 'later' ? [$forge['call']] : [];
+    $forgedLater = ($forge['segment'] ?? null) === 'later' ? [$forge['call'] => 'forged:'.$later['calls'][$forge['call']]['token']] : [];
+    // A later-segment result carrying an EARLIER call's id, tool and
+    // arguments answers the later call it matches (SEGMENT OWNERSHIP), never
+    // the earlier one: that call keeps its own outcome.
+    $cross = $c['cross'] ?? null;
+    if ($later !== null && $cross !== null) {
+        $answered = [...array_keys(array_filter($later['calls'], fn (array $call): bool => $call['tool'] === 'free')), ...array_keys($forgedLater)];
+        $earlierCall = $c['calls'][$cross['call']];
+        $target = ppSegmentMatch($later['calls'], $answered, $earlierCall['id'], $earlierCall['tool']);
+        if ($target !== null) {
+            $forgedLater[$target] = 'forged:'.$earlierCall['token'];
+        }
+    }
 
     if ($later === null) {
         $decided = ppDecideStep($c['calls'], $c['requests'], $c['prior'], $forgedOld);
@@ -395,7 +418,7 @@ function ppExpected(array $c): array
  * One step decided by its own requests.
  *
  * @param  list<int>  $prior  calls with a result before any decision
- * @param  list<int>  $forged  calls a host forged a result for
+ * @param  array<int, string>  $forged  calls a host forged a result for (index => the result)
  * @return array{repeated: bool, runs: list<int>, outcome: array<int, string>}
  */
 function ppDecideStep(array $calls, array $requests, array $prior, array $forged, bool $laterFree = false): array
@@ -410,8 +433,8 @@ function ppDecideStep(array $calls, array $requests, array $prior, array $forged
         $token = $call['token'];
         if ($call['tool'] === 'free') {
             $outcome[$token] = 'free:'.$token;
-        } elseif (in_array($index, $forged, true)) {
-            $outcome[$token] = 'forged:'.$token;
+        } elseif (isset($forged[$index])) {
+            $outcome[$token] = $forged[$index];
         } elseif (in_array($index, $prior, true)) {
             $outcome[$token] = 'prior:'.$token;
         } elseif ($repeated) {
@@ -440,9 +463,32 @@ function ppDecideStep(array $calls, array $requests, array $prior, array $forged
 }
 
 /**
+ * The call of a step that a result in ITS segment answers when its arguments
+ * are no call's of that step: the first call with its id and tool that has
+ * no result yet (none, if every such call has one); else the first call with
+ * its id that has no result yet; else none.
+ *
+ * @param  list<int>  $answered  calls that already have a result
+ */
+function ppSegmentMatch(array $calls, array $answered, string $id, string $tool): ?int
+{
+    foreach ([fn (array $call): bool => $call['id'] === $id && $call['tool'] === $tool, fn (array $call): bool => $call['id'] === $id] as $matches) {
+        $candidates = array_keys(array_filter($calls, $matches));
+        if ($candidates !== []) {
+            $open = array_values(array_diff($candidates, $answered));
+
+            return $open[0] ?? null;
+        }
+    }
+
+    return null;
+}
+
+/**
  * A superseded step: nothing runs; each gated call with no result of its own
  * gets ONE replaced denial.
  *
+ * @param  array<int, string>  $forged  calls a host forged a result for (index => the result)
  * @return array{runs: list<int>, outcome: array<int, string>}
  */
 function ppReplaced(array $calls, array $prior, array $forged): array
@@ -452,7 +498,7 @@ function ppReplaced(array $calls, array $prior, array $forged): array
         $token = $call['token'];
         $outcome[$token] = match (true) {
             $call['tool'] === 'free' => 'free:'.$token,
-            in_array($index, $forged, true) => 'forged:'.$token,
+            isset($forged[$index]) => $forged[$index],
             in_array($index, $prior, true) => 'prior:'.$token,
             default => PP_SUPERSEDED,
         };
@@ -554,18 +600,36 @@ function ppStep(array $c): array
     throw new PpViolation('the step was stored');
 }
 
-/** @return list<array{0: int, 1: string}> every stored result entry after the step's assistant row, as [token, result] */
+/**
+ * Every stored result entry after the first step, attributed by SEGMENT
+ * OWNERSHIP (round 13b), as [token, result]: an entry counts only for a call
+ * of the step whose segment it sits in (the rows after that step's assistant
+ * row and before the next assistant row with tool calls). Within a segment
+ * it is its call's by exact arguments; an entry whose arguments are no call's
+ * of that step is matched by id and tool, then id ({@see ppSegmentMatch()}),
+ * or counts for nothing. An entry the harness wrote in the wrong segment is
+ * reported as such, so it fails invariant 5.
+ *
+ * @return list<array{0: int, 1: string}>
+ */
 function ppOutcomes(array $c): array
 {
     $out = [];
-    $after = false;
+    $segment = null;
+    $steps = ['first' => $c['calls'], 'later' => $c['later']['calls'] ?? [], 'other' => []];
+    $answered = ['first' => [], 'later' => [], 'other' => []];
+    $repeats = [];
     foreach (ppRows($c) as $row) {
         if ($row['type'] === 'assistant' && ($row['tool_calls'] ?? []) !== []) {
-            $after = true;
+            // Which step: the first one, the later step (tokens 200+), or an
+            // inserted call (token 900) whose segment holds no call of ours.
+            $arguments = $row['tool_calls'][0]['arguments'] ?? [];
+            $n = (is_string($arguments) ? json_decode($arguments, true) : $arguments)['n'] ?? null;
+            $segment = $segment === null ? 'first' : ($n === 900 ? 'other' : ($n >= 200 ? 'later' : 'other'));
 
             continue;
         }
-        if (! $after || $row['type'] !== 'tool_result') {
+        if ($segment === null || $row['type'] !== 'tool_result') {
             continue;
         }
         // EVERY result row after the first step, to the end of the thread
@@ -576,7 +640,32 @@ function ppOutcomes(array $c): array
             if (! is_int($n) || $n === 900) {
                 continue;
             }
-            $out[] = [$n, (string) $entry['result']];
+            $own = array_search($n, array_column($steps[$segment], 'token'), true);
+            if ($own !== false) {
+                $answered[$segment][] = $own;
+                $out[] = [$n, (string) $entry['result']];
+
+                continue;
+            }
+            // Not a call of this segment's step: the test's own later-segment
+            // result naming an earlier call answers the later call it matches.
+            if ($segment === 'later' && (string) $entry['result'] === 'forged:'.$n) {
+                // A resume that records every result of the step again
+                // repeats it: the same entry is the same outcome.
+                $key = json_encode([$entry['tool_call_id'], $entry['tool_name'], $n]);
+                if (isset($repeats[$key])) {
+                    continue;
+                }
+                $repeats[$key] = true;
+                $at = ppSegmentMatch($steps['later'], $answered['later'], (string) $entry['tool_call_id'], (string) $entry['tool_name']);
+                if ($at !== null) {
+                    $answered['later'][] = $at;
+                    $out[] = [$steps['later'][$at]['token'], (string) $entry['result']];
+                }
+
+                continue;
+            }
+            $out[] = [$n, 'outside its segment: '.$entry['result']];
         }
     }
 
@@ -699,6 +788,9 @@ function ppRunCase(array $c): void
     }
     if (($forge['segment'] ?? null) === 'later') {
         $thread()->record([$forged($later['calls'][$forge['call']])]);
+    }
+    if ($later !== null && ($c['cross'] ?? null) !== null) {
+        $thread()->record([$forged($c['calls'][$c['cross']['call']])]);
     }
     $inserted = $insert === null ? null : match ($insert['kind']) {
         'assistant_text' => new AssistantMessage('A note.'),
@@ -874,6 +966,7 @@ function ppWithoutCall(array $c, int $drop): ?array
         'repeats' => [],
         'insert' => ($c['insert'] ?? null) === null || $c['insert']['call'] === $drop ? null : [...$c['insert'], 'call' => $remap($c['insert']['call'])],
         'forge' => ($c['forge']['segment'] ?? null) === 'earlier' ? ($c['forge']['call'] === $drop ? null : [...$c['forge'], 'call' => $remap($c['forge']['call'])]) : ($c['forge'] ?? null),
+        'cross' => ($c['cross'] ?? null) === null || $c['cross']['call'] === $drop ? null : ['call' => $remap($c['cross']['call'])],
         'prior' => array_values(array_map($remap, array_filter($c['prior'], fn (int $index): bool => $index !== $drop))),
         'order' => array_values(array_map(fn (int $index): int => $position[$index], array_filter($c['order'], fn (int $index): bool => isset($position[$index])))),
     ];
@@ -901,9 +994,9 @@ function ppSmaller(array $c): array
     if ($c['again'] !== []) {
         $out[] = [...$c, 'again' => array_slice($c['again'], 0, -1)];
     }
-    foreach (['insert', 'later', 'forge', 'repeats'] as $key) {
+    foreach (['insert', 'later', 'forge', 'cross', 'repeats'] as $key) {
         if (($c[$key] ?? null) !== null && $c[$key] !== []) {
-            $out[] = [...$c, $key => $key === 'repeats' ? [] : null, ...($key === 'later' ? ['forge' => null] : [])];
+            $out[] = [...$c, $key => $key === 'repeats' ? [] : null, ...($key === 'later' ? ['forge' => null, 'cross' => null] : [])];
         }
     }
     foreach (array_keys($c['calls']) as $i) {
@@ -1028,7 +1121,7 @@ it('reproduces the TS generator bit for bit', function (): void {
     foreach ($ts as $json) {
         $case = json_decode($json, true);
         $php = ppGenerate($case['seed']);
-        unset($php['insert'], $php['later'], $php['forge'], $php['repeats']);
+        unset($php['insert'], $php['later'], $php['forge'], $php['cross'], $php['repeats']);
         expect(json_encode($php))->toBe($json);
     }
     expect(array_map(fn (int $index): int => ppCaseSeed(0x6392, $index), [0, 1, 2, 149]))->toBe([2483776628, 2972160347, 2366528728, 3841045332]);
@@ -1095,6 +1188,32 @@ it('the default set covers every combination the property must check', function 
         }
         if (! $has(fn (array $c): bool => ($c['forge']['segment'] ?? null) === $segment && $c['insert'] !== null)) {
             $missing[] = "later step + forged result in the {$segment} segment + insert";
+        }
+    }
+    // SEGMENT OWNERSHIP: a later-segment result naming an earlier call that
+    // answers a later same-id call, one that answers a later APPROVED call,
+    // one that answers nothing, each also with an inserted row.
+    $crossTarget = function (array $c): ?int {
+        if ($c['later'] === null || $c['cross'] === null) {
+            return null;
+        }
+        $forgedLater = ($c['forge']['segment'] ?? null) === 'later' ? [$c['forge']['call']] : [];
+        $answered = [...array_keys(array_filter($c['later']['calls'], fn (array $call): bool => $call['tool'] === 'free')), ...$forgedLater];
+        $call = $c['calls'][$c['cross']['call']];
+
+        return ppSegmentMatch($c['later']['calls'], $answered, $call['id'], $call['tool']);
+    };
+    $approvedLater = fn (array $c, int $index): bool => array_filter($c['later']['requests'], fn (array $q): bool => $q['call'] === $index && $q['verdict'] === 'approve') !== [];
+    foreach ([
+        'answers a later call' => fn (array $c): bool => $crossTarget($c) !== null,
+        'answers a later approved call' => fn (array $c): bool => ($t = $crossTarget($c)) !== null && $approvedLater($c, $t),
+        'answers nothing' => fn (array $c): bool => $c['cross'] !== null && $c['later'] !== null && $crossTarget($c) === null,
+    ] as $label => $shape) {
+        if (! $has($shape)) {
+            $missing[] = "later-segment result naming an earlier call that {$label}";
+        }
+        if (! $has(fn (array $c): bool => $shape($c) && $c['insert'] !== null)) {
+            $missing[] = "later-segment result naming an earlier call that {$label} + insert";
         }
     }
     if (! $has(fn (array $c): bool => $c['later'] !== null && array_filter($c['later']['requests'], fn (array $q): bool => $q['verdict'] === 'approve') !== []

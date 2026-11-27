@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Prism\Harness\Support;
 
 use Generator;
+use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
@@ -20,9 +21,15 @@ use Prism\Prism\ValueObjects\ToolResult;
  * Anthropic receives an empty user turn for the decision-only row, which it
  * refuses. Folded, the model sees each call's result once, as it did live.
  *
- * A result is keyed by its tool call id, and a later row's result for the same
- * call replaces an earlier one, in the earlier one's position. A decision is
- * keyed by its approval id, the same way.
+ * A later row's result for the same call replaces an earlier one, in the
+ * earlier one's position. The same call is the same tool call id, tool name
+ * AND recorded arguments (the n-th such result of a row replacing the n-th of
+ * an earlier row), never the call id alone (G-387 round 13b): a provider may
+ * give two calls of one step the same id, and keyed by id a later same-id
+ * result with other arguments replaced a call's OWN result, so that call read
+ * as open and was given a second outcome. Within a step's rows a result is its
+ * call's by exact arguments first, and the replay keeps it so. A decision is
+ * keyed by its approval id.
  */
 class ToolResultRuns
 {
@@ -70,8 +77,13 @@ class ToolResultRuns
         $decisions = [];
 
         foreach ($run as $message) {
+            $seen = [];
             foreach ($message->toolResults as $result) {
-                $results[$result->toolCallId] = $result;
+                // Length-prefixed, so no id or name can collide with another
+                // pair, and no encoding step can fail on an odd value.
+                $same = strlen($result->toolCallId).':'.$result->toolCallId.'|'.strlen($result->toolName).':'.$result->toolName.'|'.CanonicalJson::digest($result->args);
+                $seen[$same] = ($seen[$same] ?? 0) + 1;
+                $results[$same.'#'.$seen[$same]] = $result;
             }
 
             foreach ($message->toolApprovalResponses as $decision) {
