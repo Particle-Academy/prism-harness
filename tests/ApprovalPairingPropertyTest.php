@@ -411,12 +411,11 @@ function pairingOracle(array $case): array
             if ($runs[$k]) {
                 $ran[] = $call['token'];
             }
-            // The refused turn resolved nothing, so the decision in effect
-            // when the step IS resolved decides: on this line a later
-            // decision for the same approval replaces an earlier one
-            // (ToolResultRuns folds decisions by approval id), so a call of
-            // a step with distinct ids may run on a later approval.
-            if ($refusedHere && $call['gated'] && ! $repeated && ! $superseded && $k !== $forged) {
+            // The refused turn resolved nothing; the FIRST decision recorded
+            // for the call still counts when the step is resolved (G-401), so
+            // a call of a step with distinct ids that was not denied may run
+            // on a later approval. A call a person denied never runs.
+            if ($refusedHere && $call['gated'] && ! $repeated && ! $superseded && $k !== $forged && ($effective[$k] ?? 'none') !== 'deny') {
                 $may[] = $call['token'];
             }
         }
@@ -464,7 +463,7 @@ function pairingOracle(array $case): array
             if ($runsR[$k]) {
                 $ran[] = $call['token'];
             }
-            if ($refusedR && ! $repeatedR && $k !== $forgedK) {
+            if ($refusedR && ! $repeatedR && $k !== $forgedK && $effectiveR[$k] !== 'deny') {
                 $may[] = $call['token'];
             }
         }
