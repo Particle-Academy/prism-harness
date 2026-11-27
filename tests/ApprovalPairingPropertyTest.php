@@ -131,7 +131,7 @@ const PAIRING_REPEATED_REASON = 'Tool call was not run because another call in t
 const PAIRING_REPLACED_REASON = 'Tool call was not run because a later step replaced it';
 
 /** The fixed-seed set every CI run checks, and the coverage test reads. */
-const PAIRING_FAST_EXAMPLES = 80;
+const PAIRING_FAST_EXAMPLES = 160;
 
 const PAIRING_ID_POOL = ['a', 'b', 'c', ''];
 
@@ -263,7 +263,7 @@ function pairingGenerate(int $seed): array
     $g = new PairingPropertyRng(($seed ^ 0x397397) & 0xFFFFFFFF);
     $gated = array_keys(array_filter($steps[0]['calls'], fn (array $call): bool => $call['gated']));
     $mode = $g->int(20);
-    if ($gated !== [] && $mode < 5) {
+    if ($gated !== [] && $mode < 8) {
         // A later tool-call step is recorded onto the thread while the first
         // is parked, as a host can: the first is replaced. The later step's
         // approval requests sometimes repeat an approval id.
@@ -292,10 +292,17 @@ function pairingGenerate(int $seed): array
         }
         $case['recorded'] = ['calls' => $calls, 'approvals' => $approvals, 'decisions' => $decisions, 'mix' => $g->shuffle($mix),
             'resume' => $g->pick(['decide', 'streamDecision', 'approveOne'])];
+        // A row the host records too: in the replaced step's segment (before
+        // the later step) or the later step's, before the decision or after
+        // the resume.
+        $kind = $g->pick(['assistant_text', 'assistant_call', 'user', 'system', 'tool_empty', 'tool_result']);
+        $case['insert'] = ['kind' => $kind, 'when' => $g->chance(0.6) ? 'before_decision' : 'after_decision',
+            'segment' => $g->chance(0.5) ? 'earlier' : 'later',
+            'call' => $kind === 'tool_result' ? $g->pick($gated) : $g->int(count($steps[0]['calls']))];
 
         return $case;
     }
-    $spent = $gated !== [] && $mode < 8;
+    $spent = $gated !== [] && $mode < 10;
     if ($gated !== [] && ($spent || $g->chance(0.6))) {
         // A row the host records after the park: before the decision, or
         // after the resume that acted on it (then repeat resumes).
@@ -349,7 +356,8 @@ function pairingOracle(array $case): array
         // without a call, or a user row) runs none of its gated calls; a
         // forged result is its call's only outcome, and that call never runs.
         $superseded = in_array($insert, ['assistant_text', 'assistant_call', 'user'], true);
-        $forged = ($case['insert']['kind'] ?? null) === 'tool_result' && $steps === [] && $insert !== null ? $case['insert']['call'] : null;
+        $forged = ($case['insert']['kind'] ?? null) === 'tool_result' && $steps === [] && $insert !== null
+            && ($case['insert']['segment'] ?? 'earlier') === 'earlier' ? $case['insert']['call'] : null;
         $runs = [];
         foreach ($step['calls'] as $k => $call) {
             $approved = ! $repeated && ! $superseded && $k !== $forged && ($effective[$k] ?? 'none') === 'approve';
@@ -382,14 +390,36 @@ function pairingOracle(array $case): array
                 $effectiveR[$k] = $r['decisions'][$k];
             }
         }
+        // A row before the decision: in the later step's segment, a text,
+        // call or user row supersedes it and a forged result is the outcome
+        // of the first of its calls with that id; a system row anywhere makes
+        // the provider refuse the turn.
+        $kind = pairingInsertBefore($case);
+        $later = ($case['insert']['segment'] ?? null) === 'later';
+        $supersededR = $later && in_array($kind, ['assistant_text', 'assistant_call', 'user'], true);
+        $refusedR = $kind === 'system';
+        $forgedK = null;
+        if ($later && $kind === 'tool_result') {
+            $forgedId = $case['steps'][0]['calls'][$case['insert']['call']]['id'];
+            foreach ($r['calls'] as $k => $call) {
+                if ($call['id'] === $forgedId) {
+                    $forgedK = $k;
+
+                    break;
+                }
+            }
+        }
         $runsR = [];
         foreach ($r['calls'] as $k => $call) {
-            $runsR[$k] = ! $repeatedR && $effectiveR[$k] === 'approve';
+            $runsR[$k] = ! $repeatedR && ! $supersededR && ! $refusedR && $k !== $forgedK && $effectiveR[$k] === 'approve';
             if ($runsR[$k]) {
                 $ran[] = $call['token'];
             }
+            if ($refusedR && ! $repeatedR && $k !== $forgedK) {
+                $may[] = $call['token'];
+            }
         }
-        $recorded = ['repeated' => $repeatedR, 'runs' => $runsR];
+        $recorded = ['repeated' => $repeatedR, 'runs' => $runsR, 'superseded' => $supersededR, 'refused' => $refusedR, 'forged' => $forgedK];
     }
     sort($ran);
 
@@ -489,11 +519,11 @@ function pairingRun(array $case): array
             }
         }
         $resume = pairingResume($step);
-        if ($s === 0 && pairingInsertBefore($case) !== null) {
+        if ($s === 0 && pairingInsertBefore($case) !== null && ($case['mode'] ?? 'normal') !== 'replaced') {
             $session()->thread()->record([pairingInsertedRow($case)]);
         }
         if (($case['mode'] ?? 'normal') === 'replaced') {
-            pairingReplace($session(), $case['recorded'], $requestFor, $step, $observed);
+            pairingReplace($session(), $case, $requestFor, $step, $observed);
             $pending = [];
 
             break;
@@ -577,13 +607,18 @@ function pairingRun(array $case): array
  * Record a later tool-call step onto the thread while `$step` is parked, then
  * resume with one batch of decisions for both steps' calls.
  *
- * @param  array<string, mixed>  $recorded
+ * @param  array<string, mixed>  $case
  * @param  array<int, ?string>  $requestFor  the parked step's approval id per gated call
  * @param  array<string, mixed>  $step
  * @param  array<string, mixed>  $observed
  */
-function pairingReplace(Session $session, array $recorded, array $requestFor, array $step, array &$observed): void
+function pairingReplace(Session $session, array $case, array $requestFor, array $step, array &$observed): void
 {
+    $recorded = $case['recorded'];
+    $before = pairingInsertBefore($case) !== null;
+    if ($before && $case['insert']['segment'] === 'earlier') {
+        $session->thread()->record([pairingInsertedRow($case)]);
+    }
     $session->thread()->record([new AssistantMessage('', array_map(
         fn (array $call): ToolCall => new ToolCall($call['id'], 'gated', ['token' => $call['token']]),
         $recorded['calls'],
@@ -592,6 +627,9 @@ function pairingReplace(Session $session, array $recorded, array $requestFor, ar
         $recorded['calls'],
         $recorded['approvals'],
     ))], null, ['gated', 'free']);
+    if ($before && $case['insert']['segment'] === 'later') {
+        $session->thread()->record([pairingInsertedRow($case)]);
+    }
 
     $batch = [];
     foreach ($recorded['mix'] as [$which, $k]) {
@@ -878,7 +916,7 @@ function pairingDecisionRows(array $observed): array
  *
  * @param  array<string, mixed>  $case
  * @param  array<string, mixed>  $observed
- * @param  array{repeated: bool, runs: array<int, bool>}  $expected
+ * @param  array{repeated: bool, runs: array<int, bool>, superseded: bool, refused: bool, forged: ?int}  $expected
  * @return list<string>
  */
 function pairingReplacedViolations(array $case, array $observed, array $expected): array
@@ -899,6 +937,29 @@ function pairingReplacedViolations(array $case, array $observed, array $expected
     }
     foreach ($case['recorded']['calls'] as $k => $call) {
         $got = array_values(array_unique($outcomes[$call['token']] ?? []));
+        if ($expected['forged'] === $k) {
+            // The forged row (which carries the other call's token) is its
+            // outcome: nothing else may be added for it, and it never runs.
+            if ($got !== []) {
+                $violations[] = "inv5: recorded {$call['token']} has a forged result and also recorded ".json_encode($got);
+            }
+
+            continue;
+        }
+        if ($expected['superseded']) {
+            if ($got !== [PAIRING_REPLACED_REASON]) {
+                $violations[] = "inv5: recorded {$call['token']} of a superseded step recorded ".json_encode($got);
+            }
+
+            continue;
+        }
+        if ($expected['refused']) {
+            if (count($got) > 1) {
+                $violations[] = "inv5: recorded {$call['token']} in a refused turn recorded ".json_encode($got);
+            }
+
+            continue;
+        }
         if (count($got) !== 1) {
             $violations[] = "inv5: recorded {$call['token']} has outcomes ".json_encode($got);
 
@@ -1117,6 +1178,10 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         }
         if ($case['mode'] === 'replaced') {
             $seen['an older parked step replaced by a later tool-call step'] = true;
+            $seen['replaced, then insert '.$case['insert']['kind'].' '.$case['insert']['when']] = true;
+            if ($case['insert']['kind'] === 'tool_result' && $case['insert']['when'] === 'before_decision') {
+                $seen['a forged result in the '.$case['insert']['segment'].' step\'s segment'] = true;
+            }
             if (count($case['recorded']['approvals']) !== count(array_unique($case['recorded']['approvals']))) {
                 $seen['an approval id repeated in one step'] = true;
             }
@@ -1137,5 +1202,12 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'insert tool_result before_decision', 'insert tool_result after_decision',
         'a row after the park, then a resume with no step left, then repeat resumes',
         'an older parked step replaced by a later tool-call step', 'an approval id repeated in one step',
+        'replaced, then insert assistant_text before_decision', 'replaced, then insert assistant_text after_decision',
+        'replaced, then insert assistant_call before_decision', 'replaced, then insert assistant_call after_decision',
+        'replaced, then insert user before_decision', 'replaced, then insert user after_decision',
+        'replaced, then insert system before_decision', 'replaced, then insert system after_decision',
+        'replaced, then insert tool_empty before_decision', 'replaced, then insert tool_empty after_decision',
+        'replaced, then insert tool_result before_decision', 'replaced, then insert tool_result after_decision',
+        'a forged result in the earlier step\'s segment', 'a forged result in the later step\'s segment',
     ]);
 });
