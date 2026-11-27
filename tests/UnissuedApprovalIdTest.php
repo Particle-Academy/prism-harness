@@ -160,7 +160,8 @@ it('keeps the real id working exactly as before', function (): void {
     expect($this->ran)->toBe(['search' => 1, 'weather' => 1])
         ->and($resumed->awaitingApproval())->toBeFalse()
         ->and(Http::recorded())->toHaveCount(2)
-        ->and(array_column(g354Rows(), 'type'))->toBe(['user', 'assistant', 'tool_result', 'tool_result', 'tool_result', 'assistant']);
+        // Round 15: plus the approved call's write-ahead started row.
+        ->and(array_column(g354Rows(), 'type'))->toBe(['user', 'assistant', 'tool_result', 'tool_result', 'tool_result', 'tool_result', 'assistant']);
 });
 
 it('refuses a repeat of an id that was already answered: no request, nothing written', function (string $path): void {

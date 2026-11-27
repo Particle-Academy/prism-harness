@@ -236,8 +236,10 @@ it('keeps the content gate as core applies it', function (bool $capture): void {
 
 // A tool built withoutErrorHandling() throws its own exception out of the
 // resolution. A call resolved before it has already run; its result is
-// recorded before the exception leaves, so the next resume runs only the call
-// that threw.
+// recorded before the exception leaves, so the next resume does not run it
+// again. Round 15: the call that threw had its write-ahead started row and no
+// result, so it reads interrupted (it may have run) and is never re-run
+// either; running it again needs a fresh approval.
 it('records the calls resolved before a tool throws, so the next resume does not run them again', function (string $path, string $resume): void {
     resolutionPath($path);
     $session = G360::session();
@@ -265,8 +267,8 @@ it('records the calls resolved before a tool throws, so the next resume does not
     } catch (Throwable) {
     }
 
-    // Only the call that threw runs again.
-    expect($this->ran)->toBe(['search' => 1, 'weather' => 2])
+    // Neither runs again (round 15: the one that threw is interrupted).
+    expect($this->ran)->toBe(['search' => 1, 'weather' => 1])
         ->and($threw)->toBe('weather backend down')
         ->and($ranAtThrow)->toBe(['search' => 1, 'weather' => 1])
         ->and($storedAtThrow)->toBe(1)

@@ -27,6 +27,7 @@ use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\Subagent;
 use Prism\Harness\Subagents\SubagentResult;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Support\InRunRecording;
 use Prism\Harness\Tools\ToolRegistry;
 use Prism\Prism\Schema\ObjectSchema;
 use Prism\Prism\Schema\StringSchema;
@@ -2648,7 +2649,8 @@ it('ends a gated call that shares its id with an ungated one when a start lands,
     expect(sgRedelegate('Start over'))->toContain('"outcome":"completed"');
 
     $child = sgFreshChild();
-    expect(sgEndedMarks())->toBe([[['tool_results', 'tool_approval_responses', Thread::ENDED_BY_START], ['approval_ids' => [$approval]]]])
+    // Round 15: the runtime's own row also names the step it answers, last.
+    expect(sgEndedMarks())->toBe([[['tool_results', 'tool_approval_responses', Thread::ENDED_BY_START, 'harness_answers_step'], ['approval_ids' => [$approval]]]])
         ->and($child->approvalStatus($approval))->toBe('superseded')
         ->and(array_filter($child->thread()->approvalDecisions()))->toBe([])
         ->and($child->thread()->pendingApprovalIds())->toBe([])
@@ -2699,7 +2701,9 @@ it('ends the gated one of two same-tool calls sharing an id when one already fai
 it('reads an approval ended when any result row of its step carries the mark naming it', function (): void {
     $thread = sgChild()->thread();
     $ended = new ToolResultMessage([new ToolResult('dup', 'weather', ['city' => 'Paris'], 'Not run: the delegation this call was proposed under ended.')]);
-    $thread->record([
+    // The runtime's own record call (round 15: `endedByStart` is runtime-only),
+    // entered as the runtime enters it, by binding into InRunRecording.
+    $write = fn () => $thread->record([
         new UserMessage('Go'),
         new AssistantMessage('', [new ToolCall('c1', 'weather', ['city' => 'Rome'])], [], [new ToolApprovalRequest('apr_0', 'c1')]),
         new ToolResultMessage([new ToolResult('c1', 'weather', ['city' => 'Rome'], 'Sunny')], [new ToolApprovalResponse('apr_0', true)]),
@@ -2709,7 +2713,8 @@ it('reads an approval ended when any result row of its step carries the mark nam
         new ToolResultMessage([], [new ToolApprovalResponse('apr_1', false, SG_REPEATED_REASON)]),
         $ended,
         new UserMessage('Start over'),
-    ], endedByStart: [['message' => $ended, 'approvals' => ['apr_1', 'apr_0']]]);
+    ], 'r_start', endedByStart: [['message' => $ended, 'approvals' => ['apr_1', 'apr_0']]]);
+    (Closure::bind(static fn (): mixed => InRunRecording::during('r_start', $write), null, InRunRecording::class))();
 
     expect($thread->endedByStart('apr_1'))->toBeTrue()
         ->and($thread->endedByStart('apr_0'))->toBeFalse()
