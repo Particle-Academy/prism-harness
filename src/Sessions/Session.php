@@ -47,6 +47,11 @@ use Prism\Prism\ValueObjects\ToolApprovalResponse;
  */
 class Session
 {
+    /**
+     * The reason a decision for a step whose call ids repeat is recorded as.
+     */
+    public const REPEATED_CALL_ID_REASON = 'Tool call was not run because another call in this step has the same id';
+
     /** @var array<string, mixed>|null */
     protected ?array $cachedState = null;
 
@@ -564,9 +569,34 @@ class Session
      */
     protected function recordDecisions(array $decisions): void
     {
+        $decisions = $this->deniedWhenCallIdsRepeat($decisions);
+
         $this->thread()->record([
             new ToolResultMessage(toolApprovalResponses: $decisions),
         ], $this->run()['id'] ?? null);
+    }
+
+    /**
+     * Every decision for a step whose call ids repeat, as a denial.
+     *
+     * A decision reaches a call through the call id its request names, and a
+     * provider can give two calls in one step the same id. Such a step is
+     * denied whatever was decided, so no gated call in it runs and the
+     * recorded decisions say so.
+     *
+     * @param  list<ToolApprovalResponse>  $decisions
+     * @return list<ToolApprovalResponse>
+     */
+    protected function deniedWhenCallIdsRepeat(array $decisions): array
+    {
+        if (! $this->thread()->pausedStepRepeatsCallIds()) {
+            return $decisions;
+        }
+
+        return array_map(
+            static fn (ToolApprovalResponse $decision): ToolApprovalResponse => new ToolApprovalResponse($decision->approvalId, false, self::REPEATED_CALL_ID_REASON),
+            $decisions,
+        );
     }
 
     /**
