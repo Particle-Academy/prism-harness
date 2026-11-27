@@ -688,14 +688,36 @@ function pairingReport(int $seed, array $case, array $violations, array $origina
         .'  original case: '.json_encode($original);
 }
 
+/**
+ * A whole number of at least 1 from the environment, or null when it is
+ * unset. Anything else set there is refused, never read as the default: a
+ * run told to use 0 examples must not pass by checking none.
+ */
+function pairingEnvInt(string $name): ?int
+{
+    $value = getenv($name);
+    if ($value === false) {
+        return null;
+    }
+    if (preg_match('/\A[1-9][0-9]{0,17}\z/', $value) !== 1) {
+        throw new InvalidArgumentException("{$name} must be a whole number of at least 1, got '{$value}'.");
+    }
+
+    return (int) $value;
+}
+
+/** The seed of example $i under base seed $base: never 0, so every one can be replayed. */
+function pairingSeed(int $base, int $i): int
+{
+    return crc32("{$base}/{$i}") ?: 1;
+}
+
 it('holds the approval pairing invariants on generated steps, decisions and resumes', function (): void {
-    $replay = getenv('PRISM_PROPERTY_SEED');
-    $base = (int) (getenv('PRISM_PROPERTY_BASE_SEED') ?: 392);
-    $examples = max(1, (int) (getenv('PRISM_PROPERTY_EXAMPLES') ?: 40));
-    $seeds = $replay !== false && $replay !== ''
-        ? [(int) $replay]
-        : array_map(fn (int $i): int => crc32("{$base}/{$i}"), range(0, $examples - 1));
-    fwrite(STDERR, '[pairing-property] base='.$base.' examples='.count($seeds).($replay ? ' replay='.$replay : '')."\n");
+    $replay = pairingEnvInt('PRISM_PROPERTY_SEED');
+    $base = pairingEnvInt('PRISM_PROPERTY_BASE_SEED') ?? 392;
+    $examples = pairingEnvInt('PRISM_PROPERTY_EXAMPLES') ?? 40;
+    $seeds = $replay !== null ? [$replay] : array_map(fn (int $i): int => pairingSeed($base, $i), range(0, $examples - 1));
+    fwrite(STDERR, '[pairing-property] base='.$base.' examples='.count($seeds).($replay !== null ? ' replay='.$replay : '')."\n");
 
     foreach ($seeds as $seed) {
         $case = pairingGenerate(new PairingPropertyRng($seed));
@@ -734,7 +756,7 @@ it('holds the approval pairing invariants on generated steps, decisions and resu
 it('generates every shape the rule distinguishes, in the fixed-seed set', function (): void {
     $seen = [];
     foreach (range(0, 39) as $i) {
-        $case = pairingGenerate(new PairingPropertyRng(crc32("392/{$i}")));
+        $case = pairingGenerate(new PairingPropertyRng(pairingSeed(392, $i)));
         $seen['entry '.$case['entry']] = true;
         foreach ($case['repeats'] as $repeat) {
             $seen['repeat '.$repeat] = true;

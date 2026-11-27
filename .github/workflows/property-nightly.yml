@@ -30,7 +30,7 @@ jobs:
     steps:
       # This job only reads files, so it keeps no token in .git/config for
       # the fetched checker to find.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -41,7 +41,7 @@ jobs:
       # requires this workflow to have succeeded, can only withhold the GitHub
       # release. It cannot withdraw a version.
       - name: Fetch the third-party allowlist
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Particle-Academy/.github
           ref: cb221e7936f8a01f2ab047a6488b253bc435d7f9
@@ -117,11 +117,11 @@ jobs:
     needs: [third-party]
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: shivammathur/setup-php@v2
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: '8.4'
           extensions: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, bcmath, fileinfo
@@ -134,9 +134,24 @@ jobs:
         run: composer audit --no-interaction
 
       - name: Run the property tests
+        shell: bash
         env:
-          PRISM_PROPERTY_EXAMPLES: ${{ inputs.examples || '5000' }}
+          EVENT: ${{ github.event_name }}
+          # Read as given, never defaulted here: a dispatch's input must be a
+          # whole number of at least 1, and the test refuses anything else
+          # too. A schedule has no inputs and runs 5000.
+          EXAMPLES_INPUT: ${{ inputs.examples }}
           PRISM_PROPERTY_BASE_SEED: ${{ github.run_id }}
         run: |
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            examples="${EXAMPLES_INPUT}"
+          else
+            examples=5000
+          fi
+          if ! [[ "${examples}" =~ ^[1-9][0-9]{0,6}$ ]]; then
+            echo "::error::examples must be a whole number of at least 1, got '${examples}'"
+            exit 1
+          fi
+          export PRISM_PROPERTY_EXAMPLES="${examples}"
           echo "base seed ${PRISM_PROPERTY_BASE_SEED}, ${PRISM_PROPERTY_EXAMPLES} examples"
           vendor/bin/pest tests/ApprovalPairingPropertyTest.php
