@@ -32,6 +32,7 @@ use Prism\Harness\StructuredAgentResponse;
 use Prism\Harness\Subagents\ChildBinding;
 use Prism\Harness\Subagents\RunContext;
 use Prism\Harness\Subagents\RunTrees;
+use Prism\Harness\Support\MessageMapper;
 use Prism\Harness\Tasks\StoreTaskSource;
 use Prism\Prism\Contracts\Schema;
 use Prism\Prism\Streaming\Events\StreamEvent;
@@ -305,7 +306,7 @@ class Session
      * @param  array{session: string, plan: string}|null  $planLedger
      * @param  array{session: string, run: string}|null  $tree
      */
-    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null, ?int $stepCeiling = null, ?string $delegation = null): self
+    public function rememberChildBinding(ChildBinding $binding, int $depth, ?array $planLedger = null, ?array $tree = null, ?int $stepCeiling = null, ?string $delegation = null, ?string $provisional = null): self
     {
         $this->assertWritableResolution();
         $child = [
@@ -326,6 +327,11 @@ class Session
         }
         if ($delegation !== null) {
             $child['delegation'] = $delegation;
+        }
+        if ($provisional !== null) {
+            // The runner start that wrote it (G-387): read as absent until
+            // that run's task row exists ({@see self::savedChild()}).
+            $child['provisional'] = $provisional;
         }
         // Under a key of its own (G-381): the session's durable record holds
         // host state, such as capabilities, that another process may change
@@ -401,14 +407,60 @@ class Session
         $this->putState($state);
     }
 
-    /** @return array<string, mixed>|null */
+    /**
+     * The child record every reader goes through: the binding, depth, refs,
+     * ceiling and delegation id. A record a runner start wrote is
+     * PROVISIONAL (G-387): it names that start's run id, and it is the
+     * child's record only once that run's task row (the user row recorded
+     * with its run id) exists in the child's thread. Until then it reads as
+     * ABSENT, so a start that failed before its task row needs no second
+     * write to be undone: a linked child with no record is refused, no
+     * saved ceiling allows nothing, and an approval on it is unanswerable.
+     * The row is the authority; nothing is written to confirm it.
+     *
+     * A record with no mark (written before marks were kept) is the record.
+     * A mark that is not a run id this runtime could have written fails
+     * closed: the record reads as absent.
+     *
+     * The runner's own run reads none of this before its task row: its
+     * binding is its context's, and its delegation id is handed to it.
+     *
+     * @return array<string, mixed>|null
+     */
     private function savedChild(): ?array
     {
         $saved = $this->durable->get($this->childKey())['child_binding'] ?? null;
         // A binding saved before it had a key of its own.
         $saved ??= ($this->durable->get($this->durableKey()) ?? [])['child_binding'] ?? null;
+        if (! is_array($saved)) {
+            return null;
+        }
+        if (array_key_exists('provisional', $saved)) {
+            $run = $saved['provisional'];
+            if (! is_string($run) || ! self::isRunId($run) || ! $this->taskRowExists($run)) {
+                return null;
+            }
+        }
 
-        return is_array($saved) ? $saved : null;
+        return $saved;
+    }
+
+    /**
+     * Whether the run recorded its task row in this session's thread: the
+     * user row recorded with its run id (G-387). Read, never written; a
+     * session with no thread has none.
+     *
+     * @internal
+     */
+    public function taskRowExists(string $runId): bool
+    {
+        return Thread::existingAt($this->address())?->storedMessages()
+            ->where('type', MessageMapper::TYPE_USER)->where('run_id', $runId)->exists() ?? false;
+    }
+
+    private static function isRunId(string $id): bool
+    {
+        return preg_match('/\Arun_[0-9a-f]{24}\z/D', $id) === 1;
     }
 
     private function childKey(): string
@@ -964,16 +1016,60 @@ class Session
      */
     public function run(): ?array
     {
-        $run = $this->state()['run'] ?? null;
-        if (! is_array($run)) {
-            return null;
-        }
+        $run = $this->currentRun($this->storedRun());
+
+        return $run === null ? null : $this->withCancel($run);
+    }
+
+    /**
+     * @param  array<string, mixed>  $run
+     * @return array<string, mixed>
+     */
+    private function withCancel(array $run): array
+    {
         $status = $run['status'] ?? null;
         if ($status !== 'running' && $status !== 'cancelled' && is_string($run['id'] ?? null) && $this->cancelRequestedFor($run['id'])) {
             $run['status'] = 'cancelled';
         }
 
         return $run;
+    }
+
+    /**
+     * The run slot exactly as stored.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function storedRun(): ?array
+    {
+        $run = $this->state()['run'] ?? null;
+
+        return is_array($run) ? $run : null;
+    }
+
+    /**
+     * The run a reader of this session's current run sees (G-387). A runner
+     * start's run is PROVISIONAL until its task row exists: one that ended
+     * without it never happened, and the run it replaced (the run the child
+     * is parked on, say) is still the current one, so it can be cancelled
+     * and its approvals stamped and answered as before. While it is still
+     * running it is the current run. Nothing is written to settle this.
+     *
+     * @param  array<string, mixed>|null  $run
+     * @return array<string, mixed>|null
+     */
+    private function currentRun(?array $run): ?array
+    {
+        if ($run === null || ($run['provisional'] ?? null) !== true || ($run['status'] ?? null) === 'running') {
+            return $run;
+        }
+        $id = $run['id'] ?? null;
+        if (is_string($id) && $this->taskRowExists($id)) {
+            return $run;
+        }
+        $prior = $run['prior'] ?? null;
+
+        return is_array($prior) ? $prior : null;
     }
 
     /**
@@ -985,7 +1081,7 @@ class Session
     /**
      * @param  array{tree: array{session: string, run: string}|'host'|'none', depth: int}|null  $tree  the run tree the run belongs to, as it began (G-381)
      */
-    public function beginRun(string $id, string $mode, string $provider, string $model, ?string $parentRunId = null, ?string $rootRunId = null, ?string $turnId = null, ?array $tree = null): self
+    public function beginRun(string $id, string $mode, string $provider, string $model, ?string $parentRunId = null, ?string $rootRunId = null, ?string $turnId = null, ?array $tree = null, bool $provisional = false): self
     {
         $history = is_array($this->state()['run_history'] ?? null) ? array_values(array_filter($this->state()['run_history'], 'is_string')) : [];
         $history = array_slice(array_values(array_unique([...$history, $id])), -self::RUN_HISTORY);
@@ -1004,9 +1100,42 @@ class Session
                 'parent_run_id' => $parentRunId, 'root_run_id' => $rootRunId, 'turn_id' => $turnId,
                 // The run tree it belongs to, as it began (G-381).
                 'tree' => $membership['tree'], 'depth' => $membership['depth'],
+                // A runner start (G-387): the current run only once its task
+                // row exists; the run it replaces is kept beside it.
+                ...($provisional ? ['provisional' => true, 'prior' => $this->priorRun()] : []),
             ],
             'run_history' => $history,
         ]);
+    }
+
+    /**
+     * The status of this run in the run slot as stored, or null when the
+     * slot holds another run (G-387).
+     *
+     * @internal
+     */
+    public function runStatus(string $id): ?string
+    {
+        $run = $this->storedRun();
+        $status = $run !== null && ($run['id'] ?? null) === $id ? ($run['status'] ?? null) : null;
+
+        return is_string($status) ? $status : null;
+    }
+
+    /**
+     * The current run a runner start replaces, as a reader sees it, without
+     * the run it replaced in turn.
+     *
+     * @return array<string, mixed>|null
+     */
+    private function priorRun(): ?array
+    {
+        $prior = $this->currentRun($this->storedRun());
+        if ($prior !== null) {
+            unset($prior['prior'], $prior['provisional']);
+        }
+
+        return $prior;
     }
 
     /**
@@ -1049,7 +1178,14 @@ class Session
             // Read fresh: the run is written by whichever process executes it.
             $this->cachedState = null;
             $state = $this->state();
-            $run = is_array($state['run'] ?? null) ? $state['run'] : null;
+            $stored = is_array($state['run'] ?? null) ? $state['run'] : null;
+            $run = $this->currentRun($stored);
+            // A runner start still running before its task row (G-387): the
+            // run it replaced is still the one a person may be parked on.
+            $prior = $stored !== null && $run === $stored && ($stored['provisional'] ?? null) === true ? ($stored['prior'] ?? null) : null;
+            if (is_array($prior) && ($prior['id'] ?? null) === $runId && ! $this->taskRowExists((string) ($stored['id'] ?? ''))) {
+                $run = $prior;
+            }
             if ($run === null) {
                 return CancelOutcome::NoTurn;
             }
@@ -1216,7 +1352,9 @@ class Session
      */
     public function runWasCancelled(string $id): bool
     {
-        $run = $this->run();
+        // The run as stored: a provisional run that ended is still this run.
+        $stored = $this->storedRun();
+        $run = $stored === null ? null : $this->withCancel($stored);
 
         return is_array($run) && ($run['id'] ?? null) === $id && ($run['status'] ?? null) === 'cancelled';
     }
@@ -1376,7 +1514,7 @@ class Session
      */
     public function rememberStepSeq(string $id, int $seq): self
     {
-        $run = $this->run();
+        $run = $this->storedRun();
         if (! is_array($run) || ($run['id'] ?? null) !== $id) {
             return $this;
         }
@@ -1585,7 +1723,9 @@ class Session
     /** @param array<string, mixed> $details */
     protected function finishRun(string $id, string $status, array $details): self
     {
-        $run = $this->run();
+        // The run as stored: a runner start's provisional run is still this run.
+        $stored = $this->storedRun();
+        $run = $stored === null ? null : $this->withCancel($stored);
         if (! is_array($run) || ($run['id'] ?? null) !== $id) {
             throw new \LogicException('Harness run state changed while the run was active.');
         }

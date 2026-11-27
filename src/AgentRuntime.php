@@ -70,9 +70,11 @@ use Prism\Prism\Structured\Response as StructuredResponse;
 use Prism\Prism\Text\Response as TextResponse;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use RuntimeException;
 use Throwable;
 
@@ -217,6 +219,7 @@ final readonly class AgentRuntime
             // visible.
             $runId = 'run_'.bin2hex(random_bytes(12));
             $undo = null;
+            $delegation = null;
 
             try {
                 // A runner start runs in the mode its declaration names; the
@@ -238,7 +241,7 @@ final readonly class AgentRuntime
                     if ($start === null || $child === null) {
                         throw new \LogicException('A runner start begins only through the start gate.');
                     }
-                    $undo = $this->commitRunnerStart($session, $membership, $facts, $child, $start, $runId);
+                    [$undo, $delegation] = $this->commitRunnerStart($session, $membership, $facts, $child, $start, $runId);
                 }
             } catch (Throwable $failure) {
                 // NO `failRun` HERE. `beginRun` has not run yet, and finishing a
@@ -261,6 +264,7 @@ final readonly class AgentRuntime
             }
 
             $resumedFrom = $this->resumedFrom($session, $prompt);
+            $begun = false;
             try {
                 // A cancelled run never resumes (G-285): refused before it begins.
                 if ($session->resumesCancelledRun($prompt)) {
@@ -272,7 +276,8 @@ final readonly class AgentRuntime
                     $undo = $this->linkStart($session, $start, $undo);
                 }
                 $session->beginRun($runId, $mode->name, $provider, $model, $context?->parentRunId, $context?->rootRunId() ?? $runId,
-                    tree: $membership);
+                    tree: $membership, provisional: $undo !== null);
+                $begun = true;
 
                 // A root run opens the tree's account; a child inherits it. Either
                 // way there is exactly one ledger per tree from here down.
@@ -285,7 +290,7 @@ final readonly class AgentRuntime
                 $run = $this->boundedAgentRun($session, $this->workflowNodeRun($session, $mode, $run));
                 $this->continuePausedSteps($session, $prompt, $context, $run, $runId, $facts, $paused);
                 $run = $this->planRun($session, $runId, $run, $context, $prompt, $membership, begun: true, facts: $facts,
-                    readBase: $start['base'] ?? null);
+                    readBase: $start['base'] ?? null, started: $delegation);
                 $budget = $run->budget;
                 $unwatch = $this->watchCancel($session, $runId, $run, $resumedFrom);
                 try {
@@ -294,18 +299,129 @@ final readonly class AgentRuntime
                     $unwatch();
                 }
             } catch (Throwable $failure) {
+                // Clean up FIRST, each step on its own, reading nothing of
+                // the failure but its class (G-387). A run that began and was
+                // not ended by the path that threw is failed here, with its
+                // RunFailed event.
+                if ($begun) {
+                    $this->closeRun($session, $runId, $context, $failure);
+                }
                 // A runner start that failed before its task row was recorded
-                // never happened (G-387): the child's records, its count and
-                // the thread link go back to what they were, and the tree
-                // hold is returned. Once the task row is recorded, the
+                // never happened (G-387). Its records are provisional, and
+                // with no task row every reader already sees them as absent;
+                // putting the child's records, its count and the thread link
+                // back, and returning the tree hold, is housekeeping, and its
+                // failure changes nothing. Once the task row is recorded, the
                 // delegation happened and stands.
                 if ($undo !== null && ! $this->taskRecorded($session, $runId)) {
-                    $undo();
+                    try {
+                        $undo();
+                    } catch (Throwable $undoFailure) {
+                        report(new RuntimeException('A subagent start could not be undone: '.$undoFailure::class.'.'));
+                    }
                 }
 
                 throw $failure;
             }
         }, ttlSeconds: $this->integerConfig('lock_ttl', 300, $session), waitSeconds: $this->integerConfig('lock_wait', 0, $session));
+    }
+
+    /** What a call the child was parked on reads when a runner start ends it (G-387). */
+    private const ENDED_BY_START = 'Not run: the delegation this call was proposed under ended.';
+
+    /**
+     * The calls of the last tool-calling step in `$history` that have no
+     * result, each ENDED with a fixed result and never run (G-387): what a
+     * runner start records with its task row in place of acting on them. A
+     * decision recorded on one is not acted on; core's resolver then finds
+     * every call answered and runs nothing. Null when nothing is open.
+     *
+     * @param  list<Message>  $history
+     */
+    private function endedCalls(array $history): ?ToolResultMessage
+    {
+        $index = null;
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            if ($history[$i] instanceof AssistantMessage && $history[$i]->toolCalls !== []) {
+                $index = $i;
+
+                break;
+            }
+        }
+        if ($index === null) {
+            return null;
+        }
+        $answered = [];
+        for ($i = $index + 1, $n = count($history); $i < $n; $i++) {
+            if ($history[$i] instanceof ToolResultMessage) {
+                foreach ($history[$i]->toolResults as $result) {
+                    $answered[$result->toolCallId] = true;
+                }
+            }
+        }
+        $ended = [];
+        /** @var AssistantMessage $assistant */
+        $assistant = $history[$index];
+        foreach ($assistant->toolCalls as $call) {
+            if (isset($answered[$call->id])) {
+                continue;
+            }
+            $ended[] = new ToolResult(
+                toolCallId: $call->id,
+                toolName: $call->name,
+                args: $call->argumentsForResult(),
+                result: self::ENDED_BY_START,
+                toolCallResultId: $call->resultId,
+            );
+        }
+
+        return $ended === [] ? null : new ToolResultMessage($ended);
+    }
+
+    /**
+     * End a run that began and that the path which threw did not end
+     * (G-387): failed (or cancelled), with its RunFailed event, each step
+     * on its own so one failing cannot skip the next. Reads nothing of the
+     * failure but its class and, for the harness's own final refusal, its
+     * code. A lost lock whose writes are rejected is left to its holder.
+     */
+    private function closeRun(Session $session, string $runId, ?RunContext $context, Throwable $failure): void
+    {
+        if ($failure instanceof SessionLockLost && $failure->isWriteRejected()) {
+            return;
+        }
+        try {
+            if ($session->runStatus($runId) !== 'running') {
+                return;
+            }
+        } catch (Throwable) {
+            // Unknown: ended here, which an ended run refuses harmlessly.
+        }
+        $cancelled = $failure instanceof RunNotPermitted && $failure->code() === 'run_cancelled';
+        try {
+            if ($cancelled) {
+                $session->cancelRun($runId);
+            } else {
+                $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
+            }
+        } catch (Throwable $unwritten) {
+            report(new RuntimeException('A failed run could not be closed: '.$unwritten::class.'.'));
+            try {
+                app(RunTrees::class)->finished($session, $runId);
+            } catch (Throwable) {
+                // Its holds are charged in full once they expire.
+            }
+        }
+        if (! $cancelled) {
+            event(new RunFailed(
+                sessionKey: $session->key(),
+                runId: $runId,
+                exception: $failure::class,
+                parentRunId: $context?->parentRunId,
+                rootRunId: $context?->rootRunId() ?? $runId,
+                harnessAgent: $session->agent(),
+            ));
+        }
     }
 
     /**
@@ -416,10 +532,21 @@ final readonly class AgentRuntime
             // messages rather than as a Thread. See newMessages() for why
             // this run has to know exactly which message objects it sent.
             $history = iterator_to_array($session->thread()->messages(), false);
+            $turn = $prompt === '' ? [] : [new UserMessage($prompt, $attachments)];
+            if ($committedStart && $prompt !== '') {
+                // A runner start acts on NO recorded decision (G-387): the
+                // calls the child was parked on are ended with its task row,
+                // never run, so a decision recorded before it (one a bare
+                // resume would refuse) is never acted on by a delegation.
+                $ended = $this->endedCalls($history);
+                if ($ended !== null) {
+                    $turn[] = $ended;
+                }
+            }
 
             $generation = Prism::text()
                 ->using($provider, $model)
-                ->withMessages($prompt === '' ? $history : [...$history, new UserMessage($prompt, $attachments)])
+                ->withMessages([...$history, ...$turn])
                 ->withTelemetryMetadata(sessionId: $session->key());
 
             if ($mode->providerOptions !== []) {
@@ -500,10 +627,17 @@ final readonly class AgentRuntime
                 throw $failure;
             }
             // A committed start that a stop kept from its first model step
-            // still records the task it was given: the delegation happened.
-            if ($committedStart && $prompt !== '' && $failure instanceof RunNotPermitted
-                && ! $session->thread()->storedMessages()->where('run_id', $runId)->exists()) {
-                $this->recordTurn($session, [new UserMessage($prompt, $attachments)], $runId, []);
+            // still records the task it was given: the delegation happened,
+            // and the calls the child was parked on end with it (G-387).
+            // Guarded: the run is failed below whatever this does.
+            try {
+                if ($committedStart && $prompt !== '' && $failure instanceof RunNotPermitted
+                    && ! $session->thread()->storedMessages()->where('run_id', $runId)->exists()) {
+                    $ended = $this->endedCalls(iterator_to_array($session->thread()->messages(), false));
+                    $this->recordTurn($session, [new UserMessage($prompt, $attachments), ...($ended === null ? [] : [$ended])], $runId, []);
+                }
+            } catch (Throwable $unrecorded) {
+                report(new RuntimeException('A subagent task could not be recorded: '.$unrecorded::class.'.'));
             }
             $this->failRunOn($session, $runId, $run, $failure);
 
@@ -2010,18 +2144,24 @@ final readonly class AgentRuntime
         return $names;
     }
 
+    /**
+     * A cost limit from config (G-387): absent or null is no limit; present,
+     * it is a finite non-negative number, or the configuration is refused.
+     */
     private function floatConfig(string $key): ?float
     {
-        $value = $this->config[$key] ?? null;
-
-        return is_numeric($value) ? (float) $value : null;
+        return RunBudget::costLimit($this->config[$key] ?? null, $key);
     }
 
+    /**
+     * A count limit from config (G-387): absent or null is no limit; present,
+     * it is a whole non-negative number, or the configuration is refused.
+     */
     private function nullableIntConfig(string $key, ?Session $session = null): ?int
     {
         $value = $session === null ? ($this->config[$key] ?? null) : $this->agentValue($session, $key);
 
-        return is_numeric($value) ? (int) $value : null;
+        return RunBudget::countLimit($value, $key);
     }
 
     /**
@@ -2165,8 +2305,9 @@ final readonly class AgentRuntime
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
      * @param  array<string, mixed>  $facts
      * @param  ?int  $readBase  a runner start's ledger count as the start gate read it (G-387)
+     * @param  ?string  $started  the delegation a runner start's commit opened (G-387)
      */
-    private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, array $membership, bool $begun, array $facts, ?int $readBase = null): RunContext
+    private function planRun(Session $session, string $runId, RunContext $run, ?RunContext $context, string $prompt, array $membership, bool $begun, array $facts, ?int $readBase = null, ?string $started = null): RunContext
     {
         try {
             $trees = app(RunTrees::class);
@@ -2177,7 +2318,7 @@ final readonly class AgentRuntime
             // run holds what it may take until it ends.
             $durable = $trees->claimDelegation($session, $runId, $run->ledger, function (int $durable) use ($facts): int {
                 return $this->allowanceOf([...$facts, 'used' => max((int) $facts['used'], $durable)])['own_left'];
-            });
+            }, $started);
             if ($durable === -1) {
                 // The count is gone or is not this delegation's: FAIL CLOSED.
                 $facts['saved_ceiling'] = $facts['used'] = $this->allowanceOf($facts)['ceiling'];
@@ -2638,10 +2779,15 @@ final readonly class AgentRuntime
      *
      * @param  array{tree: array{session: string, run: string}|'host'|'none', spends: ?string, depth: int, route: string}  $membership
      * @param  array<string, mixed>  $facts
+     *                                       The records (b) writes are PROVISIONAL (G-387): they carry this
+     *                                       start's run id, and every reader treats them as absent until its task
+     *                                       row exists. The undo is housekeeping: it may fail, and nothing depends
+     *                                       on it. Returned with the delegation id, which the start's own run
+     *                                       claims its steps from before its task row exists.
      * @param  array{mode: string, parent: Session, root: string, tree_left: ?int, base: int, context_left: int}  $start
-     * @return Closure(): void
+     * @return array{0: Closure(): void, 1: string}
      */
-    private function commitRunnerStart(Session $session, array $membership, array $facts, ChildBinding $child, array $start, string $runId): Closure
+    private function commitRunnerStart(Session $session, array $membership, array $facts, ChildBinding $child, array $start, string $runId): array
     {
         $trees = app(RunTrees::class);
         $release = $trees->holdForStart($session, $membership, $start['tree_left'], $runId);
@@ -2666,7 +2812,7 @@ final readonly class AgentRuntime
             );
             $mode = $start['mode'];
             $undo = $trees->commitChild($session, $delegation, $ceiling,
-                static function () use ($session, $child, $membership, $refs, $ceiling, $delegation, $mode): Closure {
+                static function () use ($session, $child, $membership, $refs, $ceiling, $delegation, $mode, $runId): Closure {
                     // What (b) replaces, read inside its lock.
                     $priorChild = $session->childRecord();
                     $priorMode = $session->modeSlot();
@@ -2677,7 +2823,7 @@ final readonly class AgentRuntime
                         }
                     };
                     try {
-                        $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation);
+                        $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation, provisional: $runId);
                         $session->usingMode($mode);
                     } catch (Throwable $failure) {
                         try {
@@ -2707,10 +2853,13 @@ final readonly class AgentRuntime
             throw $failure;
         }
 
-        return static function () use ($undo, $release): void {
-            $undo();
-            $release();
-        };
+        return [static function () use ($undo, $release): void {
+            try {
+                $undo();
+            } finally {
+                $release();
+            }
+        }, $delegation];
     }
 
     /**

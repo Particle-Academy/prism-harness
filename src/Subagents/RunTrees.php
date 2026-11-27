@@ -551,7 +551,10 @@ final class RunTrees
             $undone = true;
             try {
                 $store->withLock($key, static function () use ($child, $store, $key, $delegation, $restore, $prior): void {
-                    if ($child->childDelegation() === $delegation) {
+                    // Read as stored: this commit's record is provisional,
+                    // and a reader sees it as absent.
+                    $record = $child->childRecord()['child_binding'] ?? null;
+                    if (is_array($record) && ($record['delegation'] ?? null) === $delegation) {
                         $restore();
                     }
                     $count = $store->get($key);
@@ -582,11 +585,15 @@ final class RunTrees
      *
      * @internal
      *
+     * A runner start names the delegation its commit opened (`$started`):
+     * its record is provisional until the start's task row exists, and the
+     * start's own run claims from it before that row is written (G-387).
+     *
      * @param  Closure(int): int  $allow
      */
-    public function claimDelegation(Session $child, string $runId, RunLedger $ledger, Closure $allow): ?int
+    public function claimDelegation(Session $child, string $runId, RunLedger $ledger, Closure $allow, ?string $started = null): ?int
     {
-        $delegation = $child->childDelegation();
+        $delegation = $started ?? $child->childDelegation();
         if ($delegation === null) {
             // A ceiling and its delegation id are always saved together: a
             // ceiling without a valid id was not written by this runtime.
