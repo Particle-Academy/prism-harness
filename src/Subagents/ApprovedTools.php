@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace Prism\Harness\Subagents;
 
 use Closure;
+use Prism\Harness\Sessions\Session;
+use Prism\Harness\Support\CallPairing;
+use Prism\Harness\Support\PausedStep;
 use Prism\Prism\Concerns\CallsTools;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\TelemetryOperation;
@@ -193,7 +196,21 @@ final class ApprovedTools
             // its results; exposing them before that merge/writeback could
             // replay a side effect if the consumer abandons the generator at
             // that yield.
-            foreach ($this->resolveToolApprovalsAndYieldEvents($request, EventID::generate()) as $event) {
+            // A step whose call ids repeat is resolved here, never by core's
+            // resolver, which keys results and requests by call id (G-387
+            // round 13): every gated call in it gets ONE recorded outcome, the
+            // repeated-id denial, and none of them runs.
+            //
+            // And only the PAUSED step is resolved, chosen by the one rule
+            // every paused-step reader uses (G-397): a step the conversation
+            // moved past (an answer, a user turn, a system row after it) has
+            // nothing a decision can still apply to, so nothing resolves it.
+            $resolution = PausedStep::indexIn($request->messages()) === null
+                ? []
+                : (self::repeatsCallIds($request)
+                    ? $this->resolveRepeatedStep($request, EventID::generate())
+                    : $this->resolveToolApprovalsAndYieldEvents($request, EventID::generate()));
+            foreach ($resolution as $event) {
                 $events[] = $event;
             }
         } finally {
@@ -255,6 +272,108 @@ final class ApprovedTools
         }
 
         return $result;
+    }
+
+    /**
+     * The last tool-calling step of `$request`, and its index, or null.
+     *
+     * @return array{0: AssistantMessage, 1: int}|null
+     */
+    private static function lastStep(TextRequest|StructuredRequest $request): ?array
+    {
+        // The paused step, by the shared rule (G-397), never merely the
+        // newest step with tool calls.
+        $messages = $request->messages();
+        $at = PausedStep::indexIn($messages);
+        $step = $at === null ? null : $messages[$at];
+
+        return $step instanceof AssistantMessage ? [$step, $at] : null;
+    }
+
+    /** Whether the step being resumed repeats a call id among its calls or its approval requests (G-392). */
+    private static function repeatsCallIds(TextRequest|StructuredRequest $request): bool
+    {
+        $step = self::lastStep($request);
+        if ($step === null) {
+            return false;
+        }
+        $ids = array_map(static fn (ToolCall $call): string => $call->id, $step[0]->toolCalls);
+        $asked = array_map(static fn ($approval): string => $approval->toolCallId, $step[0]->toolApprovalRequests);
+        $approvals = array_map(static fn ($approval): string => $approval->approvalId, $step[0]->toolApprovalRequests);
+
+        return count($ids) !== count(array_unique($ids)) || count($asked) !== count(array_unique($asked))
+            || count($approvals) !== count(array_unique($approvals));
+    }
+
+    /**
+     * Resolve a step whose call ids repeat (G-387 round 13). A decision cannot
+     * say which of its calls it answers, so none of its gated calls runs: each
+     * gated call that has no result of its OWN (matched by position, never by
+     * id) gets the repeated-id denial, once. An ungated call is never given a
+     * denial: it ran when the step was taken. Recorded as core records a
+     * resolution: one result message after the step.
+     *
+     * @return \Generator<int, ToolResultEvent>
+     */
+    private function resolveRepeatedStep(TextRequest|StructuredRequest $request, string $messageId): \Generator
+    {
+        $step = self::lastStep($request);
+        if ($step === null) {
+            return;
+        }
+        [$assistant, $at] = $step;
+        $tools = collect($request->tools())->keyBy(fn (Tool $tool): string => $tool->name());
+        $messages = $request->messages();
+        $indexes = [];
+        $rows = [];
+        $results = [];
+        $responses = [];
+        for ($i = $at + 1, $n = count($messages); $i < $n; $i++) {
+            if (PausedStep::kindOfMessage($messages[$i]) !== PausedStep::RESULT) {
+                // The conversation moved on past this step: it was settled
+                // (and the replay folds its same-id results into one, so they
+                // can no longer be counted). Nothing here is open.
+                return;
+            }
+            if (! $messages[$i] instanceof ToolResultMessage) {
+                // This turn's own prompt, or a system row.
+                continue;
+            }
+            $indexes[] = $i;
+            $rows[] = CallPairing::ofResults($messages[$i]->toolResults);
+            $results = [...$results, ...$messages[$i]->toolResults];
+            $responses = [...$responses, ...$messages[$i]->toolApprovalResponses];
+        }
+        $answered = CallPairing::answered(CallPairing::ofCalls($assistant->toolCalls), $rows);
+        $denied = [];
+        foreach (array_values($assistant->toolCalls) as $index => $call) {
+            if ($answered[$index] || $tools->get($call->name)?->hasApprovalConfigured() !== true) {
+                continue;
+            }
+            $denied[] = $result = new ToolResult(
+                toolCallId: $call->id,
+                toolName: $call->name,
+                args: $call->argumentsForResult(),
+                result: Session::REPEATED_CALL_ID_REASON,
+                toolCallResultId: $call->resultId,
+            );
+            yield new ToolResultEvent(
+                id: EventID::generate(),
+                timestamp: time(),
+                toolResult: $result,
+                messageId: $messageId,
+                success: false,
+                error: Session::REPEATED_CALL_ID_REASON,
+            );
+        }
+        if ($denied === []) {
+            return;
+        }
+        if ($indexes !== []) {
+            $request->setMessages(array_values(array_filter($messages,
+                static fn (int $index): bool => ! in_array($index, $indexes, true), ARRAY_FILTER_USE_KEY)));
+        }
+        $request->addMessage(new ToolResultMessage([...$results, ...$denied], $responses));
     }
 
     /** The kind core gives the refusal of this stored call, when it gives one. */

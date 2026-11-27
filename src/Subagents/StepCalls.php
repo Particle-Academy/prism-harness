@@ -8,6 +8,7 @@ use Closure;
 use Generator;
 use Illuminate\Support\Collection;
 use Prism\Harness\Exceptions\RunNotPermitted;
+use Prism\Harness\Support\CallPairing;
 use Prism\Harness\Support\ToolCallArguments;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Enums\FinishReason;
@@ -256,10 +257,11 @@ final readonly class StepCalls
                 $messages[$index] = $clean;
             }
         }
-        $answered = array_fill_keys(array_map(fn (ToolResult $result): string => $result->toolCallId, $response->toolResults), true);
+        // A call is answered only by a result of its own (G-387 round 13).
+        $answered = CallPairing::answered(CallPairing::ofCalls($response->toolCalls), [CallPairing::ofResults($response->toolResults)]);
         $refused = [];
-        foreach ($response->toolCalls as $call) {
-            if (! isset($answered[$call->id])) {
+        foreach (array_values($response->toolCalls) as $at => $call) {
+            if (! $answered[$at]) {
                 $refused[] = new ToolResult($call->id, $call->name, ToolCallArguments::recordable($call)->arguments(),
                     'Not run: model step failed ('.$finish->value.').', $call->resultId);
             }
@@ -294,11 +296,11 @@ final readonly class StepCalls
             || $calls === []) {
             return false;
         }
-        $answered = array_map(fn (ToolResult $result): string => $result->toolCallId, $results);
-        foreach ($calls as $call) {
-            if (! in_array($call->id, $answered, true)) {
-                return false;
-            }
+        // Every call needs a result of its OWN, matched by position, never
+        // by id (G-387 round 13): a same-id sibling that ran does not answer
+        // an approval-required or client-executed call, which waits for its owner.
+        if (! CallPairing::allAnswered($calls, $results)) {
+            return false;
         }
 
         return true;

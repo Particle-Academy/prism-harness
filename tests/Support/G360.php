@@ -17,6 +17,9 @@ use Tests\Fixtures\Participant;
  */
 final class G360
 {
+    /** A queue entry that makes that model request fail, as a provider outage does. */
+    public const FAIL = '__provider_down__';
+
     private static int $call = 0;
 
     /** @var list<string> */
@@ -49,6 +52,9 @@ final class G360
             if ($next === null) {
                 throw new \RuntimeException('The scripted model has no response left.');
             }
+            if ($next === self::FAIL) {
+                throw new \RuntimeException('provider down');
+            }
             if ((json_decode((string) $request->body(), true)['stream'] ?? false) === true) {
                 return Http::response(self::sse($next), 200, ['Content-Type' => 'text/event-stream']);
             }
@@ -57,16 +63,22 @@ final class G360
         }]);
     }
 
-    /** @param list<array{0: string, 1: array<string, mixed>}> $calls */
+    /**
+     * One step's calls. A third element, when given, is the call's id (its
+     * item id and its call_id): a provider that repeats ids in one step.
+     *
+     * @param  list<array{0: string, 1: array<string, mixed>, 2?: string}>  $calls
+     */
     public static function calls(array $calls): void
     {
         $output = [];
-        foreach ($calls as [$name, $arguments]) {
+        foreach ($calls as $call) {
+            [$name, $arguments] = $call;
             $id = ++self::$call;
             $output[] = [
-                'id' => 'fc_'.$id, 'type' => 'function_call', 'status' => 'completed',
+                'id' => $call[2] ?? 'fc_'.$id, 'type' => 'function_call', 'status' => 'completed',
                 'arguments' => json_encode($arguments, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
-                'call_id' => 'call_g360_'.$id, 'name' => $name,
+                'call_id' => $call[2] ?? 'call_g360_'.$id, 'name' => $name,
             ];
         }
         self::$queue[] = self::response($output);

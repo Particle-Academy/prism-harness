@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Prism\Harness;
 
 use Prism\Harness\Exceptions\StructuredSchemaViolation;
+use Prism\Prism\Enums\FinishReason;
 use Prism\Prism\Structured\Response;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
 
 /**
  * One structured run's result: the document, and the text it was read from.
@@ -68,5 +70,34 @@ final readonly class StructuredAgentResponse
     public function isChildRun(): bool
     {
         return $this->parentRunId !== null;
+    }
+
+    /**
+     * Whether the run stopped for a person (round 13): a call it made needs
+     * an approval. Such a turn has no document yet, and {@see self::structured()}
+     * is empty; it is not a failure, so do not retry it. Answer the approvals
+     * with Session::decide() / approve(), as for {@see AgentResponse}.
+     */
+    public function awaitingApproval(): bool
+    {
+        return in_array($this->response->finishReason, [FinishReason::Pause, FinishReason::ToolCalls], true)
+            && $this->pendingApprovals() !== [];
+    }
+
+    /**
+     * The approvals this run is waiting on, oldest first, read from its steps.
+     *
+     * @return list<ToolApprovalRequest>
+     */
+    public function pendingApprovals(): array
+    {
+        $pending = [];
+        foreach ($this->response->steps as $step) {
+            foreach ($step->toolApprovalRequests as $request) {
+                $pending[] = $request;
+            }
+        }
+
+        return $pending;
     }
 }

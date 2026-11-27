@@ -1085,9 +1085,9 @@ class Session
                 ? $parked['id'] : null;
             $lastSeq = $parkedId !== null && is_int($parked['last_seq'] ?? null) ? $parked['last_seq'] : 0;
 
-            $this->recordDecisions($decisions, $context);
+            $recorded = $this->recordDecisions($decisions, $context);
 
-            return [$parkedId, $lastSeq];
+            return [$parkedId, $lastSeq, $recorded];
         }, $context);
     }
 
@@ -1095,8 +1095,9 @@ class Session
      * Where decisions are made durable, for every path that takes them.
      *
      * @param  list<ToolApprovalResponse>  $decisions
+     * @return list<ToolApprovalResponse> the decisions as recorded
      */
-    protected function recordDecisions(array $decisions, ?RunContext $context = null): void
+    protected function recordDecisions(array $decisions, ?RunContext $context = null): array
     {
         // BEFORE anything is written or emitted, and so before any provider
         // call: a decision answers a question the run asked (G-354).
@@ -1122,6 +1123,8 @@ class Session
         // A plan held on one of these approvals reads the decision from the
         // thread, before the run resumes (G-360).
         app(Plans::class)->decided($this);
+
+        return $decisions;
     }
 
     /**
@@ -1433,7 +1436,7 @@ class Session
         if (array_key_exists($approvalId, $decided)) {
             // A runner start ended the call, and it never ran (G-387): the
             // decision was never acted on, so the call reads as ended.
-            if ($thread->endedByStart($approvalId)) {
+            if ($thread->endedByStart($approvalId) || $thread->supersededByLaterStep($approvalId)) {
                 return 'superseded';
             }
 

@@ -63,7 +63,8 @@ it('rechecks cancellation after resolving and persisting an approved side effect
             toolApprovalRequests: [new ToolApprovalRequest('approval', 'approved-call')]),
         new ToolResultMessage(toolApprovalResponses: [new ToolApprovalResponse('approval', true)]),
     ]);
-    expect(fn () => callBudgetRun($shape, $session, $run))->toThrow(RunNotPermitted::class);
+    // A resume: a new message would supersede the parked step (DECISION B).
+    expect(fn () => callBudgetRun($shape, $session, $run, prompt: ''))->toThrow(RunNotPermitted::class);
     Http::assertNothingSent();
     $results = $session->thread()->storedMessages()->where('type', 'tool_result')->get()
         ->flatMap(fn ($row): array => $row->payload['tool_results'] ?? [])

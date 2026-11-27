@@ -47,7 +47,7 @@ final class StructuredTranscript
         // and what it got back. The last step is the answer, appended below
         // with the document on it.
         foreach ($response->steps->slice(0, -1) as $step) {
-            $messages[] = new AssistantMessage($step->text, $step->toolCalls, $step->additionalContent);
+            $messages[] = new AssistantMessage($step->text, $step->toolCalls, $step->additionalContent, $step->toolApprovalRequests);
 
             if ($step->toolResults !== []) {
                 $messages[] = new ToolResultMessage($step->toolResults);
@@ -55,6 +55,20 @@ final class StructuredTranscript
         }
 
         $last = $response->steps->last();
+
+        // A last step that stopped for a person (G-387 round 13): its calls
+        // and their approval requests are the record, with the results of
+        // the calls it did run, exactly as a text turn records a parked step.
+        // There is no answer yet, so no answer row: one would end the
+        // approval's scope and leave a person nothing to answer.
+        if ($last instanceof Step && $last->toolApprovalRequests !== []) {
+            $messages[] = new AssistantMessage($last->text, $last->toolCalls, $last->additionalContent, $last->toolApprovalRequests);
+            if ($last->toolResults !== []) {
+                $messages[] = new ToolResultMessage($last->toolResults);
+            }
+
+            return $messages;
+        }
 
         // A last step that still holds tool results is a run that ended on its
         // step ceiling rather than on an answer. Its results belong in the
