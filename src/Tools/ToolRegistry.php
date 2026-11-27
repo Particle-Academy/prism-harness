@@ -149,6 +149,18 @@ final class ToolRegistry
         return $this->agent !== null || $this->refuseDuplicates;
     }
 
+    /**
+     * Whether the static tool of this name asks for approval by itself;
+     * null when it is not a static tool (a factory's or provider's tool is
+     * known only once built).
+     *
+     * @internal
+     */
+    public function approvalConfigured(string $name): ?bool
+    {
+        return isset($this->tools[$name]) ? $this->tools[$name]->hasApprovalConfigured() : null;
+    }
+
     /** @return list<string> */
     public function names(): array
     {
