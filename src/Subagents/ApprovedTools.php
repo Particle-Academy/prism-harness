@@ -116,9 +116,9 @@ final class ApprovedTools
         $this->announcement = $announcement;
 
         $events = [];
-        $before = $request->messages();
+        $answered = false;
         try {
-            $this->collect($request, $announcement, $events);
+            $this->collect($request, $announcement, $events, $answered);
         } catch (Throwable $failure) {
             $partial = self::merged($request->messages(), $events);
             if ($partial !== null) {
@@ -136,7 +136,9 @@ final class ApprovedTools
         }
         // Recorded when anything resolved, or when the request now answers
         // a call it did not (round 17: a host's unanswered ungated call).
-        if ($events !== [] || $request->messages() !== $before) {
+        // Known from what was done, never from comparing the message list
+        // (core rebuilds some messages on every read).
+        if ($events !== [] || $answered) {
             $messages = $request->messages();
             $record($messages);
             $generation->withMessages($messages);
@@ -191,8 +193,9 @@ final class ApprovedTools
      * {@see self::failedToolExecution()}.
      *
      * @param  list<StreamEvent>  $events
+     * @param  bool  $answered  set when an unanswered ungated call was answered (round 17)
      */
-    private function collect(TextRequest|StructuredRequest $request, ResolutionAnnouncement $announcement, array &$events): void
+    private function collect(TextRequest|StructuredRequest $request, ResolutionAnnouncement $announcement, array &$events, bool &$answered = false): void
     {
         $previous = Telemetry::enabled() ? app(ContextStack::class) : null;
         if ($previous !== null) {
@@ -223,8 +226,10 @@ final class ApprovedTools
                 $events[] = $event;
             }
             if ($paused !== null) {
-                self::answerUngated($request, $paused);
-                self::answerInPlace($request, $paused);
+                $answered = self::answerUngated($request, $paused);
+                if ($events !== [] || $answered) {
+                    self::answerInPlace($request, $paused);
+                }
             }
         } finally {
             self::$resolving = array_values(array_filter(self::$resolving,
@@ -245,12 +250,12 @@ final class ApprovedTools
      * it may have run where the host runs its own calls: it is answered
      * `interrupted`, recorded with the resolution as its one outcome.
      */
-    private static function answerUngated(TextRequest|StructuredRequest $request, int $paused): void
+    private static function answerUngated(TextRequest|StructuredRequest $request, int $paused): bool
     {
         $messages = $request->messages();
         $step = $messages[$paused] ?? null;
         if (! $step instanceof AssistantMessage || $step->toolCalls === []) {
-            return;
+            return false;
         }
         $results = [];
         for ($i = $paused + 1, $n = count($messages); $i < $n; $i++) {
@@ -272,7 +277,7 @@ final class ApprovedTools
             }
         }
         if ($missing === []) {
-            return;
+            return false;
         }
         $last = array_key_last($messages);
         if ($messages[$last] instanceof ToolResultMessage && $last > $paused) {
@@ -282,6 +287,8 @@ final class ApprovedTools
             $messages[] = new ToolResultMessage($missing, []);
         }
         $request->setMessages(array_values($messages));
+
+        return true;
     }
 
     /**

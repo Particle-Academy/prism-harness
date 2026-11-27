@@ -435,7 +435,7 @@ function ppClosedDecisions(array $c): array
                 $closed[] = $target;
             }
         }
-        [$c['later']['requests'], $c['closed_later']] = ppWithoutClosed($c, $later['calls'], $later['requests'], $closed);
+        [$c['later']['requests'], $c['closed_later']] = ppWithoutClosed($c, $later['calls'], $later['requests'], $closed, array_keys($later['requests']));
     }
 
     return $c;
@@ -447,10 +447,15 @@ function ppClosedDecisions(array $c): array
  * no outcome before the decisions; only an id no other call shares may pair
  * with a call that has one (the pairing by id).
  *
+ * `$order`: the order the driver records these decisions in (the parked
+ * step's are shuffled by `order`; a later step's go in index order, round 17:
+ * the oracle used the parked step's order for both, seed 1508513416).
+ *
  * @param  list<int>  $closed
+ * @param  list<int>|null  $order
  * @return array{0: list<array<string, mixed>>, 1: bool}
  */
-function ppWithoutClosed(array $c, array $calls, array $requests, array $closed): array
+function ppWithoutClosed(array $c, array $calls, array $requests, array $closed, ?array $order = null): array
 {
     $taken = [];
     $paired = [];
@@ -473,7 +478,7 @@ function ppWithoutClosed(array $c, array $calls, array $requests, array $closed)
         $paired[$k] = $at;
     }
     $hits = fn (int $k): bool => $requests[$k]['verdict'] !== 'none' && $paired[$k] !== null && in_array($paired[$k], $closed, true);
-    $order = array_values(array_filter($c['order'], fn (int $k): bool => isset($requests[$k])));
+    $order = array_values(array_filter($order ?? $c['order'], fn (int $k): bool => isset($requests[$k])));
     if (count($order) !== count($requests)) {
         $order = array_keys($requests);
     }
@@ -1691,6 +1696,16 @@ it('holds for the seeds that broke the rule on TS main', function (int $seed): v
     ppHolds([$seed]);
     expect(true)->toBeTrue();
 })->with(PP_REGRESSION_SEEDS);
+
+// Round 17: seeds a wider run (400 from base 9000) found the ORACLE wrong
+// at (a later step's decisions read in the parked step's order), kept as
+// fixed cases.
+const PP_ROUND17_SEEDS = [1508513416];
+
+it('holds for the seeds a wider run found the oracle wrong at (round 17)', function (int $seed): void {
+    ppHolds([$seed]);
+    expect(true)->toBeTrue();
+})->with(PP_ROUND17_SEEDS);
 
 it('holds over generated steps', function (): void {
     $replay = getenv('PRISM_PROPERTY_SEED');
