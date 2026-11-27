@@ -925,8 +925,16 @@ final readonly class AgentRuntime
         // What it lists is what is STILL pending (G-387 round 17): read again
         // after the end events, since a listener or the host may have moved
         // the conversation past the parked step.
-        return $agentResponse->awaitingApproval() ? new AgentResponse($agentResponse->runId, $agentResponse->response,
-            $agentResponse->parentRunId, $agentResponse->rootRunId, $session->thread()->pendingApprovalIds()) : $agentResponse;
+        if (! $agentResponse->awaitingApproval()) {
+            return $agentResponse;
+        }
+        $still = $session->thread()->pendingApprovalIds();
+        $open = new AgentResponse($agentResponse->runId, $agentResponse->response, $agentResponse->parentRunId, $agentResponse->rootRunId, $still);
+
+        // Nothing it asked for is pending any more (decision 8): say why,
+        // never "awaiting approval" with nothing to approve.
+        return $open->pendingApprovals() !== [] ? $open : new AgentResponse($agentResponse->runId, $agentResponse->response,
+            $agentResponse->parentRunId, $agentResponse->rootRunId, $still, self::stoppedBecause($still));
     }
 
     /**
@@ -1182,7 +1190,9 @@ final readonly class AgentRuntime
             parentRunId: $run->parentRunId,
             rootRunId: $run->rootRunId(),
             // Read again after the end events (round 17), as for send().
-            stillPending: $parked ? $session->thread()->pendingApprovalIds() : null,
+            stillPending: $still = $parked ? $session->thread()->pendingApprovalIds() : null,
+            stoppedBecause: $parked && (new StructuredAgentResponse($runId, $response, stillPending: $still))->pendingApprovals() === []
+                ? self::stoppedBecause($still ?? []) : null,
         );
     }
 
@@ -2459,6 +2469,17 @@ final readonly class AgentRuntime
         if ($halted) {
             throw RunNotPermitted::parkedElsewhere();
         }
+    }
+
+    /**
+     * Why a parked turn no longer waits on what it asked for (G-387 round
+     * 17, decision 8): another step's approvals are pending, or none are.
+     *
+     * @param  list<string>  $stillPending  the session's pending approval ids now
+     */
+    private static function stoppedBecause(array $stillPending): string
+    {
+        return $stillPending === [] ? 'replaced' : 'parked_elsewhere';
     }
 
     /**

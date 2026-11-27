@@ -340,7 +340,7 @@
     },
     {
       "id": "thr-0009",
-      "title": "a later row replaces an earlier result and decision in the earlier position",
+      "title": "a later row for the same call: the first result stands, and only the decision that stood is replayed",
       "since": "0.1.0",
       "fold": [
         {
@@ -422,12 +422,12 @@
         }
       ],
       "rows": {
-        "php": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":false,\"reason\":\"no\"}]}]",
+        "php": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"first\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":false,\"reason\":\"no\"}]}]",
         "ts": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":false,\"reason\":\"no\"}]}]",
         "py": "[{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_1\",\"name\":\"a\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null},{\"id\":\"call_2\",\"name\":\"b\",\"arguments\":{},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_2\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_1\",\"tool_name\":\"a\",\"args\":{},\"result\":\"second\",\"tool_call_result_id\":null,\"artifacts\":[]},{\"tool_call_id\":\"call_2\",\"tool_name\":\"b\",\"args\":{},\"result\":\"No approval response provided\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":false,\"reason\":\"no\"}]}]"
       },
-      "agrees": true,
-      "notes": "The order a fold keeps when the same call or approval appears twice: the later value wins, in the position the first one had. If languages disagreed, the same stored thread would show a model a different result, or a spoofed later decision, in PHP than in TypeScript."
+      "agrees": false,
+      "notes": "The order a fold keeps when the same call or approval appears twice: the later value wins, in the position the first one had. CHANGED in 0.7.0 (G-387 round 17, decision 7): for a RESULT the FIRST value stands, in its position (the one every outcome reader counts as the call's), so call_1 replays \"first\"; a decision is the one that stood (0.6.0). If languages disagreed, the same stored thread would show a model a different result, or a spoofed later decision, in PHP than in TypeScript."
     },
     {
       "id": "thr-0010",
@@ -3081,6 +3081,111 @@
       },
       "agrees": false,
       "notes": "G-387 round 17, item 3 (as TypeScript and Python store it: the step first, the ungated started row, then the tool's own work). The ungated call's result belongs to its own step by the trusted mark, so it is placed with it; the newer step stays the paused one, last and unanswered. PHP never stores this shape: core runs an ungated call inside the model step, so the turn is not written at all once a tool parked a newer step (the run ends parked_elsewhere, and the call's journal row stands)."
+    },
+    {
+      "id": "thr-0041",
+      "title": "the model is sent the FIRST of two results with one key, the one every outcome reader counts, when the later is written after a host row",
+      "since": "0.7.0",
+      "place": [
+        {
+          "type": "user",
+          "content": "Weather in Paris?",
+          "additional_content": [],
+          "additional_attributes": []
+        },
+        {
+          "type": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_paris",
+              "name": "weather",
+              "arguments": {
+                "city": "Paris"
+              },
+              "result_id": null,
+              "reasoning_id": null,
+              "reasoning_summary": null
+            }
+          ],
+          "additional_content": {},
+          "tool_approval_requests": [
+            {
+              "approval_id": "apr_1",
+              "tool_call_id": "call_paris"
+            }
+          ],
+          "harness": true
+        },
+        {
+          "type": "tool_result",
+          "tool_results": [],
+          "tool_approval_responses": [
+            {
+              "approval_id": "apr_1",
+              "approved": true,
+              "reason": null
+            }
+          ]
+        },
+        {
+          "type": "tool_result",
+          "harness": true,
+          "tool_results": [
+            {
+              "tool_call_id": "call_paris",
+              "tool_name": "weather",
+              "args": {
+                "city": "Paris"
+              },
+              "result": "Sunny in Paris",
+              "tool_call_result_id": null,
+              "artifacts": []
+            }
+          ],
+          "tool_approval_responses": [],
+          "harness_answers_step": {
+            "position": 2
+          }
+        },
+        {
+          "type": "assistant",
+          "content": "Done.",
+          "tool_calls": [],
+          "additional_content": {},
+          "tool_approval_requests": [],
+          "harness": true
+        },
+        {
+          "type": "user",
+          "content": "Host row.",
+          "additional_content": [],
+          "additional_attributes": []
+        },
+        {
+          "type": "tool_result",
+          "tool_results": [
+            {
+              "tool_call_id": "call_paris",
+              "tool_name": "weather",
+              "args": {
+                "city": "Paris"
+              },
+              "result": "Rainy in Paris",
+              "tool_call_result_id": null,
+              "artifacts": []
+            }
+          ],
+          "tool_approval_responses": []
+        }
+      ],
+      "rows": {
+        "php": "[{\"type\":\"user\",\"content\":\"Weather in Paris?\",\"additional_content\":[],\"additional_attributes\":[]},{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_paris\",\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"},\"result_id\":null,\"reasoning_id\":null,\"reasoning_summary\":null}],\"additional_content\":{},\"tool_approval_requests\":[{\"approval_id\":\"apr_1\",\"tool_call_id\":\"call_paris\"}]},{\"type\":\"tool_result\",\"tool_results\":[{\"tool_call_id\":\"call_paris\",\"tool_name\":\"weather\",\"args\":{\"city\":\"Paris\"},\"result\":\"Sunny in Paris\",\"tool_call_result_id\":null,\"artifacts\":[]}],\"tool_approval_responses\":[{\"approval_id\":\"apr_1\",\"approved\":true,\"reason\":null}]},{\"type\":\"assistant\",\"content\":\"Done.\",\"tool_calls\":[],\"additional_content\":{},\"tool_approval_requests\":[]},{\"type\":\"user\",\"content\":\"Host row.\",\"additional_content\":[],\"additional_attributes\":[]}]",
+        "ts": "",
+        "py": ""
+      },
+      "agrees": false,
+      "notes": "G-387 round 17, decision 7. The replay and the outcome readers agree: of two results with one key (call id, tool name, canonical arguments) the FIRST stands, in its position, and a later one is left out of what is sent, wherever it was stored. Here the host's later result sits after a host user row in the same segment: the step is answered directly after itself with the first result only. thr-0009 changed with this rule."
     }
   ],
   "divergence_note": "thr-0001..thr-0013 agree across PHP, TypeScript and Python. thr-0016 and thr-0017 (0.5.0) pin the replay fold for same-id calls and for a step whose result rows are not consecutive; the ports agree once they fold by id, tool name and arguments, once per segment. thr-0015 (0.4.0) pins how the ended mark is READ on a step whose call ids repeat; it agrees once each port reads every result row of the step, not only the first that carries the call id. thr-0014 (0.3.0) pins the ended mark, which the three languages wrote in three different shapes before it; it agrees once each port records the PHP reference's row. Seven did not on the first run: the reference stored an empty provider state as an empty list, [], where the ports store an empty map, {}, and the reference moved. Agreement here means a run stored by one language has the same rows, and replays as the same messages, in the others. It does not mean the decisions in those rows were authorised. User rows are out of scope here by decision; a draft of thr-0013 that carried them found PHP writing additional_content and additional_attributes as empty LISTS where both ports write neither key, recorded under G-58 rather than pinned in a suite that says it does not cover them."

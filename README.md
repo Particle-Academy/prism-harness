@@ -1213,7 +1213,10 @@ replayed, as interrupted, under ids every provider accepts. A run takes no furth
 and writes nothing that would replace it, once a newer step on its session, written by anyone
 else (a tool's own work included, from an approved or an ungated call), is waiting on approval
 (it ends with `RunNotPermitted`, code `parked_elsewhere`): it never replaces the step a caller was
-just told is waiting. A parked response lists only the approvals still pending when it returns.
+just told is waiting. A parked response lists only the approvals still pending when it returns;
+when none is left it is not awaiting approval, and `$response->stoppedBecause` says why
+(`replaced`: a row written meanwhile replaced the step; `parked_elsewhere`: a newer step waits).
+Of two results recorded for one call, the model is sent the first, the one every reader counts.
 Every harness mark, and the tool offer a parked step carries, is read only on a row the runtime
 itself wrote, recorded in the `harness_written` column (no public write sets it, and a run id is
 never proof): on any other row it is read as absent, and a step with no offer the runtime stored

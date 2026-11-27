@@ -42,6 +42,15 @@ final readonly class AgentResponse
          * @var list<string>|null
          */
         public ?array $stillPending = null,
+        /**
+         * Why a turn that parked is no longer waiting on anything it asked
+         * for (G-387 round 17, decision 8), or null: `replaced` (a row
+         * written meanwhile replaced the step, and no newer step waits) or
+         * `parked_elsewhere` (a newer step on the session now waits on
+         * approval). Either way {@see self::awaitingApproval()} is false and
+         * {@see self::pendingApprovals()} is empty.
+         */
+        public ?string $stoppedBecause = null,
     ) {}
 
     public function text(): string
