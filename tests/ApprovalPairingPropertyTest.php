@@ -443,10 +443,10 @@ function pairingOracle(array $case): array
             if ($runs[$k]) {
                 $ran[] = $call['token'];
             }
-            // The refused turn resolved nothing; the FIRST decision recorded
-            // for the call still counts when the step is resolved (G-401), so
-            // a call of a step with distinct ids that was not denied may run
-            // on a later approval. A call a person denied never runs.
+            // The refused turn resolved nothing; a call of a step with
+            // distinct ids that was not denied may run on a later approval.
+            // A call a person denied never runs: a denial is final (G-401),
+            // and no denied call is exempt from invariant 1.
             if ($refusedHere && $call['gated'] && ! $repeated && ! $superseded && $k !== $forged && ($effective[$k] ?? 'none') !== 'deny') {
                 $may[] = $call['token'];
             }
