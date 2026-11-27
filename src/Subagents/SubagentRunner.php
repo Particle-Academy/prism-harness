@@ -78,8 +78,14 @@ final readonly class SubagentRunner
             // ONLY THE CLASS NAME TRAVELS. A provider, store or database
             // exception's message can carry a URL, a host, SQL, headers or a
             // key, and whatever goes in `reason` is read by a model and may be
-            // shown to a user. The full message goes to the log.
-            report($e);
+            // shown to a user. The full message goes to the log, and a
+            // host exception that throws while it is reported (its
+            // context(), say) costs only the log entry (G-387).
+            try {
+                report($e);
+            } catch (Throwable) {
+                // Nothing of it reaches the parent.
+            }
 
             return SubagentResult::failed(
                 $subagent->name,

@@ -1115,13 +1115,19 @@ and mode) in one locked write that checks again that no turn holds the child and
 approval a person can answer was parked on it since the read, then the run. A hold, a claim or
 an approval that lands between the read and the write refuses the start with the child's
 records unchanged, and the tree hold is returned. The start is held to the step count the gate
-read: steps the context spends after the read count against it. Until the child's task row is
-recorded the start can still be undone: if anything fails before it (the tool offer, the
-provider, the run beginning), the child's binding, count, mode and thread link go back to what
-they were (each only if no later writer changed it) and the tree hold is returned, so an
-approval nobody could answer stays that way. Once a start has committed, a stop that lands
-later (a cancel, say) stops its model steps but not the start: the task is recorded on the
-child and the run ends with that stop. The gate is pinned across the three languages by the
+read: steps the context spends after the read count against it. What the start writes on the
+child is provisional until the child's task row (the start's user row in the child's thread)
+is recorded: its binding record and its run state name the start's run, and every other reader
+(a decision, a host turn or resume on the child, the next start's checks, a cancel) treats them
+as absent until that row exists. A start that fails before its task row therefore needs no
+second write to be undone: the child reads as it did before, a linked child with no binding is
+refused, an approval nobody could answer stays that way, and the run the child was parked on
+can still be cancelled. The child's binding, count, mode and thread link are also put back
+(each only if no later writer changed it) and the tree hold is returned, but that is
+housekeeping, and its failure changes nothing. A start acts on no decision recorded on the
+child: the calls the child was parked on are ended with its task row, with a fixed result, and
+never run. Once a start has committed, a stop that lands later (a cancel, say) stops its model
+steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
 parity op `start_gate`; the tool-call limit exists only here.
 
 **What the parent model reads about a child is harness-written.** The runner chooses the
@@ -1137,7 +1143,10 @@ class, a fixed harness description or a harness code, never exception text, what
 **A budget that cannot bound anything is refused.** `RunBudget` refuses a negative, fractional
 or non-finite `max_steps`, a `max_cost_usd` that is negative, NaN or infinite, and a negative
 or non-whole `max_seconds` (from a host's constructor call and from config alike), rather than
-reading any of them as no limit.
+reading any of them as no limit. In config (`prism-harness.agent`, `prism-harness.workflow` and
+`RunBudget::fromArray`), a cost, time or output limit that is absent or null is no limit; one
+that is present must be a number, or text that spells one (`'0.50'`, `'60'`). Anything else
+present, such as `'NAN'`, `'INF'`, `'0,50'` or an empty string, is a configuration error.
 
 **A host run context belongs to one session's turn.** Its ledger is the account every step
 under it is counted on. Share one context across sessions and each child resumed under it is

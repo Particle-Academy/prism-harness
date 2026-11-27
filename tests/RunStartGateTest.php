@@ -1046,7 +1046,10 @@ it('never clobbers a later writer when it undoes commit (b)', function (): void 
     sgRoot()->send('Go');
 
     expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
-        ->and(sgChild()->childDelegation())->toBe('dlg_later');
+        // As stored: the start's record is provisional with no task row,
+        // so a reader sees none; the undo left the later write in place.
+        ->and(sgRawChild()['child_binding']['delegation'] ?? null)->toBe('dlg_later')
+        ->and(sgChild()->childDelegation())->toBeNull();
 });
 
 // New channel: once the task row is recorded the delegation happened, and

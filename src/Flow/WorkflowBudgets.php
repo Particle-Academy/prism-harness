@@ -7,6 +7,7 @@ namespace Prism\Harness\Flow;
 use Prism\Harness\Contracts\WorkflowLedgerStore;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Stores\MemoryWorkflowLedgerStore;
+use Prism\Harness\Subagents\RunBudget;
 
 /**
  * Opens the account a workflow run spends from (G-348).
@@ -184,7 +185,8 @@ final class WorkflowBudgets
             'max_tool_calls' => self::configured($this->config, 'max_tool_calls', 100),
             // One cost cap for a deployment: a workflow falls back to the
             // agent's, so a cap that holds for turns also holds here.
-            'max_cost_usd' => is_numeric($cost) ? (float) $cost : (is_numeric($fallback) ? (float) $fallback : null),
+            // Present but unreadable is refused, never no limit (G-387).
+            'max_cost_usd' => RunBudget::costLimit($cost) ?? RunBudget::costLimit($fallback),
             'max_seconds' => self::configured($this->config, 'max_seconds', null),
         ], 'prism-harness.workflow');
     }

@@ -53,17 +53,58 @@ final readonly class RunBudget
     public static function fromArray(array $config, int $defaultSteps = 8): self
     {
         $steps = self::wholeSteps($config['max_steps'] ?? $defaultSteps);
-        $cost = $config['max_cost_usd'] ?? null;
-        $seconds = $config['max_seconds'] ?? null;
 
         return new self(
             maxSteps: $steps,
-            maxCostUsd: is_numeric($cost) ? (float) $cost : null,
-            // Cast, 1e999 and 1.5 would become an arbitrary count: refused.
-            maxSeconds: is_numeric($seconds) ? self::wholeSeconds($seconds) : null,
-            maxOutputTokensPerCall: isset($config['max_output_tokens_per_call']) && is_int($config['max_output_tokens_per_call'])
-                ? $config['max_output_tokens_per_call'] : null,
+            // Present but unreadable is a configuration error, never no
+            // limit (G-387): 'NAN', 'INF', '0,50' and 1e999 are refused.
+            maxCostUsd: self::costLimit($config['max_cost_usd'] ?? null),
+            maxSeconds: self::countLimit($config['max_seconds'] ?? null, 'max_seconds'),
+            maxOutputTokensPerCall: self::countLimit($config['max_output_tokens_per_call'] ?? null, 'max_output_tokens_per_call'),
         );
+    }
+
+    /**
+     * A cost limit as configuration gives it (G-387): null is no limit; a
+     * number, or text that spells one, is that number when it is finite and
+     * non-negative. Anything else present (text that is not a number, such
+     * as 'NAN', 'INF' or '0,50', a boolean, a list) is refused: a cap that
+     * cannot be read is never read as no cap.
+     *
+     * @throws \InvalidArgumentException
+     */
+    public static function costLimit(mixed $value, string $key = 'max_cost_usd'): ?float
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (is_int($value) || is_float($value) || (is_string($value) && is_numeric($value))) {
+            $cost = (float) $value;
+            if (is_finite($cost) && $cost >= 0) {
+                return $cost;
+            }
+        }
+
+        throw new \InvalidArgumentException(sprintf('A run budget\'s %s must be a finite, non-negative number or null.', $key));
+    }
+
+    /**
+     * A count limit (seconds, output tokens) as configuration gives it
+     * (G-387): null is no limit; a whole non-negative number, or text that
+     * spells one, is that number. Anything else present is refused.
+     *
+     * @throws \InvalidArgumentException
+     */
+    public static function countLimit(mixed $value, string $key): ?int
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (is_int($value) || is_float($value) || (is_string($value) && is_numeric($value))) {
+            return self::wholeCount($value, $key);
+        }
+
+        throw new \InvalidArgumentException(sprintf('A run budget\'s %s must be a non-negative whole number or null.', $key));
     }
 
     /**
@@ -141,8 +182,8 @@ final readonly class RunBudget
         throw new \InvalidArgumentException('A run budget\'s max_steps must be a non-negative whole number.');
     }
 
-    /** A numeric max_seconds as a whole count; a fraction, a negative or a non-finite number is refused. */
-    private static function wholeSeconds(int|float|string $seconds): int
+    /** A numeric limit as a whole count; a fraction, a negative or a non-finite number is refused. */
+    private static function wholeCount(int|float|string $seconds, string $key): int
     {
         if (is_string($seconds)) {
             $seconds = preg_match('/\A[0-9]{1,15}\z/', $seconds) === 1 ? (int) $seconds : (float) $seconds;
@@ -154,7 +195,7 @@ final readonly class RunBudget
             return (int) $seconds;
         }
 
-        throw new \InvalidArgumentException('A run budget\'s max_seconds must be a non-negative whole number.');
+        throw new \InvalidArgumentException(sprintf('A run budget\'s %s must be a non-negative whole number.', $key));
     }
 
     private static function lesserCount(?int $a, ?int $b): ?int
