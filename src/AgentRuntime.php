@@ -215,6 +215,7 @@ final readonly class AgentRuntime
             // sibling may have consumed the remainder in between.
             $stop = $run->ledger->exhaustion($budget);
             if ($budget->maxCostUsd === null && $stop !== null) {
+                $this->endSettledCalls($session, $runId);
                 $session->failRun($runId, 'budget');
 
                 throw RunNotPermitted::exhausted($stop);
@@ -433,6 +434,7 @@ final readonly class AgentRuntime
 
             $stop = $run->ledger->exhaustion($budget);
             if ($budget->maxCostUsd === null && $stop !== null) {
+                $this->endSettledCalls($session, $runId);
                 $session->failRun($runId, 'budget');
 
                 throw RunNotPermitted::exhausted($stop);
@@ -789,9 +791,13 @@ final readonly class AgentRuntime
         $pausedSteps = $this->pausedSteps($session, $prompt, $context);
         $namedRun?->ledger->recordSteps($pausedSteps);
         if ($namedRun !== null && ($stop = $namedRun->ledger->exhaustion($namedRun->budget)) !== null) {
+            $this->endSettledCalls($session, $runId);
+
             throw RunNotPermitted::exhausted($stop);
         }
         if ($namedRun === null && $pausedSteps >= $mode->maxSteps) {
+            $this->endSettledCalls($session, $runId);
+
             throw RunNotPermitted::exhausted(sprintf('step budget exhausted (%d of %d used)', $pausedSteps, $mode->maxSteps));
         }
 
@@ -1974,17 +1980,26 @@ final readonly class AgentRuntime
         // The step this run answers: its result rows name it (G-407), and a
         // host row written from inside this run leaves it to the run.
         Session::rememberAnswering($session->key(), $session->thread()->pausedStepPosition());
-        $session->thread()->endRepeatedIdStep(Session::REPEATED_CALL_ID_REASON, $runId);
-        // A call of the paused step no request names and no result answers:
-        // no resolution answers it, so it gets its one outcome now (G-412).
-        $session->thread()->endUnrequestedOpenCalls(Thread::INTERRUPTED_RESULT, $runId);
-        // A requested call whose tool this session's mode does not offer, or
-        // that takes no approval: no resolution answers it either, so it
-        // gets its one outcome (G-412).
-        $session->thread()->endRequestedCallsNotOffered($this->requestedCallOutcome($session), $runId);
+        $this->endSettledCalls($session, $runId);
         // What the run reads: a denial recorded after this refuses a call it
         // has not started (G-410).
         Session::rememberReadUpTo($session->key(), (int) $session->thread()->storedMessages()->max('position'), $runId);
+    }
+
+    /**
+     * Give each call of the paused step whose outcome is settled already its
+     * one stored outcome (G-412): every call of a step whose ids repeat, a
+     * call no request names, and a requested call whose tool this session's
+     * mode does not offer or that takes no approval. No resolution answers
+     * any of them. Done before a run reads the conversation, and also when
+     * a resume is refused for its budget, so a refused turn leaves no call
+     * of the step without its outcome.
+     */
+    private function endSettledCalls(Session $session, string $runId): void
+    {
+        $session->thread()->endRepeatedIdStep(Session::REPEATED_CALL_ID_REASON, $runId);
+        $session->thread()->endUnrequestedOpenCalls(Thread::INTERRUPTED_RESULT, $runId);
+        $session->thread()->endRequestedCallsNotOffered($this->requestedCallOutcome($session), $runId);
     }
 
     /**
