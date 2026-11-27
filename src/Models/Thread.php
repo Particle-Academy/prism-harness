@@ -689,6 +689,31 @@ class Thread extends Model implements ThreadContract
         });
     }
 
+    /**
+     * The decision standing for every approval a decision has been recorded
+     * for, in any row (G-401): false when any of them is a denial, true when
+     * all of them are approvals.
+     *
+     * @internal Read when decisions are recorded.
+     *
+     * @return array<string, bool>
+     */
+    public function recordedDecisions(): array
+    {
+        $standing = [];
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_TOOL_RESULT)->reorder('position')->cursor() as $stored) {
+            $payload = $stored->payload ?? null;
+            foreach (is_array($payload) && is_array($payload['tool_approval_responses'] ?? null) ? $payload['tool_approval_responses'] : [] as $response) {
+                if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                    $id = $response['approval_id'];
+                    $standing[$id] = ($standing[$id] ?? true) && ($response['approved'] ?? false) === true;
+                }
+            }
+        }
+
+        return $standing;
+    }
+
     /** The result a call of a step superseded before it was resolved is recorded with (G-392/G-397). */
     public const REPLACED_REASON = 'Tool call was not run because a later step replaced it';
 

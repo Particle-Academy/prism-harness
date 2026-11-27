@@ -25,15 +25,14 @@ use Prism\Prism\ValueObjects\ToolResult;
  * earlier one's position. The same call is the same tool call id, tool name
  * AND arguments (the n-th such result of a row replacing the n-th of an
  * earlier row), never the call id alone: a provider may give two calls of one
- * step the same id, and each keeps its own result. A decision is
- * keyed by its approval id, the same way.
+ * step the same id, and each keeps its own result. A decision is keyed by its
+ * approval id, and the one that stands is the same in every row: a denial,
+ * when any decision recorded for that approval is one, and otherwise the first
+ * approval (G-401). A later approval never replaces a denial, and a denial
+ * revokes an approval no run has acted on yet.
  */
 class ToolResultRuns
 {
-    /**
-     * @param  iterable<int, Message>  $messages
-     * @return Generator<int, Message>
-     */
     /**
      * @param  iterable<int, Message>  $messages
      * @param  array<int, int>  $answers  message index => index of the step that
@@ -43,8 +42,12 @@ class ToolResultRuns
     public static function fold(iterable $messages, array $answers = []): Generator
     {
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
+        $final = self::finalDecisions($messages);
 
-        yield from self::oncePerSegment(iterator_to_array(self::foldRuns(self::withAnswersInPlace($messages, $answers)), false));
+        yield from self::oncePerSegment(array_map(
+            static fn (Message $message): Message => $message instanceof ToolResultMessage ? self::withFinalDecisions($message, $final) : $message,
+            iterator_to_array(self::foldRuns(self::withAnswersInPlace($messages, $answers)), false),
+        ));
     }
 
     /**
@@ -205,6 +208,51 @@ class ToolResultRuns
         }
 
         return $out;
+    }
+
+    /**
+     * The decision that stands for each approval across all of `$messages`
+     * (G-401): a denial, when any decision recorded for it is one, and
+     * otherwise the first approval.
+     *
+     * @param  list<Message>  $messages
+     * @return array<string, ToolApprovalResponse>
+     */
+    private static function finalDecisions(array $messages): array
+    {
+        $final = [];
+        foreach ($messages as $message) {
+            if (! $message instanceof ToolResultMessage) {
+                continue;
+            }
+            foreach ($message->toolApprovalResponses as $decision) {
+                $standing = $final[$decision->approvalId] ?? null;
+                if ($standing === null || ($standing->approved && ! $decision->approved)) {
+                    $final[$decision->approvalId] = $decision;
+                }
+            }
+        }
+
+        return $final;
+    }
+
+    /**
+     * `$message` with one decision per approval, the one that stands.
+     *
+     * @param  array<string, ToolApprovalResponse>  $final
+     */
+    private static function withFinalDecisions(ToolResultMessage $message, array $final): ToolResultMessage
+    {
+        $decisions = [];
+        foreach ($message->toolApprovalResponses as $decision) {
+            $decisions[$decision->approvalId] ??= $final[$decision->approvalId] ?? $decision;
+        }
+        $decisions = array_values($decisions);
+        if ($decisions === $message->toolApprovalResponses) {
+            return $message;
+        }
+
+        return new ToolResultMessage($message->toolResults, $decisions);
     }
 
     /**
