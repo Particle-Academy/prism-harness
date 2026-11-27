@@ -28,6 +28,7 @@ use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 use Throwable;
@@ -470,7 +471,7 @@ class Thread extends Model implements ThreadContract
 
             $position = (int) $this->storedMessages()->max('position');
 
-            foreach ($messages as $message) {
+            foreach ($this->withReplacedStepsEnded($messages) as $message) {
                 $payload = MessageMapper::toArray($message);
                 if ($message instanceof AssistantMessage && $message->toolApprovalRequests !== [] && $toolNames !== null) {
                     // Harness metadata on the same durable approval record.
@@ -489,44 +490,58 @@ class Thread extends Model implements ThreadContract
         });
     }
 
+    /** The result a call of a step replaced before it was resolved is recorded with (G-392/G-397). */
+    public const REPLACED_REASON = 'Tool call was not run because a later step replaced it';
+
     /**
-     * Whether the step the run paused at the transcript tail repeats a call
-     * id, among its tool calls or among its approval requests. A decision
-     * reaches a call through the call id its request names, so a repeated id
-     * cannot say which call a decision belongs to.
+     * Whether the paused step repeats a call id, among its tool calls or
+     * among its approval requests. A decision reaches a call through the
+     * call id its request names, so a repeated id cannot say which call a
+     * decision belongs to.
+     *
+     * The paused step is chosen by CORE's rule, the one that decides what
+     * runs: the newest assistant row that carries tool calls, wherever it
+     * sits. Rows recorded after it (an assistant note, a user message, a
+     * system or tool result row) do not move it (G-392/G-397).
      *
      * @internal Read when decisions are recorded.
      */
     public function pausedStepRepeatsCallIds(): bool
     {
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            if ($stored->type === MessageMapper::TYPE_USER) {
-                return false;
-            }
-            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
-                continue;
-            }
+        $step = $this->resolvableStep();
 
-            $callIds = [];
-            foreach ($stored->payload['tool_calls'] ?? [] as $call) {
-                $callIds[] = is_array($call) && is_scalar($call['id'] ?? null) ? (string) $call['id'] : '';
-            }
-            $requestCallIds = [];
-            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
-                $requestCallIds[] = is_array($request) && is_scalar($request['tool_call_id'] ?? null) ? (string) $request['tool_call_id'] : '';
-            }
-
-            return count($callIds) !== count(array_unique($callIds, SORT_STRING))
-                || count($requestCallIds) !== count(array_unique($requestCallIds, SORT_STRING));
-        }
-
-        return false;
+        return $step !== null && self::stepRepeatsCallIds($step['assistant']);
     }
 
     /**
-     * Give every call still without a result, in a paused step whose call ids
-     * repeat, the denial `$reason` as its result, recorded as one tool result
-     * row. Returns whether a row was written.
+     * The approval ids of every step in this thread whose call ids or
+     * request call ids repeat, wherever the step sits. A decision naming one
+     * of them is recorded as a denial, so no transcript shape can make it
+     * run a call (G-392/G-397).
+     *
+     * @internal Read when decisions are recorded.
+     *
+     * @return list<string>
+     */
+    public function repeatedIdApprovalIds(): array
+    {
+        $ids = [];
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position')->cursor() as $stored) {
+            $message = self::storedMessage($stored);
+            if ($message instanceof AssistantMessage && $message->toolCalls !== [] && self::stepRepeatsCallIds($message)) {
+                foreach ($message->toolApprovalRequests as $request) {
+                    $ids[] = $request->approvalId;
+                }
+            }
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * Give every call still without a result, in the paused step when its
+     * call ids repeat, the denial `$reason` as its result, recorded as one
+     * tool result row. Returns whether a row was written.
      *
      * A result names its call only by id, so in such a step a result of one
      * call reads as the result of every call sharing its id: an ungated call
@@ -536,34 +551,21 @@ class Thread extends Model implements ThreadContract
      * fits), so every gated call of the step gets exactly one outcome, and
      * none of them runs.
      *
-     * Only a step that asked for approval is touched, and only while it is
-     * the paused step at the tail; calling it again writes nothing.
+     * The step is the one core resolves (see pausedStepRepeatsCallIds()),
+     * and only a step that asked for approval is touched; calling it again
+     * writes nothing.
      *
      * @internal Called by every turn before it reads the conversation.
      */
     public function endRepeatedIdStep(string $reason, ?string $runId = null): bool
     {
-        if (! $this->pausedStepRepeatsCallIds()) {
+        $step = $this->resolvableStep();
+        if ($step === null || ! self::stepRepeatsCallIds($step['assistant'])) {
             return false;
         }
-
-        $assistant = null;
-        $results = [];
-        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
-            if (! is_string($stored->type) || ! is_array($stored->payload)) {
-                continue;
-            }
-            $message = MessageMapper::fromArray($stored->type, $stored->payload);
-            if ($message instanceof AssistantMessage) {
-                $assistant = $message;
-
-                break;
-            }
-            if ($message instanceof ToolResultMessage) {
-                $results = [...$message->toolResults, ...$results];
-            }
-        }
-        if (! $assistant instanceof AssistantMessage || $assistant->toolApprovalRequests === []) {
+        $assistant = $step['assistant'];
+        $results = $step['results'];
+        if ($assistant->toolApprovalRequests === []) {
             return false;
         }
 
@@ -584,6 +586,138 @@ class Thread extends Model implements ThreadContract
         ))], $runId);
 
         return true;
+    }
+
+    /**
+     * The step core resolves approvals for: the newest assistant row with
+     * tool calls, not stopping at user, system or text-only assistant rows,
+     * and every tool result recorded after it, in order.
+     *
+     * @return array{assistant: AssistantMessage, results: list<ToolResult>}|null
+     */
+    private function resolvableStep(): ?array
+    {
+        $results = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            $message = self::storedMessage($stored);
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                return ['assistant' => $message, 'results' => $results];
+            }
+            if ($message instanceof ToolResultMessage) {
+                $results = [...$message->toolResults, ...$results];
+            }
+        }
+
+        return null;
+    }
+
+    /** A stored row as a Prism message, or null when the row cannot be read. */
+    private static function storedMessage(mixed $stored): ?Message
+    {
+        $type = is_object($stored) ? ($stored->type ?? null) : null;
+        $payload = is_object($stored) ? ($stored->payload ?? null) : null;
+
+        return is_string($type) && is_array($payload) ? MessageMapper::fromArray($type, $payload) : null;
+    }
+
+    /**
+     * Whether a step's tool call ids, its requests' tool call ids, or its
+     * requests' approval ids repeat. An empty id is an id.
+     */
+    private static function stepRepeatsCallIds(AssistantMessage $step): bool
+    {
+        $callIds = array_map(static fn (ToolCall $call): string => $call->id, $step->toolCalls);
+        $requestCallIds = array_map(static fn (ToolApprovalRequest $request): string => $request->toolCallId, $step->toolApprovalRequests);
+        $approvalIds = array_map(static fn (ToolApprovalRequest $request): string => $request->approvalId, $step->toolApprovalRequests);
+
+        return count($callIds) !== count(array_unique($callIds, SORT_STRING))
+            || count($requestCallIds) !== count(array_unique($requestCallIds, SORT_STRING))
+            || count($approvalIds) !== count(array_unique($approvalIds, SORT_STRING));
+    }
+
+    /**
+     * The approval ids of every step that asked for approval and is no longer
+     * the one core resolves: a later tool-call step replaced it. A decision
+     * naming one of them is recorded as a denial, so it runs nothing
+     * (G-392/G-397).
+     *
+     * @internal Read when decisions are recorded.
+     *
+     * @return list<string>
+     */
+    public function replacedApprovalIds(): array
+    {
+        $steps = [];
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position')->cursor() as $stored) {
+            $message = self::storedMessage($stored);
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                $steps[] = $message;
+            }
+        }
+        array_pop($steps);
+
+        $ids = [];
+        foreach ($steps as $step) {
+            foreach ($step->toolApprovalRequests as $request) {
+                $ids[] = $request->approvalId;
+            }
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * `$messages`, with a result row ending the calls of a step that is
+     * replaced before it was resolved (G-392/G-397).
+     *
+     * A later tool-call step replaces the step that asked for approval: core
+     * resolves only the newest one, so a call of the earlier step with no
+     * result of its own would never get one. Each such call gets the denial
+     * {@see self::REPLACED_REASON}, recorded immediately before the step that
+     * replaces it, and so exactly once. Results are matched to calls by
+     * position, as in endRepeatedIdStep().
+     *
+     * @param  iterable<Message>  $messages
+     * @return list<Message>
+     */
+    private function withReplacedStepsEnded(iterable $messages): array
+    {
+        $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
+        $replaces = array_filter($messages, static fn (Message $message): bool => $message instanceof AssistantMessage && $message->toolCalls !== []);
+        if ($replaces === []) {
+            return $messages;
+        }
+
+        $step = $this->resolvableStep();
+        $current = $step['assistant'] ?? null;
+        $results = $step['results'] ?? [];
+        $out = [];
+        foreach ($messages as $message) {
+            if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
+                if ($current instanceof AssistantMessage && $current->toolApprovalRequests !== []) {
+                    $open = self::callsWithoutResult($current->toolCalls, $results);
+                    if ($open !== []) {
+                        $out[] = new ToolResultMessage(array_map(
+                            static fn (ToolCall $call): ToolResult => new ToolResult(
+                                toolCallId: $call->id,
+                                toolName: $call->name,
+                                args: $call->argumentsForResult(),
+                                result: self::REPLACED_REASON,
+                                toolCallResultId: $call->resultId,
+                            ),
+                            $open,
+                        ));
+                    }
+                }
+                $current = $message;
+                $results = [];
+            } elseif ($message instanceof ToolResultMessage) {
+                $results = [...$results, ...$message->toolResults];
+            }
+            $out[] = $message;
+        }
+
+        return $out;
     }
 
     /**

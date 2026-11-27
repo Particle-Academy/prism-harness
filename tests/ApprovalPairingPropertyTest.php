@@ -5,17 +5,25 @@ declare(strict_types=1);
 use Illuminate\Http\Client\Request as HttpRequest;
 use Illuminate\Support\Facades\Http;
 use Prism\Harness\AgentResponse;
+use Prism\Harness\AgentRuntime;
+use Prism\Harness\Modes\ModeRegistry;
 use Prism\Harness\PrismHarness;
 use Prism\Harness\Sessions\Session;
 use Prism\Harness\Steps\RunStep;
 use Prism\Harness\Tools\ToolRegistry;
+use Prism\Prism\Contracts\Message;
 use Prism\Prism\Schema\BooleanSchema;
 use Prism\Prism\Schema\ObjectSchema;
 use Prism\Prism\Streaming\Events\ToolApprovalRequestEvent;
 use Prism\Prism\Tool;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\SystemMessage;
 use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
+use Prism\Prism\ValueObjects\Messages\UserMessage;
+use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
+use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Fixtures\Participant;
 
 // G-392 QC: PROPERTY TESTS for approval pairing.
@@ -34,6 +42,10 @@ use Tests\Fixtures\Participant;
 //
 // Every call carries a unique token in its arguments, so a run is attributed
 // to the call that made it even when ids repeat.
+//
+// Between a park and its decision the host sometimes records a row of its
+// own (an assistant note, a user message, a system row, a tool result row):
+// none of them changes which step a decision belongs to (G-392/G-397).
 //
 // PRISM_PROPERTY_EXAMPLES sets the number of examples (a small fixed set by
 // default). PRISM_PROPERTY_BASE_SEED moves the base seed. PRISM_PROPERTY_SEED
@@ -115,6 +127,8 @@ final class PairingPropertyWorld
 }
 
 const PAIRING_REPEATED_REASON = 'Tool call was not run because another call in this step has the same id';
+
+const PAIRING_REPLACED_REASON = 'Tool call was not run because a later step replaced it';
 
 const PAIRING_ID_POOL = ['a', 'b', 'c', ''];
 
@@ -231,6 +245,8 @@ function pairingGenerate(PairingPropertyRng $rng): array
             'decisions' => $decisions,
             'order' => $order,
             'resume' => $rng->pick(['decide', 'decide', 'streamDecision', 'streamDecision', 'approveOne', 'newMessage']),
+            // A row the host records between the park and the decision.
+            'between' => $rng->chance(0.4) ? $rng->pick(['assistant', 'user', 'system', 'tool']) : null,
         ];
     }
     $repeats = [];
@@ -238,7 +254,46 @@ function pairingGenerate(PairingPropertyRng $rng): array
         $repeats[] = $rng->pick(['send', 'stream', 'structured', 'redecide', 'lateApprove']);
     }
 
-    return ['entry' => $rng->pick(['send', 'stream']), 'steps' => $steps, 'repeats' => $repeats];
+    $case = ['entry' => $rng->pick(['send', 'stream']), 'steps' => $steps, 'repeats' => $repeats, 'mode' => 'normal'];
+    $mode = $rng->int(20);
+    if ($mode < 3) {
+        // The run's steps are spent when it resumes: no assistant row
+        // follows the park. A row is recorded between, then repeat resumes.
+        $case['mode'] = 'spent';
+        $case['steps'] = [[...$steps[0], 'between' => $rng->pick(['assistant', 'user', 'system', 'tool'])]];
+        $case['repeats'] = $repeats === [] ? [$rng->pick(['send', 'stream', 'redecide', 'lateApprove'])] : $repeats;
+    } elseif ($mode < 8 && array_filter($steps[0]['calls'], fn (array $call): bool => $call['gated']) !== []) {
+        // A later tool-call step is recorded onto the thread while the first
+        // is parked, as a host can: the first is replaced. The later step's
+        // approval requests sometimes repeat an approval id.
+        $case['mode'] = 'replaced';
+        $case['steps'] = [[...$steps[0], 'between' => in_array($steps[0]['between'], ['system', null], true) ? null : $steps[0]['between']]];
+        $n = 1 + $rng->int(3);
+        $calls = [];
+        $approvals = [];
+        $decisions = [];
+        for ($k = 0; $k < $n; $k++) {
+            $calls[] = ['id' => $rng->pick(PAIRING_ID_POOL), 'gated' => true, 'token' => "r{$k}"];
+            $approvals[] = "apr_r{$k}";
+            $decisions[$k] = $rng->pick(['approve', 'approve', 'deny', 'none']);
+        }
+        if ($n > 1 && $rng->chance(0.5)) {
+            $approvals[$n - 1] = $approvals[0];
+        }
+        // One batch: decisions for the replaced step's calls and the later
+        // step's, mixed.
+        $mix = [];
+        foreach ($steps[0]['order'] as $k) {
+            $mix[] = ['old', $k];
+        }
+        foreach (array_keys(array_filter($decisions, fn (string $d): bool => $d !== 'none')) as $k) {
+            $mix[] = ['new', $k];
+        }
+        $case['recorded'] = ['calls' => $calls, 'approvals' => $approvals, 'decisions' => $decisions, 'mix' => $rng->shuffle($mix),
+            'resume' => $rng->pick(['decide', 'streamDecision', 'approveOne'])];
+    }
+
+    return $case;
 }
 
 /**
@@ -251,22 +306,69 @@ function pairingOracle(array $case): array
 {
     $ran = [];
     $steps = [];
+    // The faked provider (Anthropic) refuses a conversation that holds a
+    // system row: once one is recorded, no later step is served, and in that
+    // step a call ITS OWN approval approved may or may not have run before
+    // the refusal (the decision-stream path resolves approvals first). Any
+    // other gated call must not run.
+    $refused = false;
+    $may = [];
     foreach ($case['steps'] as $step) {
         $ids = array_column($step['calls'], 'id');
         $repeated = count($ids) !== count(array_unique($ids));
         $effective = pairingEffectiveDecisions($step);
+        $parks = array_filter($step['calls'], fn (array $call): bool => $call['gated']) !== [];
+        $unserved = $refused;
+        $mode = $case['mode'] ?? 'normal';
+        // A resume with no model step left is refused on one path and, on
+        // the decision-stream path, still resolves the step's approvals (no
+        // model step is needed for that), so it is a refused turn like the
+        // one above. A replaced step runs none of its gated calls.
+        $stopped = $mode !== 'normal';
+        $refusedHere = ! $refused && $parks && ($mode === 'spent' || (($step['between'] ?? null) === 'system' && $mode === 'normal'));
         $runs = [];
         foreach ($step['calls'] as $k => $call) {
-            $runs[$k] = ! $call['gated'] || (! $repeated && ($effective[$k] ?? 'none') === 'approve');
+            $approved = ! $repeated && ($effective[$k] ?? 'none') === 'approve';
+            $runs[$k] = ! $unserved && (! $call['gated'] || (! $refusedHere && ! $stopped && $approved));
             if ($runs[$k]) {
                 $ran[] = $call['token'];
             }
+            // The refused turn resolved nothing, so the decision in effect
+            // when the step IS resolved decides: on this line a later
+            // decision for the same approval replaces an earlier one
+            // (ToolResultRuns folds decisions by approval id), so a call of
+            // a step with distinct ids may run on a later approval.
+            if ($refusedHere && $call['gated'] && ! $repeated) {
+                $may[] = $call['token'];
+            }
         }
-        $steps[] = ['repeated' => $repeated, 'runs' => $runs];
+        $steps[] = ['repeated' => $repeated, 'runs' => $runs, 'unserved' => $unserved, 'refused' => $refusedHere];
+        $refused = $refused || $refusedHere;
+    }
+    $recorded = null;
+    if (($case['mode'] ?? 'normal') === 'replaced') {
+        $r = $case['recorded'];
+        $ids = array_column($r['calls'], 'id');
+        $repeatedR = count($ids) !== count(array_unique($ids)) || count($r['approvals']) !== count(array_unique($r['approvals']));
+        $effectiveR = array_fill_keys(array_keys($r['calls']), 'none');
+        $mix = $r['resume'] === 'approveOne' ? array_slice($r['mix'], 0, 1) : $r['mix'];
+        foreach ($mix as [$which, $k]) {
+            if ($which === 'new') {
+                $effectiveR[$k] = $r['decisions'][$k];
+            }
+        }
+        $runsR = [];
+        foreach ($r['calls'] as $k => $call) {
+            $runsR[$k] = ! $repeatedR && $effectiveR[$k] === 'approve';
+            if ($runsR[$k]) {
+                $ran[] = $call['token'];
+            }
+        }
+        $recorded = ['repeated' => $repeatedR, 'runs' => $runsR];
     }
     sort($ran);
 
-    return ['ran' => $ran, 'steps' => $steps];
+    return ['ran' => $ran, 'may' => $may, 'steps' => $steps, 'recorded' => $recorded];
 }
 
 /**
@@ -320,6 +422,11 @@ function pairingRun(array $case): array
     foreach ($case['steps'] as $s => $step) {
         PairingPropertyWorld::$queue[] = ['kind' => 'calls', 'step' => $s, 'calls' => $step['calls']];
     }
+    // A spent run has one model step in all: the one it parked on.
+    config()->set('prism-harness.agent.modes.chat.max_steps', ($case['mode'] ?? 'normal') === 'spent' ? 1 : 8);
+    foreach ([ModeRegistry::class, AgentRuntime::class, PrismHarness::class] as $class) {
+        app()->forgetInstance($class);
+    }
     $who = 'pairing-'.(++PairingPropertyWorld::$participant);
     $session = fn (): Session => pairingSession($who);
     $observed = ['parks' => [], 'recorded' => [], 'errors' => [], 'lateFrom' => null];
@@ -357,6 +464,15 @@ function pairingRun(array $case): array
             }
         }
         $resume = pairingResume($step);
+        if (($step['between'] ?? null) !== null) {
+            $session()->thread()->record([pairingBetweenRow($step['between'])]);
+        }
+        if (($case['mode'] ?? 'normal') === 'replaced') {
+            pairingReplace($session(), $case['recorded'], $requestFor, $step, $observed);
+            $pending = [];
+
+            break;
+        }
         $pending = [];
         try {
             switch ($resume) {
@@ -386,6 +502,7 @@ function pairingRun(array $case): array
 
     // Repeat resumes over the history: nothing may run twice.
     $observed['lateFrom'] = count(PairingPropertyWorld::$ran);
+    $observed['lateRow'] = $session()->thread()->storedMessages()->count();
     $schema = new ObjectSchema('answer', 'Answer', [new BooleanSchema('ok', 'Done')], ['ok']);
     foreach ($case['repeats'] as $repeat) {
         try {
@@ -407,6 +524,9 @@ function pairingRun(array $case): array
                             $late[] = new ToolApprovalResponse($request['approvalId'], true);
                         }
                     }
+                    foreach (array_unique($case['recorded']['approvals'] ?? []) as $approvalId) {
+                        $late[] = new ToolApprovalResponse($approvalId, true);
+                    }
                     if ($late !== []) {
                         $repeat === 'redecide' ? $session()->decide($late) : $session()->approve($late[0]->approvalId);
                     }
@@ -423,6 +543,62 @@ function pairingRun(array $case): array
     $observed['session'] = $session();
 
     return $observed;
+}
+
+/**
+ * Record a later tool-call step onto the thread while `$step` is parked, then
+ * resume with one batch of decisions for both steps' calls.
+ *
+ * @param  array<string, mixed>  $recorded
+ * @param  array<int, ?string>  $requestFor  the parked step's approval id per gated call
+ * @param  array<string, mixed>  $step
+ * @param  array<string, mixed>  $observed
+ */
+function pairingReplace(Session $session, array $recorded, array $requestFor, array $step, array &$observed): void
+{
+    $session->thread()->record([new AssistantMessage('', array_map(
+        fn (array $call): ToolCall => new ToolCall($call['id'], 'gated', ['token' => $call['token']]),
+        $recorded['calls'],
+    ), [], array_map(
+        fn (array $call, string $approvalId): ToolApprovalRequest => new ToolApprovalRequest($approvalId, $call['id'], ToolApprovalRequest::ARGUMENTS_AS_SENT),
+        $recorded['calls'],
+        $recorded['approvals'],
+    ))], null, ['gated', 'free']);
+
+    $batch = [];
+    foreach ($recorded['mix'] as [$which, $k]) {
+        $batch[] = $which === 'old'
+            ? new ToolApprovalResponse((string) $requestFor[$k], $step['decisions'][$k] === 'approve')
+            : new ToolApprovalResponse($recorded['approvals'][$k], $recorded['decisions'][$k] === 'approve');
+    }
+    try {
+        if ($batch === []) {
+            $session->send('Something else.');
+        } elseif ($recorded['resume'] === 'approveOne') {
+            $session->approve($batch[0]->approvalId, $batch[0]->approved);
+        } elseif ($recorded['resume'] === 'streamDecision') {
+            foreach ($session->streamDecision($batch) as $runStep) {
+                if ($runStep->type === RunStep::DECISION_RECORDED) {
+                    $observed['recordedAll'][] = [$runStep->data['approvalId'], $runStep->data['verdict']];
+                }
+            }
+        } else {
+            $session->decide($batch);
+        }
+    } catch (Throwable $e) {
+        $observed['errors'][] = 'replace: '.$e::class.': '.$e->getMessage();
+    }
+}
+
+/** A row a host records while an approval is pending. */
+function pairingBetweenRow(string $kind): Message
+{
+    return match ($kind) {
+        'assistant' => new AssistantMessage('Waiting for your approval.'),
+        'user' => new UserMessage('Hurry.'),
+        'system' => new SystemMessage('Approvals are pending.'),
+        default => new ToolResultMessage([new ToolResult('unrelated', 'free', ['token' => 'none'], 'noted')]),
+    };
 }
 
 /** @return list<array{approvalId: string, toolCallId: string}> */
@@ -457,13 +633,19 @@ function pairingViolations(array $case, array $observed): array
         }
     }
     foreach (array_slice($ran, $observed['lateFrom']) as $token) {
-        $violations[] = "inv3: {$token} ran on a repeat resume";
+        // A call of a refused turn is first decided by a later decision.
+        if (! in_array($token, $oracle['may'], true)) {
+            $violations[] = "inv3: {$token} ran on a repeat resume";
+        }
     }
 
     // The assistant row of each step, and the rows after it up to the next.
     $stepRows = [];
     $current = null;
     foreach ($observed['rows'] as $index => $row) {
+        if ($index >= $observed['lateRow']) {
+            break;
+        }
         $message = $row['message'];
         if ($message instanceof AssistantMessage && $message->toolCalls !== []) {
             $tokens = array_map(fn ($call): ?string => pairingToken($call->arguments()), $message->toolCalls);
@@ -477,9 +659,8 @@ function pairingViolations(array $case, array $observed): array
 
             continue;
         }
-        if ($message instanceof AssistantMessage) {
-            $current = null;
-        }
+        // Results belong to the newest step before them, as core reads them:
+        // a text-only assistant row, a user or a system row does not end it.
         if ($current !== null && $message instanceof ToolResultMessage) {
             $stepRows[$current]['after'][] = $row;
         }
@@ -494,7 +675,7 @@ function pairingViolations(array $case, array $observed): array
         foreach ($step['calls'] as $k => $call) {
             $didRun = in_array($call['token'], $ran, true);
             // 1. A call a person denied never runs.
-            if ($call['gated'] && $didRun && ($effective[$k] ?? 'none') !== 'approve') {
+            if ($call['gated'] && $didRun && ($effective[$k] ?? 'none') !== 'approve' && ! in_array($call['token'], $oracle['may'], true)) {
                 $violations[] = "inv1: {$call['token']} ran with decision ".($effective[$k] ?? 'none');
             }
             // 4. A repeated-id step runs none of its gated calls.
@@ -511,11 +692,11 @@ function pairingViolations(array $case, array $observed): array
             }
         }
         $ranGated = array_filter($gated, fn (int $k): bool => in_array($step['calls'][$k]['token'], $ran, true));
-        if (count($ranGated) > count($approves)) {
+        if (! $expected['refused'] && count($ranGated) > count($approves)) {
             $violations[] = "inv2: step {$s} ran ".count($ranGated).' gated calls on '.count($approves).' approvals';
         }
 
-        if ($gated === []) {
+        if ($gated === [] || $expected['unserved']) {
             continue;
         }
         if ($parked === null) {
@@ -559,6 +740,20 @@ function pairingViolations(array $case, array $observed): array
         foreach ($gated as $k) {
             $token = $step['calls'][$k]['token'];
             $got = $outcomes[$token] ?? [];
+            if (($case['mode'] ?? 'normal') === 'replaced' && array_values(array_unique($got)) !== [PAIRING_REPLACED_REASON]) {
+                $violations[] = "inv5: gated {$token} of a replaced step recorded ".json_encode($got);
+
+                continue;
+            }
+            if ($expected['refused']) {
+                // The provider refused the turn: at most one outcome, and a
+                // run only for a call its own approval approved.
+                if (count($got) > 1 || (in_array('ran:'.$token, $got, true) && ! in_array($token, $oracle['may'], true))) {
+                    $violations[] = "inv5: gated {$token} in a refused turn recorded ".json_encode($got);
+                }
+
+                continue;
+            }
             if (count($got) !== 1) {
                 $violations[] = "inv5: gated {$token} has ".count($got).' recorded outcomes '.json_encode($got);
 
@@ -575,7 +770,7 @@ function pairingViolations(array $case, array $observed): array
         foreach ($gated as $k) {
             $token = $step['calls'][$k]['token'];
             $rowsFor = $decisionRows[$approvalOf[$k]] ?? [];
-            if (in_array($token, $ran, true) && ($rowsFor === [] || in_array(false, array_column($rowsFor, 0), true))) {
+            if (! $expected['refused'] && in_array($token, $ran, true) && ($rowsFor === [] || in_array(false, array_column($rowsFor, 0), true))) {
                 $violations[] = "inv6: {$token} ran but its own request's decision rows are ".json_encode($rowsFor);
             }
             if ($expected['repeated'] && in_array(true, array_column($rowsFor, 0), true)) {
@@ -591,11 +786,73 @@ function pairingViolations(array $case, array $observed): array
         }
     }
 
-    // Full equality: what ran is what the oracle says runs.
+    if (($case['mode'] ?? 'normal') === 'replaced') {
+        array_push($violations, ...pairingReplacedViolations($case, $observed, $oracle['recorded']));
+    }
+
+    // Full equality: what ran is what the oracle says runs (plus, in a turn
+    // the provider refused, any call its own approval approved).
     $actual = array_values(array_unique($ran));
     sort($actual);
-    if ($actual !== $oracle['ran']) {
+    $extra = array_values(array_diff($actual, $oracle['ran']));
+    if (array_diff($oracle['ran'], $actual) !== [] || array_diff($extra, $oracle['may']) !== []) {
         $violations[] = 'equality: ran '.json_encode($actual).', the oracle runs '.json_encode($oracle['ran']);
+    }
+
+    return $violations;
+}
+
+/**
+ * The later, recorded step of a `replaced` case: exactly one outcome per call,
+ * a run only where its own approval approved it in a step with no repeated
+ * id, and decision rows that say so. Every decision for the replaced step is
+ * a denial.
+ *
+ * @param  array<string, mixed>  $case
+ * @param  array<string, mixed>  $observed
+ * @param  array{repeated: bool, runs: array<int, bool>}  $expected
+ * @return list<string>
+ */
+function pairingReplacedViolations(array $case, array $observed, array $expected): array
+{
+    $violations = [];
+    $outcomes = [];
+    $decisions = [];
+    foreach ($observed['rows'] as $index => $row) {
+        if ($index >= $observed['lateRow'] || ! $row['message'] instanceof ToolResultMessage) {
+            continue;
+        }
+        foreach ($row['message']->toolResults as $result) {
+            $outcomes[pairingToken($result->args) ?? '?'][] = $result->result;
+        }
+        foreach ($row['message']->toolApprovalResponses as $response) {
+            $decisions[$response->approvalId][] = $response->approved;
+        }
+    }
+    foreach ($case['recorded']['calls'] as $k => $call) {
+        $got = array_values(array_unique($outcomes[$call['token']] ?? []));
+        if (count($got) !== 1) {
+            $violations[] = "inv5: recorded {$call['token']} has outcomes ".json_encode($got);
+
+            continue;
+        }
+        if ($expected['runs'][$k] !== ($got[0] === 'ran:'.$call['token'])) {
+            $violations[] = "inv6: recorded {$call['token']} recorded ".json_encode($got[0]).' but '.($expected['runs'][$k] ? 'should have run' : 'should not have run');
+        }
+        if ($expected['repeated'] && in_array(true, $decisions[$case['recorded']['approvals'][$k]] ?? [], true)) {
+            $violations[] = "inv6: recorded {$call['token']} is in a repeated-id step and a decision row records it approved";
+        }
+    }
+    foreach ($observed['parks'][0] ?? [] as $request) {
+        if (in_array(true, $decisions[$request['approvalId']] ?? [], true)) {
+            $violations[] = "inv6: a decision for the replaced step's {$request['approvalId']} is recorded approved";
+        }
+    }
+    foreach ($observed['recordedAll'] ?? [] as [$approvalId, $verdict]) {
+        $stored = array_values(array_unique(array_map(fn (bool $approved): string => $approved ? 'approved' : 'denied', $decisions[$approvalId] ?? [])));
+        if ($stored !== [$verdict]) {
+            $violations[] = "inv6: streamDecision reported {$approvalId} {$verdict}, the thread rows hold ".json_encode($stored);
+        }
     }
 
     return $violations;
@@ -780,6 +1037,18 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
             if (count($step['order']) !== count(array_unique($step['order']))) {
                 $seen['a decision sent twice'] = true;
             }
+            if (($step['between'] ?? null) !== null && array_filter($step['calls'], fn (array $call): bool => $call['gated']) !== []) {
+                $seen['a '.$step['between'].' row between the park and the decision'] = true;
+                if ($case['mode'] === 'spent' && $case['repeats'] !== []) {
+                    $seen['a row between, then a resume with no step left, then repeat resumes'] = true;
+                }
+            }
+        }
+        if ($case['mode'] === 'replaced' && array_filter($case['steps'][0]['calls'], fn (array $call): bool => $call['gated']) !== []) {
+            $seen['an older parked step replaced by a later tool-call step'] = true;
+            if (count($case['recorded']['approvals']) !== count(array_unique($case['recorded']['approvals']))) {
+                $seen['an approval id repeated in one step'] = true;
+            }
             foreach ($step['decisions'] as $decision) {
                 $seen['decision '.$decision] = true;
             }
@@ -792,5 +1061,9 @@ it('generates every shape the rule distinguishes, in the fixed-seed set', functi
         'resume decide', 'resume streamDecision', 'resume approveOne', 'resume newMessage',
         'distinct ids', 'repeated ids', 'gated calls sharing an id', 'a gated and an ungated call sharing an id',
         'an empty gated id', 'a decision sent twice', 'decision approve', 'decision deny', 'decision none',
+        'a assistant row between the park and the decision', 'a user row between the park and the decision',
+        'a system row between the park and the decision', 'a tool row between the park and the decision',
+        'a row between, then a resume with no step left, then repeat resumes',
+        'an older parked step replaced by a later tool-call step', 'an approval id repeated in one step',
     ]);
 });
