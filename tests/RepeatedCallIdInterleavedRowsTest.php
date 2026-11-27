@@ -62,6 +62,17 @@ function g397Session(): Session
     return app(PrismHarness::class)->for(Participant::query()->firstOrCreate(['name' => 'Ada']))->session('chat');
 }
 
+/**
+ * The denial each call ends with: a text or user row recorded outside the
+ * step's run supersedes the step; a system or tool result row does not.
+ */
+function g397Reason(string $row): string
+{
+    return in_array($row, ['an assistant note', "the user's follow-up"], true)
+        ? 'Tool call was not run because a later step replaced it'
+        : Session::REPEATED_CALL_ID_REASON;
+}
+
 /** @return array<string, Message> */
 function g397Rows(): array
 {
@@ -118,8 +129,8 @@ it('runs no call of a repeated-id step when rows were recorded between the park 
 
     expect($this->ran)->toBe([])
         ->and(g397Outcomes())->toBe([
-            'Paris' => [Session::REPEATED_CALL_ID_REASON],
-            'Rome' => [Session::REPEATED_CALL_ID_REASON],
+            'Paris' => [g397Reason($row)],
+            'Rome' => [g397Reason($row)],
         ]);
 })->with(array_keys(g397Rows()))->with(array_keys(g397Resumes()));
 
@@ -137,6 +148,6 @@ it('records every decision for the step as a denial when a row was recorded betw
     }
 
     expect($decisions)->not->toBe([])
-        ->and(array_values(array_unique($decisions, SORT_REGULAR)))->toBe([[false, Session::REPEATED_CALL_ID_REASON]])
+        ->and(array_values(array_unique($decisions, SORT_REGULAR)))->toBe([[false, g397Reason($row)]])
         ->and($this->ran)->toBe([]);
 })->with(array_keys(g397Rows()));

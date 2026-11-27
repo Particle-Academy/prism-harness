@@ -1045,7 +1045,7 @@ final readonly class AgentRuntime
             }
             if (($session->run()['status'] ?? null) === 'running') {
                 if (! $recorded && $prompt !== '') {
-                    $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
+                    $session->thread()->recordForRun([new UserMessage($prompt, $attachments)], $runId);
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
@@ -1138,7 +1138,7 @@ final readonly class AgentRuntime
         } finally {
             if (($session->run()['status'] ?? null) === 'running') {
                 if (! $recorded && $prompt !== '') {
-                    $session->thread()->record([new UserMessage($prompt, $attachments)], $runId);
+                    $session->thread()->recordForRun([new UserMessage($prompt, $attachments)], $runId);
                 }
                 if (in_array($finish, [FinishReason::Error, FinishReason::Unknown], true)) {
                     $session->failRun($runId, $finish->value);
@@ -1619,7 +1619,7 @@ final readonly class AgentRuntime
     {
         // Materialised once: the thread and the observers both read it.
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
-        $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools));
+        $session->thread()->recordForRun($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools));
         // AFTER the durable record, so an observer can never lose a turn the
         // thread kept, and its failure (isolated in MemoryHooks) cannot undo one.
         app(MemoryHooks::class)->recorded($session, $runId, $messages);
