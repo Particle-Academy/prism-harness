@@ -568,7 +568,22 @@ class Session
      */
     protected function recordDecisions(array $decisions): array
     {
-        $decisions = $this->deniedWhenCallIdsRepeat($decisions);
+        // A decision for a call that already has an outcome is not recorded:
+        // the call is no longer pending, and nothing it says would happen.
+        // Decisions for a repeated-id or replaced step are still recorded,
+        // as the denials deniedWhenCallIdsRepeat() makes them.
+        $answered = array_diff_key(
+            array_fill_keys($this->thread()->answeredApprovalIds(), true),
+            array_fill_keys($this->thread()->repeatedIdApprovalIds(), true),
+            array_fill_keys($this->thread()->replacedApprovalIds(), true),
+        );
+        $decisions = $this->deniedWhenCallIdsRepeat(array_values(array_filter(
+            $decisions,
+            static fn (ToolApprovalResponse $decision): bool => ! isset($answered[$decision->approvalId]),
+        )));
+        if ($decisions === []) {
+            return [];
+        }
 
         $this->thread()->record([
             new ToolResultMessage(toolApprovalResponses: $decisions),
