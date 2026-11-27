@@ -31,6 +31,7 @@ use Prism\Prism\ValueObjects\Messages\UserMessage;
 use Prism\Prism\ValueObjects\ToolApprovalRequest;
 use Prism\Prism\ValueObjects\ToolApprovalResponse;
 use Prism\Prism\ValueObjects\ToolCall;
+use Prism\Prism\ValueObjects\ToolResult;
 use Tests\Support\G360;
 use Tests\Support\SentRequests;
 
@@ -502,3 +503,56 @@ it('says precisely why an approved call did not start: a denial that stands for 
     expect($this->ran)->toBe(['Paris'])
         ->and(r17Outcomes()['call_rome'] ?? [])->toBe([Thread::START_DENIED]);
 });
+
+// ---------------------------------------------------------------------------
+// DECISIONS 7 and 8 (coordinator, from Py #94).
+// ---------------------------------------------------------------------------
+
+it('sends the model the result the outcome readers count: the FIRST of two same-key results (decision 7)', function (): void {
+    G360::calls([['weather', ['city' => 'Paris'], 'call_paris']]);
+    $approval = r17Session()->send('Weather in Paris?')->pendingApprovals()[0]->approvalId;
+    G360::text('Done.');
+    r17Session()->decide([new ToolApprovalResponse($approval, true)]);
+    // A host row, then a later result with the SAME key (id, tool, arguments).
+    r17Session()->thread()->record([new UserMessage('Host row.')]);
+    r17Session()->thread()->record([new ToolResultMessage([new ToolResult('call_paris', 'weather', ['city' => 'Paris'], 'Rainy in Paris')])]);
+
+    $sent = [];
+    foreach (r17Session()->thread()->messages() as $message) {
+        if ($message instanceof ToolResultMessage) {
+            foreach ($message->toolResults as $result) {
+                $sent[] = (string) $result->result;
+            }
+        }
+    }
+    // The outcome the readers count is the first; the model is told the same.
+    expect(r17Outcomes()['call_paris'])->toBe(['Sunny in Paris', 'Rainy in Paris'])
+        ->and(r17Session()->approvalStatus($approval))->toBe('approved')
+        ->and($sent)->toBe(['Sunny in Paris']);
+    G360::text('Later.');
+    r17Session()->send('And later?');
+    expect(G360::outputs())->toBe(['call_paris' => 'Sunny in Paris'])
+        ->and(SentRequests::since())->toBe([]);
+});
+
+it('returns the replaced status, never awaiting approval with nothing pending, when a row written meanwhile replaces the step (decision 8)', function (string $path, string $rows): void {
+    G360::calls([['weather', ['city' => 'Paris'], 'call_paris']]);
+    $wrote = false;
+    Event::listen(RunFinished::class, function () use (&$wrote, $rows): void {
+        if (! $wrote) {
+            $wrote = true;
+            r17Session()->thread()->record($rows === 'a user row'
+                ? [new UserMessage('Something else.')]
+                : [new AssistantMessage('', [new ToolCall('call_newer', 'weather', ['city' => 'Rome'], 'call_newer')], [],
+                    [new ToolApprovalRequest('apr_newer', 'call_newer')])]);
+        }
+    });
+
+    $response = $path === 'send' ? r17Session()->send('Weather in Paris?')
+        : r17Session()->sendStructured('Weather in Paris?', new ObjectSchema('doc', 'A document.', [new BooleanSchema('ok', 'Ok.')], ['ok']));
+
+    expect($response->awaitingApproval())->toBeFalse()
+        ->and($response->pendingApprovals())->toBe([])
+        ->and($response->stoppedBecause)->toBe($rows === 'a user row' ? 'replaced' : 'parked_elsewhere')
+        ->and($this->ran)->toBe([]);
+})->with(['send', 'sendStructured'])->with(['a user row', 'a newer step']);
