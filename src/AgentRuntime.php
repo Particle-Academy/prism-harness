@@ -53,6 +53,7 @@ use Prism\Harness\Subagents\RunStarts;
 use Prism\Harness\Subagents\RunTrees;
 use Prism\Harness\Subagents\StepCalls;
 use Prism\Harness\Subagents\SubagentRunner;
+use Prism\Harness\Support\ClassLabel;
 use Prism\Harness\Support\TurnAttachments;
 use Prism\Harness\Tools\CancelGuardedTool;
 use Prism\Harness\Tools\CanonicalJson;
@@ -77,6 +78,7 @@ use Prism\Prism\ValueObjects\ToolCall;
 use Prism\Prism\ValueObjects\ToolResult;
 use RuntimeException;
 use Throwable;
+use WeakMap;
 
 final readonly class AgentRuntime
 {
@@ -89,6 +91,15 @@ final readonly class AgentRuntime
      * SCOPED slot instead: see {@see self::policySlot()}.
      */
     private ToolPolicySlot $policySlot;
+
+    /**
+     * The result messages a runner start ended calls with (G-387), until
+     * they are recorded: marked as ended in the thread, and announced as
+     * denied only once durable.
+     *
+     * @var WeakMap<ToolResultMessage, true>
+     */
+    private WeakMap $endedByStart;
 
     /** @param array<string, mixed> $config */
     public function __construct(
@@ -116,6 +127,7 @@ final readonly class AgentRuntime
         private array $agents = [],
     ) {
         $this->policySlot = new ToolPolicySlot;
+        $this->endedByStart = new WeakMap;
         foreach ($agents as $agent => $options) {
             SessionAddress::validateAgent($agent);
             if (! is_array($options)) {
@@ -254,7 +266,7 @@ final readonly class AgentRuntime
                 event(new RunFailed(
                     sessionKey: $session->key(),
                     runId: $runId,
-                    exception: $failure::class,
+                    exception: ClassLabel::of($failure),
                     parentRunId: $context?->parentRunId,
                     rootRunId: $context?->rootRunId(),
                     harnessAgent: $session->agent(),
@@ -317,7 +329,7 @@ final readonly class AgentRuntime
                     try {
                         $undo();
                     } catch (Throwable $undoFailure) {
-                        report(new RuntimeException('A subagent start could not be undone: '.$undoFailure::class.'.'));
+                        report(new RuntimeException('A subagent start could not be undone: '.ClassLabel::of($undoFailure).'.'));
                     }
                 }
 
@@ -374,8 +386,14 @@ final readonly class AgentRuntime
                 toolCallResultId: $call->resultId,
             );
         }
+        if ($ended === []) {
+            return null;
+        }
+        $message = new ToolResultMessage($ended);
+        // Recorded marked as ended, and announced only once it is durable.
+        $this->endedByStart[$message] = true;
 
-        return $ended === [] ? null : new ToolResultMessage($ended);
+        return $message;
     }
 
     /**
@@ -402,10 +420,10 @@ final readonly class AgentRuntime
             if ($cancelled) {
                 $session->cancelRun($runId);
             } else {
-                $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
+                $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : ClassLabel::of($failure));
             }
         } catch (Throwable $unwritten) {
-            report(new RuntimeException('A failed run could not be closed: '.$unwritten::class.'.'));
+            report(new RuntimeException('A failed run could not be closed: '.ClassLabel::of($unwritten).'.'));
             try {
                 app(RunTrees::class)->finished($session, $runId);
             } catch (Throwable) {
@@ -416,7 +434,7 @@ final readonly class AgentRuntime
             event(new RunFailed(
                 sessionKey: $session->key(),
                 runId: $runId,
-                exception: $failure::class,
+                exception: ClassLabel::of($failure),
                 parentRunId: $context?->parentRunId,
                 rootRunId: $context?->rootRunId() ?? $runId,
                 harnessAgent: $session->agent(),
@@ -637,7 +655,7 @@ final readonly class AgentRuntime
                     $this->recordTurn($session, [new UserMessage($prompt, $attachments), ...($ended === null ? [] : [$ended])], $runId, []);
                 }
             } catch (Throwable $unrecorded) {
-                report(new RuntimeException('A subagent task could not be recorded: '.$unrecorded::class.'.'));
+                report(new RuntimeException('A subagent task could not be recorded: '.ClassLabel::of($unrecorded).'.'));
             }
             $this->failRunOn($session, $runId, $run, $failure);
 
@@ -717,7 +735,7 @@ final readonly class AgentRuntime
                 event(new RunFailed(
                     sessionKey: $session->key(),
                     runId: $runId,
-                    exception: $failure::class,
+                    exception: ClassLabel::of($failure),
                     parentRunId: $context?->parentRunId,
                     rootRunId: $context?->rootRunId(),
                     harnessAgent: $session->agent(),
@@ -1431,9 +1449,9 @@ final readonly class AgentRuntime
         if ($failure instanceof RunNotPermitted && $failure->code() === 'run_cancelled') {
             $session->cancelRun($runId);
         } else {
-            $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : $failure::class);
+            $session->failRun($runId, $failure instanceof RunNotPermitted ? 'budget' : ClassLabel::of($failure));
         }
-        $this->announceEnd($session, $runId, $run, new RunFailed($session->key(), $runId, $failure::class,
+        $this->announceEnd($session, $runId, $run, new RunFailed($session->key(), $runId, ClassLabel::of($failure),
             $run->parentRunId, $run->rootRunId(), harnessAgent: $session->agent()));
     }
 
@@ -1948,8 +1966,19 @@ final readonly class AgentRuntime
     {
         // Materialised once: the thread and the observers both read it.
         $messages = is_array($messages) ? array_values($messages) : iterator_to_array($messages, false);
+        $ended = array_values(array_filter($messages, fn (Message $message): bool => $message instanceof ToolResultMessage && isset($this->endedByStart[$message])));
         $session->thread()->record($messages, $runId, array_map(static fn (Tool $tool): string => $tool->name(), $tools),
-            app(RunTrees::class)->parkFacts($runId));
+            app(RunTrees::class)->parkFacts($runId), $ended);
+        // The calls a runner start ended are announced as denied only now
+        // that the rows ending them are durable (G-387): a store failure on
+        // that write announces nothing that was not recorded.
+        foreach ($ended as $message) {
+            unset($this->endedByStart[$message]);
+            foreach ($message->toolResults as $result) {
+                $this->emitToolDecision(ToolDenied::class, $session, $runId, $this->declaredTool($session, $result->toolName),
+                    $result->toolName, $result->args, 'policy');
+            }
+        }
         // AFTER the durable record, so an observer can never lose a turn the
         // thread kept, and its failure (isolated in MemoryHooks) cannot undo one.
         app(MemoryHooks::class)->recorded($session, $runId, $messages);
@@ -2362,12 +2391,12 @@ final readonly class AgentRuntime
                 throw $failure;
             }
             $refused = $failure instanceof RunNotPermitted || $failure instanceof PlanRefused;
-            $session->failRun($runId, $refused ? 'budget' : $failure::class);
+            $session->failRun($runId, $refused ? 'budget' : ClassLabel::of($failure));
             if (! $refused) {
                 event(new RunFailed(
                     sessionKey: $session->key(),
                     runId: $runId,
-                    exception: $failure::class,
+                    exception: ClassLabel::of($failure),
                     parentRunId: $run->parentRunId,
                     rootRunId: $run->rootRunId(),
                     harnessAgent: $session->agent(),
@@ -2816,20 +2845,27 @@ final readonly class AgentRuntime
                     // What (b) replaces, read inside its lock.
                     $priorChild = $session->childRecord();
                     $priorMode = $session->modeSlot();
-                    $restore = static function () use ($session, $priorChild, $priorMode, $mode): void {
+                    // The refs the child reads as now: its last CONFIRMED
+                    // tree and plan ledger, kept beside the provisional
+                    // record until its task row exists.
+                    $confirmed = ['tree' => $session->childTree(), 'plan_ledger' => $session->childPlanLedger()];
+                    $restore = static function () use ($session, $priorChild, $priorMode, $mode, $runId): void {
                         $session->restoreChildRecord($priorChild);
-                        if ($session->modeSlot() === [true, $mode]) {
+                        $slot = $session->modeSlot();
+                        if ($slot[0] && $slot[1] === $mode && $slot[2] && is_array($slot[3]) && ($slot[3]['run'] ?? null) === $runId) {
                             $session->restoreModeSlot($priorMode);
                         }
                     };
                     try {
-                        $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation, provisional: $runId);
-                        $session->usingMode($mode);
+                        $session->rememberChildBinding($child, $membership['depth'], $refs['plan_ledger'], $refs['tree'], $ceiling, $delegation,
+                            provisional: $runId, confirmedRefs: $confirmed);
+                        // Provisional too (G-387): the mode before it until the task row exists.
+                        $session->usingProvisionalMode($mode, $runId);
                     } catch (Throwable $failure) {
                         try {
                             $restore();
                         } catch (Throwable $undoFailure) {
-                            report(new RuntimeException('A subagent start could not be undone: '.$undoFailure::class.'.'));
+                            report(new RuntimeException('A subagent start could not be undone: '.ClassLabel::of($undoFailure).'.'));
                         }
 
                         throw $failure;
@@ -2896,7 +2932,7 @@ final readonly class AgentRuntime
                         $thread->save();
                     }
                 } catch (Throwable $failure) {
-                    report(new RuntimeException('A subagent thread link could not be undone: '.$failure::class.'.'));
+                    report(new RuntimeException('A subagent thread link could not be undone: '.ClassLabel::of($failure).'.'));
                 }
             }
             $undo();
@@ -2919,7 +2955,8 @@ final readonly class AgentRuntime
      * Whether the child has an approval a person could still answer
      * (`answerable`: one whose run was not cancelled, on a child whose
      * decision would be accepted, its binding saved and its run tree not
-     * cancelled), one nobody can answer (`unanswerable`, which does not hold
+     * cancelled; or one a person decided that a resume could still act on,
+     * G-387), one nobody can answer (`unanswerable`, which does not hold
      * the child for ever), or none. Reads only.
      *
      * Only the refusals that MEAN nobody can answer (no saved binding, a
@@ -2941,7 +2978,13 @@ final readonly class AgentRuntime
         }
         $pending = array_filter($thread->pendingApprovalIds(),
             static fn (string $id): bool => $child->approvalStatus($id) === 'pending');
-        if ($pending === []) {
+        // A decision a person recorded that no resume has acted on yet holds
+        // the child exactly as a pending approval does (G-387): a start
+        // would end the call, and a model must not void a person's decision
+        // by delegating. Not one whose run was cancelled.
+        $decided = array_filter($thread->decidedApprovalIdsAwaitingResult(),
+            static fn (string $id): bool => ! $child->cancelRequestedFor((string) $thread->approvalRunId($id)));
+        if ($pending === [] && $decided === []) {
             return 'none';
         }
         try {

@@ -157,6 +157,18 @@ function sgAnswered(): void
     (fn () => $this->recordDecisions([new ToolApprovalResponse($pending[0], true)]))->call($child);
 }
 
+/**
+ * Make the child's pending approval one nobody can answer: a person cancels
+ * the run parked on it. (A recorded decision no longer does: a decided call
+ * a resume could still act on holds the child, G-387 round 10.)
+ */
+function sgUnanswerable(): void
+{
+    $child = sgChild();
+    $parked = $child->thread()->approvalRunId($child->thread()->pendingApprovalIds()[0]);
+    expect($child->cancel((string) $parked)->value)->toBe('ok');
+}
+
 function sgRunner(): SubagentRunner
 {
     return app(SubagentRunner::class);
@@ -457,7 +469,7 @@ function sgAfterQuery(string $needle, Closure $then): void
 
 it('refuses a start whose tree was spent between the gate read and the hold, writing nothing on the child', function (): void {
     sgParkedChild();
-    sgAnswered();
+    sgUnanswerable();
     $records = sgChildRecords();
     $tree = null;
     Event::listen(RunStarted::class, function (RunStarted $event) use (&$tree): void {
@@ -492,7 +504,7 @@ it('refuses a start whose tree was spent between the gate read and the hold, wri
 
 it('refuses a start when a resume claims the child between the gate read and the child write, releasing the tree hold', function (): void {
     sgParkedChild();
-    sgAnswered();
+    sgUnanswerable();
     $records = sgChildRecords();
     $tree = null;
     Event::listen(RunStarted::class, function (RunStarted $event) use (&$tree): void {
@@ -518,6 +530,7 @@ it('refuses a start when a resume claims the child between the gate read and the
 
     $count = sgChild()->planStore()->get(sgChild()->key().':delegation-steps');
     expect(implode(' ', G360::outputs()))->toContain('"outcome":"denied"')
+        ->and(implode(' ', G360::outputs()))->toContain('already running')
         ->and($count['holds'])->toHaveKey('run_sneak')
         ->and(array_diff_key(sgChildRecords(), array_flip(array_filter(array_keys($records), fn (string $k): bool => str_contains($k, 'delegation-steps')))))
         ->toBe(array_diff_key($records, array_flip(array_filter(array_keys($records), fn (string $k): bool => str_contains($k, 'delegation-steps')))))
@@ -597,7 +610,7 @@ it('fails closed, writing nothing, when a gate read throws', function (string $n
 // committed start: the child runs, and that approval is superseded.
 it('starts a child whose pending approval nobody can answer, and runs it', function (): void {
     sgParkedChild();
-    sgAnswered();
+    sgUnanswerable();
     G360::$queue = [];
     G360::calls([['worker', ['task' => 'Start over']]]);
     G360::text('Done again.');
@@ -1917,3 +1930,62 @@ it('reads a decided call a start ended as superseded, never approved', function 
     expect(sgFreshChild()->approvalStatus($approval))->toBe('superseded')
         ->and($this->ran['weather'])->toBe(0);
 })->with(['decided' => [true], 'never decided' => [false]]);
+
+// New channels (round 10).
+
+// A host-written record with garbage confirmed refs gains nothing: the record
+// still reads as absent (every turn on the child is refused), and the refs as none.
+it('reads garbage confirmed refs on an unconfirmed record as no refs, and the record as absent', function (mixed $refs): void {
+    sgParkedChild();
+    $pending = sgChild()->thread()->pendingApprovalIds();
+    sgWriteChild(function (array $payload) use ($refs): array {
+        $payload['child_binding']['provisional'] = 'run_'.str_repeat('d', 24);
+        $payload['child_binding']['confirmed_refs'] = $refs;
+
+        return $payload;
+    });
+
+    $child = sgFreshChild();
+    expect($child->childBinding())->toBeNull()
+        ->and($child->childTree())->toBeNull()
+        ->and($child->childPlanLedger())->toBeNull()
+        ->and(sgApproveCode($pending[0]))->toBe('child_binding_missing')
+        ->and($this->ran['weather'])->toBe(0);
+})->with(['text' => ['garbage'], 'a list' => [[1, 2]], 'a forged tree shape' => [['tree' => ['session' => 1]]]]);
+
+// A decided call holds the child only until a resume acts on it (or nobody
+// could): once the host resumes it, the next delegation starts the child.
+it('lets a re-delegation start a child once a resume acted on the decided call', function (): void {
+    sgParkedChild();
+    sgAnswered();
+    expect(sgRedelegate('Start over'))->toContain('"outcome":"denied"');
+    G360::$queue = [];
+    G360::text('Child done.');
+    sgFreshChild()->send('');
+    expect($this->ran['weather'])->toBe(1)
+        ->and(sgRedelegate('Start over'))->toContain('"outcome":"completed"')
+        ->and($this->ran['weather'])->toBe(1);
+});
+
+// The undo puts the mode back only while it is still the start's: a host that
+// chose a mode since keeps it.
+it('never clobbers a mode a host chose after commit (b) when it undoes a failed start', function (): void {
+    app(ToolRegistry::class)->registerProvider(function (Session $session): array {
+        if (str_contains($session->key(), '::sub::worker') && ! $session->isReadOnlyResolution()) {
+            $session->usingMode('chat');
+
+            throw new RuntimeException('boom');
+        }
+
+        return [];
+    }, name: 'mode-writer');
+    G360::calls([['worker', ['task' => 'Go']]]);
+    G360::text('Handled.');
+    sgPad(3);
+
+    sgRoot()->send('Go');
+
+    expect(implode(' ', G360::outputs()))->toContain('"outcome":"failed"')
+        ->and(sgMode())->toBe('chat')
+        ->and(sgFreshChild()->mode())->toBe('chat');
+});

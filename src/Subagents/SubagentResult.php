@@ -6,6 +6,7 @@ namespace Prism\Harness\Subagents;
 
 use JsonException;
 use Prism\Harness\Flow\HarnessToolInvoker;
+use Prism\Harness\Support\ClassLabel;
 
 /**
  * What a nested run hands back to its parent — as DATA, never as instructions.
@@ -116,7 +117,7 @@ final readonly class SubagentResult
                 'outcome' => SubagentOutcome::Failed->value,
                 'succeeded' => false,
                 'retryable' => false,
-                'reason' => 'The subagent produced output that could not be encoded ('.$e::class.').',
+                'reason' => 'The subagent produced output that could not be encoded ('.ClassLabel::of($e).').',
             ], JSON_UNESCAPED_SLASHES) ?: '{"outcome":"failed"}';
         }
     }

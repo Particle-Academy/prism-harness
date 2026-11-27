@@ -29,6 +29,7 @@ use Prism\Harness\Tools\CanonicalJson;
 use Prism\Prism\Contracts\Message;
 use Prism\Prism\Contracts\Thread as ThreadContract;
 use Prism\Prism\ValueObjects\Messages\AssistantMessage;
+use Prism\Prism\ValueObjects\Messages\ToolResultMessage;
 use Throwable;
 
 /**
@@ -455,8 +456,9 @@ class Thread extends Model implements ThreadContract
      * @param  iterable<Message>  $messages
      * @param  list<string>|null  $toolNames  the actual offer, stored only beside pending approvals
      * @param  array{harness_steps_used: int, harness_steps_left: int}|null  $parked  stored on the row a run parks on (G-387)
+     * @param  list<Message>  $endedByStart  the result rows a runner start ENDED calls with, never ran (G-387), marked as such
      */
-    public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null, ?array $parked = null): self
+    public function record(iterable $messages, ?string $runId = null, ?array $toolNames = null, ?array $parked = null, array $endedByStart = []): self
     {
         // ATOMIC ACROSS THE WHOLE TURN, and serialised against other recorders.
         //
@@ -475,7 +477,7 @@ class Thread extends Model implements ThreadContract
         // A turn that half-writes leaves a tool call with no result, which
         // replays to the model as an unanswered question rather than as an
         // error anyone can see.
-        return DB::transaction(function () use ($messages, $runId, $toolNames, $parked): self {
+        return DB::transaction(function () use ($messages, $runId, $toolNames, $parked, $endedByStart): self {
             // Locks the thread ROW so a concurrent recorder waits instead of
             // reading the same max. A no-op on SQLite, which is why the suite
             // cannot exercise this and why the guarantee lives in the database.
@@ -495,6 +497,10 @@ class Thread extends Model implements ThreadContract
                     // what it had left: the count its resume continues (G-387).
                     $payload['harness_steps_used'] = $parked['harness_steps_used'];
                     $payload['harness_steps_left'] = $parked['harness_steps_left'];
+                }
+                if ($message instanceof ToolResultMessage && in_array($message, $endedByStart, true)) {
+                    // Harness metadata: these calls were ended, never run.
+                    $payload[self::ENDED_BY_START] = true;
                 }
                 $this->storedMessages()->create([
                     'position' => ++$position,
@@ -686,6 +692,88 @@ class Thread extends Model implements ThreadContract
 
         return false;
     }
+
+    /**
+     * The approval ids of the approval paused at the transcript tail that a
+     * person has decided (approved or denied) and whose call has no result
+     * yet: decisions a resume would act on (G-387).
+     *
+     * @internal
+     *
+     * @return list<string>
+     */
+    public function decidedApprovalIdsAwaitingResult(): array
+    {
+        $answered = [];
+        $finished = [];
+        foreach ($this->storedMessages()->reorder('position', 'desc')->cursor() as $stored) {
+            $payload = $stored->payload;
+            if ($stored->type === MessageMapper::TYPE_TOOL_RESULT) {
+                foreach ($payload['tool_results'] ?? [] as $result) {
+                    if (is_array($result) && is_string($result['tool_call_id'] ?? null)) {
+                        $finished[$result['tool_call_id']] = true;
+                    }
+                }
+                foreach ($payload['tool_approval_responses'] ?? [] as $response) {
+                    if (is_array($response) && is_string($response['approval_id'] ?? null)) {
+                        $answered[$response['approval_id']] = true;
+                    }
+                }
+
+                continue;
+            }
+            if ($stored->type !== MessageMapper::TYPE_ASSISTANT) {
+                return [];
+            }
+            $ids = [];
+            foreach ($payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && is_string($request['approval_id'] ?? null) && isset($answered[$request['approval_id']])
+                    && is_string($request['tool_call_id'] ?? null) && ! isset($finished[$request['tool_call_id']])) {
+                    $ids[] = $request['approval_id'];
+                }
+            }
+
+            return array_values(array_unique($ids));
+        }
+
+        return [];
+    }
+
+    /**
+     * Whether a runner start ended the call this approval id was requested
+     * for, with a result row it marked as ended, never run (G-387).
+     *
+     * @internal
+     */
+    public function endedByStart(string $approvalId): bool
+    {
+        $callId = null;
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_ASSISTANT)->reorder('position', 'desc')->cursor() as $stored) {
+            foreach ($stored->payload['tool_approval_requests'] ?? [] as $request) {
+                if (is_array($request) && ($request['approval_id'] ?? null) === $approvalId && is_string($request['tool_call_id'] ?? null)) {
+                    $callId = $request['tool_call_id'];
+
+                    break 2;
+                }
+            }
+        }
+        if ($callId === null) {
+            return false;
+        }
+        foreach ($this->storedMessages()->where('type', MessageMapper::TYPE_TOOL_RESULT)->reorder('position')->cursor() as $stored) {
+            foreach ($stored->payload['tool_results'] ?? [] as $result) {
+                if (is_array($result) && ($result['tool_call_id'] ?? null) === $callId) {
+                    // The first result of the call is its result.
+                    return ($stored->payload[self::ENDED_BY_START] ?? null) === true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /** The payload key marking a result row a runner start ended calls with (G-387). */
+    public const ENDED_BY_START = 'harness_ended_by_start';
 
     /**
      * The calls of the approval paused at the transcript tail that have no
