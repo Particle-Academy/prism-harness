@@ -1978,37 +1978,55 @@ final readonly class AgentRuntime
         // A call of the paused step no request names and no result answers:
         // no resolution answers it, so it gets its one outcome now (G-412).
         $session->thread()->endUnrequestedOpenCalls(Thread::INTERRUPTED_RESULT, $runId);
-        // A requested call whose tool this session's mode does not offer:
-        // no resolution answers it either, so it gets its denial (G-412).
-        $session->thread()->endRequestedCallsNotOffered($this->offerable($session), Thread::NOT_OFFERED_RESULT, $runId);
+        // A requested call whose tool this session's mode does not offer, or
+        // that takes no approval: no resolution answers it either, so it
+        // gets its one outcome (G-412).
+        $session->thread()->endRequestedCallsNotOffered($this->requestedCallOutcome($session), $runId);
         // What the run reads: a denial recorded after this refuses a call it
         // has not started (G-410).
         Session::rememberReadUpTo($session->key(), (int) $session->thread()->storedMessages()->max('position'), $runId);
     }
 
     /**
-     * Whether this session's mode can offer a tool named `$name`, read from
-     * the mode and the registry's names alone (no tool is built): a tool the
-     * mode lists, the skill builtin of a mode with skills, or one of its
-     * subagents. Under a `*` mode, a registered name.
+     * The outcome a requested, open call of the paused step gets before the
+     * run reads the conversation, by tool name, or null to leave it to the
+     * resolution (G-412):
+     *  - not offered: a tool the mode does not list (under a `*` mode, any
+     *    name), or a listed one the registry does not resolve;
+     *  - offered but taking no approval: neither the mode nor the tool asks
+     *    for it.
+     * The skill builtin and subagents are left to the resolution. A static
+     * tool is read without building it; a factory's or provider's tool is
+     * built only here, for a requested call that has no outcome yet.
      *
-     * @return Closure(string): bool
+     * @return Closure(string): ?string
      */
-    private function offerable(Session $session): Closure
+    private function requestedCallOutcome(Session $session): Closure
     {
         $mode = $this->modes->forAgent($session->agent())->resolve($session->mode());
-        $registered = null;
+        $registry = $this->tools->forAgent($session->agent());
 
-        return function (string $name) use ($mode, $session, &$registered): bool {
+        return function (string $name) use ($mode, $registry, $session): ?string {
             if (($name === 'skill_read' && $mode->skills !== []) || array_key_exists($name, $mode->subagents)) {
-                return true;
+                return null;
             }
-            if (! in_array('*', $mode->tools, true)) {
-                return in_array($name, $mode->tools, true);
+            if (! in_array('*', $mode->tools, true) && ! in_array($name, $mode->tools, true)) {
+                return Thread::NOT_OFFERED_RESULT;
             }
-            $registered ??= $this->tools->forAgent($session->agent())->names();
+            $configured = $registry->approvalConfigured($name);
+            if ($configured === null) {
+                try {
+                    $tool = $registry->resolve([$name], $session)[$name] ?? null;
+                } catch (Throwable) {
+                    $tool = null;
+                }
+                if (! $tool instanceof Tool) {
+                    return Thread::NOT_OFFERED_RESULT;
+                }
+                $configured = $tool->hasApprovalConfigured();
+            }
 
-            return in_array($name, $registered, true);
+            return $mode->needsApproval($name) || $configured ? null : Thread::NOT_GATED_RESULT;
         };
     }
 

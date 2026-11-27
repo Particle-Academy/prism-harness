@@ -1419,47 +1419,52 @@ class Thread extends Model implements ThreadContract
     }
 
     /**
-     * Give each call of the paused step that a request names, that no result
-     * answers, and whose tool the run cannot offer `$reason` as its one
-     * stored outcome (G-412). No resolution answers such a call (core
-     * resolves only calls whose tool it is offered), so every later request
-     * would send it unanswered. Returns whether a row was written.
+     * Give each call of the paused step that a request names and no result
+     * answers the outcome `$outcome` names for its tool, as its one stored
+     * outcome (G-412): a tool the run cannot offer, or one that takes no
+     * approval. No resolution answers such a call (core resolves a requested
+     * call only for a tool it is offered that asks for approval), so every
+     * later request would send it unanswered. Returns whether a row was
+     * written.
      *
      * @internal Called before a run reads the conversation.
      *
-     * @param  Closure(string): bool  $offered  whether the run can offer a tool of this name
+     * @param  Closure(string): ?string  $outcome  the outcome a requested call of this tool name gets, or null to leave it to the resolution
      */
-    public function endRequestedCallsNotOffered(Closure $offered, string $reason, ?string $runId = null): bool
+    public function endRequestedCallsNotOffered(Closure $outcome, ?string $runId = null): bool
     {
         $step = $this->resolvableStep();
         if ($step === null || $step['assistant']->toolApprovalRequests === []) {
             return false;
         }
         $requested = array_fill_keys(array_map(static fn (ToolApprovalRequest $request): string => $request->toolCallId, $step['assistant']->toolApprovalRequests), true);
-        $open = array_values(array_filter(
-            self::callsWithoutResult($step['assistant']->toolCalls, $step['results']),
-            static fn (ToolCall $call): bool => isset($requested[$call->id]) && ! $offered($call->name),
-        ));
-        if ($open === []) {
+        $results = [];
+        foreach (self::callsWithoutResult($step['assistant']->toolCalls, $step['results']) as $call) {
+            $reason = isset($requested[$call->id]) ? $outcome($call->name) : null;
+            if ($reason !== null) {
+                $results[] = new ToolResult(
+                    toolCallId: $call->id,
+                    toolName: $call->name,
+                    args: $call->argumentsForResult(),
+                    result: $reason,
+                    toolCallResultId: $call->resultId,
+                );
+            }
+        }
+        if ($results === []) {
             return false;
         }
 
-        $this->writeRows([new ToolResultMessage(array_map(
-            static fn (ToolCall $call): ToolResult => new ToolResult(
-                toolCallId: $call->id,
-                toolName: $call->name,
-                args: $call->argumentsForResult(),
-                result: $reason,
-                toolCallResultId: $call->resultId,
-            ),
-            $open,
-        ))], $runId, null, false, $step['position'], false);
+        $this->writeRows([new ToolResultMessage($results)], $runId, null, false, $step['position'], false);
 
         return true;
     }
 
     /** What a requested call of a tool the run does not offer is answered with (G-412). */
     public const NOT_OFFERED_RESULT = 'Tool call was not run because its tool is not offered';
+
+    /** What a requested call of a tool that takes no approval is answered with (G-412). */
+    public const NOT_GATED_RESULT = 'Tool call was not run because its tool does not take approval requests';
 
     /** The position of the step a run would resolve, or null. @internal */
     public function pausedStepPosition(): ?int
