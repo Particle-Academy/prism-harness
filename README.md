@@ -1167,15 +1167,20 @@ start still ends it. When such a step is resumed, the harness resolves it itself
 core's resolver, which keys by id: every gated call in it gets exactly one result, the
 repeated-id denial, and an ungated call that ran is never given an approval or a denial.
 A decision applies only to the step that asked for it: the paused step is the newest assistant
-step with tool calls when only result rows follow it, chosen by one rule for every reader (the
+step with tool calls when only result rows (or system rows) follow it, chosen by one rule for every reader (the
 decision checks, the repeated-id guard, the resolver and the plan's readers). Any other row
-written after it (an answer, a user turn, a system row) ends that step's approvals: a decision is
+written after it (an answer, a user turn) ends that step's approvals: a decision is
 refused, nothing resolves the step, and no gated tool there counts as approved. A step is
 SUPERSEDED by any later assistant row with tool calls, or by an assistant text row or a user row
-recorded outside the run that owns it (a host's row, or a new message; the harness's own rows in
+recorded outside the runs that own it (a host's row, or a new message; the harness's own rows in
 that run do not count, and naming the run when recording does not make a row the harness's): each
-of its calls that has no result then gets exactly one, `Not run: a later step replaced it.`,
-marked by the harness, and `approvalStatus()` reads its approval as `superseded`. The mark is one shape in all three languages, pinned by the
+of its calls that has no result then gets exactly one, `Tool call was not run because a later
+step replaced it`, marked by the harness, and `approvalStatus()` reads its approval as
+`superseded`. The runs that own a step are the one that recorded it and every run that recorded
+one of its results. A decision on a superseded step, or on an approval already decided, is refused
+with `ApprovalNotPending` (code `approval_not_pending`), and a batch with one such decision records
+none of them. A system row, like a result row, leaves the step parked. A step whose requests repeat
+an approval id is treated as one whose call ids repeat. The mark is one shape in all three languages, pinned by the
 `harness-thread-rows` corpus (thr-0014): a top-level `harness_ended_by_start` holding
 `{approval_ids: [...]}`, after `tool_approval_responses`, in call order. Once a start has committed, a stop that lands later (a cancel, say) stops its model
 steps but not the start: the task is recorded on the child and the run ends with that stop. The gate is pinned across the three languages by the
