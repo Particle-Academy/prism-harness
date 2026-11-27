@@ -43,13 +43,13 @@ final readonly class BudgetedCalls
     /** @param Closure(TextResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
      */
-    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): TextResponse
+    public function text(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): TextResponse
     {
         $builder = new TextBuilder;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                (new ApprovedTools)->resolve($generation, $resolved, $started);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'text', $generation->provider());
@@ -92,13 +92,13 @@ final readonly class BudgetedCalls
     /** @param Closure(StructuredResponse):void $record
      * @param  Closure(list<Message>):void  $resolved
      */
-    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved): StructuredResponse
+    public function structured(StructuredPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): StructuredResponse
     {
         $builder = new StructuredBuilder;
         try {
             do {
                 $run->ledger->assertCallAvailable($run->budget);
-                (new ApprovedTools)->resolve($generation, $resolved);
+                (new ApprovedTools)->resolve($generation, $resolved, $started);
                 $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);
                 $request = $generation->toRequest();
                 [$reservation, $call] = $this->reserve($run, $request, 'structured', $generation->provider());
@@ -163,11 +163,11 @@ final readonly class BudgetedCalls
      * @param  Closure(list<Message>):void  $resolved
      * @return Generator<StreamEvent>
      */
-    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved): Generator
+    public function stream(TextPending $generation, RunContext $run, Closure $record, Closure $resolved, ?Closure $started = null): Generator
     {
         do {
             $run->ledger->assertCallAvailable($run->budget);
-            foreach ((new ApprovedTools)->resolve($generation, $resolved) as $event) {
+            foreach ((new ApprovedTools)->resolve($generation, $resolved, $started) as $event) {
                 yield $event;
             }
             $generation->withMaxSteps(1)->withMaxTokens($this->price->maxOutputTokens);

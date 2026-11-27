@@ -249,26 +249,23 @@ function resumeScenario(string $route, string $path, string $listener, string $p
 it('runs each approved call once across the resolving turn and the next', function (string $route, string $path, string $listener): void {
     $result = resumeScenario($route, $path, $listener);
 
-    // A tool that throws its own exception runs again on the next resume (it
-    // has no result); every call resolved before it runs once.
-    $expected = str_starts_with($route, 'raw') ? ['search' => 1, 'weather' => 2] : ($route === 'decide2' ? ['search' => 1, 'weather' => 1] : ['search' => 0, 'weather' => 1]);
+    // A tool that throws its own exception was started and has no result: it
+    // reads interrupted and never runs again (G-410); every call resolved
+    // before it runs once.
+    $expected = str_starts_with($route, 'raw') ? ['search' => 1, 'weather' => 1] : ($route === 'decide2' ? ['search' => 1, 'weather' => 1] : ['search' => 0, 'weather' => 1]);
     expect($result['runs'])->toBe($expected);
 })->with(['approve', 'decide2', 'streamDecision', 'structured', 'stream', 'abandoned stream', 'raw stream'])
     ->with(['plain', 'subagents', 'capped'])
     ->with(['quiet listener' => 'quiet', 'throwing listener' => 'throw', 'telemetry off' => 'off']);
 
 // A tool's own exception, during the resolution or on a later step of the
-// same turn, costs no other call a second run, on any path. The call that
-// threw has no result, so it alone is resolved again on the next turn.
+// same turn, costs no call a second run, on any path. The call that threw
+// was started and has no result: it reads interrupted and is never run
+// again (G-410).
 it('runs every call resolved before a tool\'s own exception once', function (string $route, string $provider, string $path, string $listener): void {
     $result = resumeScenario($route, $path, $listener, $provider);
-    // The call that threw runs again only when a later turn resolves it. On
-    // a later step it is no resolved call, and on a plain structured turn
-    // with OpenAI chat completions (which resolves approvals on the next
-    // turn, not inside the structured one) it throws in the last turn here.
-    $retried = ! str_starts_with($route, 'raw later') && ! ($route === 'raw structured' && $provider === 'openai' && $path === 'plain');
 
-    expect($result['runs'])->toBe(['search' => 1, 'weather' => $retried ? 2 : 1]);
+    expect($result['runs'])->toBe(['search' => 1, 'weather' => 1]);
 })->with([
     'decide, OpenAI' => ['raw', 'openai'],
     'decide, Anthropic' => ['raw', 'anthropic'],
@@ -294,9 +291,8 @@ it('runs an approved call once when the provider fails after it ran', function (
 // resolved first, before the turn, so a later failure costs no second run.
 it('runs every call resolved before a tool\'s own exception once when a tool cannot be watched', function (string $route, string $provider): void {
     $result = resumeScenario($route, 'plain', 'quiet', $provider, unwatchable: true);
-    $retried = ! str_starts_with($route, 'raw later');
 
-    expect($result['runs'])->toBe(['search' => 1, 'weather' => $retried ? 2 : 1]);
+    expect($result['runs'])->toBe(['search' => 1, 'weather' => 1]);
 })->with([
     'decide, OpenAI' => ['raw', 'openai'],
     'decide, Anthropic' => ['raw', 'anthropic'],
@@ -343,9 +339,8 @@ it('runs an approved call once across a structured resume', function (string $pa
 // is watched like any other: no second run, and the telemetry where it was.
 it('runs every call resolved before a tool\'s own exception once with call-time authorization on', function (string $route, string $provider, string $path): void {
     $result = resumeScenario($route, $path, 'quiet', $provider, authorize: true);
-    $retried = ! str_starts_with($route, 'raw later') && ! ($route === 'raw structured' && $provider === 'openai' && $path === 'plain');
 
-    expect($result['runs'])->toBe(['search' => 1, 'weather' => $retried ? 2 : 1]);
+    expect($result['runs'])->toBe(['search' => 1, 'weather' => 1]);
 })->with([
     'decide, OpenAI' => ['raw', 'openai'],
     'decide, Anthropic' => ['raw', 'anthropic'],

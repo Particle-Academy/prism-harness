@@ -37,6 +37,13 @@ final class ObservedTool extends DelegatingTool
 
     public function handle(...$args): string|ToolOutput|ToolError
     {
+        // The write-ahead started row, before the call runs (G-410).
+        if (! $this->recorder->starting($this->inner->name(), $args)) {
+            $output = ApprovedTools::NOT_OPEN;
+            $this->recorder->completed($this->inner->name(), $args, $output);
+
+            return $output;
+        }
         $output = $this->inner->handle(...$args);
         $this->recorder->completed($this->inner->name(), $args, $output);
 
